@@ -103,15 +103,14 @@ pub struct ResolvedAiProvider {
 #[serde(rename_all = "camelCase")]
 pub struct AiProviderDiagnosticsView {
     pub runtime_configured: bool,
-    pub lab_enabled: bool,
     pub provider_configured: bool,
     pub provider_enabled: bool,
     pub credential_configured: bool,
     pub supports_vision: bool,
     pub text_model_configured: bool,
     pub vision_model_configured: bool,
-    pub local_allowlist_count: usize,
-    pub cloud_allowlist_count: usize,
+    pub local_endpoint_count: usize,
+    pub cloud_endpoint_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -132,15 +131,36 @@ pub struct SaveAiLabSettingsInput {
     pub custom_url_approval_required: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProviderEndpointView {
+    pub id: Uuid,
+    pub provider_kind: ProviderKind,
+    pub label: String,
+    pub base_url: String,
+    pub enabled: bool,
+    pub builtin: bool,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveAiProviderEndpointInput {
+    pub provider_kind: ProviderKind,
+    pub label: String,
+    pub base_url: String,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum AiProviderStoreError {
     #[error("AI provider settings are invalid")]
     InvalidSettings,
     #[error("AI provider API key is invalid")]
     InvalidCredential,
-    #[error("local AI provider URL is not allowlisted by the server")]
+    #[error("local AI provider URL is not enabled as a laboratory Provider endpoint")]
     LocalUrlForbidden,
-    #[error("OpenAI-compatible provider URL is not allowlisted by the server")]
+    #[error("OpenAI-compatible provider URL is not enabled as a laboratory Provider endpoint")]
     CloudUrlForbidden,
     #[error("AI provider is disabled")]
     Disabled,
@@ -190,6 +210,23 @@ pub trait UserAiProviderStore: Send + Sync {
         input: SaveAiLabSettingsInput,
         audit: &AuditContext,
     ) -> Result<AiLabSettingsView, AiProviderStoreError>;
+    async fn list_provider_endpoints(
+        &self,
+        lab_id: Uuid,
+    ) -> Result<Vec<AiProviderEndpointView>, AiProviderStoreError>;
+    async fn save_provider_endpoint(
+        &self,
+        lab_id: Uuid,
+        endpoint_id: Option<Uuid>,
+        input: SaveAiProviderEndpointInput,
+        audit: &AuditContext,
+    ) -> Result<AiProviderEndpointView, AiProviderStoreError>;
+    async fn disable_provider_endpoint(
+        &self,
+        lab_id: Uuid,
+        endpoint_id: Uuid,
+        audit: &AuditContext,
+    ) -> Result<AiProviderEndpointView, AiProviderStoreError>;
 }
 
 #[derive(Debug, Default)]
@@ -231,15 +268,14 @@ impl UserAiProviderStore for DisabledAiProviderStore {
     ) -> Result<AiProviderDiagnosticsView, AiProviderStoreError> {
         Ok(AiProviderDiagnosticsView {
             runtime_configured: false,
-            lab_enabled: false,
             provider_configured: false,
             provider_enabled: false,
             credential_configured: false,
             supports_vision: false,
             text_model_configured: false,
             vision_model_configured: false,
-            local_allowlist_count: 0,
-            cloud_allowlist_count: 0,
+            local_endpoint_count: 0,
+            cloud_endpoint_count: 0,
         })
     }
     async fn get_lab_settings(
@@ -254,6 +290,29 @@ impl UserAiProviderStore for DisabledAiProviderStore {
         _input: SaveAiLabSettingsInput,
         _audit: &AuditContext,
     ) -> Result<AiLabSettingsView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+    async fn list_provider_endpoints(
+        &self,
+        _lab_id: Uuid,
+    ) -> Result<Vec<AiProviderEndpointView>, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+    async fn save_provider_endpoint(
+        &self,
+        _lab_id: Uuid,
+        _endpoint_id: Option<Uuid>,
+        _input: SaveAiProviderEndpointInput,
+        _audit: &AuditContext,
+    ) -> Result<AiProviderEndpointView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+    async fn disable_provider_endpoint(
+        &self,
+        _lab_id: Uuid,
+        _endpoint_id: Uuid,
+        _audit: &AuditContext,
+    ) -> Result<AiProviderEndpointView, AiProviderStoreError> {
         Err(AiProviderStoreError::NotConfigured)
     }
 }
@@ -282,8 +341,6 @@ mod shared_tests {
 
 #[cfg(feature = "postgres")]
 mod postgres {
-    use std::collections::BTreeSet;
-
     use base64::{Engine as _, engine::general_purpose};
     use chrono::Utc;
     use muriarc_core::{ActorType, WriteSource};
@@ -299,6 +356,8 @@ mod postgres {
 
     const NONCE_BYTES: usize = 12;
     const KEY_BYTES: usize = 32;
+    const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+    const OFFICIAL_OPENAI_LABEL: &str = "OpenAI API";
 
     pub struct AiMasterKey {
         bytes: Zeroizing<Vec<u8>>,
@@ -340,63 +399,9 @@ mod postgres {
         }
     }
 
-    #[derive(Debug, Clone)]
-    pub struct ServerAiProviderPolicy {
-        allowed_local_base_urls: BTreeSet<String>,
-        allowed_cloud_base_urls: BTreeSet<String>,
-    }
-
-    impl Default for ServerAiProviderPolicy {
-        fn default() -> Self {
-            Self::new([], ["https://api.openai.com/v1".to_owned()])
-        }
-    }
-
-    impl ServerAiProviderPolicy {
-        pub fn new(
-            local_urls: impl IntoIterator<Item = String>,
-            cloud_urls: impl IntoIterator<Item = String>,
-        ) -> Self {
-            Self {
-                allowed_local_base_urls: normalized_urls(local_urls),
-                allowed_cloud_base_urls: normalized_urls(cloud_urls),
-            }
-        }
-
-        fn allowlist_counts(&self) -> (usize, usize) {
-            (
-                self.allowed_local_base_urls.len(),
-                self.allowed_cloud_base_urls.len(),
-            )
-        }
-
-        fn validate(&self, config: &ProviderConfig) -> Result<(), AiProviderStoreError> {
-            let normalized = normalized_url(&config.base_url);
-            match config.kind {
-                ProviderKind::LocalHttp if !self.allowed_local_base_urls.contains(&normalized) => {
-                    Err(AiProviderStoreError::LocalUrlForbidden)
-                }
-                ProviderKind::OpenAiCompatible
-                    if !self.allowed_cloud_base_urls.contains(&normalized) =>
-                {
-                    Err(AiProviderStoreError::CloudUrlForbidden)
-                }
-                ProviderKind::LocalHttp | ProviderKind::OpenAiCompatible => Ok(()),
-            }
-        }
-    }
-
-    fn normalized_urls(urls: impl IntoIterator<Item = String>) -> BTreeSet<String> {
-        urls.into_iter()
-            .map(|value| normalized_url(&value))
-            .filter(|value| !value.is_empty())
-            .collect()
-    }
-
     pub struct PostgresAiProviderStore {
         postgres: PostgresStore,
         master_key: AiMasterKey,
-        policy: ServerAiProviderPolicy,
     }
 
     impl fmt::Debug for PostgresAiProviderStore {
@@ -404,21 +409,15 @@ mod postgres {
             formatter
                 .debug_struct("PostgresAiProviderStore")
                 .field("master_key", &self.master_key)
-                .field("policy", &self.policy)
                 .finish_non_exhaustive()
         }
     }
 
     impl PostgresAiProviderStore {
-        pub fn new(
-            postgres: PostgresStore,
-            master_key: AiMasterKey,
-            policy: ServerAiProviderPolicy,
-        ) -> Self {
+        pub fn new(postgres: PostgresStore, master_key: AiMasterKey) -> Self {
             Self {
                 postgres,
                 master_key,
-                policy,
             }
         }
 
@@ -440,6 +439,160 @@ mod postgres {
             BuiltinProvider::from_config(config.clone())
                 .map_err(|_| AiProviderStoreError::InvalidSettings)?;
             Ok(config)
+        }
+
+        fn endpoint_config(
+            input: &SaveAiProviderEndpointInput,
+        ) -> Result<ProviderConfig, AiProviderStoreError> {
+            let config = match input.provider_kind {
+                ProviderKind::OpenAiCompatible => ProviderConfig::openai_compatible(
+                    "endpoint-validation",
+                    "muriarc-endpoint-validation",
+                    input.base_url.clone(),
+                ),
+                ProviderKind::LocalHttp => ProviderConfig::local_http(
+                    "endpoint-validation",
+                    "muriarc-endpoint-validation",
+                    input.base_url.clone(),
+                ),
+            };
+            BuiltinProvider::from_config(config.clone())
+                .map_err(|_| AiProviderStoreError::InvalidSettings)?;
+            Ok(config)
+        }
+
+        fn validated_endpoint_label(label: &str) -> Result<String, AiProviderStoreError> {
+            let label = label.trim();
+            if label.is_empty() || label.len() > 120 {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            Ok(label.to_owned())
+        }
+
+        fn provider_kind_name(kind: ProviderKind) -> &'static str {
+            match kind {
+                ProviderKind::OpenAiCompatible => "open_ai_compatible",
+                ProviderKind::LocalHttp => "local_http",
+            }
+        }
+
+        fn provider_kind_from_db(value: &str) -> Result<ProviderKind, AiProviderStoreError> {
+            match value {
+                "open_ai_compatible" => Ok(ProviderKind::OpenAiCompatible),
+                "local_http" => Ok(ProviderKind::LocalHttp),
+                _ => Err(AiProviderStoreError::Storage),
+            }
+        }
+
+        fn builtin_openai_endpoint_id() -> Uuid {
+            Uuid::from_u128(1)
+        }
+
+        fn builtin_openai_endpoint() -> AiProviderEndpointView {
+            AiProviderEndpointView {
+                id: Self::builtin_openai_endpoint_id(),
+                provider_kind: ProviderKind::OpenAiCompatible,
+                label: OFFICIAL_OPENAI_LABEL.to_owned(),
+                base_url: OFFICIAL_OPENAI_BASE_URL.to_owned(),
+                enabled: true,
+                builtin: true,
+                revision: 1,
+            }
+        }
+
+        fn endpoint_view(
+            row: &sqlx::postgres::PgRow,
+        ) -> Result<AiProviderEndpointView, AiProviderStoreError> {
+            let kind: String = row
+                .try_get("provider_kind")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            Ok(AiProviderEndpointView {
+                id: row.try_get("id").map_err(|_| AiProviderStoreError::Storage)?,
+                provider_kind: Self::provider_kind_from_db(&kind)?,
+                label: row
+                    .try_get("label")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                base_url: row
+                    .try_get("base_url")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                enabled: row
+                    .try_get("enabled")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                builtin: row
+                    .try_get("builtin")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                revision: row
+                    .try_get("revision")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            })
+        }
+
+        fn endpoint_audit_state(view: &AiProviderEndpointView) -> Value {
+            json!({
+                "provider_kind": Self::provider_kind_name(view.provider_kind),
+                "label": view.label,
+                "enabled": view.enabled,
+                "builtin": view.builtin,
+                "base_url_present": true,
+                "revision": view.revision,
+            })
+        }
+
+        async fn active_user_lab_from_pool(
+            &self,
+            user_id: Uuid,
+        ) -> Result<Uuid, AiProviderStoreError> {
+            sqlx::query_scalar(
+                "SELECT lab_id FROM users WHERE id = $1 AND status = 'active' AND deleted_at IS NULL",
+            )
+            .bind(user_id)
+            .fetch_optional(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .ok_or(AiProviderStoreError::Storage)
+        }
+
+        async fn validate_endpoint_for_lab(
+            &self,
+            lab_id: Uuid,
+            config: &ProviderConfig,
+        ) -> Result<(), AiProviderStoreError> {
+            let normalized = normalized_url(&config.base_url);
+            if config.kind == ProviderKind::OpenAiCompatible
+                && normalized == normalized_url(OFFICIAL_OPENAI_BASE_URL)
+            {
+                return Ok(());
+            }
+            let allowed: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM ai_provider_endpoints WHERE lab_id = $1 AND provider_kind = $2 AND normalized_base_url = $3 AND enabled = TRUE)",
+            )
+            .bind(lab_id)
+            .bind(Self::provider_kind_name(config.kind))
+            .bind(&normalized)
+            .fetch_one(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            match (allowed, config.kind) {
+                (true, _) => Ok(()),
+                (false, ProviderKind::LocalHttp) => Err(AiProviderStoreError::LocalUrlForbidden),
+                (false, ProviderKind::OpenAiCompatible) => {
+                    Err(AiProviderStoreError::CloudUrlForbidden)
+                }
+            }
+        }
+
+        async fn endpoint_counts(
+            &self,
+            lab_id: Uuid,
+        ) -> Result<(usize, usize), AiProviderStoreError> {
+            let counts: (i64, i64) = sqlx::query_as(
+                "SELECT count(*) FILTER (WHERE provider_kind = 'local_http' AND enabled = TRUE)::bigint, count(*) FILTER (WHERE provider_kind = 'open_ai_compatible' AND enabled = TRUE)::bigint FROM ai_provider_endpoints WHERE lab_id = $1",
+            )
+            .bind(lab_id)
+            .fetch_one(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            Ok((counts.0 as usize, counts.1 as usize + 1))
         }
 
         fn encrypt(
@@ -556,21 +709,11 @@ mod postgres {
                     .map_err(|_| AiProviderStoreError::Storage)?,
             })
         }
-        async fn lab_enabled_for_user(&self, user_id: Uuid) -> Result<bool, AiProviderStoreError> {
-            let row: Option<(bool, bool)> = sqlx::query_as(
-                "SELECT COALESCE((SELECT enabled FROM ai_lab_settings WHERE lab_id = u.lab_id), TRUE), EXISTS(SELECT 1 FROM memberships m WHERE m.lab_id = u.lab_id AND m.user_id = u.id AND m.project_id IS NULL AND m.lab_role = 'lab_admin' AND m.deleted_at IS NULL) FROM users u WHERE u.id = $1 AND u.status = 'active' AND u.deleted_at IS NULL",
-            )
-            .bind(user_id)
-            .fetch_optional(self.postgres.pool())
-            .await
-            .map_err(|_| AiProviderStoreError::Storage)?;
-            let (lab_enabled, lab_admin) = row.ok_or(AiProviderStoreError::Storage)?;
-            Ok(lab_enabled || lab_admin)
-        }
 
-        fn resolve_row(
+        async fn resolve_row(
             &self,
             user_id: Uuid,
+            lab_id: Uuid,
             row: &sqlx::postgres::PgRow,
             vision: bool,
         ) -> Result<ResolvedAiProvider, AiProviderStoreError> {
@@ -593,7 +736,7 @@ mod postgres {
                 }
                 config.model = vision_model.ok_or(AiProviderStoreError::InvalidSettings)?;
             }
-            self.policy.validate(&config)?;
+            self.validate_endpoint_for_lab(lab_id, &config).await?;
             let provider = BuiltinProvider::from_config(config.clone())
                 .map_err(|_| AiProviderStoreError::InvalidSettings)?;
             let key_version: Option<i32> = row
@@ -635,7 +778,6 @@ mod postgres {
         ) -> Result<AiProviderSettingsView, AiProviderStoreError> {
             validate_settings_audit(user_id, audit)?;
             let config = Self::config(&input)?;
-            self.policy.validate(&config)?;
             let vision_model = input
                 .vision_model
                 .as_deref()
@@ -665,6 +807,7 @@ mod postgres {
                 .await
                 .map_err(|_| AiProviderStoreError::Storage)?;
             let lab_id = Self::active_user_lab(&mut transaction, user_id).await?;
+            self.validate_endpoint_for_lab(lab_id, &config).await?;
             let current = Self::locked_row(&mut transaction, user_id).await?;
             let before = settings_audit_state(current.as_ref())?;
             let (key_version, nonce, ciphertext) = match input.api_key.as_deref() {
@@ -772,28 +915,24 @@ mod postgres {
         }
 
         async fn resolve(&self, user_id: Uuid) -> Result<ResolvedAiProvider, AiProviderStoreError> {
-            if !self.lab_enabled_for_user(user_id).await? {
-                return Err(AiProviderStoreError::Disabled);
-            }
+            let lab_id = self.active_user_lab_from_pool(user_id).await?;
             let row = self
                 .row(user_id)
                 .await?
                 .ok_or(AiProviderStoreError::NotConfigured)?;
-            self.resolve_row(user_id, &row, false)
+            self.resolve_row(user_id, lab_id, &row, false).await
         }
 
         async fn resolve_vision(
             &self,
             user_id: Uuid,
         ) -> Result<ResolvedAiProvider, AiProviderStoreError> {
-            if !self.lab_enabled_for_user(user_id).await? {
-                return Err(AiProviderStoreError::Disabled);
-            }
+            let lab_id = self.active_user_lab_from_pool(user_id).await?;
             let row = self
                 .row(user_id)
                 .await?
                 .ok_or(AiProviderStoreError::NotConfigured)?;
-            self.resolve_row(user_id, &row, true)
+            self.resolve_row(user_id, lab_id, &row, true).await
         }
 
         async fn diagnostics(
@@ -811,18 +950,10 @@ mod postgres {
             if actual_lab != Some(lab_id) {
                 return Err(AiProviderStoreError::Storage);
             }
-            let lab_enabled: bool = sqlx::query_scalar(
-                "SELECT COALESCE((SELECT enabled FROM ai_lab_settings WHERE lab_id = $1), TRUE)",
-            )
-            .bind(lab_id)
-            .fetch_one(self.postgres.pool())
-            .await
-            .map_err(|_| AiProviderStoreError::Storage)?;
             let row = self.row(user_id).await?;
-            let (local_allowlist_count, cloud_allowlist_count) = self.policy.allowlist_counts();
+            let (local_endpoint_count, cloud_endpoint_count) = self.endpoint_counts(lab_id).await?;
             Ok(AiProviderDiagnosticsView {
                 runtime_configured: true,
-                lab_enabled,
                 provider_configured: row.is_some(),
                 provider_enabled: row
                     .as_ref()
@@ -847,8 +978,8 @@ mod postgres {
                     .and_then(|value| value.try_get::<Option<String>, _>("vision_model").ok())
                     .flatten()
                     .is_some(),
-                local_allowlist_count,
-                cloud_allowlist_count,
+                local_endpoint_count,
+                cloud_endpoint_count,
             })
         }
 
@@ -870,11 +1001,10 @@ mod postgres {
             .fetch_one(self.postgres.pool())
             .await
             .map_err(|_| AiProviderStoreError::Storage)?;
-            let (enabled, custom_url_approval_required, revision) =
-                settings.unwrap_or((true, true, 0));
+            let (_, _, revision) = settings.unwrap_or((true, false, 0));
             Ok(AiLabSettingsView {
-                enabled,
-                custom_url_approval_required,
+                enabled: true,
+                custom_url_approval_required: false,
                 configured_user_count: counts.0,
                 enabled_user_count: counts.1,
                 vision_user_count: counts.2,
@@ -885,7 +1015,7 @@ mod postgres {
         async fn save_lab_settings(
             &self,
             lab_id: Uuid,
-            input: SaveAiLabSettingsInput,
+            _input: SaveAiLabSettingsInput,
             audit: &AuditContext,
         ) -> Result<AiLabSettingsView, AiProviderStoreError> {
             let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
@@ -919,15 +1049,15 @@ mod postgres {
                 "INSERT INTO ai_lab_settings (lab_id, enabled, custom_url_approval_required, updated_by, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,now(),now(),1) ON CONFLICT (lab_id) DO UPDATE SET enabled = EXCLUDED.enabled, custom_url_approval_required = EXCLUDED.custom_url_approval_required, updated_by = EXCLUDED.updated_by, updated_at = now(), revision = ai_lab_settings.revision + 1 RETURNING enabled, custom_url_approval_required, revision",
             )
             .bind(lab_id)
-            .bind(input.enabled)
-            .bind(input.custom_url_approval_required)
+            .bind(true)
+            .bind(false)
             .bind(actor_user_id)
             .fetch_one(&mut *transaction)
             .await
             .map_err(|_| AiProviderStoreError::Storage)?;
             let after = json!({
-                "enabled": row.try_get::<bool, _>("enabled").map_err(|_| AiProviderStoreError::Storage)?,
-                "custom_url_approval_required": row.try_get::<bool, _>("custom_url_approval_required").map_err(|_| AiProviderStoreError::Storage)?,
+                "enabled": true,
+                "custom_url_approval_required": false,
                 "revision": row.try_get::<i64, _>("revision").map_err(|_| AiProviderStoreError::Storage)?,
             });
             sqlx::query(
@@ -951,6 +1081,202 @@ mod postgres {
                 .map_err(|_| AiProviderStoreError::Storage)?;
             self.get_lab_settings(lab_id).await
         }
+
+        async fn list_provider_endpoints(
+            &self,
+            lab_id: Uuid,
+        ) -> Result<Vec<AiProviderEndpointView>, AiProviderStoreError> {
+            let rows = sqlx::query(
+                "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE lab_id = $1 ORDER BY enabled DESC, provider_kind, label, base_url",
+            )
+            .bind(lab_id)
+            .fetch_all(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            let mut endpoints = vec![Self::builtin_openai_endpoint()];
+            endpoints.extend(
+                rows.iter()
+                    .map(Self::endpoint_view)
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            Ok(endpoints)
+        }
+
+        async fn save_provider_endpoint(
+            &self,
+            lab_id: Uuid,
+            endpoint_id: Option<Uuid>,
+            input: SaveAiProviderEndpointInput,
+            audit: &AuditContext,
+        ) -> Result<AiProviderEndpointView, AiProviderStoreError> {
+            let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
+            if audit.actor.actor_type != ActorType::Human {
+                return Err(AiProviderStoreError::Storage);
+            }
+            if endpoint_id == Some(Self::builtin_openai_endpoint_id()) {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            let label = Self::validated_endpoint_label(&input.label)?;
+            let config = Self::endpoint_config(&input)?;
+            let normalized = normalized_url(&config.base_url);
+            if config.kind == ProviderKind::OpenAiCompatible
+                && normalized == normalized_url(OFFICIAL_OPENAI_BASE_URL)
+            {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            let mut transaction = self
+                .postgres
+                .pool()
+                .begin()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            if Self::active_user_lab(&mut transaction, actor_user_id).await? != lab_id {
+                return Err(AiProviderStoreError::Storage);
+            }
+            let kind = Self::provider_kind_name(config.kind);
+            let before_row = match endpoint_id {
+                Some(id) => sqlx::query(
+                    "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE id = $1 AND lab_id = $2 AND builtin = FALSE FOR UPDATE",
+                )
+                .bind(id)
+                .bind(lab_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?,
+                None => sqlx::query(
+                    "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE lab_id = $1 AND provider_kind = $2 AND normalized_base_url = $3 FOR UPDATE",
+                )
+                .bind(lab_id)
+                .bind(kind)
+                .bind(&normalized)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?,
+            };
+            if endpoint_id.is_some() && before_row.is_none() {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            let before = before_row
+                .as_ref()
+                .map(Self::endpoint_view)
+                .transpose()?
+                .map(|view| Self::endpoint_audit_state(&view));
+            let id = endpoint_id
+                .or_else(|| {
+                    before_row
+                        .as_ref()
+                        .and_then(|row| row.try_get::<Uuid, _>("id").ok())
+                })
+                .unwrap_or_else(Uuid::new_v4);
+            let row = if endpoint_id.is_some() {
+                sqlx::query(
+                    "UPDATE ai_provider_endpoints SET provider_kind = $1, label = $2, base_url = $3, normalized_base_url = $4, enabled = $5, updated_by = $6, updated_at = now(), revision = revision + 1 WHERE id = $7 AND lab_id = $8 AND builtin = FALSE RETURNING id, provider_kind, label, base_url, enabled, builtin, revision",
+                )
+                .bind(kind)
+                .bind(&label)
+                .bind(&config.base_url)
+                .bind(&normalized)
+                .bind(input.enabled)
+                .bind(actor_user_id)
+                .bind(id)
+                .bind(lab_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?
+            } else {
+                sqlx::query(
+                    "INSERT INTO ai_provider_endpoints (id, lab_id, provider_kind, label, base_url, normalized_base_url, enabled, builtin, created_by, updated_by, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE,$8,$8,now(),now(),1) ON CONFLICT (lab_id, provider_kind, normalized_base_url) DO UPDATE SET label = EXCLUDED.label, base_url = EXCLUDED.base_url, enabled = EXCLUDED.enabled, updated_by = EXCLUDED.updated_by, updated_at = now(), revision = ai_provider_endpoints.revision + 1 RETURNING id, provider_kind, label, base_url, enabled, builtin, revision",
+                )
+                .bind(id)
+                .bind(lab_id)
+                .bind(kind)
+                .bind(&label)
+                .bind(&config.base_url)
+                .bind(&normalized)
+                .bind(input.enabled)
+                .bind(actor_user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?
+            };
+            let view = Self::endpoint_view(&row)?;
+            let after = Self::endpoint_audit_state(&view);
+            write_endpoint_audit(
+                &mut transaction,
+                lab_id,
+                view.id,
+                if before.is_some() { "update" } else { "create" },
+                before,
+                Some(after),
+                audit,
+                "AI provider endpoint saved",
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            Ok(view)
+        }
+
+        async fn disable_provider_endpoint(
+            &self,
+            lab_id: Uuid,
+            endpoint_id: Uuid,
+            audit: &AuditContext,
+        ) -> Result<AiProviderEndpointView, AiProviderStoreError> {
+            let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
+            if audit.actor.actor_type != ActorType::Human
+                || endpoint_id == Self::builtin_openai_endpoint_id()
+            {
+                return Err(AiProviderStoreError::Storage);
+            }
+            let mut transaction = self
+                .postgres
+                .pool()
+                .begin()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            if Self::active_user_lab(&mut transaction, actor_user_id).await? != lab_id {
+                return Err(AiProviderStoreError::Storage);
+            }
+            let current = sqlx::query(
+                "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE id = $1 AND lab_id = $2 AND builtin = FALSE FOR UPDATE",
+            )
+            .bind(endpoint_id)
+            .bind(lab_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .ok_or(AiProviderStoreError::InvalidSettings)?;
+            let before_view = Self::endpoint_view(&current)?;
+            let row = sqlx::query(
+                "UPDATE ai_provider_endpoints SET enabled = FALSE, updated_by = $1, updated_at = now(), revision = revision + 1 WHERE id = $2 AND lab_id = $3 AND builtin = FALSE RETURNING id, provider_kind, label, base_url, enabled, builtin, revision",
+            )
+            .bind(actor_user_id)
+            .bind(endpoint_id)
+            .bind(lab_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            let view = Self::endpoint_view(&row)?;
+            write_endpoint_audit(
+                &mut transaction,
+                lab_id,
+                view.id,
+                "update",
+                Some(Self::endpoint_audit_state(&before_view)),
+                Some(Self::endpoint_audit_state(&view)),
+                audit,
+                "AI provider endpoint disabled",
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            Ok(view)
+        }
     }
 
     fn aad(user_id: Uuid, version: i32) -> String {
@@ -966,6 +1292,37 @@ mod postgres {
         } else {
             Ok(())
         }
+    }
+
+    async fn write_endpoint_audit(
+        transaction: &mut Transaction<'_, Postgres>,
+        lab_id: Uuid,
+        endpoint_id: Uuid,
+        action: &'static str,
+        before: Option<Value>,
+        after: Option<Value>,
+        audit: &AuditContext,
+        reason: &'static str,
+    ) -> Result<(), AiProviderStoreError> {
+        let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
+        sqlx::query(
+            "INSERT INTO audit_entries (id, lab_id, project_id, entity_type, entity_id, action, actor_type, actor_user_id, actor_display_name, source, request_id, reason, before_json, after_json, occurred_at) VALUES ($1,$2,NULL,'ai_provider_endpoint',$3,$4,'human',$5,$6,$7,$8,$9,$10,$11,now())",
+        )
+        .bind(Uuid::new_v4())
+        .bind(lab_id)
+        .bind(endpoint_id)
+        .bind(action)
+        .bind(actor_user_id)
+        .bind(&audit.actor.display_name)
+        .bind(write_source_name(audit.source))
+        .bind(&audit.request_id)
+        .bind(reason)
+        .bind(before)
+        .bind(after)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| AiProviderStoreError::Storage)?;
+        Ok(())
     }
 
     fn settings_audit_state(
@@ -1070,7 +1427,6 @@ mod postgres {
                     sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap(),
                 ),
                 master(),
-                ServerAiProviderPolicy::default(),
             );
             let user = Uuid::new_v4();
             let (nonce, ciphertext) = store.encrypt(user, "super-secret-key").unwrap();
@@ -1090,50 +1446,6 @@ mod postgres {
             let encoded = general_purpose::STANDARD.encode([9_u8; KEY_BYTES]);
             assert!(AiMasterKey::from_base64(&encoded, 1).is_ok());
             assert!(AiMasterKey::from_base64("not-a-key", 1).is_err());
-        }
-
-        #[test]
-        fn cloud_provider_requires_an_exact_server_allowlist_entry() {
-            let policy = ServerAiProviderPolicy::default();
-            let official = ProviderConfig::openai_compatible(
-                SERVER_PROVIDER_ID,
-                "model",
-                "https://api.openai.com/v1/",
-            );
-            let private_alias = ProviderConfig::openai_compatible(
-                SERVER_PROVIDER_ID,
-                "model",
-                "https://localhost/v1",
-            );
-            assert!(policy.validate(&official).is_ok());
-            assert!(matches!(
-                policy.validate(&private_alias),
-                Err(AiProviderStoreError::CloudUrlForbidden)
-            ));
-        }
-
-        #[test]
-        fn local_provider_allowlist_preserves_case_sensitive_paths() {
-            let policy = ServerAiProviderPolicy::new(
-                ["http://localhost:11434/V1".to_owned()],
-                ["https://api.openai.com/v1".to_owned()],
-            );
-            let exact = ProviderConfig::local_http(
-                SERVER_PROVIDER_ID,
-                "local-model",
-                "http://localhost:11434/V1/",
-            );
-            let different_path = ProviderConfig::local_http(
-                SERVER_PROVIDER_ID,
-                "local-model",
-                "http://localhost:11434/v1",
-            );
-
-            assert!(policy.validate(&exact).is_ok());
-            assert!(matches!(
-                policy.validate(&different_path),
-                Err(AiProviderStoreError::LocalUrlForbidden)
-            ));
         }
 
         #[tokio::test]
@@ -1163,17 +1475,28 @@ mod postgres {
             let sensitive_url = "https://private-provider.example.test/v1";
             let sensitive_model = "private-model-name";
             let sensitive_key = "secret-provider-key-that-must-never-be-audited";
-            let store = PostgresAiProviderStore::new(
-                postgres.clone(),
-                master(),
-                ServerAiProviderPolicy::new([], [sensitive_url.to_owned()]),
-            );
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
             let audit = AuditContext {
                 actor: Actor::human(user.id, user.display_name.clone()),
                 source: WriteSource::Web,
                 request_id: Some("ai-settings-audit-test".to_owned()),
                 reason: Some(format!("must not copy {sensitive_key}")),
             };
+            let endpoint = store
+                .save_provider_endpoint(
+                    lab.id,
+                    None,
+                    SaveAiProviderEndpointInput {
+                        enabled: true,
+                        provider_kind: ProviderKind::OpenAiCompatible,
+                        label: "Private compatible API".to_owned(),
+                        base_url: sensitive_url.to_owned(),
+                    },
+                    &audit,
+                )
+                .await
+                .unwrap();
+            assert!(endpoint.enabled);
             let saved = store
                 .save(
                     user.id,
@@ -1270,4 +1593,4 @@ mod postgres {
 }
 
 #[cfg(feature = "postgres")]
-pub use postgres::{AiMasterKey, PostgresAiProviderStore, ServerAiProviderPolicy};
+pub use postgres::{AiMasterKey, PostgresAiProviderStore};

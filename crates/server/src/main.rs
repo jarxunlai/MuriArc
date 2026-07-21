@@ -6,8 +6,8 @@ use muriarc_data::DataFiles;
 use muriarc_server::{
     AiMasterKey, AppState, Authenticator, ChainedAuthenticator, EnvironmentRootConfig,
     LiveBootstrapAuthenticator, PostgresAiProviderStore, PostgresAuthBackend,
-    PostgresUserGovernance, ServerAiProviderPolicy, SessionCookieConfig, StaticTokenAuthenticator,
-    StoreJobRepository, application_router, sync_postgres_environment_root,
+    PostgresUserGovernance, SessionCookieConfig, StaticTokenAuthenticator, StoreJobRepository,
+    application_router, sync_postgres_environment_root,
 };
 use muriarc_store_postgres::PostgresStore;
 use tracing_subscriber::EnvFilter;
@@ -105,15 +105,7 @@ fn configure_ai(state: AppState, store: Arc<PostgresStore>) -> Result<AppState, 
     let encoded_key = Zeroizing::new(encoded_key);
     let key_version = optional_positive_i32_env("MURIARC_AI_MASTER_KEY_VERSION", 1)?;
     let master_key = AiMasterKey::from_base64(encoded_key.as_str(), key_version)?;
-    let allowed_local_base_urls = url_allowlist("MURIARC_AI_LOCAL_URL_ALLOWLIST");
-    let mut allowed_cloud_base_urls = url_allowlist("MURIARC_AI_OPENAI_URL_ALLOWLIST");
-    allowed_cloud_base_urls.push("https://api.openai.com/v1".to_owned());
-    let policy = ServerAiProviderPolicy::new(allowed_local_base_urls, allowed_cloud_base_urls);
-    let providers = Arc::new(PostgresAiProviderStore::new(
-        store.as_ref().clone(),
-        master_key,
-        policy,
-    ));
+    let providers = Arc::new(PostgresAiProviderStore::new(store.as_ref().clone(), master_key));
     let operations: Arc<dyn AiOperationStore> = store;
     tracing::info!(
         key_version,
@@ -226,20 +218,6 @@ fn optional_positive_i32_env(name: &'static str, default: i32) -> Result<i32, Bo
         return Err(format!("{name} must be a positive integer").into());
     }
     Ok(value)
-}
-
-fn url_allowlist(name: &str) -> Vec<String> {
-    env::var(name)
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn optional_secret_env(name: &'static str) -> Result<Option<String>, Box<dyn Error>> {

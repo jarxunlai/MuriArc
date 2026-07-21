@@ -3,10 +3,12 @@
 Thumbs.db
 .idea/
 .vscode/
-.codex/
-.agents/
 *.swp
 *.orig
+
+# Agent skills / workflows must be tracked so git worktrees
+# check them out correctly (.codex and .agents are source, not local cache).
+# Keep Python bytecode under skills ignored via __pycache__/ below.
 
 # Rust
 target/

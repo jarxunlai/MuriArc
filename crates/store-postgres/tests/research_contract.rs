@@ -79,6 +79,39 @@ async fn postgres_persists_research_entities_when_configured() {
         store.list_genotypes(child.id).await.unwrap(),
         vec![genotype.clone()]
     );
+    let mut definition = GenotypeDefinition::new(lab.id, "GeneA +/flox", now).unwrap();
+    definition
+        .replace_components(vec![
+            GenotypeComponent::new(
+                definition.id,
+                locus.id,
+                wild_type.id,
+                Some(flox.id),
+                GenotypeComponentMode::Diploid,
+                0,
+                now,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+    store
+        .create_genotype_definition(&definition, &audit)
+        .await
+        .unwrap();
+    let mut genotyping_record = GenotypingRecord::new(
+        lab.id,
+        child.id,
+        definition.id,
+        GenotypingState::Confirmed,
+        Some(now),
+        now,
+    )
+    .unwrap();
+    genotyping_record.project_id = Some(project.id);
+    store
+        .create_genotyping_record(&genotyping_record, &audit)
+        .await
+        .unwrap();
     assert!(
         store
             .list_animal_events(child.id)
@@ -251,7 +284,10 @@ async fn postgres_persists_research_entities_when_configured() {
         .unwrap();
     assert_eq!(overviews.len(), 1);
     assert_eq!(overviews[0].animal.id, child.id);
-    assert_eq!(overviews[0].genotype_labels, vec!["GeneA +/flox"]);
+    assert_eq!(
+        overviews[0].genotype_labels,
+        vec!["GeneA +/flox [confirmed]"]
+    );
     assert_eq!(overviews[0].projects[0].id, project.id);
     assert_eq!(overviews[0].latest_weight.as_ref().unwrap().value, 22.5);
     assert!(matches!(

@@ -11,9 +11,13 @@ import type {
   AnimalStatus,
   GeneAllele,
   GeneLocus,
+  GenotypeDefinition,
+  GenotypingRecord,
+  GenotypingState,
   PedigreeRelation,
   ProjectSummary,
 } from '@/domain/models'
+import { currentGenotypingRecords } from '@/domain/genetics'
 import { gateway } from '@/services/gateway'
 import {
   canManageBreeding,
@@ -42,14 +46,15 @@ const detailLoading = ref(false)
 const detailError = ref('')
 const detailTab = ref('timeline')
 const showCreate = ref(false)
+const registrationDefinitionsLoading = ref(false)
 const showSampleCreate = ref(false)
 const sampleSaving = ref(false)
-const showGenotypeCreate = ref(false)
-const genotypeSaving = ref(false)
 const geneticsLoading = ref(false)
 const geneLoci = ref<GeneLocus[]>([])
 const geneAlleles = ref<GeneAllele[]>([])
 const genotypes = ref<AnimalGenotype[]>([])
+const genotypeDefinitions = ref<GenotypeDefinition[]>([])
+const genotypingRecords = ref<GenotypingRecord[]>([])
 const attachmentUploading = ref(false)
 const attachmentDownloadingId = ref<string | null>(null)
 const attachmentProjectId = ref<string | null>(null)
@@ -63,6 +68,13 @@ const newAnimal = reactive({
   sex: 'unknown' as Animal['sex'],
   strain: '',
   birthDate: null as number | null,
+  initialGenotypingRecords: [] as Array<{
+    genotypeDefinitionId: string | null
+    state: GenotypingState
+    assessedAt: number | null
+    method: string
+    notes: string
+  }>,
 })
 const newSample = reactive({
   projectId: null as string | null,
@@ -73,15 +85,6 @@ const newSample = reactive({
   location: '',
   collectedAt: null as number | null,
 })
-const newGenotype = reactive({
-  locusValue: '',
-  allele1Value: '',
-  allele2Value: '',
-  allele1WildType: false,
-  allele2WildType: false,
-  assessedAt: null as number | null,
-})
-
 const routeProjectId = computed(() => typeof route.query.project_id === 'string'
   ? route.query.project_id
   : undefined)
@@ -100,8 +103,23 @@ const statusMeta: Record<AnimalStatus, { label: string; type: 'default' | 'succe
   experiment: { label: '实验中', type: 'warning' },
   archived: { label: '已归档', type: 'default' },
 }
+const genotypingStateMeta: Record<GenotypingState, { label: string; type: 'default' | 'info' | 'success' | 'error' }> = {
+  unknown: { label: '未知', type: 'default' },
+  expected: { label: '预期', type: 'info' },
+  confirmed: { label: '已确认', type: 'success' },
+  rejected: { label: '已排除', type: 'error' },
+}
 const statusOptions = Object.entries(statusMeta).map(([value, meta]) => ({ value, label: meta.label }))
 const projectOptions = computed(() => projects.value.map((project) => ({ label: project.name, value: project.id })))
+const genotypeDefinitionOptions = computed(() => genotypeDefinitions.value
+  .filter((definition) => !definition.archivedAt)
+  .map((definition) => ({ label: definition.name, value: definition.id })))
+const registrationStateOptions = computed(() => [
+  { label: '预期', value: 'expected' as GenotypingState },
+  { label: '未知', value: 'unknown' as GenotypingState },
+  { label: '已确认', value: 'confirmed' as GenotypingState, disabled: !genotypeWriteAllowed.value },
+  { label: '已排除', value: 'rejected' as GenotypingState, disabled: !genotypeWriteAllowed.value },
+])
 const selectedProjectRefs = computed<ProjectSummary[]>(() => {
   if (!selected.value) return []
   const refs = selected.value.projectRefs?.length
@@ -122,23 +140,6 @@ const sampleExperimentOptions = computed(() => detail.value?.experiments
   .filter((record) => !newSample.projectId || record.projectId === newSample.projectId)
   .filter((record, index, records) => records.findIndex((item) => item.experimentId === record.experimentId) === index)
   .map((record) => ({ label: record.experimentName, value: record.experimentId })) ?? [])
-const locusOptions = computed(() => geneLoci.value.map((locus) => ({
-  label: locus.symbol,
-  value: locus.id,
-})))
-const selectedLocus = computed(() => {
-  const value = newGenotype.locusValue.trim().toLowerCase()
-  return geneLoci.value.find((locus) => locus.id === newGenotype.locusValue
-    || locus.symbol.toLowerCase() === value)
-})
-const alleleOptions = computed(() => selectedLocus.value
-  ? geneAlleles.value
-      .filter((allele) => allele.locusId === selectedLocus.value?.id)
-      .map((allele) => ({
-        label: `${allele.symbol}${allele.isWildType ? '（野生型）' : ''}`,
-        value: allele.id,
-      }))
-  : [])
 const genotypeRows = computed(() => genotypes.value.map((genotype) => {
   const locus = geneLoci.value.find((candidate) => candidate.id === genotype.locusId)
   const first = geneAlleles.value.find((candidate) => candidate.id === genotype.allele1Id)
@@ -149,6 +150,13 @@ const genotypeRows = computed(() => genotypes.value.map((genotype) => {
     alleleLabel: `${first?.symbol ?? '?'} / ${second?.symbol ?? '?'}`,
   }
 }))
+const currentGenotypeRows = computed(() => currentGenotypingRecords(genotypingRecords.value)
+  .map((record) => ({
+    ...record,
+    definitionLabel: genotypeDefinitions.value.find(
+      (definition) => definition.id === record.genotypeDefinitionId,
+    )?.name ?? record.genotypeDefinitionId,
+  })))
 const filtered = computed(() => {
   const query = search.value.trim().toLowerCase()
   return animals.value.filter((animal) => (!status.value || animal.status === status.value) && (!query
@@ -195,17 +203,22 @@ function pedigreeLabel(relation: PedigreeRelation) {
 async function loadGenetics(animalId: string) {
   geneticsLoading.value = true
   try {
-    const [loci, rows] = await Promise.all([
-      gateway.listGeneLoci(projectId.value),
+    const [loci, rows, definitions, recordRows] = await Promise.all([
+      gateway.listGeneLoci(projectId.value, true),
       gateway.listGenotypes(animalId, projectId.value),
+      gateway.listGenotypeDefinitions(projectId.value, true),
+      gateway.listGenotypingRecords(animalId, projectId.value),
     ])
     const alleleGroups = await Promise.all(loci.map((locus) => gateway.listAlleles(
       locus.id,
       projectId.value,
+      true,
     )))
     geneLoci.value = loci
     geneAlleles.value = alleleGroups.flat()
     genotypes.value = rows
+    genotypeDefinitions.value = definitions
+    genotypingRecords.value = recordRows
   } finally {
     geneticsLoading.value = false
   }
@@ -217,6 +230,7 @@ async function hydrateSelected(animal: Animal, resetTab = true) {
   geneLoci.value = []
   geneAlleles.value = []
   genotypes.value = []
+  genotypingRecords.value = []
   detailError.value = ''
   if (resetTab) detailTab.value = 'timeline'
   detailLoading.value = true
@@ -296,12 +310,45 @@ async function load() {
   }
 }
 
-function openCreate() {
+async function openCreate() {
   if (projectOnly.value) {
     newAnimal.identifierScope = 'project'
     newAnimal.projectId = projectId.value ?? null
   }
   showCreate.value = true
+  registrationDefinitionsLoading.value = true
+  try {
+    genotypeDefinitions.value = await gateway.listGenotypeDefinitions(projectId.value)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '读取基因型定义失败')
+  } finally {
+    registrationDefinitionsLoading.value = false
+  }
+}
+
+function addInitialGenotypingRecord() {
+  newAnimal.initialGenotypingRecords.push({
+    genotypeDefinitionId: null,
+    state: 'expected',
+    assessedAt: null,
+    method: '',
+    notes: '',
+  })
+}
+
+function removeInitialGenotypingRecord(index: number) {
+  newAnimal.initialGenotypingRecords.splice(index, 1)
+}
+
+function availableDefinitionOptions(index: number) {
+  const selectedElsewhere = new Set(newAnimal.initialGenotypingRecords
+    .filter((_, candidateIndex) => candidateIndex !== index)
+    .map((record) => record.genotypeDefinitionId)
+    .filter((id): id is string => !!id))
+  return genotypeDefinitionOptions.value.map((option) => ({
+    ...option,
+    disabled: selectedElsewhere.has(option.value),
+  }))
 }
 
 async function createAnimal() {
@@ -311,6 +358,26 @@ async function createAnimal() {
   }
   if (newAnimal.identifierScope === 'project' && !newAnimal.projectId) {
     message.warning('项目编号命名空间必须选择项目')
+    return
+  }
+  const initialRecords = newAnimal.initialGenotypingRecords
+  if (initialRecords.some((record) => !record.genotypeDefinitionId)) {
+    message.warning('请选择每条初始基因型的定义')
+    return
+  }
+  const definitionIds = initialRecords.map((record) => record.genotypeDefinitionId as string)
+  if (new Set(definitionIds).size !== definitionIds.length) {
+    message.warning('同一基因型定义不能重复选择')
+    return
+  }
+  if (initialRecords.some((record) =>
+    (record.state === 'confirmed' || record.state === 'rejected') && !record.assessedAt)) {
+    message.warning('已确认或已排除的结果必须填写检测时间')
+    return
+  }
+  if (!genotypeWriteAllowed.value && initialRecords.some((record) =>
+    record.state === 'confirmed' || record.state === 'rejected')) {
+    message.warning('当前权限只能登记预期或未知状态')
     return
   }
   busy.value = true
@@ -323,6 +390,13 @@ async function createAnimal() {
       sex: newAnimal.sex,
       strain: newAnimal.strain.trim(),
       birthDate: formatDate(newAnimal.birthDate),
+      initialGenotypingRecords: initialRecords.map((record) => ({
+        genotypeDefinitionId: record.genotypeDefinitionId as string,
+        state: record.state,
+        assessedAt: record.assessedAt ? new Date(record.assessedAt).toISOString() : undefined,
+        method: record.method.trim() || undefined,
+        notes: record.notes.trim() || undefined,
+      })),
     })
     showCreate.value = false
     Object.assign(newAnimal, {
@@ -331,6 +405,7 @@ async function createAnimal() {
       projectId: projectOnly.value ? projectId.value ?? null : null,
       cageId: null,
       sex: 'unknown', strain: '', birthDate: null,
+      initialGenotypingRecords: [],
     })
     await load()
     message.success(`已登记小鼠 ${created.code}`)
@@ -338,101 +413,6 @@ async function createAnimal() {
     message.error(error instanceof Error ? error.message : '登记失败')
   } finally {
     busy.value = false
-  }
-}
-
-function openGenotypeCreate() {
-  if (!selected.value) return
-  Object.assign(newGenotype, {
-    locusValue: geneLoci.value[0]?.id ?? '',
-    allele1Value: '',
-    allele2Value: '',
-    allele1WildType: false,
-    allele2WildType: false,
-    assessedAt: Date.now(),
-  })
-  showGenotypeCreate.value = true
-}
-
-function normalizedGeneticValue(value: string) {
-  return value.trim().toLowerCase()
-}
-
-async function resolveLocus(value: string): Promise<GeneLocus> {
-  const normalized = normalizedGeneticValue(value)
-  const existing = geneLoci.value.find((locus) => locus.id === value
-    || locus.symbol.toLowerCase() === normalized)
-  if (existing) return existing
-  const created = await gateway.createGeneLocus({
-    projectId: projectId.value,
-    symbol: value.trim(),
-  })
-  geneLoci.value.push(created)
-  return created
-}
-
-async function resolveAllele(
-  value: string,
-  locus: GeneLocus,
-  isWildType: boolean,
-): Promise<GeneAllele> {
-  const normalized = normalizedGeneticValue(value)
-  const existing = geneAlleles.value.find((allele) => allele.locusId === locus.id
-    && (allele.id === value || allele.symbol.toLowerCase() === normalized))
-  if (existing) return existing
-  const created = await gateway.createAllele({
-    projectId: projectId.value,
-    locusId: locus.id,
-    symbol: value.trim(),
-    isWildType,
-  })
-  geneAlleles.value.push(created)
-  return created
-}
-
-function isNewAllele(value: string) {
-  const normalized = normalizedGeneticValue(value)
-  return !!value.trim() && !geneAlleles.value.some((allele) => allele.id === value
-    || (allele.locusId === selectedLocus.value?.id && allele.symbol.toLowerCase() === normalized))
-}
-
-async function recordGenotype() {
-  if (!selected.value || !newGenotype.locusValue.trim()
-    || !newGenotype.allele1Value.trim() || !newGenotype.allele2Value.trim()) {
-    message.warning('请选择或新建基因位点，并填写两个等位基因')
-    return
-  }
-  genotypeSaving.value = true
-  try {
-    const locus = await resolveLocus(newGenotype.locusValue)
-    const allele1 = await resolveAllele(
-      newGenotype.allele1Value,
-      locus,
-      newGenotype.allele1WildType,
-    )
-    const allele2 = await resolveAllele(
-      newGenotype.allele2Value,
-      locus,
-      newGenotype.allele2WildType,
-    )
-    await gateway.createGenotype({
-      projectId: projectId.value,
-      animalId: selected.value.id,
-      locusId: locus.id,
-      allele1Id: allele1.id,
-      allele2Id: allele2.id,
-      assessedAt: newGenotype.assessedAt
-        ? new Date(newGenotype.assessedAt).toISOString()
-        : undefined,
-    })
-    showGenotypeCreate.value = false
-    await hydrateSelected(selected.value, false)
-    detailTab.value = 'genotypes'
-    message.success('基因型已记录')
-  } catch (error) {
-    message.error(error instanceof Error ? error.message : '记录基因型失败')
-  } finally {
-    genotypeSaving.value = false
   }
 }
 
@@ -561,12 +541,6 @@ watch(() => newAnimal.identifierScope, (scope) => {
   if (scope === 'lab') newAnimal.projectId = null
 })
 watch(() => newSample.projectId, () => { newSample.experimentId = null })
-watch(() => newGenotype.locusValue, () => {
-  newGenotype.allele1Value = ''
-  newGenotype.allele2Value = ''
-  newGenotype.allele1WildType = false
-  newGenotype.allele2WildType = false
-})
 onMounted(load)
 </script>
 
@@ -620,29 +594,34 @@ onMounted(load)
         </div>
         <n-form-item v-if="gateway.mode === 'local'" label="初始笼位"><n-select v-model:value="newAnimal.cageId" clearable filterable :options="cageOptions" placeholder="可稍后转笼" /></n-form-item>
         <n-alert v-else type="info" :show-icon="false">共享版登记后通过受审计的转笼操作分配笼位。</n-alert>
+        <section class="initial-genetics">
+          <header>
+            <div><strong>初始基因型（可选）</strong><span>仅选择 Genetics v2 中未归档的既有定义；可登记 0、1 或多条。</span></div>
+            <n-button size="small" secondary :disabled="registrationDefinitionsLoading || !genotypeDefinitionOptions.length" @click="addInitialGenotypingRecord"><template #icon><Plus :size="15" /></template>添加</n-button>
+          </header>
+          <n-spin :show="registrationDefinitionsLoading">
+            <n-alert v-if="!registrationDefinitionsLoading && !genotypeDefinitionOptions.length" type="info" :show-icon="false">暂无可用定义。请先到繁育管理中建立 Genetics v2 定义，也可以先完成动物登记。</n-alert>
+            <article v-for="(record, index) in newAnimal.initialGenotypingRecords" :key="index" class="initial-genetics-row">
+              <div class="form-grid">
+                <n-form-item label="基因型定义" required><n-select v-model:value="record.genotypeDefinitionId" filterable :options="availableDefinitionOptions(index)" placeholder="选择既有定义" /></n-form-item>
+                <n-form-item label="状态" required><n-select v-model:value="record.state" :options="registrationStateOptions" /></n-form-item>
+              </div>
+              <div class="form-grid">
+                <n-form-item :label="record.state === 'confirmed' || record.state === 'rejected' ? '检测时间（必填）' : '检测时间'">
+                  <n-date-picker v-model:value="record.assessedAt" type="datetime" clearable />
+                </n-form-item>
+                <n-form-item label="方法"><n-input v-model:value="record.method" placeholder="例如 PCR，可选" /></n-form-item>
+              </div>
+              <div class="initial-genetics-notes">
+                <n-input v-model:value="record.notes" type="textarea" :autosize="{ minRows: 1, maxRows: 3 }" placeholder="备注（可选）" />
+                <n-button size="small" tertiary type="error" @click="removeInitialGenotypingRecord(index)">移除</n-button>
+              </div>
+            </article>
+          </n-spin>
+          <small v-if="!genotypeWriteAllowed">当前权限可登记“预期”或“未知”；“已确认/已排除”需要繁育管理权限。</small>
+        </section>
       </n-form>
       <template #footer><div class="dialog-actions"><n-button @click="showCreate = false">取消</n-button><n-button type="primary" :loading="busy" @click="createAnimal">登记小鼠</n-button></div></template>
-    </n-modal>
-
-    <n-modal v-model:show="showGenotypeCreate" preset="card" title="记录基因型" class="dialog-card" :bordered="false">
-      <n-form label-placement="top">
-        <n-form-item label="基因位点" required>
-          <n-select v-model:value="newGenotype.locusValue" filterable tag :options="locusOptions" placeholder="选择位点，或输入符号后回车新建" />
-        </n-form-item>
-        <div class="form-grid">
-          <n-form-item label="等位基因 1" required>
-            <n-select v-model:value="newGenotype.allele1Value" filterable tag :options="alleleOptions" placeholder="选择或输入后回车新建" />
-            <n-checkbox v-if="isNewAllele(newGenotype.allele1Value)" v-model:checked="newGenotype.allele1WildType">新建为野生型</n-checkbox>
-          </n-form-item>
-          <n-form-item label="等位基因 2" required>
-            <n-select v-model:value="newGenotype.allele2Value" filterable tag :options="alleleOptions" placeholder="选择或输入后回车新建" />
-            <n-checkbox v-if="isNewAllele(newGenotype.allele2Value)" v-model:checked="newGenotype.allele2WildType">新建为野生型</n-checkbox>
-          </n-form-item>
-        </div>
-        <n-form-item label="鉴定时间"><n-date-picker v-model:value="newGenotype.assessedAt" type="datetime" clearable /></n-form-item>
-        <n-alert type="info" :show-icon="false">新输入的位点或等位基因会先创建，再与本次鉴定记录一同写入审计。</n-alert>
-      </n-form>
-      <template #footer><div class="dialog-actions"><n-button @click="showGenotypeCreate = false">取消</n-button><n-button type="primary" :loading="genotypeSaving" @click="recordGenotype">确认记录</n-button></div></template>
     </n-modal>
 
     <n-modal v-model:show="showSampleCreate" preset="card" title="登记样本" class="dialog-card" :bordered="false">
@@ -700,15 +679,28 @@ onMounted(load)
             </n-tab-pane>
 
             <n-tab-pane name="genotypes" tab="基因型">
-              <div class="tab-actions"><span>按位点记录双等位基因与鉴定时间。</span><n-button v-if="genotypeWriteAllowed" size="small" type="primary" @click="openGenotypeCreate"><template #icon><Plus :size="15" /></template>记录基因型</n-button></div>
+              <div class="tab-actions"><span>当前值按每个定义最新的未作废 Genetics v2 记录计算。</span><n-button size="small" secondary @click="openBreeding">管理 Genetics v2</n-button></div>
               <n-spin :show="geneticsLoading">
-                <div v-if="genotypeRows.length" class="record-list">
+                <div v-if="currentGenotypeRows.length" class="record-list">
+                  <article v-for="record in currentGenotypeRows" :key="record.id" class="record-card genotype-card">
+                    <header>
+                      <div><strong>{{ record.definitionLabel }}</strong><span>{{ formatDateTime(record.assessedAt) }}</span></div>
+                      <n-tag size="small" :type="genotypingStateMeta[record.state].type" :bordered="false">{{ genotypingStateMeta[record.state].label }}</n-tag>
+                    </header>
+                    <dl><dt>方法</dt><dd>{{ record.method || '未记录' }}</dd><dt>备注</dt><dd>{{ record.notes || '无' }}</dd></dl>
+                    <small>revision {{ record.revision }}</small>
+                  </article>
+                </div>
+                <n-empty v-else-if="!geneticsLoading" description="暂无有效 Genetics v2 当前记录" />
+                <section v-if="genotypeRows.length" class="legacy-genotypes">
+                  <header><strong>旧版 Genotype（只读）</strong><span>仅用于兼容历史数据，不再作为当前值或新写入入口。</span></header>
+                  <div class="record-list">
                   <article v-for="genotype in genotypeRows" :key="genotype.id" class="record-card genotype-card">
                     <header><div><strong>{{ genotype.locusLabel }}</strong><span>{{ formatDateTime(genotype.assessedAt) }}</span></div><n-tag size="small" :bordered="false">{{ genotype.alleleLabel }}</n-tag></header>
                     <small>revision {{ genotype.revision }}</small>
                   </article>
-                </div>
-                <n-empty v-else-if="!geneticsLoading" description="尚未记录基因型" />
+                  </div>
+                </section>
               </n-spin>
             </n-tab-pane>
 
@@ -816,10 +808,18 @@ onMounted(load)
 .card-grid { display: grid; grid-template-columns: auto 1fr auto 1fr auto 1fr; gap: 5px; color: var(--muri-text-tertiary); font-size: 12px; }
 .card-grid b { color: var(--muri-text); font-weight: 500; }
 .animal-card > small { display: block; margin-top: 8px; color: var(--muri-text-secondary); }
-.dialog-card { width: min(590px, calc(100vw - 28px)); }
+.dialog-card { width: min(700px, calc(100vw - 28px)); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .quantity-grid { grid-template-columns: 2fr 1fr; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
+.initial-genetics { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--muri-border); }
+.initial-genetics > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.initial-genetics > header > div { display: flex; flex-direction: column; }
+.initial-genetics > header span, .initial-genetics > small { margin-top: 3px; color: var(--muri-text-tertiary); font-size: 11px; }
+.initial-genetics-row { padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }
+.initial-genetics-row + .initial-genetics-row { margin-top: 8px; }
+.initial-genetics-notes { display: flex; align-items: flex-start; gap: 8px; }
+.initial-genetics-notes .n-input { flex: 1; }
 .visually-hidden { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .detail-title { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px; }
 .detail-title > div { display: flex; flex-direction: column; }
@@ -847,6 +847,9 @@ onMounted(load)
 .record-card dt { color: var(--muri-text-tertiary); }
 .record-card dd { margin: 0; overflow: hidden; text-overflow: ellipsis; }
 .record-card > small { display: block; margin-top: 8px; color: var(--muri-text-tertiary); }
+.legacy-genotypes { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--muri-border); }
+.legacy-genotypes > header { display: flex; flex-direction: column; margin-bottom: 9px; }
+.legacy-genotypes > header span { margin-top: 2px; color: var(--muri-text-tertiary); font-size: 11px; }
 .measurement-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: 7px; }
 .measurement-row > div:first-child { display: flex; flex-direction: column; }
 .measurement-row > div:first-child span { color: var(--muri-text-tertiary); font-size: 11px; }

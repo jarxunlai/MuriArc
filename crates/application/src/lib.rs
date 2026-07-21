@@ -11,8 +11,8 @@ mod records;
 mod validation;
 
 pub use animal::{
-    CreateAnimalCommand, CreateAnimalIdentifierScope, MAX_ANIMAL_DISPLAY_ID_CHARS,
-    MAX_ANIMAL_STRAIN_CHARS, create_animal,
+    CreateAnimalCommand, CreateAnimalIdentifierScope, InitialGenotypingRecordInput,
+    MAX_ANIMAL_DISPLAY_ID_CHARS, MAX_ANIMAL_STRAIN_CHARS, create_animal,
 };
 pub use breeding::*;
 pub use cage::{

@@ -158,6 +158,12 @@ pub trait MuriArcStore: crate::WorkspaceStore + Send + Sync {
     async fn list_cages(&self, lab_id: Uuid) -> StoreResult<Vec<Cage>>;
 
     async fn create_animal(&self, animal: &Animal, audit: &AuditContext) -> StoreResult<()>;
+    async fn create_animal_with_genotyping_records(
+        &self,
+        animal: &Animal,
+        genotyping_records: &[crate::GenotypingRecord],
+        audit: &AuditContext,
+    ) -> StoreResult<()>;
     async fn get_animal(&self, id: Uuid) -> StoreResult<Animal>;
     async fn list_animals(&self, filter: &AnimalFilter) -> StoreResult<Vec<Animal>>;
     /// Lists one bounded page of animals with batched genotype, project and
@@ -250,9 +256,53 @@ pub trait MuriArcStore: crate::WorkspaceStore + Send + Sync {
     ) -> StoreResult<()>;
     async fn get_gene_locus(&self, id: Uuid) -> StoreResult<crate::GeneLocus>;
     async fn list_gene_loci(&self, lab_id: Uuid) -> StoreResult<Vec<crate::GeneLocus>>;
+    async fn list_gene_loci_including_archived(
+        &self,
+        lab_id: Uuid,
+    ) -> StoreResult<Vec<crate::GeneLocus>>;
+    async fn gene_locus_reference_counts(
+        &self,
+        id: Uuid,
+    ) -> StoreResult<crate::GeneticsReferenceCounts>;
+    async fn archive_gene_locus(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        archived_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::GeneLocus>;
+    async fn restore_gene_locus(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        restored_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::GeneLocus>;
     async fn create_allele(&self, allele: &crate::Allele, audit: &AuditContext) -> StoreResult<()>;
     async fn get_allele(&self, id: Uuid) -> StoreResult<crate::Allele>;
     async fn list_alleles(&self, locus_id: Uuid) -> StoreResult<Vec<crate::Allele>>;
+    async fn list_alleles_including_archived(
+        &self,
+        locus_id: Uuid,
+    ) -> StoreResult<Vec<crate::Allele>>;
+    async fn allele_reference_counts(
+        &self,
+        id: Uuid,
+    ) -> StoreResult<crate::GeneticsReferenceCounts>;
+    async fn archive_allele(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        archived_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::Allele>;
+    async fn restore_allele(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        restored_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::Allele>;
     async fn create_genotype(
         &self,
         genotype: &crate::Genotype,
@@ -272,6 +322,28 @@ pub trait MuriArcStore: crate::WorkspaceStore + Send + Sync {
         &self,
         lab_id: Uuid,
     ) -> StoreResult<Vec<crate::GenotypeDefinition>>;
+    async fn list_genotype_definitions_including_archived(
+        &self,
+        lab_id: Uuid,
+    ) -> StoreResult<Vec<crate::GenotypeDefinition>>;
+    async fn genotype_definition_reference_counts(
+        &self,
+        id: Uuid,
+    ) -> StoreResult<crate::GeneticsReferenceCounts>;
+    async fn archive_genotype_definition(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        archived_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::GenotypeDefinition>;
+    async fn restore_genotype_definition(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        restored_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::GenotypeDefinition>;
     async fn create_genotyping_record(
         &self,
         record: &crate::GenotypingRecord,
@@ -282,6 +354,27 @@ pub trait MuriArcStore: crate::WorkspaceStore + Send + Sync {
         &self,
         animal_id: Uuid,
     ) -> StoreResult<Vec<crate::GenotypingRecord>>;
+    async fn list_current_genotyping_records(
+        &self,
+        animal_id: Uuid,
+    ) -> StoreResult<Vec<crate::GenotypingRecord>>;
+    async fn void_genotyping_record(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        reason: &str,
+        voided_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::GenotypingRecord>;
+    async fn correct_genotyping_record(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        reason: &str,
+        voided_at: DateTime<Utc>,
+        replacement: &crate::GenotypingRecord,
+        audit: &AuditContext,
+    ) -> StoreResult<(crate::GenotypingRecord, crate::GenotypingRecord)>;
 
     async fn create_breeding_line(
         &self,

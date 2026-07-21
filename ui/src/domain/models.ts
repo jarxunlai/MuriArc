@@ -205,6 +205,7 @@ export interface GeneLocus {
   id: string
   symbol: string
   description?: string
+  archivedAt?: string
   revision: number
 }
 
@@ -214,6 +215,7 @@ export interface GeneAllele {
   symbol: string
   description?: string
   isWildType: boolean
+  archivedAt?: string
   revision: number
 }
 
@@ -254,6 +256,7 @@ export interface GenotypeDefinition {
   revision: number
   createdAt: string
   updatedAt: string
+  archivedAt?: string
 }
 
 export interface GenotypingRecord {
@@ -265,8 +268,12 @@ export interface GenotypingRecord {
   assessedAt?: string
   method?: string
   notes?: string
+  supersedesRecordId?: string
+  voidedAt?: string
+  voidReason?: string
   revision: number
   createdAt: string
+  updatedAt: string
 }
 
 export interface BreedingLine {

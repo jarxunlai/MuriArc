@@ -22,6 +22,7 @@ const validPreview: ImportPreview = {
   previewHash: PREVIEW_HASH,
   totalRows: 1,
   acceptedRows: 1,
+  previewRows: [{ display_id: 'M001' }],
   issues: [],
   canConfirm: true,
 }
@@ -89,7 +90,12 @@ describe('LocalDataGateway', () => {
     expect(calls[2]).toEqual(['cancel_data_import', { input: { jobId: 'job-1' } }])
     expect(calls[3]).toEqual([
       'create_data_export',
-      { input: { format: 'csv', idempotencyKey: expect.stringMatching(/^export-[0-9a-f-]+$/) } },
+      { input: expect.objectContaining({
+        format: 'csv',
+        projectId: undefined,
+        idempotencyKey: expect.stringMatching(/^export-[0-9a-f-]+$/),
+        options: expect.objectContaining({ include_genotype_details: true }),
+      }) },
     ])
     expect(calls[4]).toEqual([
       'create_data_snapshot',
@@ -478,7 +484,10 @@ describe('DemoDataGateway', () => {
     expect(exported).toMatchObject({ kind: 'export', fileName: 'animals.csv', mediaType: 'text/csv;charset=utf-8' })
     expect(exported.sizeBytes).toBe(exported.bytes?.length)
     expect(exported.sha256).toMatch(/^[0-9a-f]{64}$/)
-    expect(exportText).toBe('animal_uuid,display_id,sex\nanimal-1,M-001,male\nanimal-2,M-002,female')
+    expect(exportText).not.toContain('animal_uuid')
+    expect(exportText).not.toContain('animal-1')
+    expect(exportText).toContain('identifier_scope,project_name,display_id')
+    expect(exportText).toContain('"M-001"')
     expect(snapshot).toMatchObject({ kind: 'snapshot', fileName: 'muriarc-demo-snapshot.json' })
     expect(snapshotJson).toEqual({ product: 'MuriArc', demo: true, animals })
   })

@@ -1064,6 +1064,45 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         genotype_definition
     );
 
+    let registered_with_genotype =
+        Animal::new_mouse(lab.id, "BREED-ATOMIC", Sex::Unknown, now).unwrap();
+    let mut initial_record = GenotypingRecord::new(
+        lab.id,
+        registered_with_genotype.id,
+        genotype_definition.id,
+        GenotypingState::Expected,
+        None,
+        now,
+    )
+    .unwrap();
+    initial_record.project_id = Some(project.id);
+    store
+        .create_animal_with_genotyping_records(
+            &registered_with_genotype,
+            std::slice::from_ref(&initial_record),
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_current_genotyping_records(registered_with_genotype.id)
+            .await
+            .unwrap(),
+        vec![initial_record.clone()]
+    );
+    let atomic_events = store
+        .list_animal_events(registered_with_genotype.id)
+        .await
+        .unwrap();
+    assert!(atomic_events.iter().any(|event| {
+        matches!(
+            event.kind,
+            AnimalEventKind::GenotypingRecorded { record_id, .. }
+                if record_id == initial_record.id
+        )
+    }));
+
     let mut genotyping_record = GenotypingRecord::new(
         lab.id,
         female.id,
@@ -1084,11 +1123,210 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         vec![genotyping_record.clone()]
     );
 
+    let newer_time = now + Duration::milliseconds(1);
+    let mut newer_record = GenotypingRecord::new(
+        lab.id,
+        female.id,
+        genotype_definition.id,
+        GenotypingState::Expected,
+        None,
+        newer_time,
+    )
+    .unwrap();
+    newer_record.project_id = Some(project.id);
+    store
+        .create_genotyping_record(&newer_record, &human_audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_current_genotyping_records(female.id)
+            .await
+            .unwrap(),
+        vec![newer_record.clone()],
+        "the current projection must select the latest non-void record per definition"
+    );
+    let voided_newer = store
+        .void_genotyping_record(
+            newer_record.id,
+            newer_record.meta.revision,
+            "superseded expected result",
+            newer_time + Duration::milliseconds(1),
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert!(voided_newer.is_voided());
+    assert_eq!(
+        store
+            .list_current_genotyping_records(female.id)
+            .await
+            .unwrap(),
+        vec![genotyping_record.clone()],
+        "voiding the latest record must reveal the previous non-void record"
+    );
+    assert!(matches!(
+        store
+            .void_genotyping_record(
+                newer_record.id,
+                newer_record.meta.revision,
+                "stale retry",
+                newer_time + Duration::milliseconds(2),
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let correction_time = newer_time + Duration::milliseconds(3);
+    let mut replacement_record = GenotypingRecord::new(
+        lab.id,
+        female.id,
+        genotype_definition.id,
+        GenotypingState::Confirmed,
+        Some(correction_time),
+        correction_time,
+    )
+    .unwrap();
+    replacement_record.project_id = Some(project.id);
+    replacement_record.method = Some("PCR repeat".to_owned());
+    replacement_record.supersedes_record_id = Some(genotyping_record.id);
+    let (voided_original, replacement_record) = store
+        .correct_genotyping_record(
+            genotyping_record.id,
+            genotyping_record.meta.revision,
+            "incorrect original call",
+            correction_time,
+            &replacement_record,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert!(voided_original.is_voided());
+    assert_eq!(
+        replacement_record.supersedes_record_id,
+        Some(genotyping_record.id)
+    );
+    assert_eq!(
+        store
+            .list_current_genotyping_records(female.id)
+            .await
+            .unwrap(),
+        vec![replacement_record.clone()]
+    );
+
     let mut line = BreedingLine::new(lab.id, "Contract line", now).unwrap();
     line.replace_genotype_definitions(vec![genotype_definition.id])
         .unwrap();
     store
         .create_breeding_line(&line, &human_audit)
+        .await
+        .unwrap();
+    let locus_references = store.gene_locus_reference_counts(locus.id).await.unwrap();
+    assert_eq!(locus_references.active_genotype_definitions, 1);
+    assert!(locus_references.genotyping_records >= 3);
+    assert!(matches!(
+        store
+            .archive_gene_locus(locus.id, locus.meta.revision, correction_time, &human_audit,)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+
+    let archived_definition = store
+        .archive_genotype_definition(
+            genotype_definition.id,
+            genotype_definition.meta.revision,
+            correction_time,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert!(archived_definition.meta.deleted_at.is_some());
+    assert!(
+        store
+            .list_genotype_definitions(lab.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|definition| definition.id != genotype_definition.id)
+    );
+    assert!(
+        store
+            .list_genotype_definitions_including_archived(lab.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|definition| definition.id == genotype_definition.id)
+    );
+    assert_eq!(
+        store
+            .list_current_genotyping_records(female.id)
+            .await
+            .unwrap(),
+        vec![replacement_record.clone()],
+        "archiving a definition must not erase historical current records"
+    );
+
+    let archived_allele = store
+        .archive_allele(
+            wild_type.id,
+            wild_type.meta.revision,
+            correction_time,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    let archived_locus = store
+        .archive_gene_locus(locus.id, locus.meta.revision, correction_time, &human_audit)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .restore_genotype_definition(
+                archived_definition.id,
+                archived_definition.meta.revision,
+                correction_time,
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store
+            .restore_allele(
+                archived_allele.id,
+                archived_allele.meta.revision,
+                correction_time,
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    store
+        .restore_gene_locus(
+            archived_locus.id,
+            archived_locus.meta.revision,
+            correction_time,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    store
+        .restore_allele(
+            archived_allele.id,
+            archived_allele.meta.revision,
+            correction_time,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    store
+        .restore_genotype_definition(
+            archived_definition.id,
+            archived_definition.meta.revision,
+            correction_time,
+            &human_audit,
+        )
         .await
         .unwrap();
     let colony = Colony::new(lab.id, line.id, "Contract colony", now).unwrap();
@@ -1170,10 +1408,10 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
     assert_eq!(
         enrollment.genotype_snapshot,
         vec![GenotypeSnapshotEntry {
-            genotyping_record_id: genotyping_record.id,
+            genotyping_record_id: replacement_record.id,
             genotype_definition_id: genotype_definition.id,
             state: GenotypingState::Confirmed,
-            assessed_at: Some(now),
+            assessed_at: Some(correction_time),
         }]
     );
 
@@ -1613,6 +1851,7 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
     for id in [
         genotype_definition.id,
         genotyping_record.id,
+        replacement_record.id,
         line.id,
         colony.id,
         pair.id,
@@ -1908,6 +2147,26 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         meta: RecordMeta::new(now),
     };
     store.create_allele(&allele, &fixture_audit).await.unwrap();
+    let mut genotype_definition =
+        GenotypeDefinition::new(lab.id, "Import genotype definition", now).unwrap();
+    genotype_definition
+        .replace_components(vec![
+            GenotypeComponent::new(
+                genotype_definition.id,
+                locus.id,
+                allele.id,
+                Some(allele.id),
+                GenotypeComponentMode::Diploid,
+                0,
+                now,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+    store
+        .create_genotype_definition(&genotype_definition, &fixture_audit)
+        .await
+        .unwrap();
 
     let import_audit = AuditContext {
         actor: Actor::human(user.id, user.display_name.clone()),
@@ -1945,15 +2204,15 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         now,
     );
     child_registered.recorded_by = Some(user.id);
-    let genotype = Genotype {
-        id: uuid::Uuid::new_v4(),
-        animal_id: imported_child.id,
-        locus_id: locus.id,
-        allele_1_id: Some(allele.id),
-        allele_2_id: Some(allele.id),
-        assessed_at: Some(now),
-        meta: RecordMeta::new(now),
-    };
+    let genotyping_record = GenotypingRecord::new(
+        lab.id,
+        imported_child.id,
+        genotype_definition.id,
+        GenotypingState::Expected,
+        None,
+        now,
+    )
+    .unwrap();
     let pedigree = Pedigree {
         id: uuid::Uuid::new_v4(),
         animal_id: imported_child.id,
@@ -1982,7 +2241,7 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
     );
     plan.animals = vec![imported_parent.clone(), imported_child.clone()];
     plan.animal_events = vec![parent_registered.clone(), child_registered.clone()];
-    plan.genotypes.push(genotype.clone());
+    plan.genotyping_records.push(genotyping_record.clone());
     plan.pedigrees.push(pedigree.clone());
     plan.measurements.push(measurement.clone());
     plan.validate().unwrap();
@@ -2019,7 +2278,13 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         store.list_animal_events(imported_child.id).await.unwrap(),
         vec![child_registered.clone()]
     );
-    assert_eq!(store.get_genotype(genotype.id).await.unwrap(), genotype);
+    assert_eq!(
+        store
+            .get_genotyping_record(genotyping_record.id)
+            .await
+            .unwrap(),
+        genotyping_record
+    );
     assert_eq!(store.get_pedigree(pedigree.id).await.unwrap(), pedigree);
     assert_eq!(
         store.get_measurement(measurement.id).await.unwrap(),
@@ -2039,7 +2304,7 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         (EntityType::Animal, imported_child.id),
         (EntityType::AnimalEvent, parent_registered.id),
         (EntityType::AnimalEvent, child_registered.id),
-        (EntityType::Genotype, genotype.id),
+        (EntityType::GenotypingRecord, genotyping_record.id),
         (EntityType::Pedigree, pedigree.id),
         (EntityType::Measurement, measurement.id),
     ];

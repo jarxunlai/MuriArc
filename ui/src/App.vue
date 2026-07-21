@@ -31,6 +31,7 @@ const labRegistryAvailable = computed(() => gateway.mode === 'local' || hasLabRe
 const animalItems = computed(() => [
   ...(labRegistryAvailable.value ? [{ to: '/cages', label: '笼位视图', icon: Boxes }] : []),
   { to: '/animals', label: '小鼠档案', icon: Rat },
+  ...(labRegistryAvailable.value ? [{ to: '/animal-data', label: '动物数据', icon: TableProperties }] : []),
   ...(labRegistryAvailable.value ? [{ to: '/breeding', label: '繁育管理', icon: Dna }] : []),
 ])
 const isLabAdmin = computed(() => gateway.mode === 'remote' && sessionIsLabAdmin())

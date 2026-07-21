@@ -277,6 +277,7 @@ pub async fn register_animal_draft(
         birth_date: Some(draft.birth_date),
         legacy_id: None,
         initial_cage_id: command.initial_cage_id,
+        initial_genotyping_records: Vec::new(),
         now: command.now,
     })?;
     let registered = store

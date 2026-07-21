@@ -20,18 +20,19 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use muriarc_core::{
-    AnimalFilter, Attachment, AuditContext, AuditFilter, ExperimentFilter, FieldValueType,
-    ImportCommitOptions, ImportCommitResult, ImportPlan, Job, MeasurementFilter, MuriArcStore,
-    ObservationFilter, ParticipationFilter, ProvenanceFilter, SampleFilter, Sex, StoreError,
-    TemplateStatus,
+    AnimalFilter, AnimalStatus, Attachment, AuditContext, AuditFilter, ExperimentFilter,
+    FieldValueType, GenotypeComponentMode, GenotypingState, IdentifierScope, ImportCommitOptions,
+    ImportCommitResult, ImportPlan, Job, MeasurementFilter, MuriArcStore, ObservationFilter,
+    ParticipationFilter, ProvenanceFilter, SampleFilter, Sex, StoreError, TemplateStatus,
 };
 use muriarc_importer::{
-    AnimalDirectory, AnimalExportFilter, AnimalExportRecord, CageDirectory, ExportCage,
-    ExportGenotype, ExportSex, FieldMapping, GeneticDirectory, ImportError, ImportIssue,
-    ImportPlanContext, ImportPreview, IssueSeverity, MeasurementCatalog, MeasurementDefinition,
-    MeasurementFieldMapping, MeasurementImportPlanContext, MeasurementImportPreview,
-    MeasurementValueType, TabularData, build_animal_import_plan, build_measurement_import_plan,
-    export_animals_csv, export_animals_xlsx, preview_animals_with_directory, preview_measurements,
+    AnimalDirectory, AnimalExportFilter, AnimalExportOptions, AnimalExportRecord, CageDirectory,
+    ExportAnimalStatus, ExportCage, ExportGenotype, ExportGenotypingState, ExportSex, FieldMapping,
+    GeneticDirectory, ImportError, ImportIssue, ImportPlanContext, ImportPreview, IssueSeverity,
+    MeasurementCatalog, MeasurementDefinition, MeasurementFieldMapping,
+    MeasurementImportPlanContext, MeasurementImportPreview, MeasurementValueType, TabularData,
+    build_animal_import_plan, build_measurement_import_plan, export_animals_csv_with_options,
+    export_animals_xlsx_with_options, preview_animals_with_directory, preview_measurements,
     read_csv, read_xlsx,
 };
 use muriarc_snapshot::{
@@ -117,6 +118,7 @@ pub struct AnimalImportPreviewResponse {
     pub preview_hash: String,
     pub total_rows: usize,
     pub accepted_rows: usize,
+    pub preview_rows: Vec<BTreeMap<String, String>>,
     pub issues: Vec<ImportIssue>,
     pub can_confirm: bool,
 }
@@ -134,6 +136,32 @@ impl From<&PendingAnimalImport> for AnimalImportPreviewResponse {
             preview_hash: value.preview_hash.clone(),
             total_rows: value.preview.total_rows,
             accepted_rows: value.preview.accepted_rows.len(),
+            preview_rows: value
+                .preview
+                .accepted_rows
+                .iter()
+                .take(20)
+                .map(|row| {
+                    BTreeMap::from([
+                        ("display_id".to_owned(), row.display_id.clone()),
+                        ("sex".to_owned(), row.sex.clone().unwrap_or_default()),
+                        (
+                            "birth_date".to_owned(),
+                            row.birth_date
+                                .map(|date| date.to_string())
+                                .unwrap_or_default(),
+                        ),
+                        ("strain".to_owned(), row.strain.clone().unwrap_or_default()),
+                        ("cage".to_owned(), row.cage.clone().unwrap_or_default()),
+                        (
+                            "genotype".to_owned(),
+                            row.genotype.clone().unwrap_or_default(),
+                        ),
+                        ("father".to_owned(), row.father.clone().unwrap_or_default()),
+                        ("mother".to_owned(), row.mother.clone().unwrap_or_default()),
+                    ])
+                })
+                .collect(),
             issues: value.preview.issues.clone(),
             can_confirm: value.preview.can_confirm(),
         }
@@ -153,6 +181,7 @@ pub struct MeasurementImportPreviewResponse {
     pub preview_hash: String,
     pub total_rows: usize,
     pub accepted_rows: usize,
+    pub preview_rows: Vec<BTreeMap<String, String>>,
     pub issues: Vec<ImportIssue>,
     pub can_confirm: bool,
 }
@@ -170,6 +199,7 @@ impl From<&PendingMeasurementImport> for MeasurementImportPreviewResponse {
             preview_hash: value.preview_hash.clone(),
             total_rows: value.preview.total_rows,
             accepted_rows: value.preview.accepted_rows.len(),
+            preview_rows: Vec::new(),
             issues: value.preview.issues.clone(),
             can_confirm: value.preview.can_confirm(),
         }
@@ -191,6 +221,7 @@ impl From<&PendingMeasurementImport> for AnimalImportPreviewResponse {
             preview_hash: value.preview_hash.clone(),
             total_rows: value.preview.total_rows,
             accepted_rows: value.preview.accepted_rows.len(),
+            preview_rows: Vec::new(),
             issues: value.preview.issues.clone(),
             can_confirm: value.preview.can_confirm(),
         }
@@ -498,7 +529,23 @@ impl DataFiles {
                 .map(|animal| (animal.display_id.clone(), animal.id)),
         )
         .map_err(|error| DataError::Directory(error.to_string()))?;
-        let preview = preview_animals_with_directory(&table, &mapping, &animal_directory);
+        let mut preview = preview_animals_with_directory(&table, &mapping, &animal_directory);
+        if preview.can_confirm() {
+            let (existing_animals, cages, genetics) =
+                animal_import_directories(store, job.lab_id).await?;
+            let context = ImportPlanContext::new(
+                job.lab_id,
+                job.created_by,
+                job.idempotency_key.clone(),
+                source.sha256.clone(),
+                Utc::now(),
+            );
+            if let Err(error) =
+                build_animal_import_plan(&preview, &context, &existing_animals, &cages, &genetics)
+            {
+                preview.issues.extend(error.into_issues());
+            }
+        }
         let preview_hash = hash_json(&(
             WORKFLOW_SCHEMA_VERSION,
             source.sha256.as_str(),
@@ -672,42 +719,8 @@ impl DataFiles {
         if !pending.preview.can_confirm() {
             return Err(DataError::PreviewHasErrors);
         }
-        let animals = store
-            .list_animals(&AnimalFilter {
-                lab_id: job.lab_id,
-                ..AnimalFilter::default()
-            })
-            .await?;
-        let existing_animals = AnimalDirectory::from_entries(
-            animals
-                .iter()
-                .map(|animal| (animal.display_id.clone(), animal.id)),
-        )
-        .map_err(|error| DataError::Directory(error.to_string()))?;
-        let cages = CageDirectory::from_entries(
-            store
-                .list_cages(job.lab_id)
-                .await?
-                .into_iter()
-                .map(|cage| (cage.section, cage.display_id, cage.id)),
-        )
-        .map_err(|error| DataError::Directory(error.to_string()))?;
-        let loci = store.list_gene_loci(job.lab_id).await?;
-        let mut alleles = Vec::new();
-        for locus in &loci {
-            alleles.extend(
-                store
-                    .list_alleles(locus.id)
-                    .await?
-                    .into_iter()
-                    .map(|allele| (locus.id, allele.symbol, allele.id)),
-            );
-        }
-        let genetics = GeneticDirectory::from_entries(
-            loci.into_iter().map(|locus| (locus.symbol, locus.id)),
-            alleles,
-        )
-        .map_err(|error| DataError::Directory(error.to_string()))?;
+        let (existing_animals, cages, genetics) =
+            animal_import_directories(store, job.lab_id).await?;
         let context = ImportPlanContext::new(
             job.lab_id,
             job.created_by,
@@ -929,6 +942,67 @@ impl DataFiles {
     }
 }
 
+async fn animal_import_directories(
+    store: &dyn MuriArcStore,
+    lab_id: Uuid,
+) -> Result<(AnimalDirectory, CageDirectory, GeneticDirectory), DataError> {
+    let animals = store
+        .list_animals(&AnimalFilter {
+            lab_id,
+            ..AnimalFilter::default()
+        })
+        .await?;
+    let existing_animals = AnimalDirectory::from_entries(
+        animals
+            .iter()
+            .map(|animal| (animal.display_id.clone(), animal.id)),
+    )
+    .map_err(|error| DataError::Directory(error.to_string()))?;
+    let cages = CageDirectory::from_entries(
+        store
+            .list_cages(lab_id)
+            .await?
+            .into_iter()
+            .map(|cage| (cage.section, cage.display_id, cage.id)),
+    )
+    .map_err(|error| DataError::Directory(error.to_string()))?;
+    let loci = store.list_gene_loci(lab_id).await?;
+    let mut alleles = Vec::new();
+    for locus in &loci {
+        alleles.extend(
+            store
+                .list_alleles(locus.id)
+                .await?
+                .into_iter()
+                .map(|allele| (locus.id, allele.symbol, allele.id)),
+        );
+    }
+    let definitions = store
+        .list_genotype_definitions(lab_id)
+        .await?
+        .into_iter()
+        .filter_map(|definition| {
+            definition
+                .components
+                .into_iter()
+                .map(|component| {
+                    component
+                        .allele_2_id
+                        .map(|allele_2_id| (component.locus_id, component.allele_1_id, allele_2_id))
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|components| (definition.id, components))
+        })
+        .collect::<Vec<_>>();
+    let genetics = GeneticDirectory::from_entries_with_definitions(
+        loci.into_iter().map(|locus| (locus.symbol, locus.id)),
+        alleles,
+        definitions,
+    )
+    .map_err(|error| DataError::Directory(error.to_string()))?;
+    Ok((existing_animals, cages, genetics))
+}
+
 pub async fn export_animals(
     store: &dyn MuriArcStore,
     lab_id: Uuid,
@@ -936,6 +1010,15 @@ pub async fn export_animals(
     filter: &AnimalExportFilter,
 ) -> Result<Vec<u8>, DataError> {
     export_animals_scoped(store, lab_id, None, format, filter).await
+}
+
+pub async fn export_animals_with_options(
+    store: &dyn MuriArcStore,
+    lab_id: Uuid,
+    format: ExportFormat,
+    options: &AnimalExportOptions,
+) -> Result<Vec<u8>, DataError> {
+    export_animals_scoped_with_options(store, lab_id, None, format, options).await
 }
 
 /// Exports the lab registry or only animals participating in one project.
@@ -950,14 +1033,36 @@ pub async fn export_animals_scoped(
     format: ExportFormat,
     filter: &AnimalExportFilter,
 ) -> Result<Vec<u8>, DataError> {
+    export_animals_scoped_with_options(
+        store,
+        lab_id,
+        project_id,
+        format,
+        &AnimalExportOptions {
+            filter: filter.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub async fn export_animals_scoped_with_options(
+    store: &dyn MuriArcStore,
+    lab_id: Uuid,
+    project_id: Option<Uuid>,
+    format: ExportFormat,
+    options: &AnimalExportOptions,
+) -> Result<Vec<u8>, DataError> {
     let records = collect_animal_export_records_scoped(store, lab_id, project_id).await?;
     match format {
         ExportFormat::Csv => {
             let mut bytes = Vec::new();
-            export_animals_csv(&records, filter, &mut bytes)?;
+            export_animals_csv_with_options(&records, options, &mut bytes)?;
             Ok(bytes)
         }
-        ExportFormat::Xlsx => export_animals_xlsx(&records, filter).map_err(Into::into),
+        ExportFormat::Xlsx => {
+            export_animals_xlsx_with_options(&records, options).map_err(Into::into)
+        }
     }
 }
 
@@ -979,6 +1084,12 @@ pub async fn collect_animal_export_records_scoped(
         .into_iter()
         .map(|cage| (cage.id, cage))
         .collect::<BTreeMap<_, _>>();
+    let projects = store
+        .list_projects(lab_id)
+        .await?
+        .into_iter()
+        .map(|project| (project.id, project.name))
+        .collect::<BTreeMap<_, _>>();
     let mut animals = store
         .list_animals(&AnimalFilter {
             lab_id,
@@ -999,23 +1110,60 @@ pub async fn collect_animal_export_records_scoped(
                 section: Some(cage.section.clone()),
                 location: cage.location.clone(),
             });
+        let (identifier_scope, scope_project_id) = match &animal.identifier_scope {
+            IdentifierScope::Lab => ("lab".to_owned(), project_id),
+            IdentifierScope::Project { project_id } => ("project".to_owned(), Some(*project_id)),
+            IdentifierScope::Legacy { source } => (format!("legacy:{source}"), project_id),
+        };
         let mut genotypes = Vec::new();
-        for genotype in store.list_genotypes(animal.id).await? {
-            let locus = store.get_gene_locus(genotype.locus_id).await?;
-            let mut allele_symbols = Vec::new();
-            if let Some(id) = genotype.allele_1_id {
-                allele_symbols.push(store.get_allele(id).await?.symbol);
+        for record in store.list_current_genotyping_records(animal.id).await? {
+            let definition = store
+                .get_genotype_definition(record.genotype_definition_id)
+                .await?;
+            let mut seen_loci = BTreeSet::new();
+            let mut components = definition.components;
+            components.sort_by_key(|component| (component.display_order, component.id));
+            for component in components {
+                if !seen_loci.insert(component.locus_id) {
+                    return Err(DataError::Directory(format!(
+                        "genotype definition {} repeats locus {}",
+                        definition.id, component.locus_id
+                    )));
+                }
+                let locus = store.get_gene_locus(component.locus_id).await?;
+                let allele_1 = store.get_allele(component.allele_1_id).await?;
+                let allele_2 = match component.allele_2_id {
+                    Some(id) => Some(store.get_allele(id).await?.symbol),
+                    None => None,
+                };
+                genotypes.push(ExportGenotype {
+                    definition: definition.name.clone(),
+                    state: match record.state {
+                        GenotypingState::Unknown => ExportGenotypingState::Unknown,
+                        GenotypingState::Expected => ExportGenotypingState::Expected,
+                        GenotypingState::Confirmed => ExportGenotypingState::Confirmed,
+                        GenotypingState::Rejected => ExportGenotypingState::Rejected,
+                    },
+                    assessed_at: record.assessed_at,
+                    method: record.method.clone(),
+                    locus: locus.symbol,
+                    allele_1: allele_1.symbol,
+                    allele_2,
+                    component_mode: match component.mode {
+                        GenotypeComponentMode::Diploid => "diploid",
+                        GenotypeComponentMode::Hemizygous => "hemizygous",
+                        GenotypeComponentMode::TransgenePresence => "transgene_presence",
+                        GenotypeComponentMode::Conditional => "conditional",
+                    }
+                    .to_owned(),
+                    display_order: component.display_order,
+                });
             }
-            if let Some(id) = genotype.allele_2_id {
-                allele_symbols.push(store.get_allele(id).await?.symbol);
-            }
-            genotypes.push(ExportGenotype {
-                locus: locus.symbol,
-                allele: allele_symbols.join("/"),
-            });
         }
         records.push(AnimalExportRecord {
             animal_id: animal.id,
+            identifier_scope,
+            project_name: scope_project_id.and_then(|id| projects.get(&id).cloned()),
             display_id: animal.display_id,
             sex: match animal.sex {
                 Sex::Male => ExportSex::Male,
@@ -1023,7 +1171,18 @@ pub async fn collect_animal_export_records_scoped(
                 Sex::Unknown => ExportSex::Unknown,
             },
             birth_date: animal.birth_date,
+            registered_at: animal.meta.created_at,
             strain: animal.strain,
+            status: match animal.current_status {
+                AnimalStatus::Planned => ExportAnimalStatus::Planned,
+                AnimalStatus::Alive => ExportAnimalStatus::Alive,
+                AnimalStatus::InExperiment => ExportAnimalStatus::InExperiment,
+                AnimalStatus::Sampled => ExportAnimalStatus::Sampled,
+                AnimalStatus::Deceased => ExportAnimalStatus::Deceased,
+                AnimalStatus::Euthanized => ExportAnimalStatus::Euthanized,
+                AnimalStatus::Lost => ExportAnimalStatus::Lost,
+                AnimalStatus::Archived => ExportAnimalStatus::Archived,
+            },
             cage,
             genotypes,
         });
@@ -1655,8 +1814,6 @@ pub enum DataError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-
     use muriarc_core::{
         Actor, Allele, Animal, AnimalDraft, AuditContext, BreedingLine, BreedingMemberRole,
         BreedingPair, BreedingPairMember, Colony, Experiment, ExperimentEvent,
@@ -1669,6 +1826,7 @@ mod tests {
     };
     use muriarc_snapshot::verify_bundle;
     use muriarc_store_sqlite::SqliteStore;
+    use std::io::Cursor;
     use tempfile::tempdir;
 
     use super::*;
@@ -1752,6 +1910,179 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == "data/provenance.jsonl")
         );
+    }
+
+    #[tokio::test]
+    async fn animal_preview_surfaces_plan_level_directory_errors_before_confirmation() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store.migrate().await.unwrap();
+        let now = Utc::now();
+        let lab = Lab::new("Plan preview lab", now).unwrap();
+        let audit = AuditContext::system(WriteSource::Migration);
+        store.create_lab(&lab, &audit).await.unwrap();
+        let files_root = tempdir().unwrap();
+        let files = DataFiles::new(files_root.path().join("data"));
+        let job = Job {
+            id: Uuid::new_v4(),
+            lab_id: lab.id,
+            project_id: None,
+            created_by: Uuid::new_v4(),
+            kind: muriarc_core::JobKind::Import,
+            status: muriarc_core::JobStatus::Queued,
+            idempotency_key: "plan-preview".to_owned(),
+            progress_current: 0,
+            progress_total: None,
+            result: None,
+            error_report: None,
+            cancellation_requested: false,
+            meta: RecordMeta::new(now),
+        };
+        files
+            .write_upload(
+                job.id,
+                "animals.csv",
+                Cursor::new(
+                    b"display_id,cage,genotype\nM-CAGE,C404,\nM-GENE,,{Missing}[+]/[+]\n".to_vec(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let pending = files.preview_animal_import(&job, &store).await.unwrap();
+        let codes = pending
+            .preview
+            .issues
+            .iter()
+            .map(|issue| issue.code.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(codes.contains("unknown_cage"));
+        assert!(codes.contains("unknown_locus"));
+        assert!(!pending.preview.can_confirm());
+        assert!(matches!(
+            files
+                .build_animal_import_plan(&job, &pending.preview_hash, &store, now)
+                .await,
+            Err(DataError::PreviewHasErrors)
+        ));
+    }
+
+    #[tokio::test]
+    async fn business_export_flattens_every_current_definition_component_without_uuid() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store.migrate().await.unwrap();
+        let now = Utc::now();
+        let lab = Lab::new("Multi locus export lab", now).unwrap();
+        let audit = AuditContext::system(WriteSource::Migration);
+        store.create_lab(&lab, &audit).await.unwrap();
+        let animal = Animal::new_mouse(lab.id, "M-THREE", Sex::Female, now).unwrap();
+        store.create_animal(&animal, &audit).await.unwrap();
+
+        let mut components = Vec::new();
+        for (display_order, symbol) in ["Trp53", "Rosa26", "Cre"].into_iter().enumerate() {
+            let locus = GeneLocus {
+                id: Uuid::new_v4(),
+                lab_id: lab.id,
+                symbol: symbol.to_owned(),
+                description: None,
+                meta: RecordMeta::new(now),
+            };
+            store.create_gene_locus(&locus, &audit).await.unwrap();
+            let first = Allele {
+                id: Uuid::new_v4(),
+                locus_id: locus.id,
+                symbol: "+".to_owned(),
+                description: None,
+                is_wild_type: true,
+                meta: RecordMeta::new(now),
+            };
+            let second = Allele {
+                id: Uuid::new_v4(),
+                locus_id: locus.id,
+                symbol: format!("{symbol}-target"),
+                description: None,
+                is_wild_type: false,
+                meta: RecordMeta::new(now),
+            };
+            store.create_allele(&first, &audit).await.unwrap();
+            store.create_allele(&second, &audit).await.unwrap();
+            components.push((locus, first, second, display_order));
+        }
+        let mut definition =
+            GenotypeDefinition::new(lab.id, "Three locus definition", now).unwrap();
+        definition
+            .replace_components(
+                components
+                    .iter()
+                    .map(|(locus, first, second, display_order)| {
+                        GenotypeComponent::new(
+                            definition.id,
+                            locus.id,
+                            first.id,
+                            Some(second.id),
+                            GenotypeComponentMode::Diploid,
+                            *display_order as i32,
+                            now,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        store
+            .create_genotype_definition(&definition, &audit)
+            .await
+            .unwrap();
+        let record = GenotypingRecord::new(
+            lab.id,
+            animal.id,
+            definition.id,
+            GenotypingState::Confirmed,
+            Some(now),
+            now,
+        )
+        .unwrap();
+        store
+            .create_genotyping_record(&record, &audit)
+            .await
+            .unwrap();
+
+        let records = collect_animal_export_records(&store, lab.id).await.unwrap();
+        assert_eq!(records[0].genotypes.len(), 3);
+        let bytes = export_animals_with_options(
+            &store,
+            lab.id,
+            ExportFormat::Xlsx,
+            &AnimalExportOptions::default(),
+        )
+        .await
+        .unwrap();
+        let animals_sheet = read_xlsx(Cursor::new(bytes)).unwrap();
+        assert_eq!(animals_sheet.sheet_name, "animals");
+        assert!(
+            !animals_sheet
+                .headers
+                .iter()
+                .any(|header| header == "animal_uuid")
+        );
+        assert!(
+            !animals_sheet
+                .rows
+                .iter()
+                .flatten()
+                .any(|value| value == &animal.id.to_string())
+        );
+
+        let csv = export_animals_with_options(
+            &store,
+            lab.id,
+            ExportFormat::Csv,
+            &AnimalExportOptions::default(),
+        )
+        .await
+        .unwrap();
+        let rendered = String::from_utf8(csv).unwrap();
+        assert!(!rendered.contains("animal_uuid"));
+        assert!(!rendered.contains(&animal.id.to_string()));
     }
 
     #[tokio::test]

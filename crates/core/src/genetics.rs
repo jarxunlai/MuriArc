@@ -139,6 +139,14 @@ pub enum GenotypingState {
     Rejected,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GeneticsReferenceCounts {
+    pub active_genotype_definitions: usize,
+    pub genotype_definitions: usize,
+    pub genotyping_records: usize,
+    pub breeding_lines: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenotypingRecord {
     pub id: Uuid,
@@ -150,6 +158,12 @@ pub struct GenotypingRecord {
     pub assessed_at: Option<DateTime<Utc>>,
     pub method: Option<String>,
     pub notes: Option<String>,
+    #[serde(default)]
+    pub supersedes_record_id: Option<Uuid>,
+    #[serde(default)]
+    pub voided_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub void_reason: Option<String>,
     pub meta: RecordMeta,
 }
 
@@ -172,6 +186,9 @@ impl GenotypingRecord {
             assessed_at,
             method: None,
             notes: None,
+            supersedes_record_id: None,
+            voided_at: None,
+            void_reason: None,
             meta: RecordMeta::new(now),
         };
         record.validate()?;
@@ -183,15 +200,46 @@ impl GenotypingRecord {
             || self.lab_id.is_nil()
             || self.animal_id.is_nil()
             || self.genotype_definition_id.is_nil()
+            || self.supersedes_record_id == Some(self.id)
             || (matches!(
                 self.state,
                 GenotypingState::Confirmed | GenotypingState::Rejected
             ) && self.assessed_at.is_none())
+            || match (self.voided_at, self.void_reason.as_deref()) {
+                (None, None) => false,
+                (Some(_), Some(reason)) => reason.trim().is_empty(),
+                _ => true,
+            }
         {
             Err(DomainError::InvalidGenotypingRecord)
         } else {
             Ok(())
         }
+    }
+
+    pub const fn is_voided(&self) -> bool {
+        self.voided_at.is_some()
+    }
+
+    pub fn void(
+        &mut self,
+        reason: impl Into<String>,
+        now: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        if self.is_voided() {
+            return Err(DomainError::InvalidGenotypingRecord);
+        }
+        let reason = reason.into();
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(DomainError::EmptyField {
+                field: "genotyping_record.void_reason",
+            });
+        }
+        self.voided_at = Some(now);
+        self.void_reason = Some(reason.to_owned());
+        self.meta.touch(now);
+        self.validate()
     }
 }
 
@@ -240,5 +288,49 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, DomainError::InvalidGenotypingRecord);
+    }
+
+    #[test]
+    fn voiding_requires_a_reason_and_advances_revision() {
+        let now = Utc::now();
+        let mut record = GenotypingRecord::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            GenotypingState::Expected,
+            None,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            record.void("   ", now),
+            Err(DomainError::EmptyField {
+                field: "genotyping_record.void_reason"
+            })
+        );
+        record.void("wrong animal", now).unwrap();
+        assert!(record.is_voided());
+        assert_eq!(record.void_reason.as_deref(), Some("wrong animal"));
+        assert_eq!(record.meta.revision, 2);
+        assert_eq!(
+            record.void("again", now),
+            Err(DomainError::InvalidGenotypingRecord)
+        );
+    }
+
+    #[test]
+    fn record_cannot_supersede_itself() {
+        let mut record = GenotypingRecord::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            GenotypingState::Expected,
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+        record.supersedes_record_id = Some(record.id);
+        assert_eq!(record.validate(), Err(DomainError::InvalidGenotypingRecord));
     }
 }

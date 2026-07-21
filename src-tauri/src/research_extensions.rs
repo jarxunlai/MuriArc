@@ -1,21 +1,26 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use muriarc_application::{
-    CreateAnimalDraftInput as CreateAnimalDraftCommandInput, CreateAnimalIdentifierScope,
-    CreateBreedingLineCommand, CreateBreedingPairCommand, CreateColonyCommand,
-    CreateExperimentEventCommand, CreateGenotypeComponentInput, CreateGenotypeDefinitionCommand,
-    CreateGenotypingRecordCommand, CreateLitterCommand, CreateMatingEventCommand,
-    CreateObservationDefinitionCommand, RecordObservationCommand, RegisterAnimalDraftCommand,
-    ReviseObservationValueCommand, breeding_prediction, create_breeding_line, create_breeding_pair,
-    create_colony, create_experiment_event, create_genotype_definition, create_genotyping_record,
-    create_litter, create_mating_event, create_observation_definition, record_observation,
-    register_animal_draft, retire_breeding_pair, revise_observation_value,
+    CorrectGenotypingRecordCommand, CreateAnimalDraftInput as CreateAnimalDraftCommandInput,
+    CreateAnimalIdentifierScope, CreateBreedingLineCommand, CreateBreedingPairCommand,
+    CreateColonyCommand, CreateExperimentEventCommand, CreateGenotypeComponentInput,
+    CreateGenotypeDefinitionCommand, CreateGenotypingRecordCommand, CreateLitterCommand,
+    CreateMatingEventCommand, CreateObservationDefinitionCommand, GeneticsArchiveCommand,
+    RecordObservationCommand, RegisterAnimalDraftCommand, ReviseObservationValueCommand,
+    VoidGenotypingRecordCommand,
+    archive_genotype_definition as archive_genotype_definition_use_case, breeding_prediction,
+    correct_genotyping_record as correct_genotyping_record_use_case, create_breeding_line,
+    create_breeding_pair, create_colony, create_experiment_event, create_genotype_definition,
+    create_genotyping_record, create_litter, create_mating_event, create_observation_definition,
+    record_observation, register_animal_draft,
+    restore_genotype_definition as restore_genotype_definition_use_case, retire_breeding_pair,
+    revise_observation_value, void_genotyping_record as void_genotyping_record_use_case,
 };
 use muriarc_core::{
     Animal, AnimalDraft, BreedingLine, BreedingPair, Colony, ExperimentEvent,
-    GenotypeComponentMode, GenotypeDefinition, GenotypingRecord, GenotypingState, Litter,
-    LocusPrediction, MatingEvent, MuriArcStore, Observation, ObservationDefinition,
-    ObservationFilter, ObservationPolicy, ObservationSubjectType, ObservationValueData,
-    ObservationValueRecord, ObservationValueType, Sex,
+    GeneticsReferenceCounts, GenotypeComponentMode, GenotypeDefinition, GenotypingRecord,
+    GenotypingState, Litter, LocusPrediction, MatingEvent, MuriArcStore, Observation,
+    ObservationDefinition, ObservationFilter, ObservationPolicy, ObservationSubjectType,
+    ObservationValueData, ObservationValueRecord, ObservationValueType, Sex, StoreError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -51,6 +56,41 @@ pub(crate) struct CreateGenotypingRecordInput {
     assessed_at: Option<DateTime<Utc>>,
     method: Option<String>,
     notes: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct GeneticsArchiveInput {
+    pub(crate) id: Uuid,
+    pub(crate) expected_revision: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct VoidGenotypingRecordInput {
+    record_id: Uuid,
+    expected_revision: i64,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CorrectGenotypingRecordInput {
+    record_id: Uuid,
+    expected_revision: i64,
+    reason: String,
+    genotype_definition_id: Uuid,
+    state: GenotypingState,
+    assessed_at: Option<DateTime<Utc>>,
+    method: Option<String>,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CorrectGenotypingRecordView {
+    voided: GenotypingRecord,
+    replacement: GenotypingRecord,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,11 +254,69 @@ pub(crate) struct RecordedObservationView {
 impl DesktopState {
     pub(crate) async fn list_genotype_definitions(
         &self,
+        include_archived: bool,
     ) -> Result<Vec<GenotypeDefinition>, DesktopError> {
+        if include_archived {
+            Ok(self
+                .domain_store()
+                .list_genotype_definitions_including_archived(self.local_lab_id())
+                .await?)
+        } else {
+            Ok(self
+                .domain_store()
+                .list_genotype_definitions(self.local_lab_id())
+                .await?)
+        }
+    }
+
+    pub(crate) async fn genotype_definition_references(
+        &self,
+        id: Uuid,
+    ) -> Result<GeneticsReferenceCounts, DesktopError> {
+        let definition = self.domain_store().get_genotype_definition(id).await?;
+        if definition.lab_id != self.local_lab_id() {
+            return Err(DesktopError::Store(StoreError::Validation(
+                "genotype definition belongs to another lab".to_owned(),
+            )));
+        }
         Ok(self
             .domain_store()
-            .list_genotype_definitions(self.local_lab_id())
+            .genotype_definition_reference_counts(id)
             .await?)
+    }
+
+    pub(crate) async fn archive_genotype_definition(
+        &self,
+        input: GeneticsArchiveInput,
+    ) -> Result<GenotypeDefinition, DesktopError> {
+        let audit = self.audit("archive_genotype_definition").await?;
+        Ok(archive_genotype_definition_use_case(
+            self.domain_store(),
+            GeneticsArchiveCommand {
+                id: input.id,
+                expected_revision: input.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?)
+    }
+
+    pub(crate) async fn restore_genotype_definition(
+        &self,
+        input: GeneticsArchiveInput,
+    ) -> Result<GenotypeDefinition, DesktopError> {
+        let audit = self.audit("restore_genotype_definition").await?;
+        Ok(restore_genotype_definition_use_case(
+            self.domain_store(),
+            GeneticsArchiveCommand {
+                id: input.id,
+                expected_revision: input.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?)
     }
 
     pub(crate) async fn create_genotype_definition(
@@ -281,6 +379,51 @@ impl DesktopState {
             &audit,
         )
         .await?)
+    }
+
+    pub(crate) async fn void_genotyping_record(
+        &self,
+        input: VoidGenotypingRecordInput,
+    ) -> Result<GenotypingRecord, DesktopError> {
+        let audit = self.audit("void_genotyping_record").await?;
+        Ok(void_genotyping_record_use_case(
+            self.domain_store(),
+            VoidGenotypingRecordCommand {
+                record_id: input.record_id,
+                expected_revision: input.expected_revision,
+                reason: input.reason,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?)
+    }
+
+    pub(crate) async fn correct_genotyping_record(
+        &self,
+        input: CorrectGenotypingRecordInput,
+    ) -> Result<CorrectGenotypingRecordView, DesktopError> {
+        let audit = self.audit("correct_genotyping_record").await?;
+        let (voided, replacement) = correct_genotyping_record_use_case(
+            self.domain_store(),
+            CorrectGenotypingRecordCommand {
+                record_id: input.record_id,
+                expected_revision: input.expected_revision,
+                reason: input.reason,
+                genotype_definition_id: input.genotype_definition_id,
+                state: input.state,
+                assessed_at: input.assessed_at,
+                method: input.method,
+                notes: input.notes,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?;
+        Ok(CorrectGenotypingRecordView {
+            voided,
+            replacement,
+        })
     }
 
     pub(crate) async fn list_breeding_lines(&self) -> Result<Vec<BreedingLine>, DesktopError> {

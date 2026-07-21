@@ -3,17 +3,20 @@ use std::collections::HashSet;
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use chrono::{DateTime, Utc};
 use muriarc_application::{
-    CreateAlleleCommand, CreateGeneLocusCommand, CreateGenotypeCommand,
-    CreateGenotypeComponentInput, CreateGenotypeDefinitionCommand, CreateGenotypingRecordCommand,
-    CreatePedigreeCommand, create_allele as create_allele_use_case, create_gene_locus,
+    CorrectGenotypingRecordCommand, CreateAlleleCommand, CreateGeneLocusCommand,
+    CreateGenotypeCommand, CreateGenotypeComponentInput, CreateGenotypeDefinitionCommand,
+    CreateGenotypingRecordCommand, CreatePedigreeCommand, GeneticsArchiveCommand,
+    VoidGenotypingRecordCommand, archive_allele, archive_gene_locus, archive_genotype_definition,
+    correct_genotyping_record, create_allele as create_allele_use_case, create_gene_locus,
     create_genotype as create_genotype_use_case, create_genotype_definition,
-    create_genotyping_record, create_pedigree as create_pedigree_use_case,
+    create_genotyping_record, create_pedigree as create_pedigree_use_case, restore_allele,
+    restore_gene_locus, restore_genotype_definition, void_genotyping_record,
 };
 use muriarc_core::{
-    Allele, AnimalFilter, GeneLocus, Genotype, GenotypeComponentMode, GenotypeDefinition,
-    GenotypingRecord, GenotypingState, ParentType, Pedigree, Permission,
+    Allele, AnimalFilter, GeneLocus, GeneticsReferenceCounts, Genotype, GenotypeComponentMode,
+    GenotypeDefinition, GenotypingRecord, GenotypingState, ParentType, Pedigree, Permission,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{ApiError, AppState, AuthPrincipal, RequestMetadata};
@@ -28,8 +31,26 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/gene-loci", get(list_loci).post(create_locus))
         .route("/gene-loci/{id}", get(get_locus))
+        .route("/gene-loci/{id}/references", get(get_locus_references))
+        .route(
+            "/gene-loci/{id}/archive",
+            axum::routing::post(archive_locus),
+        )
+        .route(
+            "/gene-loci/{id}/restore",
+            axum::routing::post(restore_locus),
+        )
         .route("/alleles", get(list_alleles).post(create_allele))
         .route("/alleles/{id}", get(get_allele))
+        .route("/alleles/{id}/references", get(get_allele_references))
+        .route(
+            "/alleles/{id}/archive",
+            axum::routing::post(archive_allele_route),
+        )
+        .route(
+            "/alleles/{id}/restore",
+            axum::routing::post(restore_allele_route),
+        )
         .route("/genotypes", get(list_genotypes).post(create_genotype))
         .route("/genotypes/{id}", get(get_genotype))
         .route(
@@ -38,10 +59,30 @@ pub(super) fn router() -> Router<AppState> {
         )
         .route("/genotype-definitions/{id}", get(get_genotype_definition))
         .route(
+            "/genotype-definitions/{id}/references",
+            get(get_genotype_definition_references),
+        )
+        .route(
+            "/genotype-definitions/{id}/archive",
+            axum::routing::post(archive_genotype_definition_route),
+        )
+        .route(
+            "/genotype-definitions/{id}/restore",
+            axum::routing::post(restore_genotype_definition_route),
+        )
+        .route(
             "/genotyping-records",
             get(list_genotyping_records).post(create_genotyping_record_route),
         )
         .route("/genotyping-records/{id}", get(get_genotyping_record))
+        .route(
+            "/genotyping-records/{id}/void",
+            axum::routing::post(void_genotyping_record_route),
+        )
+        .route(
+            "/genotyping-records/{id}/correct",
+            axum::routing::post(correct_genotyping_record_route),
+        )
         .route("/pedigrees", get(list_pedigrees).post(create_pedigree))
         .route("/pedigrees/{id}", get(get_pedigree))
 }
@@ -52,11 +93,20 @@ struct AccessQuery {
     project_id: Option<Uuid>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveRequest {
+    project_id: Option<Uuid>,
+    expected_revision: i64,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocusListQuery {
     project_id: Option<Uuid>,
     limit: Option<usize>,
+    #[serde(default)]
+    include_archived: bool,
 }
 
 async fn list_loci(
@@ -73,7 +123,17 @@ async fn list_loci(
         Permission::ReadAnimal,
     )
     .await?;
-    let mut loci = store(state.store.list_gene_loci(principal.lab_id), &metadata).await?;
+    let mut loci = if query.include_archived {
+        store(
+            state
+                .store
+                .list_gene_loci_including_archived(principal.lab_id),
+            &metadata,
+        )
+        .await?
+    } else {
+        store(state.store.list_gene_loci(principal.lab_id), &metadata).await?
+    };
     truncate(&mut loci, collection_limit(query.limit, &metadata)?);
     Ok(collection(loci, &metadata))
 }
@@ -94,6 +154,92 @@ async fn get_locus(
     )
     .await?;
     let locus = visible_locus(&state, &principal, &metadata, id).await?;
+    Ok(item(locus, &metadata))
+}
+
+async fn get_locus_references(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiQuery(query): ApiQuery<AccessQuery>,
+) -> Result<Json<ItemResponse<GeneticsReferenceCounts>>, ApiError> {
+    scope::optional_project_permission(
+        &state,
+        &principal,
+        &metadata,
+        query.project_id,
+        Permission::ReadAnimal,
+    )
+    .await?;
+    visible_locus(&state, &principal, &metadata, id).await?;
+    let counts = store(state.store.gene_locus_reference_counts(id), &metadata).await?;
+    Ok(item(counts, &metadata))
+}
+
+async fn archive_locus(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<ArchiveRequest>,
+) -> Result<Json<ItemResponse<GeneLocus>>, ApiError> {
+    scope::optional_project_permission(
+        &state,
+        &principal,
+        &metadata,
+        payload.project_id,
+        Permission::ManageBreeding,
+    )
+    .await?;
+    visible_locus(&state, &principal, &metadata, id).await?;
+    let audit = principal.audit_context(&metadata);
+    let locus = application(
+        archive_gene_locus(
+            state.store.as_ref(),
+            GeneticsArchiveCommand {
+                id,
+                expected_revision: payload.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
+    Ok(item(locus, &metadata))
+}
+
+async fn restore_locus(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<ArchiveRequest>,
+) -> Result<Json<ItemResponse<GeneLocus>>, ApiError> {
+    scope::optional_project_permission(
+        &state,
+        &principal,
+        &metadata,
+        payload.project_id,
+        Permission::ManageBreeding,
+    )
+    .await?;
+    visible_locus(&state, &principal, &metadata, id).await?;
+    let audit = principal.audit_context(&metadata);
+    let locus = application(
+        restore_gene_locus(
+            state.store.as_ref(),
+            GeneticsArchiveCommand {
+                id,
+                expected_revision: payload.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
     Ok(item(locus, &metadata))
 }
 
@@ -143,6 +289,8 @@ struct AlleleListQuery {
     locus_id: Uuid,
     project_id: Option<Uuid>,
     limit: Option<usize>,
+    #[serde(default)]
+    include_archived: bool,
 }
 
 async fn list_alleles(
@@ -160,7 +308,15 @@ async fn list_alleles(
     )
     .await?;
     visible_locus(&state, &principal, &metadata, query.locus_id).await?;
-    let mut alleles = store(state.store.list_alleles(query.locus_id), &metadata).await?;
+    let mut alleles = if query.include_archived {
+        store(
+            state.store.list_alleles_including_archived(query.locus_id),
+            &metadata,
+        )
+        .await?
+    } else {
+        store(state.store.list_alleles(query.locus_id), &metadata).await?
+    };
     truncate(&mut alleles, collection_limit(query.limit, &metadata)?);
     Ok(collection(alleles, &metadata))
 }
@@ -182,6 +338,95 @@ async fn get_allele(
     .await?;
     let allele = store(state.store.get_allele(id), &metadata).await?;
     visible_locus(&state, &principal, &metadata, allele.locus_id).await?;
+    Ok(item(allele, &metadata))
+}
+
+async fn get_allele_references(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiQuery(query): ApiQuery<AccessQuery>,
+) -> Result<Json<ItemResponse<GeneticsReferenceCounts>>, ApiError> {
+    scope::optional_project_permission(
+        &state,
+        &principal,
+        &metadata,
+        query.project_id,
+        Permission::ReadAnimal,
+    )
+    .await?;
+    let allele = store(state.store.get_allele(id), &metadata).await?;
+    visible_locus(&state, &principal, &metadata, allele.locus_id).await?;
+    let counts = store(state.store.allele_reference_counts(id), &metadata).await?;
+    Ok(item(counts, &metadata))
+}
+
+async fn archive_allele_route(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<ArchiveRequest>,
+) -> Result<Json<ItemResponse<Allele>>, ApiError> {
+    scope::optional_project_permission(
+        &state,
+        &principal,
+        &metadata,
+        payload.project_id,
+        Permission::ManageBreeding,
+    )
+    .await?;
+    let existing = store(state.store.get_allele(id), &metadata).await?;
+    visible_locus(&state, &principal, &metadata, existing.locus_id).await?;
+    let audit = principal.audit_context(&metadata);
+    let allele = application(
+        archive_allele(
+            state.store.as_ref(),
+            GeneticsArchiveCommand {
+                id,
+                expected_revision: payload.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
+    Ok(item(allele, &metadata))
+}
+
+async fn restore_allele_route(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<ArchiveRequest>,
+) -> Result<Json<ItemResponse<Allele>>, ApiError> {
+    scope::optional_project_permission(
+        &state,
+        &principal,
+        &metadata,
+        payload.project_id,
+        Permission::ManageBreeding,
+    )
+    .await?;
+    let existing = store(state.store.get_allele(id), &metadata).await?;
+    visible_locus(&state, &principal, &metadata, existing.locus_id).await?;
+    let audit = principal.audit_context(&metadata);
+    let allele = application(
+        restore_allele(
+            state.store.as_ref(),
+            GeneticsArchiveCommand {
+                id,
+                expected_revision: payload.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
     Ok(item(allele, &metadata))
 }
 
@@ -360,11 +605,21 @@ async fn list_genotype_definitions(
         Permission::ReadAnimal,
     )
     .await?;
-    let mut definitions = store(
-        state.store.list_genotype_definitions(principal.lab_id),
-        &metadata,
-    )
-    .await?;
+    let mut definitions = if query.include_archived {
+        store(
+            state
+                .store
+                .list_genotype_definitions_including_archived(principal.lab_id),
+            &metadata,
+        )
+        .await?
+    } else {
+        store(
+            state.store.list_genotype_definitions(principal.lab_id),
+            &metadata,
+        )
+        .await?
+    };
     truncate(&mut definitions, collection_limit(query.limit, &metadata)?);
     Ok(collection(definitions, &metadata))
 }
@@ -386,6 +641,99 @@ async fn get_genotype_definition(
     .await?;
     let definition = store(state.store.get_genotype_definition(id), &metadata).await?;
     ensure_lab(definition.lab_id, &principal, &metadata)?;
+    Ok(item(definition, &metadata))
+}
+
+async fn get_genotype_definition_references(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiQuery(query): ApiQuery<AccessQuery>,
+) -> Result<Json<ItemResponse<GeneticsReferenceCounts>>, ApiError> {
+    scope::optional_project_permission(
+        &state,
+        &principal,
+        &metadata,
+        query.project_id,
+        Permission::ReadAnimal,
+    )
+    .await?;
+    let definition = store(state.store.get_genotype_definition(id), &metadata).await?;
+    ensure_lab(definition.lab_id, &principal, &metadata)?;
+    let counts = store(
+        state.store.genotype_definition_reference_counts(id),
+        &metadata,
+    )
+    .await?;
+    Ok(item(counts, &metadata))
+}
+
+async fn archive_genotype_definition_route(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<ArchiveRequest>,
+) -> Result<Json<ItemResponse<GenotypeDefinition>>, ApiError> {
+    scope::optional_project_permission(
+        &state,
+        &principal,
+        &metadata,
+        payload.project_id,
+        Permission::ManageBreeding,
+    )
+    .await?;
+    let existing = store(state.store.get_genotype_definition(id), &metadata).await?;
+    ensure_lab(existing.lab_id, &principal, &metadata)?;
+    let audit = principal.audit_context(&metadata);
+    let definition = application(
+        archive_genotype_definition(
+            state.store.as_ref(),
+            GeneticsArchiveCommand {
+                id,
+                expected_revision: payload.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
+    Ok(item(definition, &metadata))
+}
+
+async fn restore_genotype_definition_route(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<ArchiveRequest>,
+) -> Result<Json<ItemResponse<GenotypeDefinition>>, ApiError> {
+    scope::optional_project_permission(
+        &state,
+        &principal,
+        &metadata,
+        payload.project_id,
+        Permission::ManageBreeding,
+    )
+    .await?;
+    let existing = store(state.store.get_genotype_definition(id), &metadata).await?;
+    ensure_lab(existing.lab_id, &principal, &metadata)?;
+    let audit = principal.audit_context(&metadata);
+    let definition = application(
+        restore_genotype_definition(
+            state.store.as_ref(),
+            GeneticsArchiveCommand {
+                id,
+                expected_revision: payload.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
     Ok(item(definition, &metadata))
 }
 
@@ -489,19 +837,54 @@ struct CreateGenotypingRecordRequest {
     notes: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoidGenotypingRecordRequest {
+    project_id: Option<Uuid>,
+    expected_revision: i64,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorrectGenotypingRecordRequest {
+    project_id: Option<Uuid>,
+    expected_revision: i64,
+    reason: String,
+    genotype_definition_id: Uuid,
+    state: GenotypingState,
+    assessed_at: Option<DateTime<Utc>>,
+    method: Option<String>,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CorrectGenotypingRecordResponse {
+    voided: GenotypingRecord,
+    replacement: GenotypingRecord,
+}
+
 async fn create_genotyping_record_route(
     State(state): State<AppState>,
     principal: AuthPrincipal,
     metadata: RequestMetadata,
     ApiJson(payload): ApiJson<CreateGenotypingRecordRequest>,
 ) -> Result<(StatusCode, Json<ItemResponse<GenotypingRecord>>), ApiError> {
+    let permission = if matches!(
+        payload.state,
+        GenotypingState::Confirmed | GenotypingState::Rejected
+    ) {
+        Permission::ManageBreeding
+    } else {
+        Permission::WriteAnimal
+    };
     scope::animal_with_permission(
         &state,
         &principal,
         &metadata,
         payload.animal_id,
         payload.project_id,
-        Permission::ManageBreeding,
+        permission,
     )
     .await?;
     let definition = store(
@@ -533,6 +916,97 @@ async fn create_genotyping_record_route(
     )
     .await?;
     Ok((StatusCode::CREATED, item(record, &metadata)))
+}
+
+async fn void_genotyping_record_route(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<VoidGenotypingRecordRequest>,
+) -> Result<Json<ItemResponse<GenotypingRecord>>, ApiError> {
+    let existing = store(state.store.get_genotyping_record(id), &metadata).await?;
+    ensure_lab(existing.lab_id, &principal, &metadata)?;
+    scope::animal_with_permission(
+        &state,
+        &principal,
+        &metadata,
+        existing.animal_id,
+        payload.project_id.or(existing.project_id),
+        Permission::ManageBreeding,
+    )
+    .await?;
+    let audit = principal.audit_context(&metadata);
+    let record = application(
+        void_genotyping_record(
+            state.store.as_ref(),
+            VoidGenotypingRecordCommand {
+                record_id: id,
+                expected_revision: payload.expected_revision,
+                reason: payload.reason,
+                now: Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
+    Ok(item(record, &metadata))
+}
+
+async fn correct_genotyping_record_route(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<CorrectGenotypingRecordRequest>,
+) -> Result<Json<ItemResponse<CorrectGenotypingRecordResponse>>, ApiError> {
+    let existing = store(state.store.get_genotyping_record(id), &metadata).await?;
+    ensure_lab(existing.lab_id, &principal, &metadata)?;
+    scope::animal_with_permission(
+        &state,
+        &principal,
+        &metadata,
+        existing.animal_id,
+        payload.project_id.or(existing.project_id),
+        Permission::ManageBreeding,
+    )
+    .await?;
+    let definition = store(
+        state
+            .store
+            .get_genotype_definition(payload.genotype_definition_id),
+        &metadata,
+    )
+    .await?;
+    ensure_lab(definition.lab_id, &principal, &metadata)?;
+    let audit = principal.audit_context(&metadata);
+    let (voided, replacement) = application(
+        correct_genotyping_record(
+            state.store.as_ref(),
+            CorrectGenotypingRecordCommand {
+                record_id: id,
+                expected_revision: payload.expected_revision,
+                reason: payload.reason,
+                genotype_definition_id: payload.genotype_definition_id,
+                state: payload.state,
+                assessed_at: payload.assessed_at,
+                method: payload.method,
+                notes: payload.notes,
+                now: Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
+    Ok(item(
+        CorrectGenotypingRecordResponse {
+            voided,
+            replacement,
+        },
+        &metadata,
+    ))
 }
 
 async fn list_pedigrees(

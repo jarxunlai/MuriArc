@@ -12,7 +12,7 @@ MuriArc 是面向个人研究者和共享实验室的实验动物研究管理平
 
 ## 运行形态
 
-- **Desktop**：Tauri v2 + SQLite，面向个人用户；每次启动显示无密码“进入本地空间”，它只确认实验室和操作者、不是安全锁，进入后可完全离线使用。
+- **Desktop**：Tauri v2 + SQLite，面向个人用户；正式本地交付为 Windows Tauri WebView 安装包，不通过 VNC/noVNC 或浏览器远程桌面部署。每次启动显示无密码“进入本地空间”，它只确认实验室和操作者、不是安全锁，进入后可完全离线使用。
 - **Server**：Axum + PostgreSQL + 响应式 Web，面向一个实验室内的多用户、多项目协作。
 - **AI**：只通过受控领域工具和查询 DSL 访问数据；查询自动执行，写入先预览再确认。
 
@@ -76,7 +76,8 @@ pnpm run build
 pnpm run test:e2e
 ```
 
-Tauri 开发入口和环境变量以 `src-tauri/tauri.conf.json`、`.env.example` 为准。
+Tauri 开发入口和环境变量以 `src-tauri/tauri.conf.json`、`.env.example` 为准。Desktop
+本地交付边界见 [docs/DESKTOP_DELIVERY.md](docs/DESKTOP_DELIVERY.md)；VNC/noVNC 只能作为临时远程预览手段，不能作为正式 Desktop 部署方式。
 
 共享 Server 使用 Argon2id 账号、HttpOnly/SameSite session、CSRF 防护和
 可撤销外部 token。部署必须通过 `MURIARC_ROOT_*` 环境变量声明唯一 Environment Root；
@@ -106,5 +107,5 @@ MuriArc 0.1.0 为预发布重构版本：Genetics v2、Breeding、Observation、
 - Snapshot 生成并校验 manifest、全量业务 JSONL、附件、大小与 SHA-256；不提供
   restore/apply、实时同步或自动合并。
 - 普通导入/导出没有通用实体选择器：导入仅动物登记/实验测量，导出仅 Animal Registry。
-- Windows Desktop 为首发目标；macOS 必须在真实设备验证后发布。
+- Windows Desktop 安装包为首发本地交付目标；macOS 必须在真实设备验证后发布。
 - 公开发布前必须完成遗留凭据轮换与自有远程 Git 历史中的敏感数据清理，并再次执行发布审计。

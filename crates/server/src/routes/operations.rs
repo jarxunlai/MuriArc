@@ -329,6 +329,7 @@ const fn entity_label(entity_type: EntityType) -> &'static str {
         EntityType::AiConversation => "AI 会话",
         EntityType::AiConversationMessage => "AI 消息",
         EntityType::AiProviderSettings => "AI Provider 设置",
+        EntityType::AiProviderEndpoint => "AI Provider 端点",
         EntityType::AiLabSettings => "实验室 AI 设置",
         EntityType::ToolRun => "AI 工具执行",
         EntityType::Approval => "审批",
@@ -359,6 +360,10 @@ mod tests {
             "关联附件关联"
         );
         assert_eq!(source_label(WriteSource::Web), "Web");
+        assert_eq!(
+            operation_title(EntityType::AiProviderEndpoint, AuditAction::Create),
+            "新建AI Provider 端点"
+        );
         assert!(in_scope(EntityType::AiExtractionDraft, OperationScope::Ai));
         assert!(!in_scope(EntityType::Animal, OperationScope::Ai));
     }

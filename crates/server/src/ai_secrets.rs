@@ -1206,12 +1206,14 @@ mod postgres {
             write_endpoint_audit(
                 &mut transaction,
                 lab_id,
-                view.id,
-                if before.is_some() { "update" } else { "create" },
-                before,
-                Some(after),
                 audit,
-                "AI provider endpoint saved",
+                EndpointAuditChange {
+                    endpoint_id: view.id,
+                    action: if before.is_some() { "update" } else { "create" },
+                    before,
+                    after: Some(after),
+                    reason: "AI provider endpoint saved",
+                },
             )
             .await?;
             transaction
@@ -1265,12 +1267,14 @@ mod postgres {
             write_endpoint_audit(
                 &mut transaction,
                 lab_id,
-                view.id,
-                "update",
-                Some(Self::endpoint_audit_state(&before_view)),
-                Some(Self::endpoint_audit_state(&view)),
                 audit,
-                "AI provider endpoint disabled",
+                EndpointAuditChange {
+                    endpoint_id: view.id,
+                    action: "update",
+                    before: Some(Self::endpoint_audit_state(&before_view)),
+                    after: Some(Self::endpoint_audit_state(&view)),
+                    reason: "AI provider endpoint disabled",
+                },
             )
             .await?;
             transaction
@@ -1296,15 +1300,19 @@ mod postgres {
         }
     }
 
-    async fn write_endpoint_audit(
-        transaction: &mut Transaction<'_, Postgres>,
-        lab_id: Uuid,
+    struct EndpointAuditChange {
         endpoint_id: Uuid,
         action: &'static str,
         before: Option<Value>,
         after: Option<Value>,
-        audit: &AuditContext,
         reason: &'static str,
+    }
+
+    async fn write_endpoint_audit(
+        transaction: &mut Transaction<'_, Postgres>,
+        lab_id: Uuid,
+        audit: &AuditContext,
+        change: EndpointAuditChange,
     ) -> Result<(), AiProviderStoreError> {
         let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
         sqlx::query(
@@ -1312,15 +1320,15 @@ mod postgres {
         )
         .bind(Uuid::new_v4())
         .bind(lab_id)
-        .bind(endpoint_id)
-        .bind(action)
+        .bind(change.endpoint_id)
+        .bind(change.action)
         .bind(actor_user_id)
         .bind(&audit.actor.display_name)
         .bind(write_source_name(audit.source))
         .bind(&audit.request_id)
-        .bind(reason)
-        .bind(before)
-        .bind(after)
+        .bind(change.reason)
+        .bind(change.before)
+        .bind(change.after)
         .execute(&mut **transaction)
         .await
         .map_err(|_| AiProviderStoreError::Storage)?;

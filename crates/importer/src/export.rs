@@ -524,12 +524,12 @@ fn matches_filter(record: &AnimalExportRecord, filter: &AnimalExportFilter) -> b
                                 .as_deref()
                                 .is_some_and(|allele| text_matches(value, allele))
                     }))
-                && !filter
+                && filter
                     .assessed_at_from
-                    .is_some_and(|from| genotype.assessed_at.is_none_or(|at| at < from))
-                && !filter
+                    .is_none_or(|from| genotype.assessed_at.is_some_and(|at| at >= from))
+                && filter
                     .assessed_at_to
-                    .is_some_and(|to| genotype.assessed_at.is_none_or(|at| at > to))
+                    .is_none_or(|to| genotype.assessed_at.is_some_and(|at| at <= to))
         })
     {
         return false;

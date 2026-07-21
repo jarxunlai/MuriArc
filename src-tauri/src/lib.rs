@@ -9,7 +9,9 @@ mod data;
 mod research_extensions;
 mod settings;
 
-use ai::{DesktopAiError, DesktopAiState, DesktopDraftDecisionInput, parse_uuid};
+use ai::{
+    DesktopAiError, DesktopAiState, DesktopAutonomyInput, DesktopDraftDecisionInput, parse_uuid,
+};
 use animal_details::{
     AlleleView, AnimalDetailView, CreateAlleleInput, CreateAnimalSampleInput, CreateGeneLocusInput,
     CreateGenotypeInput, CreatePedigreeInput, GeneLocusView, GenotypeView, PedigreeRelationView,
@@ -23,22 +25,26 @@ use application::{
     SaveWorkspaceSettingsInput, TemplateView, WorkspaceSettingsView,
 };
 use data::{
-    AttachmentDownloadView, AttachmentScopeInput, AttachmentView, CancelDataImportInput,
-    ConfirmDataImportInput, CreateDataExportInput, CreateDataSnapshotInput, DataArtifactView,
+    AnimalImportTemplateInput, AnimalImportTemplateView, AttachmentDownloadView,
+    AttachmentScopeInput, AttachmentView, CancelDataImportInput, ConfirmDataImportInput,
+    CreateDataExportInput, CreateDataSnapshotInput, DataArtifactView, DeleteAttachmentInput,
     DesktopDataError, DesktopDataState, ImportReceiptView, PreviewDataImportInput,
     RemapDataImportInput, UploadAttachmentInput,
 };
 use muriarc_ai::{
-    AssistantConversationDetail, AssistantConversationSummary, AssistantTurnRequest,
-    AssistantTurnResponse, DraftDecisionResponse, DraftStatus, WriteDraftSummary,
+    AiAutonomyView, AssistantConversationDetail, AssistantConversationSummary,
+    AssistantTurnRequest, AssistantTurnResponse, DraftDecisionResponse, DraftStatus,
+    WriteDraftSummary,
 };
 use research_extensions::{
-    BreedingPredictionInput, CreateBreedingLineInput, CreateBreedingPairInput,
+    BreedingPredictionInput, CorrectGenotypingRecordInput, CorrectGenotypingRecordView,
+    CreateBreedingLineInput, CreateBreedingPairInput,
     CreateColonyInput as CreateResearchColonyInput, CreateExperimentEventInput,
     CreateGenotypeDefinitionInput, CreateGenotypingRecordInput, CreateLitterInput,
     CreateMatingEventInput, CreateObservationDefinitionInput, CreatedLitterView,
-    RecordObservationInput, RecordedObservationView, RegisterAnimalDraftInput,
-    RegisteredAnimalDraftView, RetireBreedingPairInput, ReviseObservationInput,
+    GeneticsArchiveInput, RecordObservationInput, RecordedObservationView,
+    RegisterAnimalDraftInput, RegisteredAnimalDraftView, RetireBreedingPairInput,
+    ReviseObservationInput, VoidGenotypingRecordInput,
 };
 use settings::{AiSettingsView, SaveAiSettingsInput};
 
@@ -167,11 +173,36 @@ async fn create_pedigree_relation(
 async fn list_gene_loci(
     state: tauri::State<'_, DesktopState>,
     project_id: Option<String>,
+    include_archived: Option<bool>,
 ) -> CommandResult<Vec<GeneLocusView>> {
     state
-        .list_gene_loci(project_id.as_deref())
+        .list_gene_loci(project_id.as_deref(), include_archived.unwrap_or(false))
         .await
         .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn gene_locus_references(
+    state: tauri::State<'_, DesktopState>,
+    id: uuid::Uuid,
+) -> CommandResult<muriarc_core::GeneticsReferenceCounts> {
+    state.gene_locus_references(id).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn archive_gene_locus(
+    state: tauri::State<'_, DesktopState>,
+    input: GeneticsArchiveInput,
+) -> CommandResult<GeneLocusView> {
+    state.archive_gene_locus(input).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn restore_gene_locus(
+    state: tauri::State<'_, DesktopState>,
+    input: GeneticsArchiveInput,
+) -> CommandResult<GeneLocusView> {
+    state.restore_gene_locus(input).await.map_err(Into::into)
 }
 
 #[tauri::command]
@@ -187,11 +218,40 @@ async fn list_alleles(
     state: tauri::State<'_, DesktopState>,
     locus_id: String,
     project_id: Option<String>,
+    include_archived: Option<bool>,
 ) -> CommandResult<Vec<AlleleView>> {
     state
-        .list_alleles(&locus_id, project_id.as_deref())
+        .list_alleles(
+            &locus_id,
+            project_id.as_deref(),
+            include_archived.unwrap_or(false),
+        )
         .await
         .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn allele_references(
+    state: tauri::State<'_, DesktopState>,
+    id: uuid::Uuid,
+) -> CommandResult<muriarc_core::GeneticsReferenceCounts> {
+    state.allele_references(id).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn archive_allele(
+    state: tauri::State<'_, DesktopState>,
+    input: GeneticsArchiveInput,
+) -> CommandResult<AlleleView> {
+    state.archive_allele(input).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn restore_allele(
+    state: tauri::State<'_, DesktopState>,
+    input: GeneticsArchiveInput,
+) -> CommandResult<AlleleView> {
+    state.restore_allele(input).await.map_err(Into::into)
 }
 
 #[tauri::command]
@@ -225,8 +285,45 @@ async fn create_genotype(
 #[tauri::command]
 async fn list_genotype_definitions(
     state: tauri::State<'_, DesktopState>,
+    include_archived: Option<bool>,
 ) -> CommandResult<Vec<muriarc_core::GenotypeDefinition>> {
-    state.list_genotype_definitions().await.map_err(Into::into)
+    state
+        .list_genotype_definitions(include_archived.unwrap_or(false))
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn genotype_definition_references(
+    state: tauri::State<'_, DesktopState>,
+    id: uuid::Uuid,
+) -> CommandResult<muriarc_core::GeneticsReferenceCounts> {
+    state
+        .genotype_definition_references(id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn archive_genotype_definition(
+    state: tauri::State<'_, DesktopState>,
+    input: GeneticsArchiveInput,
+) -> CommandResult<muriarc_core::GenotypeDefinition> {
+    state
+        .archive_genotype_definition(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn restore_genotype_definition(
+    state: tauri::State<'_, DesktopState>,
+    input: GeneticsArchiveInput,
+) -> CommandResult<muriarc_core::GenotypeDefinition> {
+    state
+        .restore_genotype_definition(input)
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -258,6 +355,28 @@ async fn create_genotyping_record(
 ) -> CommandResult<muriarc_core::GenotypingRecord> {
     state
         .create_genotyping_record(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn void_genotyping_record(
+    state: tauri::State<'_, DesktopState>,
+    input: VoidGenotypingRecordInput,
+) -> CommandResult<muriarc_core::GenotypingRecord> {
+    state
+        .void_genotyping_record(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn correct_genotyping_record(
+    state: tauri::State<'_, DesktopState>,
+    input: CorrectGenotypingRecordInput,
+) -> CommandResult<CorrectGenotypingRecordView> {
+    state
+        .correct_genotyping_record(input)
         .await
         .map_err(Into::into)
 }
@@ -695,6 +814,29 @@ async fn get_ai_conversation(
 }
 
 #[tauri::command]
+async fn get_ai_autonomy(
+    state: tauri::State<'_, DesktopAiState>,
+    conversation_id: String,
+) -> CommandResult<AiAutonomyView> {
+    state
+        .get_autonomy(parse_uuid(&conversation_id)?)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn set_ai_autonomy(
+    state: tauri::State<'_, DesktopAiState>,
+    conversation_id: String,
+    input: DesktopAutonomyInput,
+) -> CommandResult<AiAutonomyView> {
+    state
+        .set_autonomy(parse_uuid(&conversation_id)?, input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 async fn list_ai_drafts(
     state: tauri::State<'_, DesktopAiState>,
     project_id: Option<String>,
@@ -763,6 +905,21 @@ async fn cancel_data_import(
 }
 
 #[tauri::command]
+fn get_animal_import_schema(
+    state: tauri::State<'_, DesktopDataState>,
+) -> CommandResult<muriarc_importer::AnimalImportSchema> {
+    Ok(state.animal_import_schema())
+}
+
+#[tauri::command]
+fn get_animal_import_template(
+    state: tauri::State<'_, DesktopDataState>,
+    input: AnimalImportTemplateInput,
+) -> CommandResult<AnimalImportTemplateView> {
+    state.animal_import_template(input).map_err(Into::into)
+}
+
+#[tauri::command]
 async fn create_data_export(
     state: tauri::State<'_, DesktopDataState>,
     input: CreateDataExportInput,
@@ -810,6 +967,14 @@ async fn download_attachment(
     state.download_attachment(&id).await.map_err(Into::into)
 }
 
+#[tauri::command]
+async fn delete_attachment(
+    state: tauri::State<'_, DesktopDataState>,
+    input: DeleteAttachmentInput,
+) -> CommandResult<AttachmentView> {
+    state.delete_attachment(input).await.map_err(Into::into)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -842,15 +1007,26 @@ pub fn run() {
             create_animal_sample,
             create_pedigree_relation,
             list_gene_loci,
+            gene_locus_references,
+            archive_gene_locus,
+            restore_gene_locus,
             create_gene_locus,
             list_alleles,
+            allele_references,
+            archive_allele,
+            restore_allele,
             create_allele,
             list_genotypes,
             create_genotype,
             list_genotype_definitions,
+            genotype_definition_references,
+            archive_genotype_definition,
+            restore_genotype_definition,
             create_genotype_definition,
             list_genotyping_records,
             create_genotyping_record,
+            void_genotyping_record,
+            correct_genotyping_record,
             list_breeding_lines,
             create_breeding_line,
             list_colonies_v2,
@@ -899,6 +1075,8 @@ pub fn run() {
             ai_turn,
             list_ai_conversations,
             get_ai_conversation,
+            get_ai_autonomy,
+            set_ai_autonomy,
             list_ai_drafts,
             get_ai_draft,
             decide_ai_draft,
@@ -906,12 +1084,15 @@ pub fn run() {
             remap_data_import,
             confirm_data_import,
             cancel_data_import,
+            get_animal_import_schema,
+            get_animal_import_template,
             create_data_export,
             create_data_snapshot,
             read_data_artifact,
             list_attachments,
             upload_attachment,
             download_attachment,
+            delete_attachment,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run MuriArc desktop application");

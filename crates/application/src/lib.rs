@@ -7,12 +7,13 @@ mod experiment;
 mod genetics;
 mod observation;
 mod organization;
+mod project_animal;
 mod records;
 mod validation;
 
 pub use animal::{
-    CreateAnimalCommand, CreateAnimalIdentifierScope, MAX_ANIMAL_DISPLAY_ID_CHARS,
-    MAX_ANIMAL_STRAIN_CHARS, create_animal,
+    CreateAnimalCommand, CreateAnimalIdentifierScope, InitialGenotypingRecordInput,
+    MAX_ANIMAL_DISPLAY_ID_CHARS, MAX_ANIMAL_STRAIN_CHARS, create_animal,
 };
 pub use breeding::*;
 pub use cage::{
@@ -24,6 +25,7 @@ pub use genetics::*;
 use muriarc_core::{DomainError, StoreError};
 pub use observation::*;
 pub use organization::*;
+pub use project_animal::*;
 pub use records::*;
 use thiserror::Error;
 

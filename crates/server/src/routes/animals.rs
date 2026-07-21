@@ -1,10 +1,12 @@
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use chrono::{DateTime, NaiveDate, Utc};
 use muriarc_application::{
-    CreateAnimalCommand, CreateAnimalIdentifierScope, TransferAnimalsCommand, create_animal,
-    transfer_animals,
+    CreateAnimalCommand, CreateAnimalIdentifierScope, InitialGenotypingRecordInput,
+    TransferAnimalsCommand, create_animal, transfer_animals,
 };
-use muriarc_core::{Animal, AnimalEvent, AnimalFilter, AnimalStatus, Permission, Sex};
+use muriarc_core::{
+    Animal, AnimalEvent, AnimalFilter, AnimalStatus, GenotypingState, Permission, Sex,
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -174,6 +176,23 @@ struct CreateRequest {
     strain: Option<String>,
     birth_date: Option<NaiveDate>,
     legacy_id: Option<String>,
+    #[serde(default)]
+    initial_genotyping_records: Vec<InitialGenotypingRecordRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InitialGenotypingRecordRequest {
+    genotype_definition_id: Uuid,
+    #[serde(default = "expected_genotyping_state")]
+    state: GenotypingState,
+    assessed_at: Option<DateTime<Utc>>,
+    method: Option<String>,
+    notes: Option<String>,
+}
+
+const fn expected_genotyping_state() -> GenotypingState {
+    GenotypingState::Expected
 }
 
 async fn create(
@@ -182,12 +201,22 @@ async fn create(
     metadata: RequestMetadata,
     ApiJson(payload): ApiJson<CreateRequest>,
 ) -> Result<(StatusCode, Json<ItemResponse<Animal>>), ApiError> {
+    let permission = if payload.initial_genotyping_records.iter().any(|record| {
+        matches!(
+            record.state,
+            GenotypingState::Confirmed | GenotypingState::Rejected
+        )
+    }) {
+        Permission::ManageBreeding
+    } else {
+        Permission::WriteAnimal
+    };
     scope::optional_project_permission(
         &state,
         &principal,
         &metadata,
         payload.project_id,
-        Permission::WriteAnimal,
+        permission,
     )
     .await?;
     let identifier_scope = payload
@@ -207,6 +236,17 @@ async fn create(
                 birth_date: payload.birth_date,
                 legacy_id: payload.legacy_id,
                 initial_cage_id: None,
+                initial_genotyping_records: payload
+                    .initial_genotyping_records
+                    .into_iter()
+                    .map(|record| InitialGenotypingRecordInput {
+                        genotype_definition_id: record.genotype_definition_id,
+                        state: record.state,
+                        assessed_at: record.assessed_at,
+                        method: record.method,
+                        notes: record.notes,
+                    })
+                    .collect(),
                 now: Utc::now(),
             },
             &audit,

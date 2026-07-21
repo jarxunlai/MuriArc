@@ -3,20 +3,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{DateTime, Utc};
 use muriarc_application::{
     CreateAlleleCommand, CreateGeneLocusCommand, CreateGenotypeCommand, CreatePedigreeCommand,
-    CreateSampleCommand, create_allele as create_allele_use_case,
+    CreateSampleCommand, GeneticsArchiveCommand, archive_allele as archive_allele_use_case,
+    archive_gene_locus as archive_gene_locus_use_case, create_allele as create_allele_use_case,
     create_gene_locus as create_gene_locus_use_case, create_genotype as create_genotype_use_case,
     create_pedigree as create_pedigree_use_case, create_sample as create_sample_use_case,
+    restore_allele as restore_allele_use_case, restore_gene_locus as restore_gene_locus_use_case,
 };
 use muriarc_core::{
     Allele, Animal, AnimalEvent, AnimalEventKind, AnimalFilter, AnimalProjectRef, AnimalStatus,
-    Attachment, AuditAction, AuditFilter, GeneLocus, Genotype, Measurement, MeasurementFilter,
-    MeasurementValue, MuriArcStore, ParentType, ParticipationFilter, ParticipationStatus,
-    ProvenanceFilter, ProvenanceSource, RecordStatus, Sample, SampleFilter, Sex, WriteSource,
+    Attachment, AuditAction, AuditFilter, GeneLocus, GeneticsReferenceCounts, Genotype,
+    Measurement, MeasurementFilter, MeasurementValue, MuriArcStore, ParentType,
+    ParticipationFilter, ParticipationStatus, ProvenanceFilter, ProvenanceSource, RecordStatus,
+    Sample, SampleFilter, Sex, WriteSource,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::application::{DesktopError, DesktopState};
+use crate::research_extensions::GeneticsArchiveInput;
 
 const DETAIL_LIMIT: usize = 500;
 const MAX_PROJECTS_PER_ANIMAL: usize = 64;
@@ -99,6 +103,7 @@ pub(crate) struct GeneLocusView {
     id: String,
     symbol: String,
     description: Option<String>,
+    archived_at: Option<String>,
     revision: i64,
 }
 
@@ -108,6 +113,7 @@ impl From<GeneLocus> for GeneLocusView {
             id: value.id.to_string(),
             symbol: value.symbol,
             description: value.description,
+            archived_at: value.meta.deleted_at.map(|at| at.to_rfc3339()),
             revision: value.meta.revision,
         }
     }
@@ -121,6 +127,7 @@ pub(crate) struct AlleleView {
     symbol: String,
     description: Option<String>,
     is_wild_type: bool,
+    archived_at: Option<String>,
     revision: i64,
 }
 
@@ -132,6 +139,7 @@ impl From<Allele> for AlleleView {
             symbol: value.symbol,
             description: value.description,
             is_wild_type: value.is_wild_type,
+            archived_at: value.meta.deleted_at.map(|at| at.to_rfc3339()),
             revision: value.meta.revision,
         }
     }
@@ -576,15 +584,63 @@ impl DesktopState {
     pub(crate) async fn list_gene_loci(
         &self,
         project_id: Option<&str>,
+        include_archived: bool,
     ) -> Result<Vec<GeneLocusView>, DesktopError> {
         validate_project_scope(self, project_id).await?;
-        Ok(self
-            .read_store()
-            .list_gene_loci(self.lab_id())
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+        let loci = if include_archived {
+            self.read_store()
+                .list_gene_loci_including_archived(self.lab_id())
+                .await?
+        } else {
+            self.read_store().list_gene_loci(self.lab_id()).await?
+        };
+        Ok(loci.into_iter().map(Into::into).collect())
+    }
+
+    pub(crate) async fn gene_locus_references(
+        &self,
+        id: Uuid,
+    ) -> Result<GeneticsReferenceCounts, DesktopError> {
+        visible_locus(self, id).await?;
+        Ok(self.read_store().gene_locus_reference_counts(id).await?)
+    }
+
+    pub(crate) async fn archive_gene_locus(
+        &self,
+        input: GeneticsArchiveInput,
+    ) -> Result<GeneLocusView, DesktopError> {
+        visible_locus(self, input.id).await?;
+        let audit = self.audit("archive_gene_locus").await?;
+        Ok(archive_gene_locus_use_case(
+            self.read_store(),
+            GeneticsArchiveCommand {
+                id: input.id,
+                expected_revision: input.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?
+        .into())
+    }
+
+    pub(crate) async fn restore_gene_locus(
+        &self,
+        input: GeneticsArchiveInput,
+    ) -> Result<GeneLocusView, DesktopError> {
+        visible_locus(self, input.id).await?;
+        let audit = self.audit("restore_gene_locus").await?;
+        Ok(restore_gene_locus_use_case(
+            self.read_store(),
+            GeneticsArchiveCommand {
+                id: input.id,
+                expected_revision: input.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?
+        .into())
     }
 
     pub(crate) async fn create_gene_locus(
@@ -611,16 +667,67 @@ impl DesktopState {
         &self,
         locus_id: &str,
         project_id: Option<&str>,
+        include_archived: bool,
     ) -> Result<Vec<AlleleView>, DesktopError> {
         validate_project_scope(self, project_id).await?;
         let locus = visible_locus(self, parse_id("gene_locus", locus_id)?).await?;
-        Ok(self
-            .read_store()
-            .list_alleles(locus.id)
-            .await?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+        let alleles = if include_archived {
+            self.read_store()
+                .list_alleles_including_archived(locus.id)
+                .await?
+        } else {
+            self.read_store().list_alleles(locus.id).await?
+        };
+        Ok(alleles.into_iter().map(Into::into).collect())
+    }
+
+    pub(crate) async fn allele_references(
+        &self,
+        id: Uuid,
+    ) -> Result<GeneticsReferenceCounts, DesktopError> {
+        let allele = self.read_store().get_allele(id).await?;
+        visible_locus(self, allele.locus_id).await?;
+        Ok(self.read_store().allele_reference_counts(id).await?)
+    }
+
+    pub(crate) async fn archive_allele(
+        &self,
+        input: GeneticsArchiveInput,
+    ) -> Result<AlleleView, DesktopError> {
+        let allele = self.read_store().get_allele(input.id).await?;
+        visible_locus(self, allele.locus_id).await?;
+        let audit = self.audit("archive_allele").await?;
+        Ok(archive_allele_use_case(
+            self.read_store(),
+            GeneticsArchiveCommand {
+                id: input.id,
+                expected_revision: input.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?
+        .into())
+    }
+
+    pub(crate) async fn restore_allele(
+        &self,
+        input: GeneticsArchiveInput,
+    ) -> Result<AlleleView, DesktopError> {
+        let allele = self.read_store().get_allele(input.id).await?;
+        visible_locus(self, allele.locus_id).await?;
+        let audit = self.audit("restore_allele").await?;
+        Ok(restore_allele_use_case(
+            self.read_store(),
+            GeneticsArchiveCommand {
+                id: input.id,
+                expected_revision: input.expected_revision,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?
+        .into())
     }
 
     pub(crate) async fn create_allele(
@@ -1135,6 +1242,7 @@ mod tests {
                     sex: Sex::Unknown,
                     strain: "C57BL/6J".to_owned(),
                     birth_date: None,
+                    initial_genotyping_records: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -1313,12 +1421,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            state.list_gene_loci(Some(&project_id)).await.unwrap().len(),
+            state
+                .list_gene_loci(Some(&project_id), false)
+                .await
+                .unwrap()
+                .len(),
             1
         );
         assert_eq!(
             state
-                .list_alleles(&locus.id, Some(&project_id))
+                .list_alleles(&locus.id, Some(&project_id), false)
                 .await
                 .unwrap()
                 .len(),

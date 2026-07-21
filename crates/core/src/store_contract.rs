@@ -10,6 +10,29 @@ fn contract_now() -> chrono::DateTime<Utc> {
         .expect("the current UTC timestamp is representable")
 }
 
+async fn assign_project_animal(
+    store: &dyn MuriArcStore,
+    lab_id: uuid::Uuid,
+    project_id: uuid::Uuid,
+    animal_id: uuid::Uuid,
+    audit: &AuditContext,
+    now: chrono::DateTime<Utc>,
+) -> ProjectAnimalAssignment {
+    let assignment = ProjectAnimalAssignment::new(
+        lab_id,
+        project_id,
+        animal_id,
+        audit.actor.user_id,
+        Some("store contract fixture".to_owned()),
+        now,
+    );
+    store
+        .assign_animals_to_project(std::slice::from_ref(&assignment), audit)
+        .await
+        .expect("project animal assignment succeeds");
+    assignment
+}
+
 /// Runs the behavior contract shared by every persistence adapter.
 /// The target store must already be connected to an isolated database.
 pub async fn run_store_contract(store: &dyn MuriArcStore) {
@@ -164,6 +187,33 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
         Err(StoreError::Validation(_))
     ));
 
+    let removable_assignment =
+        assign_project_animal(store, lab.id, project.id, scoped_animal.id, &audit, now).await;
+    let removed_assignments = store
+        .remove_animals_from_project(
+            &[ProjectAnimalAssignmentRemoval {
+                assignment_id: removable_assignment.id,
+                expected_revision: removable_assignment.meta.revision,
+            }],
+            now + Duration::milliseconds(1),
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed_assignments.len(), 1);
+    assert!(removed_assignments[0].meta.deleted_at.is_some());
+    assert!(
+        store
+            .list_project_animal_assignments(&ProjectAnimalAssignmentFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                animal_id: Some(scoped_animal.id),
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     let mut project_membership =
         Membership::project(lab.id, project.id, user.id, ProjectRole::Viewer, now);
     store
@@ -225,6 +275,25 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
     animal.current_cage_id = Some(cage.id);
     store.create_animal(&animal, &audit).await.unwrap();
     assert_eq!(store.get_animal(animal.id).await.unwrap(), animal);
+    let assignment = assign_project_animal(store, lab.id, project.id, animal.id, &audit, now).await;
+    assert_eq!(
+        store
+            .list_project_animal_assignments(&ProjectAnimalAssignmentFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                animal_id: Some(animal.id),
+            })
+            .await
+            .unwrap(),
+        vec![assignment.clone()]
+    );
+    assert_eq!(
+        store
+            .list_cages_for_project(lab.id, project.id)
+            .await
+            .unwrap(),
+        vec![cage.clone()]
+    );
 
     let event = AnimalEvent::new(
         lab.id,
@@ -469,6 +538,17 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
     assert!(store.list_animal_events(animal.id).await.unwrap().iter().any(|event| {
         matches!(event.kind, AnimalEventKind::ProcedurePerformed { procedure_id } if procedure_id == procedure.id)
     }));
+    let procedure_events = store.list_experiment_events(experiment.id).await.unwrap();
+    let procedure_id = procedure.id.to_string();
+    assert!(procedure_events.iter().any(|event| {
+        event.event_key == format!("procedure_{}", procedure.id)
+            && event.label == procedure.name
+            && event
+                .details
+                .get("procedure_id")
+                .and_then(|value| value.as_str())
+                == Some(procedure_id.as_str())
+    }));
 
     let mut measurement = Measurement::draft(
         lab.id,
@@ -573,6 +653,101 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
         store.get_attachment(attachment.id).await.unwrap(),
         attachment
     );
+    assert!(matches!(
+        store
+            .soft_delete_attachment(
+                attachment.id,
+                attachment.meta.revision,
+                now + Duration::seconds(1),
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let deletable_attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        entity_type: "project".to_owned(),
+        entity_id: project.id,
+        file_name: "delete-me.txt".to_owned(),
+        media_type: Some("text/plain".to_owned()),
+        relative_path: format!("attachments/{}.txt", uuid::Uuid::new_v4()),
+        size_bytes: 1,
+        sha256: "b".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_attachment(&deletable_attachment, &audit)
+        .await
+        .unwrap();
+    let deleted_attachment = store
+        .soft_delete_attachment(
+            deletable_attachment.id,
+            deletable_attachment.meta.revision,
+            now + Duration::seconds(2),
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted_attachment.meta.revision,
+        deletable_attachment.meta.revision + 1
+    );
+    assert!(deleted_attachment.meta.deleted_at.is_some());
+    assert!(matches!(
+        store.get_attachment(deletable_attachment.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert!(
+        store
+            .list_project_attachments(lab.id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|item| item.id != deletable_attachment.id)
+    );
+    let linked_attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        entity_type: "project".to_owned(),
+        entity_id: project.id,
+        file_name: "linked.txt".to_owned(),
+        media_type: Some("text/plain".to_owned()),
+        relative_path: format!("attachments/{}.txt", uuid::Uuid::new_v4()),
+        size_bytes: 1,
+        sha256: "c".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_attachment(&linked_attachment, &audit)
+        .await
+        .unwrap();
+    let link = AttachmentLink {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: project.id,
+        attachment_id: linked_attachment.id,
+        target_type: AttachmentLinkTarget::Project,
+        target_id: project.id,
+        created_by: user.id,
+        meta: RecordMeta::new(now),
+    };
+    store.create_attachment_link(&link, &audit).await.unwrap();
+    assert!(matches!(
+        store
+            .soft_delete_attachment(
+                linked_attachment.id,
+                linked_attachment.meta.revision,
+                now + Duration::seconds(3),
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
     for (entity_type, entity_id) in [
         (EntityType::Participation, participation.id),
         (EntityType::Procedure, procedure.id),
@@ -689,6 +864,7 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
         .create_animal(&lifecycle_animal, &audit)
         .await
         .unwrap();
+    assign_project_animal(store, lab.id, project.id, lifecycle_animal.id, &audit, now).await;
     let mut completed_experiment =
         Experiment::new(lab.id, project.id, "Completed study", now).unwrap();
     completed_experiment.status = ExperimentStatus::Active;
@@ -753,6 +929,7 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
     )
     .unwrap();
     store.create_animal(&terminal_animal, &audit).await.unwrap();
+    assign_project_animal(store, lab.id, project.id, terminal_animal.id, &audit, now).await;
     let mut terminal_experiment =
         Experiment::new(lab.id, project.id, "Terminal status study", now).unwrap();
     terminal_experiment.status = ExperimentStatus::Active;
@@ -958,6 +1135,45 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         genotype_definition
     );
 
+    let registered_with_genotype =
+        Animal::new_mouse(lab.id, "BREED-ATOMIC", Sex::Unknown, now).unwrap();
+    let mut initial_record = GenotypingRecord::new(
+        lab.id,
+        registered_with_genotype.id,
+        genotype_definition.id,
+        GenotypingState::Expected,
+        None,
+        now,
+    )
+    .unwrap();
+    initial_record.project_id = Some(project.id);
+    store
+        .create_animal_with_genotyping_records(
+            &registered_with_genotype,
+            std::slice::from_ref(&initial_record),
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_current_genotyping_records(registered_with_genotype.id)
+            .await
+            .unwrap(),
+        vec![initial_record.clone()]
+    );
+    let atomic_events = store
+        .list_animal_events(registered_with_genotype.id)
+        .await
+        .unwrap();
+    assert!(atomic_events.iter().any(|event| {
+        matches!(
+            event.kind,
+            AnimalEventKind::GenotypingRecorded { record_id, .. }
+                if record_id == initial_record.id
+        )
+    }));
+
     let mut genotyping_record = GenotypingRecord::new(
         lab.id,
         female.id,
@@ -978,11 +1194,210 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         vec![genotyping_record.clone()]
     );
 
+    let newer_time = now + Duration::milliseconds(1);
+    let mut newer_record = GenotypingRecord::new(
+        lab.id,
+        female.id,
+        genotype_definition.id,
+        GenotypingState::Expected,
+        None,
+        newer_time,
+    )
+    .unwrap();
+    newer_record.project_id = Some(project.id);
+    store
+        .create_genotyping_record(&newer_record, &human_audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_current_genotyping_records(female.id)
+            .await
+            .unwrap(),
+        vec![newer_record.clone()],
+        "the current projection must select the latest non-void record per definition"
+    );
+    let voided_newer = store
+        .void_genotyping_record(
+            newer_record.id,
+            newer_record.meta.revision,
+            "superseded expected result",
+            newer_time + Duration::milliseconds(1),
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert!(voided_newer.is_voided());
+    assert_eq!(
+        store
+            .list_current_genotyping_records(female.id)
+            .await
+            .unwrap(),
+        vec![genotyping_record.clone()],
+        "voiding the latest record must reveal the previous non-void record"
+    );
+    assert!(matches!(
+        store
+            .void_genotyping_record(
+                newer_record.id,
+                newer_record.meta.revision,
+                "stale retry",
+                newer_time + Duration::milliseconds(2),
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let correction_time = newer_time + Duration::milliseconds(3);
+    let mut replacement_record = GenotypingRecord::new(
+        lab.id,
+        female.id,
+        genotype_definition.id,
+        GenotypingState::Confirmed,
+        Some(correction_time),
+        correction_time,
+    )
+    .unwrap();
+    replacement_record.project_id = Some(project.id);
+    replacement_record.method = Some("PCR repeat".to_owned());
+    replacement_record.supersedes_record_id = Some(genotyping_record.id);
+    let (voided_original, replacement_record) = store
+        .correct_genotyping_record(
+            genotyping_record.id,
+            genotyping_record.meta.revision,
+            "incorrect original call",
+            correction_time,
+            &replacement_record,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert!(voided_original.is_voided());
+    assert_eq!(
+        replacement_record.supersedes_record_id,
+        Some(genotyping_record.id)
+    );
+    assert_eq!(
+        store
+            .list_current_genotyping_records(female.id)
+            .await
+            .unwrap(),
+        vec![replacement_record.clone()]
+    );
+
     let mut line = BreedingLine::new(lab.id, "Contract line", now).unwrap();
     line.replace_genotype_definitions(vec![genotype_definition.id])
         .unwrap();
     store
         .create_breeding_line(&line, &human_audit)
+        .await
+        .unwrap();
+    let locus_references = store.gene_locus_reference_counts(locus.id).await.unwrap();
+    assert_eq!(locus_references.active_genotype_definitions, 1);
+    assert!(locus_references.genotyping_records >= 3);
+    assert!(matches!(
+        store
+            .archive_gene_locus(locus.id, locus.meta.revision, correction_time, &human_audit,)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+
+    let archived_definition = store
+        .archive_genotype_definition(
+            genotype_definition.id,
+            genotype_definition.meta.revision,
+            correction_time,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert!(archived_definition.meta.deleted_at.is_some());
+    assert!(
+        store
+            .list_genotype_definitions(lab.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|definition| definition.id != genotype_definition.id)
+    );
+    assert!(
+        store
+            .list_genotype_definitions_including_archived(lab.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|definition| definition.id == genotype_definition.id)
+    );
+    assert_eq!(
+        store
+            .list_current_genotyping_records(female.id)
+            .await
+            .unwrap(),
+        vec![replacement_record.clone()],
+        "archiving a definition must not erase historical current records"
+    );
+
+    let archived_allele = store
+        .archive_allele(
+            wild_type.id,
+            wild_type.meta.revision,
+            correction_time,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    let archived_locus = store
+        .archive_gene_locus(locus.id, locus.meta.revision, correction_time, &human_audit)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .restore_genotype_definition(
+                archived_definition.id,
+                archived_definition.meta.revision,
+                correction_time,
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store
+            .restore_allele(
+                archived_allele.id,
+                archived_allele.meta.revision,
+                correction_time,
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    store
+        .restore_gene_locus(
+            archived_locus.id,
+            archived_locus.meta.revision,
+            correction_time,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    store
+        .restore_allele(
+            archived_allele.id,
+            archived_allele.meta.revision,
+            correction_time,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    store
+        .restore_genotype_definition(
+            archived_definition.id,
+            archived_definition.meta.revision,
+            correction_time,
+            &human_audit,
+        )
         .await
         .unwrap();
     let colony = Colony::new(lab.id, line.id, "Contract colony", now).unwrap();
@@ -1056,6 +1471,7 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         .create_experiment(&experiment, &human_audit)
         .await
         .unwrap();
+    assign_project_animal(store, lab.id, project.id, female.id, &human_audit, now).await;
     let enrollment = Participation::enroll(experiment.id, female.id, now);
     let enrollment = store
         .create_participation(&enrollment, &human_audit)
@@ -1064,10 +1480,10 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
     assert_eq!(
         enrollment.genotype_snapshot,
         vec![GenotypeSnapshotEntry {
-            genotyping_record_id: genotyping_record.id,
+            genotyping_record_id: replacement_record.id,
             genotype_definition_id: genotype_definition.id,
             state: GenotypingState::Confirmed,
-            assessed_at: Some(now),
+            assessed_at: Some(correction_time),
         }]
     );
 
@@ -1507,6 +1923,7 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
     for id in [
         genotype_definition.id,
         genotyping_record.id,
+        replacement_record.id,
         line.id,
         colony.id,
         pair.id,
@@ -1617,6 +2034,66 @@ where
         .await
         .unwrap();
     assert_eq!(project_only, vec![conversation.clone()]);
+
+    let mut autonomy = AiAutonomyGrant {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: conversation.id,
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        session_id: Some(uuid::Uuid::new_v4()),
+        mode: AiAutonomyMode::Full,
+        allowed_categories: vec![
+            AiActionCategory::Read,
+            AiActionCategory::Artifact,
+            AiActionCategory::ReversibleDraft,
+        ],
+        batch_limit: 100,
+        step_up_verified_at: Some(now),
+        last_used_at: now,
+        expires_at: Some(now + Duration::minutes(30)),
+        revoked_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .save_ai_autonomy_grant(&autonomy, None, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        Some(autonomy.clone())
+    );
+    let autonomy_revision = autonomy.meta.revision;
+    autonomy.mode = AiAutonomyMode::Auto;
+    autonomy.batch_limit = 20;
+    autonomy.session_id = None;
+    autonomy.step_up_verified_at = None;
+    autonomy.expires_at = None;
+    autonomy.meta.touch(now + Duration::seconds(1));
+    store
+        .save_ai_autonomy_grant(&autonomy, Some(autonomy_revision), &audit)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .save_ai_autonomy_grant(&autonomy, Some(autonomy_revision), &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let autonomy_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_id: Some(autonomy.id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(autonomy_audits.len(), 2);
+    assert!(
+        autonomy_audits
+            .iter()
+            .all(|entry| entry.entity_type == EntityType::AiAutonomyGrant)
+    );
 
     let user_message = AiConversationMessage::new(
         conversation.id,
@@ -1775,6 +2252,15 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         .create_animal(&measurement_animal, &fixture_audit)
         .await
         .unwrap();
+    assign_project_animal(
+        store,
+        lab.id,
+        project.id,
+        measurement_animal.id,
+        &fixture_audit,
+        now,
+    )
+    .await;
     let measurement_participation =
         Participation::enroll(experiment.id, measurement_animal.id, now);
     store
@@ -1802,6 +2288,26 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         meta: RecordMeta::new(now),
     };
     store.create_allele(&allele, &fixture_audit).await.unwrap();
+    let mut genotype_definition =
+        GenotypeDefinition::new(lab.id, "Import genotype definition", now).unwrap();
+    genotype_definition
+        .replace_components(vec![
+            GenotypeComponent::new(
+                genotype_definition.id,
+                locus.id,
+                allele.id,
+                Some(allele.id),
+                GenotypeComponentMode::Diploid,
+                0,
+                now,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+    store
+        .create_genotype_definition(&genotype_definition, &fixture_audit)
+        .await
+        .unwrap();
 
     let import_audit = AuditContext {
         actor: Actor::human(user.id, user.display_name.clone()),
@@ -1839,15 +2345,15 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         now,
     );
     child_registered.recorded_by = Some(user.id);
-    let genotype = Genotype {
-        id: uuid::Uuid::new_v4(),
-        animal_id: imported_child.id,
-        locus_id: locus.id,
-        allele_1_id: Some(allele.id),
-        allele_2_id: Some(allele.id),
-        assessed_at: Some(now),
-        meta: RecordMeta::new(now),
-    };
+    let genotyping_record = GenotypingRecord::new(
+        lab.id,
+        imported_child.id,
+        genotype_definition.id,
+        GenotypingState::Expected,
+        None,
+        now,
+    )
+    .unwrap();
     let pedigree = Pedigree {
         id: uuid::Uuid::new_v4(),
         animal_id: imported_child.id,
@@ -1876,7 +2382,7 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
     );
     plan.animals = vec![imported_parent.clone(), imported_child.clone()];
     plan.animal_events = vec![parent_registered.clone(), child_registered.clone()];
-    plan.genotypes.push(genotype.clone());
+    plan.genotyping_records.push(genotyping_record.clone());
     plan.pedigrees.push(pedigree.clone());
     plan.measurements.push(measurement.clone());
     plan.validate().unwrap();
@@ -1913,7 +2419,13 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         store.list_animal_events(imported_child.id).await.unwrap(),
         vec![child_registered.clone()]
     );
-    assert_eq!(store.get_genotype(genotype.id).await.unwrap(), genotype);
+    assert_eq!(
+        store
+            .get_genotyping_record(genotyping_record.id)
+            .await
+            .unwrap(),
+        genotyping_record
+    );
     assert_eq!(store.get_pedigree(pedigree.id).await.unwrap(), pedigree);
     assert_eq!(
         store.get_measurement(measurement.id).await.unwrap(),
@@ -1933,7 +2445,7 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         (EntityType::Animal, imported_child.id),
         (EntityType::AnimalEvent, parent_registered.id),
         (EntityType::AnimalEvent, child_registered.id),
-        (EntityType::Genotype, genotype.id),
+        (EntityType::GenotypingRecord, genotyping_record.id),
         (EntityType::Pedigree, pedigree.id),
         (EntityType::Measurement, measurement.id),
     ];
@@ -2325,6 +2837,9 @@ async fn run_relationship_contract(store: &dyn MuriArcStore, now: chrono::DateTi
         &experiment_b,
     ] {
         store.create_experiment(experiment, &audit).await.unwrap();
+    }
+    for animal_id in [animal_a.id, animal_a_peer.id] {
+        assign_project_animal(store, lab_a.id, project_a.id, animal_id, &audit, now).await;
     }
     for animal_id in [animal_a.id, animal_a_peer.id] {
         let participation = Participation::enroll(experiment_a.id, animal_id, now);

@@ -12,9 +12,10 @@ MuriArc 是面向个人研究者和共享实验室的实验动物研究管理平
 
 ## 运行形态
 
-- **Desktop**：Tauri v2 + SQLite，面向个人用户；每次启动显示无密码“进入本地空间”，它只确认实验室和操作者、不是安全锁，进入后可完全离线使用。
+- **Desktop**：Tauri v2 + SQLite，面向个人用户；正式本地交付为 Windows Tauri WebView 安装包，不通过 VNC/noVNC 或浏览器远程桌面部署。每次启动显示无密码“进入本地空间”，它只确认实验室和操作者、不是安全锁，进入后可完全离线使用。
 - **Server**：Axum + PostgreSQL + 响应式 Web，面向一个实验室内的多用户、多项目协作。
-- **AI**：只通过受控领域工具和查询 DSL 访问数据；查询自动执行，写入先预览再确认。
+- **AI**：只通过受控领域工具和查询 DSL 访问数据；对话可在实验室上限内使用 Ask / Auto /
+  Full 委托，所有写入仍先形成草稿并经过预览、审批或科研签署。
 
 ## 工程结构
 
@@ -49,10 +50,14 @@ migrations/               数据库迁移
   以及 Immutable / Mutable / Versioned 策略和追加式值版本历史。
 - **Enrollment snapshot**：动物入组实验时，按基因型定义捕获当时最新检测记录；之后的检测
   不回写既有 Participation。
+- **项目动物范围**：动物由实验室角色通过显式 `ProjectAnimalAssignment` 批量分配；项目成员
+  可查看本项目动物所在笼位和实验，但不会看到同笼的其他项目动物或实验室总占用。
 - **双运行形态**：Desktop/Tauri/SQLite 与 Server/Axum/PostgreSQL 共享 Application、Domain、
   Store contract 和 Vue 页面。
-- **受控 AI**：固定工具、最小权限、结构化引用与人工审批；繁育只允许分析、预测和建议，
-  不存在自动创建 MatingEvent 或直接修改 Animal 的工具。
+- **受控 AI**：固定工具、最小权限、结构化引用和对话级 Ask / Auto / Full 授权；科研签署、
+  动物转移/死亡、删除/批量导入、权限账号、技术日志清理与繁育事实始终由人工完成。
+- **分层操作记录**：成员日常只看聚合后的关键活动；正式 Audit/Provenance 永久保留，Server
+  技术日志按数量与最短天数自动清理，只有 Environment Root 能预览、调整策略或手动清理。
 
 ## 开发
 
@@ -76,7 +81,8 @@ pnpm run build
 pnpm run test:e2e
 ```
 
-Tauri 开发入口和环境变量以 `src-tauri/tauri.conf.json`、`.env.example` 为准。
+Tauri 开发入口和环境变量以 `src-tauri/tauri.conf.json`、`.env.example` 为准。Desktop
+本地交付边界见 [docs/DESKTOP_DELIVERY.md](docs/DESKTOP_DELIVERY.md)；VNC/noVNC 只能作为临时远程预览手段，不能作为正式 Desktop 部署方式。
 
 共享 Server 使用 Argon2id 账号、HttpOnly/SameSite session、CSRF 防护和
 可撤销外部 token。部署必须通过 `MURIARC_ROOT_*` 环境变量声明唯一 Environment Root；
@@ -106,5 +112,5 @@ MuriArc 0.1.0 为预发布重构版本：Genetics v2、Breeding、Observation、
 - Snapshot 生成并校验 manifest、全量业务 JSONL、附件、大小与 SHA-256；不提供
   restore/apply、实时同步或自动合并。
 - 普通导入/导出没有通用实体选择器：导入仅动物登记/实验测量，导出仅 Animal Registry。
-- Windows Desktop 为首发目标；macOS 必须在真实设备验证后发布。
+- Windows Desktop 安装包为首发本地交付目标；macOS 必须在真实设备验证后发布。
 - 公开发布前必须完成遗留凭据轮换与自有远程 Git 历史中的敏感数据清理，并再次执行发布审计。

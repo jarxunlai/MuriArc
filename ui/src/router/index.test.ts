@@ -77,7 +77,7 @@ describe('remote route authentication guard', () => {
     expect(auth.gateway.restoreSession).not.toHaveBeenCalled()
   })
 
-  it('starts a pure Project Viewer on the scoped animal page instead of cages', async () => {
+  it('allows a pure Project Viewer to use the scoped cage page', async () => {
     auth.gateway.restoreSession.mockResolvedValue({
       user: {
         id: 'viewer-1', labId: 'lab-1', displayName: 'Viewer', labRoles: [],
@@ -89,7 +89,7 @@ describe('remote route authentication guard', () => {
 
     await router.push('/cages?project-login=1')
 
-    expect(router.currentRoute.value.name).toBe('animals')
+    expect(router.currentRoute.value.name).toBe('cages')
     expect(currentProjectId.value).toBe('project-1')
   })
 

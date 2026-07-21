@@ -2,6 +2,12 @@
 
 The shared edition is an Axum server backed by PostgreSQL and serving the same responsive Vue application used by the desktop edition. Axum listens on the container network, while the provided Compose file publishes its host port only on loopback by default; terminate TLS in Caddy, Nginx, or an equivalent reverse proxy.
 
+This document is only for the shared Server deployment. The personal Desktop
+edition is delivered as a Windows Tauri WebView installer backed by local SQLite
+and OS keyring storage; it is not deployed through Docker, VNC, noVNC, or a
+browser remote desktop. See [DESKTOP_DELIVERY.md](DESKTOP_DELIVERY.md) for the
+Desktop local delivery boundary.
+
 The shared edition uses persistent Argon2id credentials and revocable PostgreSQL
 sessions. Browser session secrets are held only in an HttpOnly, SameSite=Strict
 cookie; PostgreSQL stores SHA-256 token and CSRF digests, never their plaintext.
@@ -56,23 +62,18 @@ documented re-encryption workflow is available.
 
 If the key is empty, invalid, or absent, the Server never falls back to
 plaintext: `/api/v1/ai/settings`, `/api/v1/ai/turns`, and
-`/api/v1/ai/approvals` remain disabled. `LocalHttp` and non-official
-OpenAI-compatible Provider URLs are denied by default. To permit a
-laboratory-hosted endpoint or another reviewed HTTPS-compatible endpoint, list
-complete base URLs as exact comma-separated values, without wildcards:
+`/api/v1/ai/approvals` remain disabled.
 
-```dotenv
-MURIARC_AI_LOCAL_URL_ALLOWLIST=http://ollama.internal:11434/v1,https://ai.internal/v1
-MURIARC_AI_OPENAI_URL_ALLOWLIST=https://reviewed-provider.example/v1
-```
-
-The official `https://api.openai.com/v1` endpoint is always allowed. Every
-other OpenAI-compatible URL requires the cloud allowlist and must use HTTPS.
-Provider HTTP clients reject redirects, so allowlisting one URL cannot silently
+Provider exits are managed inside MuriArc by LabAdmin. The official
+`https://api.openai.com/v1` endpoint is built in. Every other
+OpenAI-compatible URL and every `LocalHttp` URL must be added as an exact
+Provider endpoint in the AI management page before users can save it in their
+personal AI settings. OpenAI-compatible custom endpoints must use HTTPS.
+Provider HTTP clients reject redirects, so approving one URL cannot silently
 redirect requests elsewhere. Use an HTTPS reverse proxy and network policy for
-any non-loopback Provider. Never put a user's Provider API key in these
-environment variables; users save their own key through the authenticated
-settings endpoint, which never echoes it back.
+any non-loopback Provider. Never put a user's Provider API key in environment
+variables; users save their own key through the authenticated settings endpoint,
+which never echoes it back.
 
 MuriArc reconciles the Environment Root on **every** Server start under one PostgreSQL transaction and advisory lock. It creates or verifies the Lab, Root User, LabAdmin membership, and Argon2id credential. A changed Root email/name is synchronized. If the environment password no longer verifies against the database hash, the hash, password-change timestamp, and credential revision are updated. Root identity or credential changes revoke all Root browser Sessions. Every write has a stable, sanitized Audit operation; plaintext passwords and hashes are never recorded.
 

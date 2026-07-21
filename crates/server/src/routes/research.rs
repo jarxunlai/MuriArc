@@ -386,7 +386,7 @@ async fn create_participation(
     metadata: RequestMetadata,
     ApiJson(payload): ApiJson<CreateParticipationRequest>,
 ) -> Result<(StatusCode, Json<ItemResponse<Participation>>), ApiError> {
-    scope::experiment_with_permission(
+    let experiment = scope::experiment_with_permission(
         &state,
         &principal,
         &metadata,
@@ -394,8 +394,15 @@ async fn create_participation(
         Permission::WriteExperiment,
     )
     .await?;
-    let animal = store(state.store.get_animal(payload.animal_id), &metadata).await?;
-    ensure_lab(animal.lab_id, &principal, &metadata)?;
+    scope::animal_with_permission(
+        &state,
+        &principal,
+        &metadata,
+        payload.animal_id,
+        Some(experiment.project_id),
+        Permission::ReadAnimal,
+    )
+    .await?;
 
     if let Some(cohort_id) = payload.cohort_id {
         let belongs_to_experiment =

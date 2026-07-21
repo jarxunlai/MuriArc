@@ -12,7 +12,7 @@ import {
   UserRound,
   X,
 } from '@lucide/vue'
-import type { AiWriteDraft } from '@/domain/models'
+import type { AiAutonomyMode, AiWriteDraft } from '@/domain/models'
 import { useAiAssistant } from '@/composables/useAiAssistant'
 
 const props = withDefaults(defineProps<{ compact?: boolean }>(), { compact: false })
@@ -24,6 +24,23 @@ const statements = reactive<Record<string, string>>({})
 const signed = reactive<Record<string, boolean>>({})
 const reinforcedConfirmed = reactive<Record<string, boolean>>({})
 const currentPasswords = reactive<Record<string, string>>({})
+const autonomyModalOpen = ref(false)
+const autonomyPassword = ref('')
+const autonomyDeclared = ref(false)
+const modeOptions = computed(() => {
+  const rank: Record<AiAutonomyMode, number> = { ask: 0, auto: 1, full: 2 }
+  const max = ai.autonomy.value.maxMode
+  return [
+    { label: 'Ask', value: 'ask' as const, disabled: rank.ask > rank[max] },
+    { label: 'Auto', value: 'auto' as const, disabled: rank.auto > rank[max] },
+    { label: 'Full', value: 'full' as const, disabled: rank.full > rank[max] },
+  ]
+})
+const autonomyDescription = computed(() => ({
+  ask: '查询自动执行；创建导出等产物前需要你确认。',
+  auto: `查询和普通产物可自动执行；普通批量上限 ${ai.autonomy.value.batchLimit} 条。`,
+  full: `当前会话内扩大普通操作授权，批量上限 ${ai.autonomy.value.batchLimit} 条；30 分钟无活动自动降级。`,
+})[ai.autonomy.value.effectiveMode])
 const suggestions = computed(() => props.compact
   ? ['这个页面有哪些异常？', '哪些数据还没记录？']
   : ['总结进行中的实验', '找出待确认的基因型', '哪些动物缺少近期体重？'])
@@ -111,6 +128,37 @@ async function decide(draft: AiWriteDraft, decision: 'approve' | 'reject') {
   }
 }
 
+async function selectAutonomy(mode: AiAutonomyMode) {
+  if (mode === ai.autonomy.value.mode) return
+  if (mode === 'full') {
+    autonomyPassword.value = ''
+    autonomyDeclared.value = false
+    autonomyModalOpen.value = true
+    return
+  }
+  try {
+    await ai.updateAutonomy(mode)
+    toast.success(`当前会话已切换到 ${mode === 'ask' ? 'Ask' : 'Auto'} 模式`)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法更新 AI 授权')
+  }
+}
+
+async function applyFullAutonomy() {
+  if (!autonomyDeclared.value) return
+  try {
+    await ai.updateAutonomy('full', {
+      currentPassword: autonomyPassword.value || undefined,
+      declared: autonomyDeclared.value,
+    })
+    autonomyModalOpen.value = false
+    autonomyPassword.value = ''
+    toast.success('当前会话已启用 Full 模式，30 分钟无活动后自动降级')
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法启用 Full 模式')
+  }
+}
+
 watch(() => ai.messages.value.length, async () => {
   await nextTick()
   scrollArea.value?.scrollTo({ top: scrollArea.value.scrollHeight, behavior: 'smooth' })
@@ -125,6 +173,17 @@ watch(() => ai.messages.value.length, async () => {
         <span>当前上下文：<strong>{{ ai.contextTitle.value }}</strong></span>
         <span class="scope-divider">·</span>
         <span>{{ ai.selectedProject.value?.name ?? '跨项目只读' }}</span>
+        <span class="scope-divider">·</span>
+        <n-select
+          class="autonomy-select"
+          size="tiny"
+          :value="ai.autonomy.value.mode"
+          :options="modeOptions"
+          :loading="ai.autonomyBusy.value"
+          :disabled="!ai.conversationId.value"
+          aria-label="AI 会话授权模式"
+          @update:value="selectAutonomy"
+        />
       </div>
       <article v-for="entry in ai.messages.value" :key="entry.id" class="message" :class="entry.role">
         <div class="avatar">
@@ -251,15 +310,47 @@ watch(() => ai.messages.value.length, async () => {
           <template #icon><CornerDownLeft :size="17" /></template>
         </n-button>
       </div>
-      <div class="safety-note"><ShieldCheck :size="13" /> 查询可直接执行，写入只生成 diff 草稿并等待人工确认</div>
+      <div class="safety-note"><ShieldCheck :size="13" /> {{ autonomyDescription }} 科研签署和高风险操作始终由人工确认。</div>
     </div>
+
+    <n-modal v-model:show="autonomyModalOpen" preset="card" title="启用当前会话的 Full 模式" class="autonomy-modal">
+      <n-alert type="warning" :bordered="false">
+        Full 不是新角色，也不会扩大你的项目权限。动物转移/死亡、删除与批量导入、科研签署、繁育事实、账号权限和日志清理仍无法自动执行。
+      </n-alert>
+      <div class="autonomy-boundary-list">
+        <span>仅当前会话</span><span>30 分钟无活动降级</span><span>普通批量最多 100 条</span>
+      </div>
+      <n-input
+        v-if="ai.reinforcedPasswordRequired.value"
+        v-model:value="autonomyPassword"
+        type="password"
+        show-password-on="click"
+        autocomplete="current-password"
+        maxlength="1024"
+        placeholder="输入当前登录密码完成身份确认"
+      />
+      <n-checkbox v-model:checked="autonomyDeclared">
+        我理解 Full 仅是当前会话的受限委托，不会绕过人工审批和签署
+      </n-checkbox>
+      <template #footer>
+        <div class="modal-actions">
+          <n-button @click="autonomyModalOpen = false">取消</n-button>
+          <n-button
+            type="primary"
+            :loading="ai.autonomyBusy.value"
+            :disabled="!autonomyDeclared || (ai.reinforcedPasswordRequired.value && !autonomyPassword)"
+            @click="applyFullAutonomy"
+          >确认启用</n-button>
+        </div>
+      </template>
+    </n-modal>
   </section>
 </template>
 
 <style scoped>
 .ai-conversation { display: grid; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; height: 100%; background: var(--muri-surface); }
 .message-list { overflow: auto; padding: 20px; }
-.context-strip { display: flex; align-items: center; gap: 6px; width: fit-content; margin: 0 auto 20px; padding: 6px 10px; border: 1px solid var(--muri-border); border-radius: 999px; color: var(--muri-text-secondary); background: var(--muri-surface-muted); font-size: 12px; }.scope-divider { color: var(--muri-border-strong); }
+.context-strip { display: flex; align-items: center; gap: 6px; width: fit-content; margin: 0 auto 20px; padding: 6px 10px; border: 1px solid var(--muri-border); border-radius: 999px; color: var(--muri-text-secondary); background: var(--muri-surface-muted); font-size: 12px; }.scope-divider { color: var(--muri-border-strong); }.autonomy-select { width: 82px; }
 .message { display: flex; align-items: flex-start; gap: 10px; max-width: 760px; margin: 0 auto 16px; }.message.user { flex-direction: row-reverse; }
 .avatar { display: grid; flex: 0 0 30px; width: 30px; height: 30px; place-items: center; border: 1px solid var(--muri-border); border-radius: 50%; color: var(--muri-primary); background: white; }.user .avatar { color: var(--muri-text-secondary); }
 .bubble { max-width: min(82%, 640px); padding: 10px 13px; border: 1px solid var(--muri-border); border-radius: 4px 12px 12px; background: var(--muri-surface-muted); line-height: 1.65; }.user .bubble { border-color: #c8deef; border-radius: 12px 4px 12px 12px; background: var(--muri-primary-soft); }.bubble.error { border-color: #efd0d0; color: var(--muri-danger); background: #fff7f7; }.bubble.pending { color: var(--muri-text-secondary); animation: soft-pulse 1.3s ease-in-out infinite; }.bubble p { margin: 0; white-space: pre-wrap; }
@@ -271,6 +362,7 @@ watch(() => ai.messages.value.length, async () => {
 .composer { padding: 12px 18px 16px; border-top: 1px solid var(--muri-border); background: white; }.suggestions { display: flex; gap: 7px; max-width: 760px; margin: 0 auto 8px; overflow-x: auto; scrollbar-width: none; }.suggestions button { flex: 0 0 auto; padding: 5px 9px; border: 1px solid var(--muri-border); border-radius: 999px; color: var(--muri-text-secondary); background: white; cursor: pointer; transition: border-color var(--muri-transition-fast), color var(--muri-transition-fast); }.suggestions button:hover { border-color: var(--muri-primary); color: var(--muri-primary); }
 .input-wrap { display: flex; align-items: flex-end; gap: 8px; max-width: 760px; margin: 0 auto; padding: 8px; border: 1px solid var(--muri-border-strong); border-radius: 10px; transition: border-color var(--muri-transition-fast), box-shadow var(--muri-transition-fast); }.input-wrap:focus-within { border-color: var(--muri-primary); box-shadow: 0 0 0 3px rgba(15, 95, 170, 0.1); }textarea { flex: 1; min-height: 42px; max-height: 130px; padding: 3px 5px; resize: none; border: 0; outline: 0; color: var(--muri-text); background: transparent; line-height: 1.5; }.safety-note { display: flex; align-items: center; justify-content: center; gap: 5px; margin-top: 7px; color: var(--muri-text-tertiary); font-size: 11px; }
 .compact .message-list { padding: 16px 14px; }.compact .composer { padding: 10px 12px 12px; }.compact .suggestions { max-width: 100%; }
+.autonomy-modal { width: min(520px, calc(100vw - 28px)); }.autonomy-boundary-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }.autonomy-boundary-list span { padding: 4px 8px; border-radius: 999px; color: var(--muri-primary); background: var(--muri-primary-soft); font-size: 12px; }.autonomy-modal :deep(.n-checkbox) { margin-top: 14px; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 @keyframes soft-pulse { 50% { opacity: 0.55; } }
 @media (max-width: 620px) { .context-strip { max-width: 100%; flex-wrap: wrap; justify-content: center; }.diff-row { grid-template-columns: 1fr 18px 1fr; }.diff-row code { grid-column: 1 / -1; }.draft-card { padding: 11px; } }
 @media (prefers-reduced-motion: reduce) { .bubble.pending { animation: none; }.tool-trace summary svg { transition: none; } }

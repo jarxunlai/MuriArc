@@ -18,6 +18,131 @@ pub struct AiConversation {
     pub meta: RecordMeta,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiAutonomyMode {
+    #[default]
+    Ask,
+    Auto,
+    Full,
+}
+
+impl AiAutonomyMode {
+    pub const fn batch_limit(self) -> u32 {
+        match self {
+            Self::Ask => 1,
+            Self::Auto => 20,
+            Self::Full => 100,
+        }
+    }
+
+    pub const fn min(self, ceiling: Self) -> Self {
+        if self as u8 <= ceiling as u8 {
+            self
+        } else {
+            ceiling
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiActionCategory {
+    Read,
+    Artifact,
+    ReversibleDraft,
+}
+
+/// A revocable, conversation-scoped delegation grant. This is not a role and
+/// never expands the holder's ordinary project or laboratory permissions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiAutonomyGrant {
+    pub id: Uuid,
+    pub conversation_id: Uuid,
+    pub lab_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub user_id: Uuid,
+    pub session_id: Option<Uuid>,
+    pub mode: AiAutonomyMode,
+    pub allowed_categories: Vec<AiActionCategory>,
+    pub batch_limit: u32,
+    pub step_up_verified_at: Option<DateTime<Utc>>,
+    pub last_used_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    pub meta: RecordMeta,
+}
+
+impl AiAutonomyGrant {
+    pub fn effective_mode(&self, now: DateTime<Utc>, session_id: Option<Uuid>) -> AiAutonomyMode {
+        if self.revoked_at.is_some()
+            || self.expires_at.is_some_and(|expires_at| expires_at <= now)
+            || (self.mode == AiAutonomyMode::Full
+                && self.session_id.is_some()
+                && self.session_id != session_id)
+        {
+            AiAutonomyMode::Ask
+        } else {
+            self.mode
+        }
+    }
+}
+
+#[cfg(test)]
+mod autonomy_tests {
+    use chrono::Duration;
+
+    use super::*;
+
+    fn grant(now: DateTime<Utc>, session_id: Option<Uuid>) -> AiAutonomyGrant {
+        AiAutonomyGrant {
+            id: Uuid::new_v4(),
+            conversation_id: Uuid::new_v4(),
+            lab_id: Uuid::new_v4(),
+            project_id: Some(Uuid::new_v4()),
+            user_id: Uuid::new_v4(),
+            session_id,
+            mode: AiAutonomyMode::Full,
+            allowed_categories: vec![AiActionCategory::Read],
+            batch_limit: 100,
+            step_up_verified_at: Some(now),
+            last_used_at: now,
+            expires_at: Some(now + Duration::minutes(30)),
+            revoked_at: None,
+            meta: RecordMeta::new(now),
+        }
+    }
+
+    #[test]
+    fn full_autonomy_is_bound_to_its_session_and_idle_window() {
+        let now = Utc::now();
+        let session_id = Uuid::new_v4();
+        let grant = grant(now, Some(session_id));
+
+        assert_eq!(
+            grant.effective_mode(now, Some(session_id)),
+            AiAutonomyMode::Full
+        );
+        assert_eq!(
+            grant.effective_mode(now, Some(Uuid::new_v4())),
+            AiAutonomyMode::Ask
+        );
+        assert_eq!(
+            grant.effective_mode(now + Duration::minutes(30), Some(session_id)),
+            AiAutonomyMode::Ask
+        );
+    }
+
+    #[test]
+    fn revoked_autonomy_always_falls_back_to_ask() {
+        let now = Utc::now();
+        let mut grant = grant(now, None);
+        grant.revoked_at = Some(now);
+
+        assert_eq!(grant.effective_mode(now, None), AiAutonomyMode::Ask);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiConversationMessageRole {

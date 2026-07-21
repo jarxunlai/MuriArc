@@ -6,7 +6,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use muriarc_core::{Attachment, Permission, RecordMeta};
 use muriarc_data::{AttachmentInspectionError, inspect_attachment};
@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::{ApiError, AppState, AuthPrincipal, RequestMetadata};
 
 use super::{
-    ApiPath, ApiQuery, CollectionResponse, ItemResponse,
+    ApiJson, ApiPath, ApiQuery, CollectionResponse, ItemResponse,
     attachment_files::{
         AttachmentFileError, MAX_ATTACHMENT_BYTES, open_verified, remove_installed_object,
         write_object,
@@ -40,6 +40,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/attachments", get(list))
         .route("/attachments/{id}/content", get(download))
         .route("/attachments/{id}/preview", get(preview))
+        .route("/attachments/{id}", delete(delete_attachment))
         .layer(DefaultBodyLimit::max(1024 * 1024));
     upload.merge(reads)
 }
@@ -176,6 +177,13 @@ struct UploadQuery {
     project_id: Option<Uuid>,
     file_name: String,
     media_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteAttachmentRequest {
+    expected_revision: i64,
+    reason: Option<String>,
 }
 
 async fn upload(
@@ -383,6 +391,51 @@ async fn preview(
         ),
     );
     Ok(response)
+}
+
+async fn delete_attachment(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<DeleteAttachmentRequest>,
+) -> Result<Json<ItemResponse<AttachmentMetadata>>, ApiError> {
+    let attachment = store(state.store.get_attachment(id), &metadata).await?;
+    ensure_lab(attachment.lab_id, &principal, &metadata)?;
+    let target = AttachmentTarget::from_stored(&attachment.entity_type).ok_or_else(|| {
+        ApiError::not_found("attachment target was not found")
+            .with_request_id(metadata.request_id.clone())
+    })?;
+    let effective_project = authorize_target(
+        &state,
+        &principal,
+        &metadata,
+        target,
+        attachment.entity_id,
+        attachment.project_id,
+        Permission::WriteAttachment,
+    )
+    .await?;
+    if effective_project != attachment.project_id {
+        return Err(
+            ApiError::not_found("attachment was not found").with_request_id(metadata.request_id)
+        );
+    }
+    let mut audit = principal.audit_context(&metadata);
+    if payload.reason.is_some() {
+        audit.reason = optional_text(payload.reason, "reason", 1024, &metadata)?;
+    }
+    let deleted = store(
+        state.store.soft_delete_attachment(
+            id,
+            payload.expected_revision,
+            chrono::Utc::now(),
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
+    Ok(item(AttachmentMetadata::from(deleted), &metadata))
 }
 
 fn preview_media_type(value: Option<&str>) -> bool {

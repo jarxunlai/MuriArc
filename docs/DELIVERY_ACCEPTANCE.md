@@ -12,7 +12,7 @@
 - `ExperimentEvent`、`ObservationDefinition`、动态类型 `Observation`、初值和追加式修订历史已贯通。
 - Participation 入组时保存每个 GenotypeDefinition 当时最新的检测快照。
 - Snapshot 已纳入全部上述研究实体，并保持确定性 ID 排序、manifest record count、附件与 SHA-256。
-- Desktop/Tauri/SQLite 与 Server/Axum/PostgreSQL 保持单代码库，共享 Domain、Application、Store contract 和主体 Vue UI；Desktop 不新增认证表，每个 WebView 会话只显示一次无密码欢迎页。
+- Desktop/Tauri/SQLite 与 Server/Axum/PostgreSQL 保持单代码库，共享 Domain、Application、Store contract 和主体 Vue UI；Desktop 正式本地交付为 Windows Tauri WebView 安装包，不以 VNC/noVNC 作为部署方式，不新增认证表，每个 WebView 会话只显示一次无密码欢迎页。
 - Server 启动从环境配置单事务同步唯一 Environment Root、LabAdmin membership 与 Argon2id Credential；冲突阻断启动，配置变化撤销 Root Session，Audit 不含密码/hash。
 - 新成员使用临时密码并强制首次改密；自助改密保留当前 Session、撤销其他 Session，管理员重置撤销目标全部 Session/external token，并受 Root/LabAdmin 层级约束。
 
@@ -61,7 +61,7 @@ cargo fmt --all -- --check                                        PASS
 Non-Desktop workspace strict Clippy                               PASS
 Server tests: 85 passed                                           PASS
 PostgreSQL 17 Store runtime: 4 contracts + 1 research test        PASS
-PostgreSQL fresh/reapply and 0017 -> 0018 migration tests         PASS
+PostgreSQL fresh/reapply and 0017 -> 0023 migration tests         PASS
 Tauri Linux check image: strict Clippy + 28 tests                 PASS
 UI Vitest: 14 files / 91 tests                                    PASS
 TypeScript vue-tsc + remote Vite production build                 PASS
@@ -84,9 +84,11 @@ PostgreSQL contract 使用无挂载卷的临时 PostgreSQL 17 实例并设置真
 - `user_credential`、`auth_session`、`external_token` 与 `revoke` 安全生命周期 Audit 的兼容读取，
   未知 Audit 枚举值会返回带具体列名和原始枚举错误的诊断，而不是模糊的 JSON 行列错误。
 
-PostgreSQL migration 门禁从空库真实执行 `0001`–`0018`，再次执行验证幂等，并从 `0017` 状态增量应用
-`0018_auth_credential_lifecycle.sql`；既有 password hash 保留，`must_change_password=false`、
-`revision=1` 默认值符合升级契约。宿主 Linux 缺少 Tauri 的 GTK/WebKit 系统开发库，因此 Desktop
+PostgreSQL migration 门禁从空库真实执行 `0001`–`0023`，再次执行验证幂等，并从 `0017` 状态增量
+应用到当前版本；`0018_auth_credential_lifecycle.sql` 升级后既有 password hash 保留，
+`must_change_password=false`、`revision=1` 默认值符合升级契约。后续迁移依次覆盖 Provider endpoint、
+项目动物关系、AI 自主授权、Server 技术日志与 Genetics v2 检测记录生命周期；SQLite 对应业务链为
+`0018`–`0021`。宿主 Linux 缺少 Tauri 的 GTK/WebKit 系统开发库，因此 Desktop
 Clippy/test 使用隔离的 Tauri Linux 工具镜像执行；strict Clippy 与 28 个测试均通过，不是跳过或以
 非 Desktop 结果代替。
 
@@ -108,11 +110,13 @@ external token 明文。验收停止时只执行 `docker compose down`，未使�
 
 ### A. 双运行形态
 
-1. 以 Desktop/local gateway 启动，确认显示 Lab、LocalOperator 和“进入本地空间”，页面没有密码字段，
+1. 以 Windows Desktop 安装包或等价的 Tauri 本地启动方式打开，确认出现原生 MuriArc 窗口；窗口外不应出现浏览器地址栏、noVNC toolbar、远程桌面边框或额外缩放层。
+2. 以 Desktop/local gateway 启动，确认显示 Lab、LocalOperator 和“进入本地空间”，页面没有密码字段，
    并明确提示它不是安全锁。
-2. 进入后刷新页面，确认同一 `sessionStorage` 生命周期不重复显示；关闭并新建 WebView 会话后再次显示。
-3. 以 remote gateway 打开 Server，确认显示正式登录页，不出现 Desktop 欢迎页。
-4. 登录普通账号，确认笼位、动物、繁育、实验、数据中心和设置页可访问，刷新后 HttpOnly Session 仍有效。
+3. 进入后刷新页面，确认同一 `sessionStorage` 生命周期不重复显示；关闭并新建 WebView 会话后再次显示。
+4. 新建笼位、动物并上传附件，关闭后重新启动，确认 SQLite 数据、附件和数据任务文件仍位于 OS application data 管理的本地目录。
+5. 以 remote gateway 打开 Server，确认显示正式登录页，不出现 Desktop 欢迎页。
+6. 登录普通账号，确认笼位、动物、繁育、实验、数据中心和设置页可访问，刷新后 HttpOnly Session 仍有效。
 
 ### B. Environment Root 与账号安全
 
@@ -174,14 +178,22 @@ external token 明文。验收停止时只执行 `docker compose down`，未使�
 3. 在审计/来源页面抽查 Definition、检测、配对、窝次、Draft 注册、Observation 初值/修订，确认
    actor、source、entity ID 与 revision 可追溯。
 
+### H. Desktop Windows 本地交付
+
+1. 正式发布包必须来自 Tauri bundle；`pnpm run dev`、Vite preview、VNC/noVNC 和远程桌面会话不能替代 Desktop 安装包验收。
+2. 在干净 Windows 机器上安装后启动，确认 WebView2 runtime 策略有效：应用可正常显示或给出明确安装提示，不要求用户连接 noVNC。
+3. 保存 AI Provider 设置后确认 API key 不进入项目数据库、日志、审计、快照或前端状态；清除 key 后重启仍保持清除状态。
+4. 卸载、重装或升级不得静默删除 application data；清除本地数据必须是用户通过 OS 或明确产品流程主动执行。
+
 ## 6. Known limitations
 
 - Snapshot restore/apply 尚未实现；Snapshot 也不包含账号、Membership、session、token、AI secret、
   Job 或部署配置。
 - 普通 Import/Export 没有通用资源选择器，支持范围严格限于上表。
-- Desktop 与 Server 不实时同步，Snapshot 也不是同步协议。
+- V1 不提供 Local Web、本地 Axum+SQLite 浏览器服务；Desktop 与 Server 不实时同步，Snapshot 也不是同步协议。
 - Desktop 欢迎页不是登录、磁盘加密或操作系统权限边界；需要设备安全时必须依赖 OS 账号与磁盘加密。
+- VNC/noVNC 只能作为临时远程预览或人工协助工具，不能作为正式 Desktop 部署方式。
 - Environment Root 明文密码按确认方案位于宿主机 `.env`；权限 600 不能防护宿主机管理员、Docker daemon/inspect、进程环境采集或未加密备份。
 - AI 没有 Breeding 写工具；这是安全边界，不是遗漏。实际配对和交配必须人工确认。
 - 当前 Web 主入口 chunk 有大于 500 KiB 的构建告警，但不阻断功能；后续可继续按页面/组件拆分。
-- Windows 是首发 Desktop 平台；macOS 发布前仍需真实设备验证。
+- Windows Tauri WebView 安装包是首发 Desktop 本地交付平台；macOS 发布前仍需真实设备验证。

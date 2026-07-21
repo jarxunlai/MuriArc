@@ -34,18 +34,20 @@ export function activeProjectRole(session = currentAuthSession.value): ProjectRo
   return roles.includes('viewer') ? 'viewer' : undefined
 }
 
+export function isActiveProjectAdmin(session = currentAuthSession.value): boolean {
+  return activeProjectRole(session) === 'project_admin'
+}
+
 export function canWriteAnimal(session = currentAuthSession.value): boolean {
   if (!session) return true
   return isLabAdmin(session)
     || session.user.labRoles.includes('animal_manager')
-    || activeProjectRole(session) === 'project_admin'
 }
 
 export function canManageBreeding(session = currentAuthSession.value): boolean {
   if (!session) return true
   return isLabAdmin(session)
     || session.user.labRoles.includes('animal_manager')
-    || activeProjectRole(session) === 'project_admin'
 }
 
 export function canWriteExperiment(session = currentAuthSession.value): boolean {
@@ -78,7 +80,12 @@ export function canImportData(session = currentAuthSession.value): boolean {
 
 export function canExportData(session = currentAuthSession.value): boolean {
   if (!session) return true
-  return hasLabRegistryAccess(session) || activeProjectRole(session) != null
+  const role = activeProjectRole(session)
+  return hasLabRegistryAccess(session) || role === 'project_admin' || role === 'editor'
+}
+
+export function canManageProjectAnimals(session = currentAuthSession.value): boolean {
+  return !session || hasLabRegistryAccess(session)
 }
 
 export function canCreateSnapshot(session = currentAuthSession.value): boolean {

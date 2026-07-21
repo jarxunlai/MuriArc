@@ -113,6 +113,7 @@ pub enum Permission {
     ManageLab,
     ManageUsers,
     ManageProject,
+    ManageProjectAnimals,
     ReadAnimal,
     WriteAnimal,
     ManageCage,
@@ -130,6 +131,7 @@ pub enum Permission {
     WriteAttachment,
     ImportData,
     ExportData,
+    ReadActivity,
     ReadAudit,
 }
 
@@ -183,6 +185,7 @@ impl ActorAccess {
                 permission,
                 Permission::ReadAnimal
                     | Permission::WriteAnimal
+                    | Permission::ManageProjectAnimals
                     | Permission::ManageCage
                     | Permission::ManageBreeding
                     | Permission::ReadExperiment
@@ -191,6 +194,7 @@ impl ActorAccess {
                     | Permission::ReadAttachment
                     | Permission::ImportData
                     | Permission::ExportData
+                    | Permission::ReadActivity
             )
         {
             return true;
@@ -199,7 +203,12 @@ impl ActorAccess {
         if self.project_roles.contains(&ProjectRole::ProjectAdmin)
             && !matches!(
                 permission,
-                Permission::ManageLab | Permission::ManageUsers | Permission::ManageCage
+                Permission::ManageLab
+                    | Permission::ManageUsers
+                    | Permission::ManageCage
+                    | Permission::WriteAnimal
+                    | Permission::ManageProjectAnimals
+                    | Permission::ReadAudit
             )
         {
             return true;
@@ -221,6 +230,7 @@ impl ActorAccess {
                     | Permission::WriteAttachment
                     | Permission::ImportData
                     | Permission::ExportData
+                    | Permission::ReadActivity
             )
         {
             return true;
@@ -234,7 +244,7 @@ impl ActorAccess {
                     | Permission::ReadMeasurement
                     | Permission::ReadSample
                     | Permission::ReadAttachment
-                    | Permission::ExportData
+                    | Permission::ReadActivity
             )
     }
 
@@ -248,7 +258,8 @@ impl ActorAccess {
             | Permission::ReadExperiment
             | Permission::ReadMeasurement
             | Permission::ReadSample
-            | Permission::ReadAttachment => scopes.contains(&AiScope::Read),
+            | Permission::ReadAttachment
+            | Permission::ReadActivity => scopes.contains(&AiScope::Read),
             Permission::WriteMeasurementDraft | Permission::WriteSample => {
                 scopes.contains(&AiScope::WriteDraft)
             }

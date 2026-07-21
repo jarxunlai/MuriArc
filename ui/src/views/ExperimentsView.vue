@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { CalendarClock, CheckCircle2, FlaskConical, Plus, UsersRound } from '@lucide/vue'
+import { CalendarClock, CheckCircle2, Download, FlaskConical, Plus, Upload, UsersRound } from '@lucide/vue'
 import { useMessage } from 'naive-ui'
 import type {
   Animal,
@@ -20,7 +20,7 @@ import type {
   ProjectSummary,
   TemplateFieldValueType,
 } from '@/domain/models'
-import { gateway } from '@/services/gateway'
+import { gateway, type AttachmentMetadata } from '@/services/gateway'
 import {
   canCreateProject,
   canPublishTemplate,
@@ -62,6 +62,7 @@ const experimentEvents = ref<ExperimentEvent[]>([])
 const observationDefinitions = ref<ObservationDefinition[]>([])
 const observations = ref<Observation[]>([])
 const observationValues = ref(new Map<string, ObservationValueRecord[]>())
+const experimentAttachments = ref<AttachmentMetadata[]>([])
 const historyObservation = ref<Observation | null>(null)
 const revisionObservation = ref<Observation | null>(null)
 const showCreate = ref(false)
@@ -75,6 +76,9 @@ const showObservationDefinition = ref(false)
 const showObservation = ref(false)
 const showObservationRevision = ref(false)
 const showObservationHistory = ref(false)
+const experimentFileInput = ref<HTMLInputElement | null>(null)
+const attachmentUploading = ref(false)
+const attachmentDownloadingId = ref<string | null>(null)
 const writeAllowed = computed(() => gateway.mode === 'local' || canWriteExperiment())
 const projectCreationAllowed = computed(() => gateway.mode === 'local' || canCreateProject())
 const templatePublishAllowed = computed(() => gateway.mode === 'local' || canPublishTemplate())
@@ -279,6 +283,13 @@ const animalsById = computed(() => new Map(animals.value.map((animal) => [animal
 const experimentLevelObservations = computed(() => observations.value.filter(
   (observation) => observation.subjectType === 'experiment',
 ))
+const currentProcedure = computed(() => {
+  const planned = procedures.value.find((procedure) => procedure.status === 'planned')
+  return planned ?? procedures.value.at(-1) ?? null
+})
+const currentProcedureEvent = computed(() => currentProcedure.value
+  ? procedureEvent(currentProcedure.value)
+  : undefined)
 
 function procedureStatusLabel(status: Procedure['status']) {
   return { planned: '已计划', completed: '已完成', skipped: '已跳过', cancelled: '已取消' }[status]
@@ -291,6 +302,18 @@ function formatInstant(value?: string) {
 function eventNotes(event: ExperimentEvent) {
   const notes = event.details.notes
   return typeof notes === 'string' && notes.trim() ? notes : ''
+}
+
+function procedureEvent(procedure: Procedure) {
+  return experimentEvents.value.find((event) => event.details.procedure_id === procedure.id)
+}
+
+function procedureNodeStatus(procedure: Procedure) {
+  return procedureEvent(procedure) ? '已生成采集节点' : '未生成采集节点'
+}
+
+function procedureNodeTime(procedure: Procedure) {
+  return procedure.performedAt ?? procedure.scheduledAt
 }
 
 function cellObservation(animalId: string, eventId: string, definitionId: string) {
@@ -393,6 +416,15 @@ async function loadExperimentDetail(experiment: Experiment) {
     experimentEvents.value = loadedEvents
     observationDefinitions.value = loadedDefinitions
     observations.value = loadedObservations
+    if (gateway.listAttachments) {
+      experimentAttachments.value = await gateway.listAttachments({
+        entityType: 'experiment',
+        entityId: experiment.id,
+        projectId: experiment.projectId,
+      })
+    } else {
+      experimentAttachments.value = []
+    }
     const values = await Promise.all(loadedObservations.map(async (observation) => [
       observation.id,
       await gateway.listObservationValues(observation.id),
@@ -525,10 +557,101 @@ async function createProcedure() {
     showProcedure.value = false
     Object.assign(newProcedure, { animalId: null, name: '', status: 'planned', at: null })
     await load()
+    if (selected.value) await loadExperimentDetail(selected.value)
     message.success(completed ? '执行记录已保存' : '实验步骤已安排')
   } catch (error) {
     message.error(error instanceof Error ? error.message : '记录步骤失败')
   } finally { busy.value = false }
+}
+
+async function syncProcedureEvent(procedure: Procedure) {
+  if (!selected.value) return
+  if (procedureEvent(procedure)) {
+    await router.push({
+      name: 'experiment-detail',
+      params: { experimentId: selected.value.id, section: 'data' },
+      query: currentRoute.value.query,
+    })
+    return
+  }
+  busy.value = true
+  try {
+    const event = await gateway.createExperimentEvent({
+      experimentId: selected.value.id,
+      eventKey: `procedure_${procedure.id}`,
+      label: procedure.name,
+      occurredAt: procedureNodeTime(procedure),
+      details: {
+        source: 'procedure',
+        procedure_id: procedure.id,
+        procedure_status: procedure.status,
+      },
+    })
+    experimentEvents.value.push(event)
+    await router.push({
+      name: 'experiment-detail',
+      params: { experimentId: selected.value.id, section: 'data' },
+      query: currentRoute.value.query,
+    })
+    message.success('采集节点已生成')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '生成采集节点失败')
+  } finally {
+    busy.value = false
+  }
+}
+
+function chooseExperimentAttachment() {
+  if (!gateway.uploadAttachment) {
+    message.warning('当前运行模式未提供附件上传')
+    return
+  }
+  experimentFileInput.value?.click()
+}
+
+async function uploadExperimentAttachment(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file || !selected.value || !gateway.uploadAttachment) return
+  attachmentUploading.value = true
+  try {
+    await gateway.uploadAttachment({
+      entityType: 'experiment',
+      entityId: selected.value.id,
+      projectId: selected.value.projectId,
+      fileName: file.name,
+      mediaType: file.type || undefined,
+      content: file,
+    })
+    await loadExperimentDetail(selected.value)
+    message.success(`已上传 ${file.name}`)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '附件上传失败')
+  } finally {
+    attachmentUploading.value = false
+    input.value = ''
+  }
+}
+
+async function downloadExperimentAttachment(attachment: AttachmentMetadata) {
+  if (!gateway.downloadAttachment) {
+    message.warning('当前运行模式未提供附件下载')
+    return
+  }
+  attachmentDownloadingId.value = attachment.id
+  try {
+    const blob = await gateway.downloadAttachment(attachment.id)
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = attachment.fileName
+    anchor.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '附件下载失败')
+  } finally {
+    attachmentDownloadingId.value = null
+  }
 }
 
 function openExperimentEvent() {
@@ -764,6 +887,13 @@ onMounted(loadRoute)
 
 <template>
   <div class="page">
+    <input
+      ref="experimentFileInput"
+      class="visually-hidden"
+      type="file"
+      accept="image/*,.pdf,.tif,.tiff,.heic,.heif,.csv,.xlsx"
+      @change="uploadExperimentAttachment"
+    >
     <template v-if="!detailMode">
     <PageHeader title="实验管理" description="将参与动物、实验步骤与测量数据组织在同一个可追溯流程中。">
       <template #actions><n-button v-if="writeAllowed" type="primary" @click="showCreate = true"><template #icon><Plus :size="17" /></template>创建实验</n-button></template>
@@ -880,8 +1010,46 @@ onMounted(loadRoute)
         </section>
 
         <section v-else-if="detailSection === 'execution'" class="workspace-section">
-          <div class="section-toolbar"><div><h2>实验执行</h2><p>步骤名称和状态保持突出，精确时间作为次级信息显示。</p></div><n-button v-if="writeAllowed && selectedIsOpen" type="primary" @click="showProcedure = true">安排或记录操作</n-button></div>
-          <div class="procedure-list"><article v-for="procedure in procedures" :key="procedure.id" class="surface procedure-card"><div class="procedure-status"><span :class="['status-dot', procedure.status]" /><n-tag size="small" :bordered="false">{{ procedureStatusLabel(procedure.status) }}</n-tag></div><div><h3>{{ procedure.name }}</h3><p>{{ procedure.animalId ? animalLabels.get(procedure.animalId) : '全实验' }}</p></div><div class="procedure-time"><small>{{ procedure.status === 'completed' ? '实际执行' : '计划执行' }}</small><strong>{{ formatInstant(procedure.performedAt ?? procedure.scheduledAt) }}</strong></div></article><n-empty v-if="!procedures.length" description="尚未安排实验操作" /></div>
+          <div class="section-toolbar">
+            <div><h2>实验执行</h2><p>步骤名称和状态保持突出，精确时间作为次级信息显示。</p></div>
+            <div v-if="writeAllowed && selectedIsOpen">
+              <n-button secondary :loading="attachmentUploading" :disabled="!gateway.uploadAttachment" @click="chooseExperimentAttachment"><template #icon><Upload :size="15" /></template>上传附件</n-button>
+              <n-button type="primary" @click="showProcedure = true">安排或记录操作</n-button>
+            </div>
+          </div>
+          <article v-if="currentProcedure" class="surface current-node">
+            <div>
+              <span>当前采集节点</span>
+              <strong>{{ currentProcedureEvent?.label ?? currentProcedure.name }}</strong>
+              <small>{{ procedureNodeStatus(currentProcedure) }} · {{ formatInstant(procedureNodeTime(currentProcedure)) }}</small>
+            </div>
+            <n-button size="small" type="primary" secondary :loading="busy" @click="syncProcedureEvent(currentProcedure)">
+              {{ currentProcedureEvent ? '打开工作表' : '生成并打开工作表' }}
+            </n-button>
+          </article>
+          <div class="procedure-list">
+            <article v-for="procedure in procedures" :key="procedure.id" class="surface procedure-card">
+              <div class="procedure-status"><span :class="['status-dot', procedure.status]" /><n-tag size="small" :bordered="false">{{ procedureStatusLabel(procedure.status) }}</n-tag></div>
+              <div><h3>{{ procedure.name }}</h3><p>{{ procedure.animalId ? animalLabels.get(procedure.animalId) : '全实验' }} · {{ procedureNodeStatus(procedure) }}</p></div>
+              <div class="procedure-time"><small>{{ procedure.status === 'completed' ? '实际执行' : '计划执行' }}</small><strong>{{ formatInstant(procedureNodeTime(procedure)) }}</strong><n-button v-if="writeAllowed && selectedIsOpen" text type="primary" size="tiny" :loading="busy" @click="syncProcedureEvent(procedure)">{{ procedureEvent(procedure) ? '工作表' : '生成节点' }}</n-button></div>
+            </article>
+            <n-empty v-if="!procedures.length" description="尚未安排实验操作" />
+          </div>
+          <article class="surface experiment-attachments">
+            <div class="section-title">
+              <div><span>实验附件</span><small>保存本实验相关图片、PDF 和数据文件。</small></div>
+              <n-button v-if="writeAllowed && selectedIsOpen" size="small" type="primary" secondary :loading="attachmentUploading" :disabled="!gateway.uploadAttachment" @click="chooseExperimentAttachment"><template #icon><Upload :size="15" /></template>上传附件</n-button>
+            </div>
+            <div v-if="experimentAttachments.length" class="attachment-list">
+              <div v-for="attachment in experimentAttachments" :key="attachment.id" class="attachment-row">
+                <div><strong>{{ attachment.fileName }}</strong><span>{{ attachment.mediaType || 'application/octet-stream' }} · {{ (attachment.sizeBytes / 1024).toFixed(1) }} KiB · v{{ attachment.version }}</span></div>
+                <div>
+                  <n-button size="small" secondary :loading="attachmentDownloadingId === attachment.id" :disabled="!gateway.downloadAttachment" @click="downloadExperimentAttachment(attachment)"><template #icon><Download :size="14" /></template>下载</n-button>
+                </div>
+              </div>
+            </div>
+            <n-empty v-else description="暂无实验附件" />
+          </article>
         </section>
 
         <section v-else-if="detailSection === 'data'" class="workspace-section data-section">
@@ -890,6 +1058,19 @@ onMounted(loadRoute)
             <n-tab-pane name="animal" tab="动物纵向数据"><div v-if="participations.length && experimentEvents.length && observationDefinitions.length" class="sheet surface"><table class="data-grid"><thead><tr><th rowspan="2" class="frozen frozen-id">动物编号</th><th rowspan="2" class="frozen frozen-group">实验组</th><th v-for="event in experimentEvents" :key="event.id" :colspan="observationDefinitions.length" class="event-heading"><strong>{{ event.label }}</strong><small>{{ formatInstant(event.occurredAt) }}</small></th></tr><tr><template v-for="event in experimentEvents" :key="event.id"><th v-for="definition in observationDefinitions" :key="event.id + '-' + definition.id"><strong>{{ definition.label }}</strong><small v-if="definition.unit">{{ definition.unit }}</small></th></template></tr></thead><tbody><tr v-for="participation in participations" :key="participation.id"><td class="frozen frozen-id"><strong>{{ animalLabels.get(participation.animalId) ?? participation.animalId }}</strong></td><td class="frozen frozen-group">{{ participation.cohortId ? cohortLabels.get(participation.cohortId) : '未分组' }}</td><template v-for="event in experimentEvents" :key="event.id"><td v-for="definition in observationDefinitions" :key="participation.id + '-' + event.id + '-' + definition.id"><button type="button" class="data-cell" :class="{ filled: !!cellObservation(participation.animalId, event.id, definition.id) }" :disabled="!writeAllowed || !selectedIsOpen" @click="editDataCell(participation, event, definition)">{{ cellDisplayValue(participation.animalId, event.id, definition.id) }}</button></td></template></tr></tbody></table></div><n-empty v-else description="请先纳入动物，并准备采集节点和数据列" /></n-tab-pane>
             <n-tab-pane name="experiment" tab="实验级记录"><div class="surface experiment-records"><div v-for="observation in experimentLevelObservations" :key="observation.id" class="compact-row"><div><strong>{{ definitionLabels.get(observation.definitionId) ?? observation.definitionId }}</strong><small>{{ eventLabels.get(observation.experimentEventId) ?? observation.experimentEventId }} · v{{ observation.currentValueVersion }}</small></div><div class="observation-actions"><b>{{ formatObservationValue(latestObservationValue(observation)?.value) }}</b><n-button text size="tiny" @click="openObservationHistory(observation)">历史</n-button><n-button v-if="writeAllowed && selectedIsOpen && observationDefinitions.find((definition) => definition.id === observation.definitionId)?.policy !== 'immutable'" text type="primary" size="tiny" @click="openObservationRevision(observation)">修订</n-button></div></div><n-empty v-if="!experimentLevelObservations.length" description="尚无实验级记录" /></div></n-tab-pane>
           </n-tabs>
+          <article class="surface experiment-attachments data-attachments">
+            <div class="section-title">
+              <div><span>数据图片与附件</span><small>当前先关联到实验；单元格级证据将复用资料库关联模型。</small></div>
+              <n-button v-if="writeAllowed && selectedIsOpen" size="small" type="primary" secondary :loading="attachmentUploading" :disabled="!gateway.uploadAttachment" @click="chooseExperimentAttachment"><template #icon><Upload :size="15" /></template>上传附件</n-button>
+            </div>
+            <div v-if="experimentAttachments.length" class="attachment-list compact-attachments">
+              <div v-for="attachment in experimentAttachments" :key="attachment.id" class="attachment-row">
+                <div><strong>{{ attachment.fileName }}</strong><span>{{ attachment.mediaType || 'application/octet-stream' }} · v{{ attachment.version }}</span></div>
+                <n-button size="small" secondary :loading="attachmentDownloadingId === attachment.id" :disabled="!gateway.downloadAttachment" @click="downloadExperimentAttachment(attachment)"><template #icon><Download :size="14" /></template>下载</n-button>
+              </div>
+            </div>
+            <n-empty v-else description="暂无数据图片或附件" />
+          </article>
         </section>
 
         <section v-else class="workspace-section">
@@ -1035,6 +1216,10 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .participant-table th,.participant-table td { padding: 12px; border-bottom: 1px solid var(--muri-border); text-align: left; white-space: nowrap; }
 .participant-table th { color: var(--muri-text-tertiary); background: var(--muri-surface-muted); font-size: 11px; }
 .procedure-list { display: flex; flex-direction: column; gap: 9px; }
+.current-node { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; margin-bottom: 10px; }
+.current-node > div { display: flex; min-width: 0; flex-direction: column; }
+.current-node span,.current-node small { color: var(--muri-text-tertiary); font-size: 11px; }
+.current-node strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .procedure-card { display: grid; grid-template-columns: 110px minmax(0, 1fr) minmax(190px, auto); align-items: center; gap: 14px; padding: 15px 17px; }
 .procedure-card h3 { margin: 0 0 3px; font-size: 15px; }
 .procedure-card p { margin: 0; color: var(--muri-text-tertiary); font-size: 11px; }
@@ -1044,6 +1229,15 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .status-dot.skipped,.status-dot.cancelled { background: var(--muri-text-tertiary); }
 .procedure-time { display: flex; align-items: flex-end; flex-direction: column; white-space: nowrap; }
 .procedure-time small { color: var(--muri-text-tertiary); }
+.experiment-attachments { padding: 16px; margin-top: 10px; }
+.data-attachments { margin-top: 12px; }
+.attachment-list { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.attachment-row { display: flex; min-height: 50px; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--muri-border); }
+.attachment-row:last-child { border-bottom: 0; }
+.attachment-row > div:first-child { display: flex; min-width: 0; flex-direction: column; }
+.attachment-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-row span { color: var(--muri-text-tertiary); font-size: 11px; }
+.attachment-row > div:last-child { display: flex; gap: 7px; }
 .data-section :deep(.n-tabs-nav) { margin-bottom: 10px; }
 .sheet { max-height: calc(100vh - 310px); }
 .data-grid { min-width: max-content; }
@@ -1066,6 +1260,6 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .trace-item small { color: var(--muri-text-tertiary); }
 .experiment-records { min-height: 180px; }
 @media (max-width: 1050px) { .workspace-metrics { grid-template-columns: 1fr 1fr; }.overview-grid,.design-grid,.trace-grid { grid-template-columns: 1fr; }.design-wide { grid-column: auto; }.procedure-card { grid-template-columns: 100px 1fr; }.procedure-time { grid-column: 2; align-items: flex-start; } }
-@media (max-width: 620px) { .workspace-heading { padding: 14px 14px 0; }.workspace-title-row { flex-direction: column; }.workspace-title-row h1 { font-size: 20px; }.workspace-nav { padding: 0 8px; }.workspace-metrics { grid-template-columns: 1fr 1fr; }.section-toolbar { align-items: flex-start; flex-direction: column; }.procedure-card { grid-template-columns: 1fr; }.procedure-time { grid-column: auto; }.readiness-list { grid-template-columns: 1fr; } }
+@media (max-width: 620px) { .workspace-heading { padding: 14px 14px 0; }.workspace-title-row { flex-direction: column; }.workspace-title-row h1 { font-size: 20px; }.workspace-nav { padding: 0 8px; }.workspace-metrics { grid-template-columns: 1fr 1fr; }.section-toolbar,.current-node,.attachment-row { align-items: flex-start; flex-direction: column; }.procedure-card { grid-template-columns: 1fr; }.procedure-time { grid-column: auto; align-items: flex-start; }.readiness-list { grid-template-columns: 1fr; } }
 
 </style>

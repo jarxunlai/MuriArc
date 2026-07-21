@@ -1,20 +1,28 @@
 #![forbid(unsafe_code)]
 
+mod animal_schema;
 mod cancellation;
 mod catalog;
 mod export;
 mod measurement;
 mod plan;
 
+pub use animal_schema::{
+    ANIMAL_IMPORT_HEADERS, AnimalImportExample, AnimalImportFieldSpec, AnimalImportFieldType,
+    AnimalImportSchema, animal_import_schema, animal_import_template_csv,
+    animal_import_template_xlsx,
+};
 pub use cancellation::{CancellationCheck, CancellationToken, NoCancellation};
 pub use catalog::{
     AnimalDirectory, AnimalResolution, CatalogError, MeasurementCatalog, MeasurementDefinition,
     MeasurementValueType,
 };
 pub use export::{
-    AnimalExportFilter, AnimalExportRecord, ExportCage, ExportGenotype, ExportSex,
-    export_animals_csv, export_animals_csv_with_cancel, export_animals_xlsx,
-    export_animals_xlsx_with_cancel, filter_animals, filter_animals_with_cancel,
+    AnimalExportField, AnimalExportFilter, AnimalExportOptions, AnimalExportRecord,
+    ExportAnimalStatus, ExportCage, ExportGenotype, ExportGenotypingState, ExportSex,
+    export_animals_csv, export_animals_csv_with_cancel, export_animals_csv_with_options,
+    export_animals_xlsx, export_animals_xlsx_with_cancel, export_animals_xlsx_with_options,
+    filter_animals, filter_animals_with_cancel,
 };
 pub use measurement::{
     MeasurementFieldMapping, MeasurementImportPreview, MeasurementImportRow,

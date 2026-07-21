@@ -10,8 +10,8 @@ use muriarc_core::{
     Actor, AiScope, Animal, AnimalEvent, AnimalEventKind, Attachment, AuditContext, Cage,
     EntityType, Experiment, ExperimentTemplateVersion, FieldValueType, Lab, LabRole, Measurement,
     MeasurementFilter, MeasurementValue, MuriArcStore, ParentType, Participation, Pedigree,
-    Project, ProjectRole, ProvenanceFilter, ProvenanceSource, RecordMeta, RecordStatus, Sample,
-    Sex, TemplateField, User, WriteSource,
+    Project, ProjectAnimalAssignment, ProjectRole, ProvenanceFilter, ProvenanceSource, RecordMeta,
+    RecordStatus, Sample, Sex, TemplateField, User, WriteSource,
 };
 use muriarc_data::DataFiles;
 use muriarc_store_sqlite::SqliteStore;
@@ -1024,6 +1024,21 @@ async fn research_routes_publish_templates_with_revision_checks_and_audit() {
         .unwrap();
     let animal = Animal::new_mouse(fixture.lab_id, "REST-001", Sex::Female, now).unwrap();
     fixture.store.create_animal(&animal, &audit).await.unwrap();
+    fixture
+        .store
+        .assign_animals_to_project(
+            &[ProjectAnimalAssignment::new(
+                fixture.lab_id,
+                fixture.project_id,
+                animal.id,
+                Some(fixture.user_id),
+                Some("REST research test assignment".to_owned()),
+                now,
+            )],
+            &audit,
+        )
+        .await
+        .unwrap();
 
     let response = fixture
         .app
@@ -1787,7 +1802,7 @@ async fn research_handlers_hide_resources_from_other_labs() {
 }
 
 #[tokio::test]
-async fn project_viewer_export_is_project_scoped_and_lab_snapshot_stays_forbidden() {
+async fn project_editor_export_is_scoped_while_viewer_and_lab_snapshot_stay_forbidden() {
     let fixture = Fixture::new(None).await;
     let now = chrono::Utc::now();
     let audit = AuditContext::system(WriteSource::Migration);
@@ -1845,7 +1860,7 @@ async fn project_viewer_export_is_project_scoped_and_lab_snapshot_stays_forbidde
         .await
         .unwrap();
 
-    let export = fixture
+    let viewer_export = fixture
         .app
         .clone()
         .oneshot(fixture.request(
@@ -1855,6 +1870,23 @@ async fn project_viewer_export_is_project_scoped_and_lab_snapshot_stays_forbidde
             json!({
                 "format": "csv",
                 "idempotency_key": "project-viewer-export",
+                "project_id": fixture.project_id
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(viewer_export.status(), StatusCode::FORBIDDEN);
+
+    let export = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::POST,
+            "/api/v1/data/exports",
+            PROJECT_EDITOR_TOKEN,
+            json!({
+                "format": "csv",
+                "idempotency_key": "project-editor-export",
                 "project_id": fixture.project_id
             }),
         ))
@@ -1872,7 +1904,7 @@ async fn project_viewer_export_is_project_scoped_and_lab_snapshot_stays_forbidde
                 "/api/v1/data/artifacts/{}",
                 artifact["jobId"].as_str().unwrap()
             ),
-            PROJECT_TOKEN,
+            PROJECT_EDITOR_TOKEN,
             json!({}),
         ))
         .await

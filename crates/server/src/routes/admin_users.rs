@@ -14,7 +14,7 @@ use crate::{
     RequestMetadata, SensitivePassword, UserGovernanceError,
 };
 
-use super::{ApiJson, ApiPath, CollectionResponse, ItemResponse, collection, item};
+use super::{ApiJson, ApiPath, ApiQuery, CollectionResponse, ItemResponse, collection, item};
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -131,14 +131,21 @@ struct RevokeMembershipInput {
     current_password: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserListQuery {
+    project_id: Option<Uuid>,
+}
+
 async fn list_users(
     State(state): State<AppState>,
     principal: AuthPrincipal,
     authentication: AuthenticationMethod,
     metadata: RequestMetadata,
+    ApiQuery(query): ApiQuery<UserListQuery>,
 ) -> Result<Json<CollectionResponse<ManagedUser>>, ApiError> {
     let users = governance(&state, &metadata)?
-        .list_users(&principal, authentication)
+        .list_users(&principal, authentication, query.project_id)
         .await
         .map_err(|error| governance_error(error, &metadata))?;
     Ok(collection(users, &metadata))
@@ -375,6 +382,9 @@ fn governance_error(error: UserGovernanceError, metadata: &RequestMetadata) -> A
         UserGovernanceError::LastActiveLabAdmin => {
             ApiError::conflict("the final active LabAdmin cannot be suspended, demoted, or revoked")
         }
+        UserGovernanceError::LastActiveProjectAdmin => ApiError::conflict(
+            "the final active ProjectAdmin cannot be demoted or removed from the project",
+        ),
         UserGovernanceError::SelfLockout => ApiError::conflict(
             "an administrator cannot remove their own active administrator access",
         ),

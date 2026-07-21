@@ -1,11 +1,15 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
+  AiAutonomyMode,
+  AiAutonomyUpdateInput,
+  AiAutonomyView,
   AiConversationDetail,
   AiConversationSummary,
   AiDraftDecisionInput,
   AiDraftDecisionResponse,
   AiDraftStatus,
   AiEntityType,
+  AiProviderKind,
   AiSettings,
   AiTurnInput,
   AiTurnResponse,
@@ -52,6 +56,7 @@ import type {
   PedigreeRelation,
   Procedure,
   ProjectRole,
+  ProjectAnimalAssignment,
   ProjectSummary,
   RecordedObservation,
   RegisteredAnimalDraft,
@@ -85,6 +90,13 @@ export interface CreateAnimalInput {
   sex: 'male' | 'female' | 'unknown'
   strain: string
   birthDate?: string
+  initialGenotypingRecords?: Array<{
+    genotypeDefinitionId: string
+    state: GenotypingState
+    assessedAt?: string
+    method?: string
+    notes?: string
+  }>
 }
 
 export interface CreateProjectInput {
@@ -197,6 +209,43 @@ export interface CreateGenotypingRecordInput {
   assessedAt?: string
   method?: string
   notes?: string
+}
+
+export interface GeneticsArchiveInput {
+  id: string
+  expectedRevision: number
+  projectId?: string
+}
+
+export interface GeneticsReferenceCounts {
+  activeGenotypeDefinitions: number
+  genotypeDefinitions: number
+  genotypingRecords: number
+  breedingLines: number
+}
+
+export interface VoidGenotypingRecordInput {
+  recordId: string
+  expectedRevision: number
+  reason: string
+  projectId?: string
+}
+
+export interface CorrectGenotypingRecordInput {
+  recordId: string
+  expectedRevision: number
+  reason: string
+  genotypeDefinitionId: string
+  state: GenotypingState
+  assessedAt?: string
+  method?: string
+  notes?: string
+  projectId?: string
+}
+
+export interface CorrectGenotypingRecordResult {
+  voided: GenotypingRecord
+  replacement: GenotypingRecord
 }
 
 export interface CreateBreedingLineInput {
@@ -315,6 +364,7 @@ export interface AttachmentMetadata {
   sizeBytes: number
   sha256: string
   version: number
+  revision: number
   contentHref: string
   previewSupported: boolean
   previewHref?: string
@@ -332,6 +382,12 @@ export interface UploadAttachmentInput extends AttachmentScope {
   fileName: string
   mediaType?: string
   content: Blob
+}
+
+export interface DeleteAttachmentInput {
+  id: string
+  expectedRevision: number
+  reason?: string
 }
 
 export interface OperationRecord {
@@ -353,6 +409,7 @@ export interface OperationRecord {
   before?: unknown
   after?: unknown
   occurredAt: string
+  batchCount: number
 }
 export interface AttachmentLinkRecord {
   id: string
@@ -389,15 +446,14 @@ export interface AiExtractionRecord {
 }
 export interface AiDiagnostics {
   runtimeConfigured: boolean
-  labEnabled: boolean
   providerConfigured: boolean
   providerEnabled: boolean
   credentialConfigured: boolean
   supportsVision: boolean
   textModelConfigured: boolean
   visionModelConfigured: boolean
-  localAllowlistCount: number
-  cloudAllowlistCount: number
+  localEndpointCount: number
+  cloudEndpointCount: number
 }
 export interface AiLabSettings {
   enabled: boolean
@@ -406,6 +462,35 @@ export interface AiLabSettings {
   enabledUserCount: number
   visionUserCount: number
   revision: number
+  maxAutonomyMode: AiAutonomyMode
+}
+export interface TechnicalLogPolicy {
+  maxRows: number
+  minRetentionDays: number
+  revision: number
+}
+export interface TechnicalLogCleanupPreview {
+  totalRows: number
+  eligibleRows: number
+  cutoff: string
+  policyRevision: number
+}
+
+export interface AiProviderEndpoint {
+  id: string
+  providerKind: AiProviderKind
+  label: string
+  baseUrl: string
+  enabled: boolean
+  builtin: boolean
+  revision: number
+}
+
+export interface SaveAiProviderEndpointInput {
+  providerKind: AiProviderKind
+  label: string
+  baseUrl: string
+  enabled: boolean
 }
 
 export interface ChangePasswordInput {
@@ -480,7 +565,7 @@ export interface MuriArcGateway {
   readonly displayName: string
   readonly currentSession?: AuthSession
   readonly requiresLocalWelcome?: boolean
-  listCages(): Promise<Cage[]>
+  listCages(context?: AnimalAccessContext): Promise<Cage[]>
   createCage(input: CreateCageInput): Promise<Cage>
   createAnimal(input: CreateAnimalInput): Promise<Animal>
   listAnimals(context?: AnimalAccessContext): Promise<Animal[]>
@@ -488,16 +573,27 @@ export interface MuriArcGateway {
   getAnimalDetail(id: string, context?: AnimalAccessContext): Promise<AnimalDetail>
   createAnimalSample(input: CreateAnimalSampleInput): Promise<AnimalSample>
   createPedigree(input: CreatePedigreeInput): Promise<PedigreeRelation>
-  listGeneLoci(projectId?: string): Promise<GeneLocus[]>
+  listGeneLoci(projectId?: string, includeArchived?: boolean): Promise<GeneLocus[]>
+  geneLocusReferences(id: string, projectId?: string): Promise<GeneticsReferenceCounts>
+  archiveGeneLocus(input: GeneticsArchiveInput): Promise<GeneLocus>
+  restoreGeneLocus(input: GeneticsArchiveInput): Promise<GeneLocus>
   createGeneLocus(input: CreateGeneLocusInput): Promise<GeneLocus>
-  listAlleles(locusId: string, projectId?: string): Promise<GeneAllele[]>
+  listAlleles(locusId: string, projectId?: string, includeArchived?: boolean): Promise<GeneAllele[]>
+  alleleReferences(id: string, projectId?: string): Promise<GeneticsReferenceCounts>
+  archiveAllele(input: GeneticsArchiveInput): Promise<GeneAllele>
+  restoreAllele(input: GeneticsArchiveInput): Promise<GeneAllele>
   createAllele(input: CreateAlleleInput): Promise<GeneAllele>
   listGenotypes(animalId: string, projectId?: string): Promise<AnimalGenotype[]>
   createGenotype(input: CreateGenotypeInput): Promise<AnimalGenotype>
-  listGenotypeDefinitions(projectId?: string): Promise<GenotypeDefinition[]>
+  listGenotypeDefinitions(projectId?: string, includeArchived?: boolean): Promise<GenotypeDefinition[]>
+  genotypeDefinitionReferences(id: string, projectId?: string): Promise<GeneticsReferenceCounts>
+  archiveGenotypeDefinition(input: GeneticsArchiveInput): Promise<GenotypeDefinition>
+  restoreGenotypeDefinition(input: GeneticsArchiveInput): Promise<GenotypeDefinition>
   createGenotypeDefinition(input: CreateGenotypeDefinitionInput): Promise<GenotypeDefinition>
   listGenotypingRecords(animalId: string, projectId?: string): Promise<GenotypingRecord[]>
   createGenotypingRecord(input: CreateGenotypingRecordInput): Promise<GenotypingRecord>
+  voidGenotypingRecord(input: VoidGenotypingRecordInput): Promise<GenotypingRecord>
+  correctGenotypingRecord(input: CorrectGenotypingRecordInput): Promise<CorrectGenotypingRecordResult>
   listBreedingLines(): Promise<BreedingLine[]>
   createBreedingLine(input: CreateBreedingLineInput): Promise<BreedingLine>
   listColonies(breedingLineId?: string): Promise<Colony[]>
@@ -515,6 +611,9 @@ export interface MuriArcGateway {
   moveAnimals(animalIds: string[], targetCageId: string): Promise<void>
   createProject(input: CreateProjectInput): Promise<ProjectSummary>
   listProjects(): Promise<ProjectSummary[]>
+  listProjectAnimalAssignments?(projectId: string): Promise<ProjectAnimalAssignment[]>
+  assignAnimalsToProject?(projectId: string, animalIds: string[], reason?: string): Promise<ProjectAnimalAssignment[]>
+  removeAnimalsFromProject?(projectId: string, assignments: Array<{ assignmentId: string; expectedRevision: number }>): Promise<ProjectAnimalAssignment[]>
   listPublishedTemplates(): Promise<ExperimentTemplateSummary[]>
   createPublishedTemplate(input: CreatePublishedTemplateInput): Promise<ExperimentTemplateSummary>
   createExperiment(input: CreateExperimentInput): Promise<Experiment>
@@ -541,6 +640,7 @@ export interface MuriArcGateway {
   listAttachments?(scope: AttachmentScope): Promise<AttachmentMetadata[]>
   uploadAttachment?(input: UploadAttachmentInput): Promise<AttachmentMetadata>
   downloadAttachment?(id: string): Promise<Blob>
+  deleteAttachment?(input: DeleteAttachmentInput): Promise<AttachmentMetadata>
   getWorkspaceSettings?(): Promise<WorkspaceSettings>
   saveWorkspaceSettings?(input: WorkspaceSettings): Promise<WorkspaceSettings>
   getAiSettings?(): Promise<AiSettings>
@@ -549,8 +649,15 @@ export interface MuriArcGateway {
   testAiSettings?(): Promise<{ ok: boolean; latencyMs: number; errorCode?: string }>
   getAiDiagnostics?(): Promise<AiDiagnostics>
   getAiLabSettings?(): Promise<AiLabSettings>
-  saveAiLabSettings?(input: { enabled: boolean; customUrlApprovalRequired: boolean }): Promise<AiLabSettings>
+  saveAiLabSettings?(input: { enabled: boolean; customUrlApprovalRequired: boolean; maxAutonomyMode: AiAutonomyMode }): Promise<AiLabSettings>
+  listAiProviderEndpoints?(): Promise<AiProviderEndpoint[]>
+  saveAiProviderEndpoint?(input: SaveAiProviderEndpointInput, id?: string): Promise<AiProviderEndpoint>
+  disableAiProviderEndpoint?(id: string): Promise<AiProviderEndpoint>
   listOperations?(query?: URLSearchParams): Promise<OperationRecord[]>
+  getTechnicalLogPolicy?(): Promise<TechnicalLogPolicy>
+  saveTechnicalLogPolicy?(input: { maxRows: number; minRetentionDays: number; expectedRevision: number }): Promise<TechnicalLogPolicy>
+  previewTechnicalLogCleanup?(): Promise<TechnicalLogCleanupPreview>
+  cleanupTechnicalLogs?(input: { expectedPolicyRevision: number; expectedEligibleRows: number }): Promise<TechnicalLogCleanupPreview>
   listLibrary?(projectId: string, experimentId?: string): Promise<LibraryRecord[]>
   listPrivateImages?(): Promise<PrivateImageRecord[]>
   uploadPrivateImage?(file: File, conversationId?: string): Promise<PrivateImageRecord>
@@ -561,6 +668,8 @@ export interface MuriArcGateway {
   aiTurn(input: AiTurnInput): Promise<AiTurnResponse>
   listAiConversations(projectId?: string, limit?: number): Promise<AiConversationSummary[]>
   getAiConversation(conversationId: string, limit?: number): Promise<AiConversationDetail>
+  getAiAutonomy?(conversationId: string): Promise<AiAutonomyView>
+  setAiAutonomy?(conversationId: string, input: AiAutonomyUpdateInput): Promise<AiAutonomyView>
   listAiDrafts(projectId?: string, status?: AiDraftStatus): Promise<AiWriteDraft[]>
   getAiDraft(draftId: string): Promise<AiWriteDraft>
   decideAiDraft(draftId: string, input: AiDraftDecisionInput): Promise<AiDraftDecisionResponse>
@@ -569,7 +678,7 @@ export interface MuriArcGateway {
   logout?(): Promise<void>
   changePassword?(input: ChangePasswordInput): Promise<AuthSession>
   updateProfile?(input: UpdateProfileInput): Promise<AuthSession>
-  listManagedUsers?(): Promise<ManagedUser[]>
+  listManagedUsers?(projectId?: string): Promise<ManagedUser[]>
   createManagedUser?(input: CreateManagedUserInput): Promise<ManagedUser>
   updateManagedUserProfile?(userId: string, input: UpdateManagedUserProfileInput): Promise<ManagedUser>
   resetManagedUserPassword?(userId: string, input: ResetManagedUserPasswordInput): Promise<ManagedUser>
@@ -613,7 +722,7 @@ export class LocalTauriGateway implements MuriArcGateway {
     }
   }
 
-  listCages() { return this.call<Cage[]>('list_cages') }
+  listCages(_context?: AnimalAccessContext) { return this.call<Cage[]>('list_cages') }
   createCage(input: CreateCageInput) { return this.call<Cage>('create_cage', { input }) }
   createAnimal(input: CreateAnimalInput) { return this.call<Animal>('create_animal', { input }) }
   listAnimals(_context?: AnimalAccessContext) { return this.call<Animal[]>('list_animals') }
@@ -632,14 +741,38 @@ export class LocalTauriGateway implements MuriArcGateway {
   createPedigree(input: CreatePedigreeInput) {
     return this.call<PedigreeRelation>('create_pedigree_relation', { input })
   }
-  listGeneLoci(projectId?: string) {
-    return this.call<GeneLocus[]>('list_gene_loci', { projectId })
+  listGeneLoci(projectId?: string, includeArchived = false) {
+    return this.call<GeneLocus[]>('list_gene_loci', { projectId, includeArchived })
+  }
+  geneLocusReferences(id: string, _projectId?: string) {
+    return this.call<RawGeneticsReferenceCounts>('gene_locus_references', { id })
+      .then(mapGeneticsReferenceCounts)
+  }
+  archiveGeneLocus(input: GeneticsArchiveInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return this.call<GeneLocus>('archive_gene_locus', { input: localInput })
+  }
+  restoreGeneLocus(input: GeneticsArchiveInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return this.call<GeneLocus>('restore_gene_locus', { input: localInput })
   }
   createGeneLocus(input: CreateGeneLocusInput) {
     return this.call<GeneLocus>('create_gene_locus', { input })
   }
-  listAlleles(locusId: string, projectId?: string) {
-    return this.call<GeneAllele[]>('list_alleles', { locusId, projectId })
+  listAlleles(locusId: string, projectId?: string, includeArchived = false) {
+    return this.call<GeneAllele[]>('list_alleles', { locusId, projectId, includeArchived })
+  }
+  alleleReferences(id: string, _projectId?: string) {
+    return this.call<RawGeneticsReferenceCounts>('allele_references', { id })
+      .then(mapGeneticsReferenceCounts)
+  }
+  archiveAllele(input: GeneticsArchiveInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return this.call<GeneAllele>('archive_allele', { input: localInput })
+  }
+  restoreAllele(input: GeneticsArchiveInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return this.call<GeneAllele>('restore_allele', { input: localInput })
   }
   createAllele(input: CreateAlleleInput) {
     return this.call<GeneAllele>('create_allele', { input })
@@ -650,9 +783,23 @@ export class LocalTauriGateway implements MuriArcGateway {
   createGenotype(input: CreateGenotypeInput) {
     return this.call<AnimalGenotype>('create_genotype', { input })
   }
-  listGenotypeDefinitions(_projectId?: string) {
-    return this.call<RawGenotypeDefinition[]>('list_genotype_definitions')
+  listGenotypeDefinitions(_projectId?: string, includeArchived = false) {
+    return this.call<RawGenotypeDefinition[]>('list_genotype_definitions', { includeArchived })
       .then((items) => items.map(mapGenotypeDefinition))
+  }
+  genotypeDefinitionReferences(id: string, _projectId?: string) {
+    return this.call<RawGeneticsReferenceCounts>('genotype_definition_references', { id })
+      .then(mapGeneticsReferenceCounts)
+  }
+  archiveGenotypeDefinition(input: GeneticsArchiveInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return this.call<RawGenotypeDefinition>('archive_genotype_definition', { input: localInput })
+      .then(mapGenotypeDefinition)
+  }
+  restoreGenotypeDefinition(input: GeneticsArchiveInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return this.call<RawGenotypeDefinition>('restore_genotype_definition', { input: localInput })
+      .then(mapGenotypeDefinition)
   }
   createGenotypeDefinition(input: CreateGenotypeDefinitionInput) {
     const { projectId: _projectId, ...localInput } = input
@@ -666,6 +813,20 @@ export class LocalTauriGateway implements MuriArcGateway {
   createGenotypingRecord(input: CreateGenotypingRecordInput) {
     return this.call<RawGenotypingRecord>('create_genotyping_record', { input })
       .then(mapGenotypingRecord)
+  }
+  voidGenotypingRecord(input: VoidGenotypingRecordInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return this.call<RawGenotypingRecord>('void_genotyping_record', { input: localInput })
+      .then(mapGenotypingRecord)
+  }
+  correctGenotypingRecord(input: CorrectGenotypingRecordInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return this.call<RawCorrectGenotypingRecordResult>('correct_genotyping_record', {
+      input: localInput,
+    }).then((result) => ({
+      voided: mapGenotypingRecord(result.voided),
+      replacement: mapGenotypingRecord(result.replacement),
+    }))
   }
   listBreedingLines() {
     return this.call<RawBreedingLine[]>('list_breeding_lines')
@@ -834,6 +995,9 @@ export class LocalTauriGateway implements MuriArcGateway {
       type: result.metadata.mediaType ?? 'application/octet-stream',
     })
   }
+  deleteAttachment(input: DeleteAttachmentInput): Promise<AttachmentMetadata> {
+    return this.call<AttachmentMetadata>('delete_attachment', { input })
+  }
   getWorkspaceSettings() { return this.call<WorkspaceSettings>('get_workspace_settings') }
   saveWorkspaceSettings(input: WorkspaceSettings) {
     return this.call<WorkspaceSettings>('save_workspace_settings', { input })
@@ -856,6 +1020,19 @@ export class LocalTauriGateway implements MuriArcGateway {
       limit,
     })
     return mapAiConversationDetail(detail)
+  }
+  getAiAutonomy(conversationId: string) {
+    return this.call<AiAutonomyView>('get_ai_autonomy', { conversationId })
+  }
+  setAiAutonomy(conversationId: string, input: AiAutonomyUpdateInput) {
+    return this.call<AiAutonomyView>('set_ai_autonomy', {
+      conversationId,
+      input: {
+        mode: input.mode,
+        expectedRevision: input.expectedRevision,
+        declared: Boolean(input.declared),
+      },
+    })
   }
   listAiDrafts(projectId?: string, status?: AiDraftStatus) {
     return this.call<AiWriteDraft[]>('list_ai_drafts', { projectId, status })
@@ -882,6 +1059,18 @@ interface RawCage {
   display_id: string
   location?: string | null
   capacity: number
+}
+
+interface RawProjectAnimalAssignment {
+  id: string
+  project_id: string
+  animal_id: string
+  assigned_by?: string | null
+  reason?: string | null
+  meta: {
+    created_at: string
+    revision: number
+  }
 }
 
 interface RawAnimal {
@@ -1008,7 +1197,7 @@ interface RawGeneLocus {
   id: string
   symbol: string
   description?: string | null
-  meta: { revision: number }
+  meta: RawRecordMeta
 }
 
 interface RawAllele {
@@ -1017,7 +1206,7 @@ interface RawAllele {
   symbol: string
   description?: string | null
   is_wild_type: boolean
-  meta: { revision: number }
+  meta: RawRecordMeta
 }
 
 interface RawGenotype {
@@ -1067,7 +1256,22 @@ interface RawGenotypingRecord {
   assessed_at?: string | null
   method?: string | null
   notes?: string | null
+  supersedes_record_id?: string | null
+  voided_at?: string | null
+  void_reason?: string | null
   meta: RawRecordMeta
+}
+
+interface RawGeneticsReferenceCounts {
+  active_genotype_definitions: number
+  genotype_definitions: number
+  genotyping_records: number
+  breeding_lines: number
+}
+
+interface RawCorrectGenotypingRecordResult {
+  voided: RawGenotypingRecord
+  replacement: RawGenotypingRecord
 }
 
 interface RawBreedingLine {
@@ -1295,7 +1499,7 @@ interface RawAttachment {
   preview_supported: boolean
   preview_href?: string | null
   preview_reason?: string | null
-  meta: { created_at: string }
+  meta: { created_at: string; revision?: number }
 }
 
 interface RawAuthUser {
@@ -1355,6 +1559,7 @@ interface RawAiTurnResponse {
       total_tokens: number
     }
   }
+  autonomy?: AiAutonomyView
 }
 
 interface RawAiConversationMessage {
@@ -1556,9 +1761,37 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return this.updateSessionUser(response.data)
   }
 
-  async listManagedUsers(): Promise<ManagedUser[]> {
-    const response = await this.request<ApiCollection<ManagedUser>>('/admin/users')
+  async listManagedUsers(projectId?: string): Promise<ManagedUser[]> {
+    const suffix = projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''
+    const response = await this.request<ApiCollection<ManagedUser>>(`/admin/users${suffix}`)
     return response.data
+  }
+
+  async getTechnicalLogPolicy(): Promise<TechnicalLogPolicy> {
+    return (await this.request<ApiItem<TechnicalLogPolicy>>('/admin/technical-logs/policy')).data
+  }
+
+  async saveTechnicalLogPolicy(
+    input: { maxRows: number; minRetentionDays: number; expectedRevision: number },
+  ): Promise<TechnicalLogPolicy> {
+    return (await this.request<ApiItem<TechnicalLogPolicy>>('/admin/technical-logs/policy', {
+      method: 'PUT', body: JSON.stringify(input),
+    })).data
+  }
+
+  async previewTechnicalLogCleanup(): Promise<TechnicalLogCleanupPreview> {
+    return (await this.request<ApiItem<TechnicalLogCleanupPreview>>(
+      '/admin/technical-logs/cleanup/preview',
+    )).data
+  }
+
+  async cleanupTechnicalLogs(
+    input: { expectedPolicyRevision: number; expectedEligibleRows: number },
+  ): Promise<TechnicalLogCleanupPreview> {
+    return (await this.request<ApiItem<TechnicalLogCleanupPreview>>(
+      '/admin/technical-logs/cleanup',
+      { method: 'POST', body: JSON.stringify(input) },
+    )).data
   }
 
   async createManagedUser(input: CreateManagedUserInput): Promise<ManagedUser> {
@@ -1651,12 +1884,57 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return response.data
   }
 
-  async listCages(): Promise<Cage[]> {
+  async listCages(context?: AnimalAccessContext): Promise<Cage[]> {
+    const projectId = activeProjectId(context?.projectId)
+    const query = projectId
+      ? `?project_id=${encodeURIComponent(projectId)}`
+      : ''
     const [cages, animals] = await Promise.all([
-      this.request<ApiCollection<RawCage>>('/cages'),
-      this.request<ApiCollection<RawAnimal>>('/animals'),
+      this.request<ApiCollection<RawCage>>(`/cages${query}`),
+      this.request<ApiCollection<RawAnimal>>(`/animals${query}`),
     ])
     return mapCages(cages.data, animals.data)
+  }
+
+  async listProjectAnimalAssignments(projectId: string): Promise<ProjectAnimalAssignment[]> {
+    const response = await this.request<ApiCollection<RawProjectAnimalAssignment>>(
+      `/projects/${encodeURIComponent(projectId)}/animal-assignments`,
+    )
+    return response.data.map(mapProjectAnimalAssignment)
+  }
+
+  async assignAnimalsToProject(
+    projectId: string,
+    animalIds: string[],
+    reason?: string,
+  ): Promise<ProjectAnimalAssignment[]> {
+    const response = await this.request<ApiItem<RawProjectAnimalAssignment[]>>(
+      `/projects/${encodeURIComponent(projectId)}/animal-assignments`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ animal_ids: animalIds, reason: reason || null }),
+      },
+    )
+    return response.data.map(mapProjectAnimalAssignment)
+  }
+
+  async removeAnimalsFromProject(
+    projectId: string,
+    assignments: Array<{ assignmentId: string; expectedRevision: number }>,
+  ): Promise<ProjectAnimalAssignment[]> {
+    const response = await this.request<ApiItem<RawProjectAnimalAssignment[]>>(
+      `/projects/${encodeURIComponent(projectId)}/animal-assignments`,
+      {
+        method: 'DELETE',
+        body: JSON.stringify({
+          assignments: assignments.map((assignment) => ({
+            assignment_id: assignment.assignmentId,
+            expected_revision: assignment.expectedRevision,
+          })),
+        }),
+      },
+    )
+    return response.data.map(mapProjectAnimalAssignment)
   }
 
   async createCage(input: CreateCageInput): Promise<Cage> {
@@ -1687,6 +1965,13 @@ export class RemoteHttpGateway implements MuriArcGateway {
         strain: input.strain || null,
         birth_date: input.birthDate || null,
         legacy_id: null,
+        initial_genotyping_records: (input.initialGenotypingRecords ?? []).map((record) => ({
+          genotype_definition_id: record.genotypeDefinitionId,
+          state: record.state,
+          assessed_at: record.assessedAt ?? null,
+          method: record.method ?? null,
+          notes: record.notes ?? null,
+        })),
       }),
     })
     return mapAnimal(response.data)
@@ -1718,8 +2003,8 @@ export class RemoteHttpGateway implements MuriArcGateway {
       const query = projectId
         ? `?project_id=${encodeURIComponent(projectId)}`
         : ''
-      const cagesRequest = !currentAuthSession.value || hasLabRegistryAccess()
-        ? this.request<ApiCollection<RawCage>>('/cages')
+      const cagesRequest = !currentAuthSession.value || hasLabRegistryAccess() || projectId
+        ? this.request<ApiCollection<RawCage>>(`/cages${query}`)
         : Promise.resolve({ data: [], count: 0, request_id: '' })
       const [response, events, cages] = await Promise.all([
         this.request<ApiItem<RawAnimal>>(`/animals/${pathId}${query}`),
@@ -1761,12 +2046,48 @@ export class RemoteHttpGateway implements MuriArcGateway {
     )
   }
 
-  async listGeneLoci(projectId?: string): Promise<GeneLocus[]> {
+  async listGeneLoci(projectId?: string, includeArchived = false): Promise<GeneLocus[]> {
     const query = new URLSearchParams({ limit: '500' })
     const scope = activeProjectId(projectId)
     if (scope) query.set('project_id', scope)
+    if (includeArchived) query.set('include_archived', 'true')
     const response = await this.request<ApiCollection<RawGeneLocus>>(`/gene-loci?${query}`)
     return response.data.map(mapGeneLocus)
+  }
+
+  async geneLocusReferences(id: string, projectId?: string): Promise<GeneticsReferenceCounts> {
+    const query = new URLSearchParams()
+    const scope = activeProjectId(projectId)
+    if (scope) query.set('project_id', scope)
+    const response = await this.request<ApiItem<RawGeneticsReferenceCounts>>(
+      `/gene-loci/${encodeURIComponent(id)}/references?${query}`,
+    )
+    return mapGeneticsReferenceCounts(response.data)
+  }
+
+  async archiveGeneLocus(input: GeneticsArchiveInput): Promise<GeneLocus> {
+    return this.setGeneLocusArchived(input, 'archive')
+  }
+
+  async restoreGeneLocus(input: GeneticsArchiveInput): Promise<GeneLocus> {
+    return this.setGeneLocusArchived(input, 'restore')
+  }
+
+  private async setGeneLocusArchived(
+    input: GeneticsArchiveInput,
+    action: 'archive' | 'restore',
+  ): Promise<GeneLocus> {
+    const response = await this.request<ApiItem<RawGeneLocus>>(
+      `/gene-loci/${encodeURIComponent(input.id)}/${action}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: activeProjectId(input.projectId) ?? null,
+          expected_revision: input.expectedRevision,
+        }),
+      },
+    )
+    return mapGeneLocus(response.data)
   }
 
   async createGeneLocus(input: CreateGeneLocusInput): Promise<GeneLocus> {
@@ -1781,12 +2102,52 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return mapGeneLocus(response.data)
   }
 
-  async listAlleles(locusId: string, projectId?: string): Promise<GeneAllele[]> {
+  async listAlleles(
+    locusId: string,
+    projectId?: string,
+    includeArchived = false,
+  ): Promise<GeneAllele[]> {
     const query = new URLSearchParams({ locus_id: locusId, limit: '500' })
     const scope = activeProjectId(projectId)
     if (scope) query.set('project_id', scope)
+    if (includeArchived) query.set('include_archived', 'true')
     const response = await this.request<ApiCollection<RawAllele>>(`/alleles?${query}`)
     return response.data.map(mapAllele)
+  }
+
+  async alleleReferences(id: string, projectId?: string): Promise<GeneticsReferenceCounts> {
+    const query = new URLSearchParams()
+    const scope = activeProjectId(projectId)
+    if (scope) query.set('project_id', scope)
+    const response = await this.request<ApiItem<RawGeneticsReferenceCounts>>(
+      `/alleles/${encodeURIComponent(id)}/references?${query}`,
+    )
+    return mapGeneticsReferenceCounts(response.data)
+  }
+
+  async archiveAllele(input: GeneticsArchiveInput): Promise<GeneAllele> {
+    return this.setAlleleArchived(input, 'archive')
+  }
+
+  async restoreAllele(input: GeneticsArchiveInput): Promise<GeneAllele> {
+    return this.setAlleleArchived(input, 'restore')
+  }
+
+  private async setAlleleArchived(
+    input: GeneticsArchiveInput,
+    action: 'archive' | 'restore',
+  ): Promise<GeneAllele> {
+    const response = await this.request<ApiItem<RawAllele>>(
+      `/alleles/${encodeURIComponent(input.id)}/${action}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: activeProjectId(input.projectId) ?? null,
+          expected_revision: input.expectedRevision,
+        }),
+      },
+    )
+    return mapAllele(response.data)
   }
 
   async createAllele(input: CreateAlleleInput): Promise<GeneAllele> {
@@ -1826,14 +2187,56 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return mapGenotype(response.data)
   }
 
-  async listGenotypeDefinitions(projectId?: string): Promise<GenotypeDefinition[]> {
+  async listGenotypeDefinitions(
+    projectId?: string,
+    includeArchived = false,
+  ): Promise<GenotypeDefinition[]> {
     const query = new URLSearchParams({ limit: '500' })
     const scope = activeProjectId(projectId)
     if (scope) query.set('project_id', scope)
+    if (includeArchived) query.set('include_archived', 'true')
     const response = await this.request<ApiCollection<RawGenotypeDefinition>>(
       `/genotype-definitions?${query}`,
     )
     return response.data.map(mapGenotypeDefinition)
+  }
+
+  async genotypeDefinitionReferences(
+    id: string,
+    projectId?: string,
+  ): Promise<GeneticsReferenceCounts> {
+    const query = new URLSearchParams()
+    const scope = activeProjectId(projectId)
+    if (scope) query.set('project_id', scope)
+    const response = await this.request<ApiItem<RawGeneticsReferenceCounts>>(
+      `/genotype-definitions/${encodeURIComponent(id)}/references?${query}`,
+    )
+    return mapGeneticsReferenceCounts(response.data)
+  }
+
+  async archiveGenotypeDefinition(input: GeneticsArchiveInput): Promise<GenotypeDefinition> {
+    return this.setGenotypeDefinitionArchived(input, 'archive')
+  }
+
+  async restoreGenotypeDefinition(input: GeneticsArchiveInput): Promise<GenotypeDefinition> {
+    return this.setGenotypeDefinitionArchived(input, 'restore')
+  }
+
+  private async setGenotypeDefinitionArchived(
+    input: GeneticsArchiveInput,
+    action: 'archive' | 'restore',
+  ): Promise<GenotypeDefinition> {
+    const response = await this.request<ApiItem<RawGenotypeDefinition>>(
+      `/genotype-definitions/${encodeURIComponent(input.id)}/${action}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: activeProjectId(input.projectId) ?? null,
+          expected_revision: input.expectedRevision,
+        }),
+      },
+    )
+    return mapGenotypeDefinition(response.data)
   }
 
   async createGenotypeDefinition(
@@ -1884,6 +2287,46 @@ export class RemoteHttpGateway implements MuriArcGateway {
       }),
     })
     return mapGenotypingRecord(response.data)
+  }
+
+  async voidGenotypingRecord(input: VoidGenotypingRecordInput): Promise<GenotypingRecord> {
+    const response = await this.request<ApiItem<RawGenotypingRecord>>(
+      `/genotyping-records/${encodeURIComponent(input.recordId)}/void`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: activeProjectId(input.projectId) ?? null,
+          expected_revision: input.expectedRevision,
+          reason: input.reason,
+        }),
+      },
+    )
+    return mapGenotypingRecord(response.data)
+  }
+
+  async correctGenotypingRecord(
+    input: CorrectGenotypingRecordInput,
+  ): Promise<CorrectGenotypingRecordResult> {
+    const response = await this.request<ApiItem<RawCorrectGenotypingRecordResult>>(
+      `/genotyping-records/${encodeURIComponent(input.recordId)}/correct`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: activeProjectId(input.projectId) ?? null,
+          expected_revision: input.expectedRevision,
+          reason: input.reason,
+          genotype_definition_id: input.genotypeDefinitionId,
+          state: input.state,
+          assessed_at: input.assessedAt ?? null,
+          method: input.method ?? null,
+          notes: input.notes ?? null,
+        }),
+      },
+    )
+    return {
+      voided: mapGenotypingRecord(response.data.voided),
+      replacement: mapGenotypingRecord(response.data.replacement),
+    }
   }
 
   async listBreedingLines(): Promise<BreedingLine[]> {
@@ -2438,9 +2881,26 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return response.blob()
   }
 
+  async deleteAttachment(input: DeleteAttachmentInput): Promise<AttachmentMetadata> {
+    const response = await this.request<ApiItem<RawAttachment>>(
+      `/attachments/${encodeURIComponent(input.id)}`,
+      {
+        method: 'DELETE',
+        body: JSON.stringify({
+          expected_revision: input.expectedRevision,
+          reason: input.reason ?? null,
+        }),
+      },
+    )
+    return mapAttachment(response.data)
+  }
+
   async listOperations(query = new URLSearchParams()): Promise<OperationRecord[]> {
-    if (!query.has('limit')) query.set('limit', '200')
-    const response = await this.request<ApiCollection<OperationRecord>>('/operations?' + query.toString())
+    const scopedQuery = new URLSearchParams(query)
+    const projectId = activeProjectId()
+    if (projectId && !scopedQuery.has('project_id')) scopedQuery.set('project_id', projectId)
+    if (!scopedQuery.has('limit')) scopedQuery.set('limit', '200')
+    const response = await this.request<ApiCollection<OperationRecord>>('/operations?' + scopedQuery.toString())
     return response.data
   }
 
@@ -2448,7 +2908,7 @@ export class RemoteHttpGateway implements MuriArcGateway {
     const query = new URLSearchParams({ project_id: projectId, limit: '500' })
     if (experimentId) query.set('experiment_id', experimentId)
     const response = await this.request<ApiCollection<{
-      attachment: { id: string; project_id?: string | null; entity_type: AttachmentTarget; entity_id: string; file_name: string; media_type?: string | null; size_bytes: number; sha256: string; version: number; meta: { created_at: string } }
+      attachment: { id: string; project_id?: string | null; entity_type: AttachmentTarget; entity_id: string; file_name: string; media_type?: string | null; size_bytes: number; sha256: string; version: number; meta: { created_at: string; revision?: number } }
       links: AttachmentLinkRecord[]
       derivatives: Array<Record<string, unknown>>
       previewSupported: boolean
@@ -2462,7 +2922,7 @@ export class RemoteHttpGateway implements MuriArcGateway {
         entityType: entry.attachment.entity_type, entityId: entry.attachment.entity_id,
         fileName: entry.attachment.file_name, mediaType: entry.attachment.media_type ?? undefined,
         sizeBytes: entry.attachment.size_bytes, sha256: entry.attachment.sha256,
-        version: entry.attachment.version,
+        version: entry.attachment.version, revision: entry.attachment.meta.revision ?? entry.attachment.version,
         contentHref: '/api/v1/attachments/' + entry.attachment.id + '/content',
         previewSupported: entry.previewSupported, previewHref: entry.previewHref,
         previewReason: entry.previewReason, createdAt: entry.attachment.meta.created_at,
@@ -2506,9 +2966,21 @@ export class RemoteHttpGateway implements MuriArcGateway {
   async getAiLabSettings(): Promise<AiLabSettings> {
     return (await this.request<ApiItem<AiLabSettings>>('/admin/ai')).data
   }
-  async saveAiLabSettings(input: { enabled: boolean; customUrlApprovalRequired: boolean }) {
+  async saveAiLabSettings(input: { enabled: boolean; customUrlApprovalRequired: boolean; maxAutonomyMode: AiAutonomyMode }) {
     return (await this.request<ApiItem<AiLabSettings>>('/admin/ai',
       { method: 'PUT', body: JSON.stringify(input) })).data
+  }
+  async listAiProviderEndpoints(): Promise<AiProviderEndpoint[]> {
+    return (await this.request<ApiCollection<AiProviderEndpoint>>('/admin/ai/endpoints')).data
+  }
+  async saveAiProviderEndpoint(input: SaveAiProviderEndpointInput, id?: string) {
+    const path = id ? `/admin/ai/endpoints/${encodeURIComponent(id)}` : '/admin/ai/endpoints'
+    return (await this.request<ApiItem<AiProviderEndpoint>>(path,
+      { method: id ? 'PUT' : 'POST', body: JSON.stringify(input) })).data
+  }
+  async disableAiProviderEndpoint(id: string) {
+    return (await this.request<ApiItem<AiProviderEndpoint>>(`/admin/ai/endpoints/${encodeURIComponent(id)}/disable`,
+      { method: 'POST' })).data
   }
 
   async getAiSettings(): Promise<AiSettings> {
@@ -2557,6 +3029,31 @@ export class RemoteHttpGateway implements MuriArcGateway {
       `/ai/conversations/${encodeURIComponent(conversationId)}?${query.toString()}`,
     )
     return mapAiConversationDetail(response.data)
+  }
+
+  async getAiAutonomy(conversationId: string): Promise<AiAutonomyView> {
+    const response = await this.request<ApiItem<AiAutonomyView>>(
+      `/ai/conversations/${encodeURIComponent(conversationId)}/autonomy`,
+    )
+    return response.data
+  }
+
+  async setAiAutonomy(
+    conversationId: string,
+    input: AiAutonomyUpdateInput,
+  ): Promise<AiAutonomyView> {
+    const response = await this.request<ApiItem<AiAutonomyView>>(
+      `/ai/conversations/${encodeURIComponent(conversationId)}/autonomy`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          mode: input.mode,
+          expectedRevision: input.expectedRevision,
+          ...(input.currentPassword ? { currentPassword: input.currentPassword } : {}),
+        }),
+      },
+    )
+    return response.data
   }
 
   async listAiDrafts(projectId?: string, status?: AiDraftStatus): Promise<AiWriteDraft[]> {
@@ -2648,6 +3145,25 @@ function mapAiTurn(raw: RawAiTurnResponse): AiTurnResponse {
         totalTokens: raw.trace.usage.total_tokens,
       },
     },
+    autonomy: raw.autonomy ?? defaultAiAutonomy(),
+  }
+}
+
+function defaultAiAutonomy(): AiAutonomyView {
+  return {
+    mode: 'ask',
+    effectiveMode: 'ask',
+    maxMode: 'full',
+    batchLimit: 1,
+    revision: 0,
+    requiresHumanApproval: [
+      'research_signature',
+      'animal_transfer_or_death',
+      'delete_or_bulk_import',
+      'permissions_and_accounts',
+      'audit_or_log_cleanup',
+      'breeding_scientific_facts',
+    ],
   }
 }
 
@@ -2823,6 +3339,7 @@ function mapGeneLocus(raw: RawGeneLocus): GeneLocus {
     id: raw.id,
     symbol: raw.symbol,
     description: raw.description ?? undefined,
+    archivedAt: raw.meta.deleted_at ?? undefined,
     revision: raw.meta.revision,
   }
 }
@@ -2834,6 +3351,7 @@ function mapAllele(raw: RawAllele): GeneAllele {
     symbol: raw.symbol,
     description: raw.description ?? undefined,
     isWildType: raw.is_wild_type,
+    archivedAt: raw.meta.deleted_at ?? undefined,
     revision: raw.meta.revision,
   }
 }
@@ -2871,6 +3389,7 @@ function mapGenotypeDefinition(raw: RawGenotypeDefinition): GenotypeDefinition {
     revision: raw.meta.revision,
     createdAt: raw.meta.created_at,
     updatedAt: raw.meta.updated_at,
+    archivedAt: raw.meta.deleted_at ?? undefined,
   }
 }
 
@@ -2884,8 +3403,21 @@ function mapGenotypingRecord(raw: RawGenotypingRecord): GenotypingRecord {
     assessedAt: raw.assessed_at ?? undefined,
     method: raw.method ?? undefined,
     notes: raw.notes ?? undefined,
+    supersedesRecordId: raw.supersedes_record_id ?? undefined,
+    voidedAt: raw.voided_at ?? undefined,
+    voidReason: raw.void_reason ?? undefined,
     revision: raw.meta.revision,
     createdAt: raw.meta.created_at,
+    updatedAt: raw.meta.updated_at,
+  }
+}
+
+function mapGeneticsReferenceCounts(raw: RawGeneticsReferenceCounts): GeneticsReferenceCounts {
+  return {
+    activeGenotypeDefinitions: raw.active_genotype_definitions,
+    genotypeDefinitions: raw.genotype_definitions,
+    genotypingRecords: raw.genotyping_records,
+    breedingLines: raw.breeding_lines,
   }
 }
 
@@ -3116,6 +3648,20 @@ function mapCages(cages: RawCage[], animals: RawAnimal[]): Cage[] {
   })
 }
 
+function mapProjectAnimalAssignment(
+  raw: RawProjectAnimalAssignment,
+): ProjectAnimalAssignment {
+  return {
+    id: raw.id,
+    projectId: raw.project_id,
+    animalId: raw.animal_id,
+    assignedBy: raw.assigned_by ?? undefined,
+    reason: raw.reason ?? undefined,
+    assignedAt: raw.meta.created_at,
+    revision: raw.meta.revision,
+  }
+}
+
 function mapTemplate(raw: RawTemplate): ExperimentTemplateSummary {
   return { id: raw.id, name: raw.name, version: raw.version }
 }
@@ -3226,6 +3772,7 @@ function mapAttachment(raw: RawAttachment): AttachmentMetadata {
     sizeBytes: raw.size_bytes,
     sha256: raw.sha256,
     version: raw.version,
+    revision: raw.meta.revision ?? raw.version,
     contentHref: raw.content_href,
     previewSupported: raw.preview_supported,
     previewHref: raw.preview_href ?? undefined,
@@ -3279,6 +3826,17 @@ class DemoDomainStore {
     hasKey: false,
     supportsVision: false,
   }
+  aiProviderEndpoints: AiProviderEndpoint[] = [
+    {
+      id: '00000000-0000-0000-0000-000000000001',
+      providerKind: 'open_ai_compatible',
+      label: 'OpenAI API',
+      baseUrl: 'https://api.openai.com/v1',
+      enabled: true,
+      builtin: true,
+      revision: 1,
+    },
+  ]
 
   createCage(input: CreateCageInput) {
     if (this.cages.some((cage) => cage.room === input.room && cage.code.toLowerCase() === input.code.toLowerCase())) {
@@ -3308,26 +3866,69 @@ class DemoDomainStore {
       if (!cage) throw new Error('笼位不存在')
       if (cage.animalIds.length >= cage.capacity) throw new Error('笼位容量不足')
     }
-    const animal: Animal = {
+    const initialInputs = input.initialGenotypingRecords ?? []
+    const definitionIds = new Set<string>()
+    const initialDefinitions = initialInputs.map((record) => {
+      if (definitionIds.has(record.genotypeDefinitionId)) {
+        throw new Error('同一基因型定义不能在登记时重复选择')
+      }
+      definitionIds.add(record.genotypeDefinitionId)
+      const definition = this.genotypeDefinitions.find((candidate) =>
+        candidate.id === record.genotypeDefinitionId && !candidate.archivedAt)
+      if (!definition) throw new Error('初始基因型定义不存在或已归档')
+      if ((record.state === 'confirmed' || record.state === 'rejected') && !record.assessedAt) {
+        throw new Error('确认或排除结果必须填写检测时间')
+      }
+      return definition
+    })
+    const now = new Date().toISOString()
+    const animalId = crypto.randomUUID()
+    const initialRecords = initialInputs.map<GenotypingRecord>((record) => ({
       id: crypto.randomUUID(),
+      projectId: project?.id,
+      animalId,
+      genotypeDefinitionId: record.genotypeDefinitionId,
+      state: record.state,
+      assessedAt: record.assessedAt,
+      method: record.method?.trim() || undefined,
+      notes: record.notes?.trim() || undefined,
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+    }))
+    const animal: Animal = {
+      id: animalId,
       code: input.displayId,
       sex: input.sex,
       strain: input.strain || '未设置',
-      genotype: '待确认',
+      genotype: initialDefinitions.map((definition, index) =>
+        `${definition.name} · ${initialInputs[index]?.state ?? 'expected'}`).join(' · ') || '待确认',
       birthDate: input.birthDate ?? '',
       status: 'active',
       cageId: input.cageId ?? null,
       projectNames: project ? [project.name] : [],
       timeline: [{
         id: crypto.randomUUID(),
-        at: new Date().toISOString(),
+        at: now,
         type: input.birthDate ? 'birth' : 'note',
         title: input.birthDate ? '出生登记' : '登记动物',
         detail: input.birthDate ? `出生日期 ${input.birthDate}` : '创建动物档案',
         operator: '演示操作员',
       }],
     }
+    for (const [index, record] of initialRecords.entries()) {
+      const definition = initialDefinitions[index]
+      animal.timeline.unshift({
+        id: crypto.randomUUID(),
+        at: record.assessedAt ?? now,
+        type: 'genotype',
+        title: '初始基因型',
+        detail: `${definition?.name ?? record.genotypeDefinitionId} · ${record.state}`,
+        operator: '演示操作员',
+      })
+    }
     this.animals.push(animal)
+    this.genotypingRecords.push(...initialRecords)
     const cage = this.cages.find((item) => item.id === input.cageId)
     if (cage) cage.animalIds.push(animal.id)
     return clone(animal)
@@ -3388,7 +3989,24 @@ export class DemoGateway implements MuriArcGateway {
   private readonly store = new DemoDomainStore()
   private readonly aiConversations = new Map<string, AiConversationDetail>()
 
-  async listCages() { await pause(20); return clone(this.store.cages) }
+  private setDemoArchive<T extends {
+    id: string
+    revision: number
+    archivedAt?: string
+    updatedAt?: string
+  }>(items: T[], input: GeneticsArchiveInput, archived: boolean): T {
+    const item = items.find((candidate) => candidate.id === input.id)
+    if (!item || item.revision !== input.expectedRevision || Boolean(item.archivedAt) === archived) {
+      throw new Error('目录记录已变化，请刷新后重试')
+    }
+    const now = new Date().toISOString()
+    item.archivedAt = archived ? now : undefined
+    if ('updatedAt' in item) item.updatedAt = now
+    item.revision += 1
+    return clone(item)
+  }
+
+  async listCages(_context?: AnimalAccessContext) { await pause(20); return clone(this.store.cages) }
   async createCage(input: CreateCageInput) { await pause(20); return this.store.createCage(input) }
   async createAnimal(input: CreateAnimalInput) { await pause(20); return this.store.createAnimal(input) }
   async listAnimals(_context?: AnimalAccessContext) { await pause(20); return clone(this.store.animals) }
@@ -3414,9 +4032,32 @@ export class DemoGateway implements MuriArcGateway {
       provenance: [],
     }
   }
-  async listGeneLoci(_projectId?: string) {
+  async listGeneLoci(_projectId?: string, includeArchived = false) {
     await pause(20)
-    return clone(this.store.geneLoci)
+    return clone(this.store.geneLoci.filter((locus) => includeArchived || !locus.archivedAt))
+  }
+  async geneLocusReferences(id: string, _projectId?: string) {
+    await pause(20)
+    const definitionIds = this.store.genotypeDefinitions
+      .filter((definition) => definition.components.some((component) => component.locusId === id))
+      .map((definition) => definition.id)
+    const activeDefinitionIds = new Set(this.store.genotypeDefinitions
+      .filter((definition) => !definition.archivedAt && definitionIds.includes(definition.id))
+      .map((definition) => definition.id))
+    return {
+      activeGenotypeDefinitions: activeDefinitionIds.size,
+      genotypeDefinitions: definitionIds.length,
+      genotypingRecords: this.store.genotypingRecords.filter((record) => definitionIds.includes(record.genotypeDefinitionId)).length,
+      breedingLines: this.store.breedingLines.filter((line) => line.genotypeDefinitionIds.some((definitionId) => definitionIds.includes(definitionId))).length,
+    }
+  }
+  async archiveGeneLocus(input: GeneticsArchiveInput) {
+    const references = await this.geneLocusReferences(input.id)
+    if (references.activeGenotypeDefinitions) throw new Error('该位点仍被活动基因型定义引用')
+    return this.setDemoArchive(this.store.geneLoci, input, true)
+  }
+  async restoreGeneLocus(input: GeneticsArchiveInput) {
+    return this.setDemoArchive(this.store.geneLoci, input, false)
   }
   async createGeneLocus(input: CreateGeneLocusInput) {
     await pause(20)
@@ -3428,9 +4069,36 @@ export class DemoGateway implements MuriArcGateway {
     this.store.geneLoci.push(locus)
     return clone(locus)
   }
-  async listAlleles(locusId: string, _projectId?: string) {
+  async listAlleles(locusId: string, _projectId?: string, includeArchived = false) {
     await pause(20)
-    return clone(this.store.alleles.filter((allele) => allele.locusId === locusId))
+    return clone(this.store.alleles.filter((allele) =>
+      allele.locusId === locusId && (includeArchived || !allele.archivedAt)))
+  }
+  async alleleReferences(id: string, _projectId?: string) {
+    await pause(20)
+    const definitionIds = this.store.genotypeDefinitions
+      .filter((definition) => definition.components.some((component) =>
+        component.allele1Id === id || component.allele2Id === id))
+      .map((definition) => definition.id)
+    return {
+      activeGenotypeDefinitions: this.store.genotypeDefinitions.filter((definition) =>
+        !definition.archivedAt && definitionIds.includes(definition.id)).length,
+      genotypeDefinitions: definitionIds.length,
+      genotypingRecords: this.store.genotypingRecords.filter((record) => definitionIds.includes(record.genotypeDefinitionId)).length,
+      breedingLines: this.store.breedingLines.filter((line) => line.genotypeDefinitionIds.some((definitionId) => definitionIds.includes(definitionId))).length,
+    }
+  }
+  async archiveAllele(input: GeneticsArchiveInput) {
+    const references = await this.alleleReferences(input.id)
+    if (references.activeGenotypeDefinitions) throw new Error('该 allele 仍被活动基因型定义引用')
+    return this.setDemoArchive(this.store.alleles, input, true)
+  }
+  async restoreAllele(input: GeneticsArchiveInput) {
+    const allele = this.store.alleles.find((candidate) => candidate.id === input.id)
+    if (allele && this.store.geneLoci.find((locus) => locus.id === allele.locusId)?.archivedAt) {
+      throw new Error('请先恢复所属位点')
+    }
+    return this.setDemoArchive(this.store.alleles, input, false)
   }
   async createAllele(input: CreateAlleleInput) {
     await pause(20)
@@ -3474,9 +4142,32 @@ export class DemoGateway implements MuriArcGateway {
     })
     return clone(genotype)
   }
-  async listGenotypeDefinitions(_projectId?: string) {
+  async listGenotypeDefinitions(_projectId?: string, includeArchived = false) {
     await pause(20)
-    return clone(this.store.genotypeDefinitions)
+    return clone(this.store.genotypeDefinitions.filter((definition) =>
+      includeArchived || !definition.archivedAt))
+  }
+  async genotypeDefinitionReferences(id: string, _projectId?: string) {
+    await pause(20)
+    return {
+      activeGenotypeDefinitions: 0,
+      genotypeDefinitions: 0,
+      genotypingRecords: this.store.genotypingRecords.filter((record) => record.genotypeDefinitionId === id).length,
+      breedingLines: this.store.breedingLines.filter((line) => line.genotypeDefinitionIds.includes(id)).length,
+    }
+  }
+  async archiveGenotypeDefinition(input: GeneticsArchiveInput) {
+    return this.setDemoArchive(this.store.genotypeDefinitions, input, true)
+  }
+  async restoreGenotypeDefinition(input: GeneticsArchiveInput) {
+    const definition = this.store.genotypeDefinitions.find((candidate) => candidate.id === input.id)
+    if (definition?.components.some((component) =>
+      this.store.geneLoci.find((locus) => locus.id === component.locusId)?.archivedAt
+      || this.store.alleles.find((allele) => allele.id === component.allele1Id)?.archivedAt
+      || (component.allele2Id && this.store.alleles.find((allele) => allele.id === component.allele2Id)?.archivedAt))) {
+      throw new Error('请先恢复定义引用的位点和 allele')
+    }
+    return this.setDemoArchive(this.store.genotypeDefinitions, input, false)
   }
   async createGenotypeDefinition(input: CreateGenotypeDefinitionInput) {
     await pause(20)
@@ -3551,6 +4242,7 @@ export class DemoGateway implements MuriArcGateway {
       notes: input.notes?.trim() || undefined,
       revision: 1,
       createdAt: now,
+      updatedAt: now,
     }
     this.store.genotypingRecords.push(record)
     animal.timeline.unshift({
@@ -3559,6 +4251,56 @@ export class DemoGateway implements MuriArcGateway {
       operator: '演示操作员',
     })
     return clone(record)
+  }
+  async voidGenotypingRecord(input: VoidGenotypingRecordInput) {
+    await pause(20)
+    const record = this.store.genotypingRecords.find((candidate) => candidate.id === input.recordId)
+    const reason = input.reason.trim()
+    if (!record || record.revision !== input.expectedRevision || record.voidedAt) {
+      throw new Error('检测记录已变化，请刷新后重试')
+    }
+    if (!reason) throw new Error('请填写作废原因')
+    const now = new Date().toISOString()
+    record.voidedAt = now
+    record.voidReason = reason
+    record.updatedAt = now
+    record.revision += 1
+    return clone(record)
+  }
+  async correctGenotypingRecord(input: CorrectGenotypingRecordInput) {
+    await pause(20)
+    const original = this.store.genotypingRecords.find((candidate) => candidate.id === input.recordId)
+    const definition = this.store.genotypeDefinitions.find((candidate) =>
+      candidate.id === input.genotypeDefinitionId && !candidate.archivedAt)
+    if (!original || original.revision !== input.expectedRevision || original.voidedAt) {
+      throw new Error('检测记录已变化，请刷新后重试')
+    }
+    if (!definition) throw new Error('替代基因型定义不存在或已归档')
+    if (!input.reason.trim()) throw new Error('请填写更正原因')
+    if ((input.state === 'confirmed' || input.state === 'rejected') && !input.assessedAt) {
+      throw new Error('确认或排除结果必须填写检测时间')
+    }
+    const now = new Date().toISOString()
+    const replacement: GenotypingRecord = {
+      id: crypto.randomUUID(),
+      projectId: original.projectId,
+      animalId: original.animalId,
+      genotypeDefinitionId: input.genotypeDefinitionId,
+      state: input.state,
+      assessedAt: input.assessedAt,
+      method: input.method?.trim() || undefined,
+      notes: input.notes?.trim() || undefined,
+      supersedesRecordId: original.id,
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+    }
+    original.voidedAt = now
+    original.voidReason = input.reason.trim()
+    original.updatedAt = now
+    original.revision += 1
+    this.store.genotypingRecords.push(replacement)
+    return { voided: clone(original), replacement: clone(replacement) }
   }
   async listBreedingLines() {
     await pause(20)
@@ -4068,6 +4810,39 @@ export class DemoGateway implements MuriArcGateway {
     await pause(20)
     this.store.aiSettings.hasKey = false
     return clone(this.store.aiSettings)
+  }
+  async listAiProviderEndpoints() {
+    await pause(20)
+    return clone(this.store.aiProviderEndpoints)
+  }
+  async saveAiProviderEndpoint(input: SaveAiProviderEndpointInput, id?: string) {
+    await pause(20)
+    if (id === '00000000-0000-0000-0000-000000000001') throw new Error('内置出口不能修改')
+    const existing = id ? this.store.aiProviderEndpoints.find((item) => item.id === id) : undefined
+    const endpoint: AiProviderEndpoint = existing ?? {
+      id: crypto.randomUUID(),
+      providerKind: input.providerKind,
+      label: input.label,
+      baseUrl: input.baseUrl,
+      enabled: input.enabled,
+      builtin: false,
+      revision: 0,
+    }
+    endpoint.providerKind = input.providerKind
+    endpoint.label = input.label
+    endpoint.baseUrl = input.baseUrl
+    endpoint.enabled = input.enabled
+    endpoint.revision += 1
+    if (!existing) this.store.aiProviderEndpoints.push(endpoint)
+    return clone(endpoint)
+  }
+  async disableAiProviderEndpoint(id: string) {
+    await pause(20)
+    const endpoint = this.store.aiProviderEndpoints.find((item) => item.id === id && !item.builtin)
+    if (!endpoint) throw new Error('Provider 出口不存在或不可停用')
+    endpoint.enabled = false
+    endpoint.revision += 1
+    return clone(endpoint)
   }
   async aiTurn(input: AiTurnInput): Promise<AiTurnResponse> {
     await pause(80)

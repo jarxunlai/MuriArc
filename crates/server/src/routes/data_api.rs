@@ -14,9 +14,12 @@ use muriarc_core::{ImportCommitResult, Job, JobKind, JobStatus, Permission, Reco
 use muriarc_data::{
     AnimalImportPreviewResponse, ArtifactKind, ArtifactMetadata, DataError, DataFiles,
     ExportFormat, ImportKind, ImportRemapJobResult, artifact_metadata, build_lab_snapshot,
-    export_animals_scoped,
+    export_animals_scoped_with_options,
 };
-use muriarc_importer::{AnimalExportFilter, FieldMapping, MeasurementFieldMapping};
+use muriarc_importer::{
+    AnimalExportOptions, AnimalImportSchema, FieldMapping, MeasurementFieldMapping,
+    animal_import_schema, animal_import_template_csv, animal_import_template_xlsx,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -41,11 +44,64 @@ pub(super) fn router() -> Router<AppState> {
         .route("/data/imports/{id}/remap", post(remap_import))
         .route("/data/imports/{id}/confirm", post(confirm_import))
         .route("/data/imports/{id}/cancel", post(cancel_import))
+        .route("/data/animal-import/schema", get(get_animal_import_schema))
+        .route(
+            "/data/animal-import/template",
+            get(download_animal_import_template),
+        )
         .route("/data/exports", post(create_export))
         .route("/data/snapshots", post(create_snapshot))
         .route("/data/artifacts/{id}", get(download_artifact))
         .layer(DefaultBodyLimit::max(MAX_DATA_JSON_BYTES));
     upload.merge(json_and_download)
+}
+
+async fn get_animal_import_schema(
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+) -> Result<Json<ItemResponse<AnimalImportSchema>>, ApiError> {
+    authorize(&principal, Permission::ImportData, None, &metadata)?;
+    Ok(item(animal_import_schema(), &metadata))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnimalImportTemplateQuery {
+    format: ExportFormat,
+}
+
+async fn download_animal_import_template(
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiQuery(query): ApiQuery<AnimalImportTemplateQuery>,
+) -> Result<Response, ApiError> {
+    authorize(&principal, Permission::ImportData, None, &metadata)?;
+    let (file_name, media_type, bytes) = match query.format {
+        ExportFormat::Csv => {
+            let mut bytes = Vec::new();
+            animal_import_template_csv(&mut bytes)
+                .map_err(DataError::from)
+                .map_err(|error| data_error(error, &metadata))?;
+            ("muriarc-animal-import.csv", "text/csv;charset=utf-8", bytes)
+        }
+        ExportFormat::Xlsx => (
+            "muriarc-animal-import.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            animal_import_template_xlsx()
+                .map_err(DataError::from)
+                .map_err(|error| data_error(error, &metadata))?,
+        ),
+    };
+    let mut response = Response::new(Body::from(bytes));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(media_type));
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{file_name}\""))
+            .map_err(|_| validation("invalid template file name", &metadata))?,
+    );
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -688,6 +744,8 @@ struct ExportRequest {
     format: ExportFormat,
     idempotency_key: String,
     project_id: Option<Uuid>,
+    #[serde(default)]
+    options: AnimalExportOptions,
 }
 
 async fn create_export(
@@ -718,12 +776,12 @@ async fn create_export(
         payload.idempotency_key,
         move |job, state, _| {
             Box::pin(async move {
-                let bytes = export_animals_scoped(
+                let bytes = export_animals_scoped_with_options(
                     state.store.as_ref(),
                     job.lab_id,
                     job.project_id,
                     payload.format,
-                    &AnimalExportFilter::default(),
+                    &payload.options,
                 )
                 .await?;
                 let metadata = artifact_metadata(

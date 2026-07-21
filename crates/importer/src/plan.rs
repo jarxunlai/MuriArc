@@ -6,8 +6,8 @@ use std::{
 
 use chrono::{DateTime, NaiveTime, Utc};
 use muriarc_core::{
-    Animal, AnimalEvent, AnimalEventKind, Genotype, ImportPlan, Measurement, MeasurementValue,
-    ParentType, Pedigree, RecordMeta, Sex,
+    Animal, AnimalEvent, AnimalEventKind, GenotypingRecord, GenotypingState, ImportPlan,
+    Measurement, MeasurementValue, ParentType, Pedigree, RecordMeta, Sex,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error as ThisError;
@@ -110,6 +110,7 @@ pub struct GeneticDirectory {
     locus_ids: BTreeSet<Uuid>,
     alleles_by_locus_and_symbol: BTreeMap<(Uuid, String), BTreeSet<Uuid>>,
     allele_loci: BTreeMap<Uuid, Uuid>,
+    definitions_by_components: BTreeMap<Vec<(Uuid, Uuid, Uuid)>, BTreeSet<Uuid>>,
 }
 
 impl GeneticDirectory {
@@ -127,6 +128,22 @@ impl GeneticDirectory {
         }
         for (locus_id, symbol, allele_id) in alleles {
             directory.insert_allele(locus_id, symbol, allele_id)?;
+        }
+        Ok(directory)
+    }
+
+    pub fn from_entries_with_definitions<LocusSymbol, AlleleSymbol>(
+        loci: impl IntoIterator<Item = (LocusSymbol, Uuid)>,
+        alleles: impl IntoIterator<Item = (Uuid, AlleleSymbol, Uuid)>,
+        definitions: impl IntoIterator<Item = (Uuid, Vec<(Uuid, Uuid, Uuid)>)>,
+    ) -> Result<Self, DirectoryError>
+    where
+        LocusSymbol: Into<String>,
+        AlleleSymbol: Into<String>,
+    {
+        let mut directory = Self::from_entries(loci, alleles)?;
+        for (definition_id, components) in definitions {
+            directory.insert_definition(definition_id, components)?;
         }
         Ok(directory)
     }
@@ -194,6 +211,66 @@ impl GeneticDirectory {
         )
     }
 
+    pub fn insert_definition(
+        &mut self,
+        definition_id: Uuid,
+        components: Vec<(Uuid, Uuid, Uuid)>,
+    ) -> Result<(), DirectoryError> {
+        if definition_id.is_nil()
+            || components
+                .iter()
+                .any(|(locus_id, allele_1_id, allele_2_id)| {
+                    locus_id.is_nil() || allele_1_id.is_nil() || allele_2_id.is_nil()
+                })
+        {
+            return Err(DirectoryError::NilIdentifier);
+        }
+        if components.is_empty() {
+            return Err(DirectoryError::EmptyGenotypeDefinition);
+        }
+        let mut signature = Vec::with_capacity(components.len());
+        let mut loci = BTreeSet::new();
+        for (locus_id, allele_1_id, allele_2_id) in components {
+            if !self.locus_ids.contains(&locus_id)
+                || self.allele_loci.get(&allele_1_id) != Some(&locus_id)
+                || self.allele_loci.get(&allele_2_id) != Some(&locus_id)
+            {
+                return Err(DirectoryError::InvalidDefinitionComponent);
+            }
+            if !loci.insert(locus_id) {
+                return Err(DirectoryError::DuplicateDefinitionLocus(locus_id));
+            }
+            let (first, second) = if allele_1_id <= allele_2_id {
+                (allele_1_id, allele_2_id)
+            } else {
+                (allele_2_id, allele_1_id)
+            };
+            signature.push((locus_id, first, second));
+        }
+        signature.sort_unstable();
+        self.definitions_by_components
+            .entry(signature)
+            .or_default()
+            .insert(definition_id);
+        Ok(())
+    }
+
+    pub fn resolve_definition(&self, components: &[(Uuid, Uuid, Uuid)]) -> DirectoryResolution {
+        let mut signature = components
+            .iter()
+            .map(|(locus_id, allele_1_id, allele_2_id)| {
+                let (first, second) = if allele_1_id <= allele_2_id {
+                    (*allele_1_id, *allele_2_id)
+                } else {
+                    (*allele_2_id, *allele_1_id)
+                };
+                (*locus_id, first, second)
+            })
+            .collect::<Vec<_>>();
+        signature.sort_unstable();
+        resolution(self.definitions_by_components.get(&signature))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.locus_ids.is_empty()
     }
@@ -213,6 +290,12 @@ pub enum DirectoryError {
     EmptyAlleleSymbol,
     #[error("allele references a locus that is not present in this directory: {0}")]
     UnknownAlleleLocus(Uuid),
+    #[error("genotype definition must contain at least one import-compatible component")]
+    EmptyGenotypeDefinition,
+    #[error("genotype definition contains a locus or allele outside the active directory")]
+    InvalidDefinitionComponent,
+    #[error("genotype definition contains locus {0} more than once")]
+    DuplicateDefinitionLocus(Uuid),
     #[error(
         "allele {allele_id} belongs to both locus {first_locus_id} and locus {second_locus_id}"
     )]
@@ -527,16 +610,9 @@ struct ResolvedAnimalRow<'a> {
     animal_id: Uuid,
     sex: Sex,
     cage_id: Option<Uuid>,
-    genotypes: Vec<ResolvedGenotype>,
+    genotype_definition_id: Option<Uuid>,
     father_id: Option<Uuid>,
     mother_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ResolvedGenotype {
-    locus_id: Uuid,
-    allele_1_id: Uuid,
-    allele_2_id: Uuid,
 }
 
 fn resolve_animal_row<'a>(
@@ -588,11 +664,10 @@ fn resolve_animal_row<'a>(
             }
         });
 
-    let genotypes = row
+    let genotype_definition_id = row
         .genotype
         .as_deref()
-        .map(|value| resolve_genotypes(value, row.source_row, genetics, issues))
-        .unwrap_or_default();
+        .and_then(|value| resolve_genotype_definition(value, row.source_row, genetics, issues));
 
     let father_id = resolve_parent(
         row.father.as_deref(),
@@ -624,7 +699,7 @@ fn resolve_animal_row<'a>(
         animal_id,
         sex,
         cage_id,
-        genotypes,
+        genotype_definition_id,
         father_id,
         mother_id,
     })
@@ -671,12 +746,12 @@ fn resolve_parent(
     }
 }
 
-fn resolve_genotypes(
+fn resolve_genotype_definition(
     value: &str,
     source_row: usize,
     genetics: &GeneticDirectory,
     issues: &mut Vec<ImportIssue>,
-) -> Vec<ResolvedGenotype> {
+) -> Option<Uuid> {
     let parsed = match parse_genotype(value) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -686,10 +761,11 @@ fn resolve_genotypes(
                 error.code,
                 error.message,
             ));
-            return Vec::new();
+            return None;
         }
     };
-    let mut resolved = Vec::with_capacity(parsed.len());
+    let expected_components = parsed.len();
+    let mut resolved = Vec::with_capacity(expected_components);
     let mut resolved_loci = BTreeSet::new();
     for genotype in parsed {
         let locus_id = match genetics.resolve_locus(&genotype.locus) {
@@ -727,14 +803,33 @@ fn resolve_genotypes(
         let allele_2_id =
             resolve_allele(genetics, locus_id, &genotype.allele_2, source_row, issues);
         if let (Some(allele_1_id), Some(allele_2_id)) = (allele_1_id, allele_2_id) {
-            resolved.push(ResolvedGenotype {
-                locus_id,
-                allele_1_id,
-                allele_2_id,
-            });
+            resolved.push((locus_id, allele_1_id, allele_2_id));
         }
     }
-    resolved
+    if resolved.len() != expected_components {
+        return None;
+    }
+    match genetics.resolve_definition(&resolved) {
+        DirectoryResolution::Unique(definition_id) => Some(definition_id),
+        DirectoryResolution::Unknown => {
+            issues.push(plan_row_issue(
+                source_row,
+                "genotype",
+                "unknown_genotype_definition",
+                "resolved loci and alleles do not match an active existing genotype definition",
+            ));
+            None
+        }
+        DirectoryResolution::Ambiguous => {
+            issues.push(plan_row_issue(
+                source_row,
+                "genotype",
+                "ambiguous_genotype_definition",
+                "resolved loci and alleles match more than one active genotype definition",
+            ));
+            None
+        }
+    }
 }
 
 fn resolve_allele(
@@ -835,20 +930,22 @@ fn append_resolved_animal(
         plan.animal_events.push(transferred);
     }
 
-    for genotype in resolved.genotypes {
-        plan.genotypes.push(Genotype {
-            id: stable_uuid(
-                hash,
-                "genotype",
-                &format!("{identity}\0{}", genotype.locus_id),
-            ),
-            animal_id: resolved.animal_id,
-            locus_id: genotype.locus_id,
-            allele_1_id: Some(genotype.allele_1_id),
-            allele_2_id: Some(genotype.allele_2_id),
-            assessed_at: Some(context.confirmed_at),
-            meta: RecordMeta::new(context.confirmed_at),
-        });
+    if let Some(definition_id) = resolved.genotype_definition_id {
+        let mut record = GenotypingRecord::new(
+            context.lab_id,
+            resolved.animal_id,
+            definition_id,
+            GenotypingState::Expected,
+            None,
+            context.confirmed_at,
+        )
+        .expect("resolved expected genotyping record is valid");
+        record.id = stable_uuid(
+            hash,
+            "genotyping_record",
+            &format!("{identity}\0{definition_id}"),
+        );
+        plan.genotyping_records.push(record);
     }
     if let Some(parent_id) = resolved.father_id {
         plan.pedigrees.push(Pedigree {
@@ -935,7 +1032,7 @@ fn base_plan(context: &ImportPlanContext, normalized_hash: &str) -> ImportPlan {
         preview_hash: normalized_hash.to_owned(),
         animals: Vec::new(),
         animal_events: Vec::new(),
-        genotypes: Vec::new(),
+        genotyping_records: Vec::new(),
         pedigrees: Vec::new(),
         measurements: Vec::new(),
     }
@@ -1232,10 +1329,12 @@ mod tests {
         let locus_id = Uuid::from_u128(21);
         let wild_type = Uuid::from_u128(22);
         let floxed = Uuid::from_u128(23);
+        let definition_id = Uuid::from_u128(24);
         let cages = CageDirectory::from_entries([("Room A", "C1", cage_id)]).unwrap();
-        let genetics = GeneticDirectory::from_entries(
+        let genetics = GeneticDirectory::from_entries_with_definitions(
             [("GeneA", locus_id)],
             [(locus_id, "+", wild_type), (locus_id, "fl", floxed)],
+            [(definition_id, vec![(locus_id, wild_type, floxed)])],
         )
         .unwrap();
         let mut father = animal_row("F1");
@@ -1258,7 +1357,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(plan.animals.len(), 2);
-        assert_eq!(plan.genotypes.len(), 1);
+        assert_eq!(plan.genotyping_records.len(), 1);
         assert_eq!(plan.pedigrees.len(), 1);
         let father_id = plan
             .animals
@@ -1273,9 +1372,13 @@ mod tests {
             .unwrap();
         assert_eq!(child.current_cage_id, Some(cage_id));
         assert_eq!(plan.pedigrees[0].parent_id, father_id);
-        assert_eq!(plan.genotypes[0].animal_id, child.id);
-        assert_eq!(plan.genotypes[0].allele_1_id, Some(wild_type));
-        assert_eq!(plan.genotypes[0].allele_2_id, Some(floxed));
+        assert_eq!(plan.genotyping_records[0].animal_id, child.id);
+        assert_eq!(
+            plan.genotyping_records[0].genotype_definition_id,
+            definition_id
+        );
+        assert_eq!(plan.genotyping_records[0].state, GenotypingState::Expected);
+        assert_eq!(plan.genotyping_records[0].assessed_at, None);
         assert!(plan.animal_events.iter().all(|event| {
             event.recorded_by == Some(import_context().actor_user_id)
                 && matches!(
@@ -1425,6 +1528,47 @@ mod tests {
         )
         .unwrap_err();
         assert!(issue_codes(&error).contains("invalid_genotype_syntax"));
+
+        let locus_id = Uuid::from_u128(47);
+        let first = Uuid::from_u128(48);
+        let second = Uuid::from_u128(49);
+        let without_definition = GeneticDirectory::from_entries(
+            [("GeneB", locus_id)],
+            [(locus_id, "+", first), (locus_id, "fl", second)],
+        )
+        .unwrap();
+        let mut row = animal_row("M6");
+        row.genotype = Some("{GeneB}[+]/[fl]".to_owned());
+        let error = build_animal_import_plan(
+            &preview(vec![row]),
+            &import_context(),
+            &AnimalDirectory::default(),
+            &CageDirectory::default(),
+            &without_definition,
+        )
+        .unwrap_err();
+        assert!(issue_codes(&error).contains("unknown_genotype_definition"));
+
+        let ambiguous_definition = GeneticDirectory::from_entries_with_definitions(
+            [("GeneB", locus_id)],
+            [(locus_id, "+", first), (locus_id, "fl", second)],
+            [
+                (Uuid::from_u128(50), vec![(locus_id, first, second)]),
+                (Uuid::from_u128(51), vec![(locus_id, first, second)]),
+            ],
+        )
+        .unwrap();
+        let mut row = animal_row("M7");
+        row.genotype = Some("{GeneB}[+]/[fl]".to_owned());
+        let error = build_animal_import_plan(
+            &preview(vec![row]),
+            &import_context(),
+            &AnimalDirectory::default(),
+            &CageDirectory::default(),
+            &ambiguous_definition,
+        )
+        .unwrap_err();
+        assert!(issue_codes(&error).contains("ambiguous_genotype_definition"));
     }
 
     #[test]

@@ -1,23 +1,24 @@
 use std::{collections::BTreeSet, sync::Arc};
 
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use muriarc_core::{
-    Actor, ActorType, AiApprovalFilter, AiConversation, AiConversationFilter,
-    AiConversationMessage, AiConversationMessageRole, AiOperationStore, Approval,
-    ApprovalDecision as StoredApprovalDecision, AuditContext, Measurement, MuriArcStore,
-    RecordMeta, StoreError, ToolRun, ToolRunStatus, WriteSource,
+    Actor, ActorType, AiActionCategory, AiApprovalFilter, AiAutonomyGrant, AiAutonomyMode,
+    AiConversation, AiConversationFilter, AiConversationMessage, AiConversationMessageRole,
+    AiOperationStore, Approval, ApprovalDecision as StoredApprovalDecision, AuditContext,
+    Measurement, MuriArcStore, RecordMeta, StoreError, ToolRun, ToolRunStatus, WriteSource,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    AccessGrant, AiDataAccessContext, AiDataToolBackend, AiProvider, ApprovalDecision,
-    ApprovalError, AssistantConversationDetail, AssistantConversationMessage,
-    AssistantConversationSummary, AssistantError, AssistantRequest, AssistantService,
-    AssistantTurnRequest, AssistantTurnResponse, ChatMessage, DraftDecisionRequest, DraftKind,
-    DraftStatus, HumanApprover, ProposalActor, ProviderCredentials, StoreDomainToolExecutor,
-    StoreToolAccessContext, ToolExecutionError, ToolName, WriteDraft, WriteDraftSummary,
+    AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiDataAccessContext, AiDataToolBackend,
+    AiProvider, ApprovalDecision, ApprovalError, AssistantConversationDetail,
+    AssistantConversationMessage, AssistantConversationSummary, AssistantError, AssistantRequest,
+    AssistantService, AssistantTurnRequest, AssistantTurnResponse, ChatMessage,
+    DraftDecisionRequest, DraftKind, DraftStatus, HumanApprover, ProposalActor,
+    ProviderCredentials, StoreDomainToolExecutor, StoreToolAccessContext, ToolExecutionError,
+    ToolName, WriteDraft, WriteDraftSummary,
 };
 
 const PROVIDER_HISTORY_LIMIT: u32 = 40;
@@ -37,6 +38,8 @@ pub struct AiExecutionContext {
     lab_import: bool,
     lab_registry_read: bool,
     access_grant: AccessGrant,
+    session_id: Option<Uuid>,
+    max_autonomy_mode: AiAutonomyMode,
 }
 
 impl AiExecutionContext {
@@ -68,7 +71,19 @@ impl AiExecutionContext {
             lab_import: false,
             lab_registry_read,
             access_grant,
+            session_id: None,
+            max_autonomy_mode: AiAutonomyMode::Full,
         }
+    }
+
+    pub const fn with_autonomy_context(
+        mut self,
+        session_id: Option<Uuid>,
+        max_mode: AiAutonomyMode,
+    ) -> Self {
+        self.session_id = session_id;
+        self.max_autonomy_mode = max_mode;
+        self
     }
 
     pub fn allows_project(&self, project_id: Uuid) -> bool {
@@ -191,11 +206,29 @@ impl AiWorkflowService {
         let resolved = self.resolve_conversation(context, &request).await?;
         let conversation_id = resolved.conversation_id;
         let project_id = resolved.project_id;
+        let ai_audit = ai_audit(context, "assistant_turn");
+        let (mut stored_autonomy, mut autonomy) =
+            self.effective_autonomy(context, conversation_id).await?;
+        if autonomy.effective_mode == AiAutonomyMode::Full {
+            if let Some(grant) = stored_autonomy.as_mut() {
+                let expected_revision = grant.meta.revision;
+                let now = Utc::now();
+                grant.last_used_at = now;
+                grant.expires_at = Some(now + Duration::minutes(30));
+                grant.meta.touch(now);
+                self.operations
+                    .save_ai_autonomy_grant(grant, Some(expected_revision), &ai_audit)
+                    .await?;
+                autonomy.revision = grant.meta.revision;
+                autonomy.expires_at = grant.expires_at;
+            }
+        }
         let (scoped_projects, writable_projects) = scoped_project_access(context, project_id);
         let tool_access = StoreToolAccessContext::new(context.lab_id, scoped_projects)
             .with_lab_registry_read(context.lab_registry_read && project_id.is_none())
             .with_writable_projects(writable_projects);
-        let mut executor = StoreDomainToolExecutor::new(self.store.clone(), tool_access);
+        let mut executor = StoreDomainToolExecutor::new(self.store.clone(), tool_access)
+            .with_autonomy_mode(autonomy.effective_mode);
         if let Some(data_tools) = &self.data_tools {
             executor = executor.with_data_tools(
                 context.data_access_for_conversation(project_id),
@@ -216,7 +249,6 @@ impl AiWorkflowService {
             )
             .await?;
 
-        let ai_audit = ai_audit(context, "assistant_turn");
         if let Some(conversation) = resolved.new_conversation.as_ref() {
             self.operations
                 .create_ai_conversation(conversation, &ai_audit)
@@ -224,7 +256,8 @@ impl AiWorkflowService {
         }
         self.persist_tool_runs(context, conversation_id, project_id, &response, &ai_audit)
             .await?;
-        let turn_response = AssistantTurnResponse::from_service(conversation_id, response);
+        let turn_response =
+            AssistantTurnResponse::from_service(conversation_id, response, autonomy);
         self.persist_turn_messages(
             context,
             project_id,
@@ -235,6 +268,113 @@ impl AiWorkflowService {
         )
         .await?;
         Ok(turn_response)
+    }
+
+    pub async fn get_autonomy(
+        &self,
+        context: &AiExecutionContext,
+        conversation_id: Uuid,
+    ) -> Result<AiAutonomyView, AiWorkflowError> {
+        let conversation = self.operations.get_ai_conversation(conversation_id).await?;
+        authorize_conversation(context, &conversation)?;
+        self.effective_autonomy(context, conversation_id)
+            .await
+            .map(|(_, view)| view)
+    }
+
+    pub async fn set_autonomy(
+        &self,
+        context: &AiExecutionContext,
+        conversation_id: Uuid,
+        request: AiAutonomyUpdateRequest,
+        step_up_verified: bool,
+        audit: &AuditContext,
+    ) -> Result<AiAutonomyView, AiWorkflowError> {
+        let conversation = self.operations.get_ai_conversation(conversation_id).await?;
+        authorize_conversation(context, &conversation)?;
+        if audit.actor.actor_type != ActorType::Human
+            || audit.actor.user_id != Some(context.user_id)
+            || request.expected_revision < 0
+            || request.mode > context.max_autonomy_mode
+            || (request.mode == AiAutonomyMode::Full && !step_up_verified)
+        {
+            return Err(AiWorkflowError::Forbidden);
+        }
+        let now = Utc::now();
+        let existing = self
+            .operations
+            .get_ai_autonomy_grant(conversation_id)
+            .await?;
+        if existing.as_ref().map_or(0, |value| value.meta.revision) != request.expected_revision {
+            return Err(
+                StoreError::Conflict("AI autonomy grant revision changed".to_owned()).into(),
+            );
+        }
+        let expected_revision = existing.as_ref().map(|value| value.meta.revision);
+        let mut grant = existing.unwrap_or_else(|| AiAutonomyGrant {
+            id: Uuid::new_v4(),
+            conversation_id,
+            lab_id: conversation.lab_id,
+            project_id: conversation.project_id,
+            user_id: conversation.user_id,
+            session_id: None,
+            mode: AiAutonomyMode::Ask,
+            allowed_categories: vec![AiActionCategory::Read],
+            batch_limit: 1,
+            step_up_verified_at: None,
+            last_used_at: now,
+            expires_at: None,
+            revoked_at: None,
+            meta: RecordMeta::new(now),
+        });
+        grant.mode = request.mode;
+        grant.allowed_categories = match request.mode {
+            AiAutonomyMode::Ask => vec![AiActionCategory::Read],
+            AiAutonomyMode::Auto | AiAutonomyMode::Full => vec![
+                AiActionCategory::Read,
+                AiActionCategory::Artifact,
+                AiActionCategory::ReversibleDraft,
+            ],
+        };
+        grant.batch_limit = request.mode.batch_limit();
+        grant.session_id = (request.mode == AiAutonomyMode::Full)
+            .then_some(context.session_id)
+            .flatten();
+        grant.step_up_verified_at = (request.mode == AiAutonomyMode::Full).then_some(now);
+        grant.last_used_at = now;
+        grant.expires_at =
+            (request.mode == AiAutonomyMode::Full).then_some(now + Duration::minutes(30));
+        grant.revoked_at = None;
+        if expected_revision.is_some() {
+            grant.meta.touch(now);
+        }
+        self.operations
+            .save_ai_autonomy_grant(&grant, expected_revision, audit)
+            .await?;
+        Ok(autonomy_view(
+            Some(&grant),
+            context.max_autonomy_mode,
+            context.session_id,
+            now,
+        ))
+    }
+
+    async fn effective_autonomy(
+        &self,
+        context: &AiExecutionContext,
+        conversation_id: Uuid,
+    ) -> Result<(Option<AiAutonomyGrant>, AiAutonomyView), AiWorkflowError> {
+        let grant = self
+            .operations
+            .get_ai_autonomy_grant(conversation_id)
+            .await?;
+        let view = autonomy_view(
+            grant.as_ref(),
+            context.max_autonomy_mode,
+            context.session_id,
+            Utc::now(),
+        );
+        Ok((grant, view))
     }
 
     pub async fn list_conversations(
@@ -756,6 +896,31 @@ fn authorize_conversation(
         Err(AiWorkflowError::Forbidden)
     } else {
         Ok(())
+    }
+}
+
+fn autonomy_view(
+    grant: Option<&AiAutonomyGrant>,
+    max_mode: AiAutonomyMode,
+    session_id: Option<Uuid>,
+    now: chrono::DateTime<Utc>,
+) -> AiAutonomyView {
+    let requested = grant.map_or(AiAutonomyMode::Ask, |value| value.mode);
+    let effective = grant
+        .map_or(AiAutonomyMode::Ask, |value| {
+            value.effective_mode(now, session_id)
+        })
+        .min(max_mode);
+    AiAutonomyView {
+        mode: requested,
+        effective_mode: effective,
+        max_mode,
+        batch_limit: effective.batch_limit(),
+        revision: grant.map_or(0, |value| value.meta.revision),
+        expires_at: (effective == AiAutonomyMode::Full)
+            .then(|| grant.and_then(|value| value.expires_at))
+            .flatten(),
+        requires_human_approval: crate::transport::hard_boundaries(),
     }
 }
 

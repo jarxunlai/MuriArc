@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{Animal, AnimalEvent, AnimalEventKind, Genotype, Measurement, Pedigree, RecordStatus};
+use crate::{
+    Animal, AnimalEvent, AnimalEventKind, GenotypingRecord, Measurement, Pedigree, RecordStatus,
+};
 
 pub const MAX_IMPORT_ENTITIES: usize = 50_000;
 
@@ -23,7 +25,7 @@ pub struct ImportPlan {
     pub preview_hash: String,
     pub animals: Vec<Animal>,
     pub animal_events: Vec<AnimalEvent>,
-    pub genotypes: Vec<Genotype>,
+    pub genotyping_records: Vec<GenotypingRecord>,
     pub pedigrees: Vec<Pedigree>,
     pub measurements: Vec<Measurement>,
 }
@@ -41,7 +43,7 @@ impl ImportPlan {
             preview_hash: preview_hash.into(),
             animals: Vec::new(),
             animal_events: Vec::new(),
-            genotypes: Vec::new(),
+            genotyping_records: Vec::new(),
             pedigrees: Vec::new(),
             measurements: Vec::new(),
         }
@@ -51,7 +53,9 @@ impl ImportPlan {
         ImportEntityCounts {
             animals: self.animals.len(),
             animal_events: self.animal_events.len(),
-            genotypes: self.genotypes.len(),
+            // Keep the receipt field name stable for existing API clients and
+            // import_commits rows; it now counts Genetics v2 records.
+            genotypes: self.genotyping_records.len(),
             pedigrees: self.pedigrees.len(),
             measurements: self.measurements.len(),
         }
@@ -92,8 +96,8 @@ impl ImportPlan {
             self.animal_events.iter().map(|event| event.id),
         )?;
         unique_ids(
-            "genotype",
-            self.genotypes.iter().map(|genotype| genotype.id),
+            "genotyping_record",
+            self.genotyping_records.iter().map(|record| record.id),
         )?;
         unique_ids(
             "pedigree",
@@ -182,14 +186,17 @@ impl ImportPlan {
                 });
             }
         }
-        if self
-            .genotypes
+        if self.genotyping_records.iter().any(|record| {
+            record.lab_id != self.lab_id
+                || !imported_animals.contains(&record.animal_id)
+                || record.supersedes_record_id.is_some()
+                || record.is_voided()
+                || record.meta.deleted_at.is_some()
+                || record.validate().is_err()
+        }) || self
+            .pedigrees
             .iter()
-            .any(|genotype| !imported_animals.contains(&genotype.animal_id))
-            || self
-                .pedigrees
-                .iter()
-                .any(|pedigree| !imported_animals.contains(&pedigree.animal_id))
+            .any(|pedigree| !imported_animals.contains(&pedigree.animal_id))
         {
             return Err(ImportPlanError::CrossLabOrUnresolvedAnimal);
         }

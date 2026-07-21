@@ -1,14 +1,15 @@
 use std::{path::Path, sync::Arc};
 
 use muriarc_ai::{
-    AccessGrant, AiExecutionContext, AiWorkflowError, AiWorkflowService, ApprovalDecision,
-    ApprovalRequirement, AssistantConversationDetail, AssistantConversationSummary,
-    AssistantTurnRequest, AssistantTurnResponse, DraftDecisionRequest, DraftDecisionResponse,
-    DraftStatus, ScopeSet, ToolScope, WriteDraftSummary,
+    AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiExecutionContext, AiWorkflowError,
+    AiWorkflowService, ApprovalDecision, ApprovalRequirement, AssistantConversationDetail,
+    AssistantConversationSummary, AssistantTurnRequest, AssistantTurnResponse,
+    DraftDecisionRequest, DraftDecisionResponse, DraftStatus, ScopeSet, ToolScope,
+    WriteDraftSummary,
 };
 use muriarc_core::{
-    Actor, AiOperationStore, AuditContext, LOCAL_LAB_ID, LOCAL_USER_ID, MuriArcStore, StoreError,
-    WriteSource,
+    Actor, AiAutonomyMode, AiOperationStore, AuditContext, LOCAL_LAB_ID, LOCAL_USER_ID,
+    MuriArcStore, StoreError, WriteSource,
 };
 use muriarc_store_sqlite::SqliteStore;
 use thiserror::Error;
@@ -79,6 +80,46 @@ impl DesktopAiState {
     ) -> Result<AssistantConversationDetail, DesktopAiError> {
         self.workflow
             .get_conversation(&self.context().await?, conversation_id, limit)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn get_autonomy(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<AiAutonomyView, DesktopAiError> {
+        self.workflow
+            .get_autonomy(&self.context().await?, conversation_id)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn set_autonomy(
+        &self,
+        conversation_id: Uuid,
+        input: DesktopAutonomyInput,
+    ) -> Result<AiAutonomyView, DesktopAiError> {
+        let context = self.context().await?;
+        if input.mode == AiAutonomyMode::Full && !input.declared {
+            return Err(DesktopAiError::AutonomyDeclarationRequired);
+        }
+        let audit = AuditContext {
+            actor: Actor::human(context.user_id, context.user_display_name.clone()),
+            source: WriteSource::Desktop,
+            request_id: Some(Uuid::new_v4().to_string()),
+            reason: Some("update_ai_autonomy".to_owned()),
+        };
+        self.workflow
+            .set_autonomy(
+                &context,
+                conversation_id,
+                AiAutonomyUpdateRequest {
+                    mode: input.mode,
+                    expected_revision: input.expected_revision,
+                },
+                input.mode == AiAutonomyMode::Full && input.declared,
+                &audit,
+            )
             .await
             .map_err(Into::into)
     }
@@ -171,6 +212,15 @@ pub(crate) struct DesktopDraftDecisionInput {
     pub statement: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DesktopAutonomyInput {
+    pub mode: AiAutonomyMode,
+    pub expected_revision: i64,
+    #[serde(default)]
+    pub declared: bool,
+}
+
 fn trusted_desktop_decision(
     requirement: ApprovalRequirement,
     input: DesktopDraftDecisionInput,
@@ -214,12 +264,16 @@ pub(crate) enum DesktopAiError {
     Forbidden,
     #[error("加强确认必须填写不超过 500 字的人工声明")]
     InvalidApprovalStatement,
+    #[error("Full 模式需要明确确认其仅适用于当前会话，且不会绕过人工审批边界")]
+    AutonomyDeclarationRequired,
 }
 
 impl DesktopAiError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::InvalidId | Self::InvalidApprovalStatement => "validation",
+            Self::InvalidId
+            | Self::InvalidApprovalStatement
+            | Self::AutonomyDeclarationRequired => "validation",
             Self::Forbidden | Self::Workflow(AiWorkflowError::Forbidden) => "forbidden",
             Self::Settings(SettingsError::Disabled | SettingsError::MissingCredential) => {
                 "ai_not_configured"

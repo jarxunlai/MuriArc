@@ -9,7 +9,9 @@ mod data;
 mod research_extensions;
 mod settings;
 
-use ai::{DesktopAiError, DesktopAiState, DesktopDraftDecisionInput, parse_uuid};
+use ai::{
+    DesktopAiError, DesktopAiState, DesktopAutonomyInput, DesktopDraftDecisionInput, parse_uuid,
+};
 use animal_details::{
     AlleleView, AnimalDetailView, CreateAlleleInput, CreateAnimalSampleInput, CreateGeneLocusInput,
     CreateGenotypeInput, CreatePedigreeInput, GeneLocusView, GenotypeView, PedigreeRelationView,
@@ -29,8 +31,9 @@ use data::{
     RemapDataImportInput, UploadAttachmentInput,
 };
 use muriarc_ai::{
-    AssistantConversationDetail, AssistantConversationSummary, AssistantTurnRequest,
-    AssistantTurnResponse, DraftDecisionResponse, DraftStatus, WriteDraftSummary,
+    AiAutonomyView, AssistantConversationDetail, AssistantConversationSummary,
+    AssistantTurnRequest, AssistantTurnResponse, DraftDecisionResponse, DraftStatus,
+    WriteDraftSummary,
 };
 use research_extensions::{
     BreedingPredictionInput, CreateBreedingLineInput, CreateBreedingPairInput,
@@ -695,6 +698,29 @@ async fn get_ai_conversation(
 }
 
 #[tauri::command]
+async fn get_ai_autonomy(
+    state: tauri::State<'_, DesktopAiState>,
+    conversation_id: String,
+) -> CommandResult<AiAutonomyView> {
+    state
+        .get_autonomy(parse_uuid(&conversation_id)?)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn set_ai_autonomy(
+    state: tauri::State<'_, DesktopAiState>,
+    conversation_id: String,
+    input: DesktopAutonomyInput,
+) -> CommandResult<AiAutonomyView> {
+    state
+        .set_autonomy(parse_uuid(&conversation_id)?, input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 async fn list_ai_drafts(
     state: tauri::State<'_, DesktopAiState>,
     project_id: Option<String>,
@@ -899,6 +925,8 @@ pub fn run() {
             ai_turn,
             list_ai_conversations,
             get_ai_conversation,
+            get_ai_autonomy,
+            set_ai_autonomy,
             list_ai_drafts,
             get_ai_draft,
             decide_ai_draft,

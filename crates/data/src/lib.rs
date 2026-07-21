@@ -22,8 +22,8 @@ use chrono::{DateTime, Utc};
 use muriarc_core::{
     AnimalFilter, Attachment, AuditContext, AuditFilter, ExperimentFilter, FieldValueType,
     ImportCommitOptions, ImportCommitResult, ImportPlan, Job, MeasurementFilter, MuriArcStore,
-    ObservationFilter, ParticipationFilter, ProvenanceFilter, SampleFilter, Sex, StoreError,
-    TemplateStatus,
+    ObservationFilter, ParticipationFilter, ProjectAnimalAssignmentFilter, ProvenanceFilter,
+    SampleFilter, Sex, StoreError, TemplateStatus,
 };
 use muriarc_importer::{
     AnimalDirectory, AnimalExportFilter, AnimalExportRecord, CageDirectory, ExportCage,
@@ -1049,6 +1049,13 @@ pub async fn build_lab_snapshot(
             ..AnimalFilter::default()
         })
         .await?;
+    let mut project_animal_assignments = store
+        .list_project_animal_assignments(&ProjectAnimalAssignmentFilter {
+            lab_id,
+            project_id: None,
+            animal_id: None,
+        })
+        .await?;
     projects.sort_by_key(|record| record.id);
     cages.sort_by_key(|record| record.id);
     animals.sort_by_key(|record| record.id);
@@ -1164,6 +1171,7 @@ pub async fn build_lab_snapshot(
         })
         .await?;
     sort_by_id(&mut events, |value| value.id);
+    sort_by_id(&mut project_animal_assignments, |value| value.id);
     sort_by_id(&mut loci, |value| value.id);
     sort_by_id(&mut alleles, |value| value.id);
     sort_by_id(&mut genotypes, |value| value.id);
@@ -1196,6 +1204,7 @@ pub async fn build_lab_snapshot(
         jsonl_entry("project", &projects)?,
         jsonl_entry("cage", &cages)?,
         jsonl_entry("animal", &animals)?,
+        jsonl_entry("project_animal_assignment", &project_animal_assignments)?,
         jsonl_entry("animal_event", &events)?,
         jsonl_entry("gene_locus", &loci)?,
         jsonl_entry("allele", &alleles)?,

@@ -624,6 +624,8 @@ pub(crate) async fn authenticate_request(
 ) -> Result<Response, ApiError> {
     let metadata = request_metadata(request.headers());
     let request_id = metadata.request_id.clone();
+    let method_name = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
 
     let (principal, method) = match bearer_token(request.headers())
         .map_err(|error| error.into_api_error().with_request_id(request_id.clone()))?
@@ -657,11 +659,28 @@ pub(crate) async fn authenticate_request(
         }
     };
 
-    request.extensions_mut().insert(principal);
+    request.extensions_mut().insert(principal.clone());
     request.extensions_mut().insert(method);
     request.extensions_mut().insert(metadata);
 
     let response = next.run(request).await;
+    let status_code = response.status().as_u16();
+    let technical_logs = state.technical_logs.clone();
+    let event = crate::TechnicalLogEvent {
+        id: Uuid::new_v4(),
+        lab_id: principal.lab_id,
+        user_id: Some(principal.user_id),
+        request_id: Some(request_id.clone()),
+        method: method_name,
+        path,
+        status_code,
+        occurred_at: Utc::now(),
+    };
+    tokio::spawn(async move {
+        if let Err(error) = technical_logs.record(event).await {
+            tracing::warn!(error = %error, "technical request log could not be persisted");
+        }
+    });
     Ok(with_request_id(response, &request_id))
 }
 

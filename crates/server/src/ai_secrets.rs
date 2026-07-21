@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use muriarc_ai::{BuiltinProvider, ProviderKind};
 #[cfg(feature = "postgres")]
 use muriarc_ai::{ProviderConfig, ProviderCredentials};
-use muriarc_core::AuditContext;
+use muriarc_core::{AiAutonomyMode, AuditContext};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -123,6 +123,7 @@ pub struct AiLabSettingsView {
     pub enabled_user_count: i64,
     pub vision_user_count: i64,
     pub revision: i64,
+    pub max_autonomy_mode: AiAutonomyMode,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +131,29 @@ pub struct AiLabSettingsView {
 pub struct SaveAiLabSettingsInput {
     pub enabled: bool,
     pub custom_url_approval_required: bool,
+    #[serde(default = "default_max_autonomy_mode")]
+    pub max_autonomy_mode: AiAutonomyMode,
+}
+
+const fn default_max_autonomy_mode() -> AiAutonomyMode {
+    AiAutonomyMode::Full
+}
+
+const fn autonomy_mode_name(mode: AiAutonomyMode) -> &'static str {
+    match mode {
+        AiAutonomyMode::Ask => "ask",
+        AiAutonomyMode::Auto => "auto",
+        AiAutonomyMode::Full => "full",
+    }
+}
+
+fn parse_autonomy_mode(value: &str) -> Result<AiAutonomyMode, AiProviderStoreError> {
+    match value {
+        "ask" => Ok(AiAutonomyMode::Ask),
+        "auto" => Ok(AiAutonomyMode::Auto),
+        "full" => Ok(AiAutonomyMode::Full),
+        _ => Err(AiProviderStoreError::Storage),
+    }
 }
 
 #[derive(Debug, Error)]
@@ -856,8 +880,8 @@ mod postgres {
             &self,
             lab_id: Uuid,
         ) -> Result<AiLabSettingsView, AiProviderStoreError> {
-            let settings: Option<(bool, bool, i64)> = sqlx::query_as(
-                "SELECT enabled, custom_url_approval_required, revision FROM ai_lab_settings WHERE lab_id = $1",
+            let settings: Option<(bool, bool, String, i64)> = sqlx::query_as(
+                "SELECT enabled, custom_url_approval_required, max_autonomy_mode, revision FROM ai_lab_settings WHERE lab_id = $1",
             )
             .bind(lab_id)
             .fetch_optional(self.postgres.pool())
@@ -870,8 +894,8 @@ mod postgres {
             .fetch_one(self.postgres.pool())
             .await
             .map_err(|_| AiProviderStoreError::Storage)?;
-            let (enabled, custom_url_approval_required, revision) =
-                settings.unwrap_or((true, true, 0));
+            let (enabled, custom_url_approval_required, max_autonomy_mode, revision) =
+                settings.unwrap_or((true, true, "full".to_owned(), 0));
             Ok(AiLabSettingsView {
                 enabled,
                 custom_url_approval_required,
@@ -879,6 +903,7 @@ mod postgres {
                 enabled_user_count: counts.1,
                 vision_user_count: counts.2,
                 revision,
+                max_autonomy_mode: parse_autonomy_mode(&max_autonomy_mode)?,
             })
         }
 
@@ -902,7 +927,7 @@ mod postgres {
                 return Err(AiProviderStoreError::Storage);
             }
             let before: Option<Value> = sqlx::query(
-                "SELECT enabled, custom_url_approval_required, revision FROM ai_lab_settings WHERE lab_id = $1 FOR UPDATE",
+                "SELECT enabled, custom_url_approval_required, max_autonomy_mode, revision FROM ai_lab_settings WHERE lab_id = $1 FOR UPDATE",
             )
             .bind(lab_id)
             .fetch_optional(&mut *transaction)
@@ -912,15 +937,17 @@ mod postgres {
                 json!({
                     "enabled": row.try_get::<bool, _>("enabled").unwrap_or(true),
                     "custom_url_approval_required": row.try_get::<bool, _>("custom_url_approval_required").unwrap_or(true),
+                    "max_autonomy_mode": row.try_get::<String, _>("max_autonomy_mode").unwrap_or_else(|_| "full".to_owned()),
                     "revision": row.try_get::<i64, _>("revision").unwrap_or(0),
                 })
             });
             let row = sqlx::query(
-                "INSERT INTO ai_lab_settings (lab_id, enabled, custom_url_approval_required, updated_by, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,now(),now(),1) ON CONFLICT (lab_id) DO UPDATE SET enabled = EXCLUDED.enabled, custom_url_approval_required = EXCLUDED.custom_url_approval_required, updated_by = EXCLUDED.updated_by, updated_at = now(), revision = ai_lab_settings.revision + 1 RETURNING enabled, custom_url_approval_required, revision",
+                "INSERT INTO ai_lab_settings (lab_id, enabled, custom_url_approval_required, max_autonomy_mode, updated_by, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,$5,now(),now(),1) ON CONFLICT (lab_id) DO UPDATE SET enabled = EXCLUDED.enabled, custom_url_approval_required = EXCLUDED.custom_url_approval_required, max_autonomy_mode = EXCLUDED.max_autonomy_mode, updated_by = EXCLUDED.updated_by, updated_at = now(), revision = ai_lab_settings.revision + 1 RETURNING enabled, custom_url_approval_required, max_autonomy_mode, revision",
             )
             .bind(lab_id)
             .bind(input.enabled)
             .bind(input.custom_url_approval_required)
+            .bind(autonomy_mode_name(input.max_autonomy_mode))
             .bind(actor_user_id)
             .fetch_one(&mut *transaction)
             .await
@@ -928,6 +955,7 @@ mod postgres {
             let after = json!({
                 "enabled": row.try_get::<bool, _>("enabled").map_err(|_| AiProviderStoreError::Storage)?,
                 "custom_url_approval_required": row.try_get::<bool, _>("custom_url_approval_required").map_err(|_| AiProviderStoreError::Storage)?,
+                "max_autonomy_mode": row.try_get::<String, _>("max_autonomy_mode").map_err(|_| AiProviderStoreError::Storage)?,
                 "revision": row.try_get::<i64, _>("revision").map_err(|_| AiProviderStoreError::Storage)?,
             });
             sqlx::query(

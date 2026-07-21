@@ -7,6 +7,7 @@ mod experiment;
 mod genetics;
 mod observation;
 mod organization;
+mod project_animal;
 mod records;
 mod validation;
 
@@ -24,6 +25,7 @@ pub use genetics::*;
 use muriarc_core::{DomainError, StoreError};
 pub use observation::*;
 pub use organization::*;
+pub use project_animal::*;
 pub use records::*;
 use thiserror::Error;
 

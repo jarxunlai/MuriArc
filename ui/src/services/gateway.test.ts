@@ -544,7 +544,7 @@ describe('MuriArc gateway selection', () => {
               },
               genotype: '待确认', projects: [], latest_weight: null,
             }]
-        : url.endsWith('/cages')
+        : url.includes('/cages')
           ? [{ id: 'cage-1', section: 'SPF-A', display_id: 'A01', location: 'R1', capacity: 5 }]
           : {
               id: 'animal-1', display_id: 'M-001', strain: 'C57BL/6J', sex: 'male',

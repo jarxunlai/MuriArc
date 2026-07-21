@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import { Plus, RefreshCw, Search, UsersRound } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Animal, Cage } from '@/domain/models'
 import { gateway } from '@/services/gateway'
+import { currentProjectId, hasLabRegistryAccess } from '@/services/projectContext'
 import PageHeader from '@/components/PageHeader.vue'
 
 const message = useMessage()
@@ -23,6 +24,10 @@ const moveTarget = ref<string | null>(null)
 const busy = ref(false)
 const highlightedCage = ref<string | null>(null)
 const newCage = reactive({ code: '', room: 'SPF-A', rack: 'R1', capacity: 5 })
+const canManageCages = computed(() => gateway.mode === 'local' || hasLabRegistryAccess())
+const accessContext = computed(() => currentProjectId.value
+  ? { projectId: currentProjectId.value }
+  : undefined)
 
 const animalById = computed(() => new Map(animals.value.map((animal) => [animal.id, animal])))
 const roomOptions = computed(() => [...new Set(cages.value.map((cage) => cage.room))].map((value) => ({ label: value, value })))
@@ -40,11 +45,15 @@ const filteredCages = computed(() => {
 })
 const attentionCount = computed(() => cages.value.filter((cage) => cage.status === 'attention').length)
 const totalAnimals = computed(() => cages.value.reduce((sum, cage) => sum + cage.animalIds.length, 0))
+const unassignedAnimals = computed(() => animals.value.filter((animal) => !animal.cageId))
 
 async function load() {
   loading.value = true
   try {
-    ;[cages.value, animals.value] = await Promise.all([gateway.listCages(), gateway.listAnimals()])
+    ;[cages.value, animals.value] = await Promise.all([
+      gateway.listCages(accessContext.value),
+      gateway.listAnimals(accessContext.value),
+    ])
     const focus = route.query.focus
     if (typeof focus === 'string') {
       highlightedCage.value = focus
@@ -57,11 +66,13 @@ function animalLabel(id: string) { return animalById.value.get(id)?.code ?? id }
 function openAnimal(id: string) { void router.push({ path: '/animals', query: { animal: id } }) }
 
 function onDragStart(event: DragEvent, animalId: string) {
+  if (!canManageCages.value) return
   event.dataTransfer?.setData('text/muriarc-animal', animalId)
   if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
 }
 
 async function onDrop(event: DragEvent, cageId: string) {
+  if (!canManageCages.value) return
   const animalId = event.dataTransfer?.getData('text/muriarc-animal')
   if (!animalId) return
   await move([animalId], cageId)
@@ -97,16 +108,23 @@ async function createCage() {
 }
 
 onMounted(load)
+watch(currentProjectId, () => {
+  if (gateway.mode === 'remote') void load()
+})
 </script>
 
 <template>
   <div class="page cages-page">
-    <PageHeader title="笼位视图" section="动物管理" description="按房间与笼架查看动物，桌面端可直接拖放转笼。">
+    <PageHeader title="笼位视图" section="动物管理" :description="canManageCages ? '按房间与笼架查看动物，桌面端可直接拖放转笼。' : '查看当前项目动物所在笼位；转笼仍由动物管理员完成。'">
       <template #actions>
-        <n-button type="primary" @click="showAdd = true"><template #icon><Plus :size="17" /></template>新增笼位</n-button>
+        <n-button v-if="canManageCages" type="primary" @click="showAdd = true"><template #icon><Plus :size="17" /></template>新增笼位</n-button>
         <n-button secondary :loading="loading" @click="load"><template #icon><RefreshCw :size="16" /></template>刷新</n-button>
       </template>
     </PageHeader>
+
+    <n-alert v-if="!canManageCages" type="info" :show-icon="false" class="project-scope-note">
+      当前为项目范围视图，只显示本项目动物身份；笼位中的其他项目动物及实验室总占用不会展示。
+    </n-alert>
 
     <div v-if="attentionCount" class="attention-bar">
       <span><strong>{{ attentionCount }}</strong> 个笼位需要关注</span>
@@ -135,15 +153,15 @@ onMounted(load)
               {{ cage.status === 'attention' ? '需关注' : cage.status === 'empty' ? '空笼' : '正常' }}
             </n-tag>
           </header>
-          <div class="capacity-row"><span>{{ cage.summary }}</span><strong>{{ cage.animalIds.length }} / {{ cage.capacity }}</strong></div>
+          <div class="capacity-row"><span>{{ cage.summary }}</span><strong>{{ canManageCages ? `${cage.animalIds.length} / ${cage.capacity}` : `项目内 ${cage.animalIds.length} 只` }}</strong></div>
           <n-progress type="line" :percentage="Math.round(cage.animalIds.length / cage.capacity * 100)" :show-indicator="false" :height="5" :color="cage.status === 'attention' ? '#d98216' : '#0f5faa'" />
 
           <div v-if="cage.animalIds.length" class="animal-list">
             <button
               v-for="animalId in cage.animalIds" :key="animalId" type="button" class="animal-chip"
-              draggable="true" @dragstart="onDragStart($event, animalId)" @click="openAnimal(animalId)"
+              :draggable="canManageCages" @dragstart="onDragStart($event, animalId)" @click="openAnimal(animalId)"
             >
-              <n-checkbox :checked="selectedAnimalIds.includes(animalId)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animalId] : selectedAnimalIds.filter((id) => id !== animalId)" />
+              <n-checkbox v-if="canManageCages" :checked="selectedAnimalIds.includes(animalId)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animalId] : selectedAnimalIds.filter((id) => id !== animalId)" />
               <span>{{ animalLabel(animalId) }}</span>
               <small>{{ animalById.get(animalId)?.sex === 'male' ? '♂' : '♀' }} · {{ animalById.get(animalId)?.genotype }}</small>
             </button>
@@ -151,13 +169,23 @@ onMounted(load)
           <div v-else class="empty-cage"><UsersRound :size="22" /><span>可接收动物</span></div>
           <footer v-if="cage.note"><span>{{ cage.note }}</span></footer>
         </article>
+
+        <article v-if="unassignedAnimals.length" class="cage-card unassigned-card surface">
+          <header><div><span class="cage-code">未分配笼位</span><small>当前项目动物</small></div><n-tag size="small" :bordered="false">{{ unassignedAnimals.length }} 只</n-tag></header>
+          <div class="animal-list">
+            <button v-for="animal in unassignedAnimals" :key="animal.id" type="button" class="animal-chip" @click="openAnimal(animal.id)">
+              <n-checkbox v-if="canManageCages" :checked="selectedAnimalIds.includes(animal.id)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animal.id] : selectedAnimalIds.filter((id) => id !== animal.id)" />
+              <span>{{ animal.code }}</span><small>{{ animal.sex === 'male' ? '♂' : animal.sex === 'female' ? '♀' : '？' }} · {{ animal.genotype }}</small>
+            </button>
+          </div>
+        </article>
       </div>
     </n-spin>
 
     <n-empty v-if="!loading && !filteredCages.length" description="没有找到匹配的笼位" class="empty-result"><n-button @click="search = ''; room = null">清除筛选</n-button></n-empty>
 
     <transition name="selection">
-      <div v-if="selectedAnimalIds.length" class="selection-bar">
+      <div v-if="canManageCages && selectedAnimalIds.length" class="selection-bar">
         <span>已选择 <strong>{{ selectedAnimalIds.length }}</strong> 只小鼠</span>
         <n-button quaternary size="small" @click="selectedAnimalIds = []">取消</n-button>
         <n-button type="primary" size="small" @click="showMove = true">移动到笼位</n-button>
@@ -182,6 +210,7 @@ onMounted(load)
 </template>
 
 <style scoped>
+.project-scope-note { margin-bottom: 12px; }
 .attention-bar { display: flex; align-items: center; gap: 7px; min-height: 38px; margin-bottom: 12px; padding: 8px 13px; border: 1px solid #efd6ad; border-radius: var(--muri-radius); color: #79511a; background: #fff9ee; font-size: 13px; }
 .attention-bar button { margin-left: auto; border: 0; color: #9a6217; background: transparent; cursor: pointer; font-weight: 600; }
 .toolbar { display: grid; grid-template-columns: minmax(260px, 430px) 180px 1fr; align-items: center; gap: 10px; margin-bottom: 14px; padding: 10px; }
@@ -192,6 +221,7 @@ onMounted(load)
 .cage-card::before { position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--muri-primary); content: ''; }
 .cage-card.status-attention::before { background: var(--muri-warning); }
 .cage-card.status-empty::before { background: var(--muri-border-strong); }
+.cage-card.unassigned-card::before { background: var(--muri-text-tertiary); }
 .cage-card.highlighted { border-color: var(--muri-primary); box-shadow: 0 0 0 3px rgba(15,95,170,.14); }
 .cage-card header { display: flex; align-items: flex-start; justify-content: space-between; }
 .cage-card header > div { display: flex; flex-direction: column; }

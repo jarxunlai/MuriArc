@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use muriarc_core::{
-    AiConversation, AiConversationFilter, AiConversationMessage, AiConversationMessageRole,
-    AiOperationStore, AnimalEvent, AnimalEventKind, Approval, ApprovalDecision, AuditAction,
-    AuditContext, EntityType, Measurement, Provenance, ProvenanceSource, RecordStatus, StoreError,
-    StoreResult, ToolRun, ToolRunStatus,
+    AiAutonomyGrant, AiConversation, AiConversationFilter, AiConversationMessage,
+    AiConversationMessageRole, AiOperationStore, AnimalEvent, AnimalEventKind, Approval,
+    ApprovalDecision, AuditAction, AuditContext, EntityType, Measurement, Provenance,
+    ProvenanceSource, RecordStatus, StoreError, StoreResult, ToolRun, ToolRunStatus,
 };
 use serde_json::Value;
 use sqlx::{Row, Sqlite, sqlite::SqliteRow};
@@ -19,6 +19,7 @@ const CONVERSATION_COLUMNS: &str =
 const MESSAGE_COLUMNS: &str = "id, conversation_id, lab_id, project_id, user_id, sequence, role, content, response_json, created_at, updated_at, deleted_at, revision";
 const TOOL_RUN_COLUMNS: &str = "id, conversation_id, lab_id, project_id, user_id, tool_name, input_json, output_json, status, source, started_at, completed_at, error, created_at, updated_at, deleted_at, revision";
 const APPROVAL_COLUMNS: &str = "id, tool_run_id, requested_diff_json, decision, decided_by, decided_at, reason, created_at, updated_at, deleted_at, revision";
+const AUTONOMY_GRANT_COLUMNS: &str = "id, conversation_id, lab_id, project_id, user_id, session_id, mode, allowed_categories_json, batch_limit, step_up_verified_at, last_used_at, expires_at, revoked_at, created_at, updated_at, deleted_at, revision";
 
 fn parse_json(value: &str) -> StoreResult<Value> {
     serde_json::from_str(value).map_err(|error| StoreError::Serialization(error.to_string()))
@@ -90,6 +91,47 @@ fn approval_from_row(row: &SqliteRow) -> StoreResult<Approval> {
         reason: row.try_get("reason").map_err(map_sqlx)?,
         meta: meta(row)?,
     })
+}
+
+fn autonomy_grant_from_row(row: &SqliteRow) -> StoreResult<AiAutonomyGrant> {
+    Ok(AiAutonomyGrant {
+        id: uuid(row.try_get("id").map_err(map_sqlx)?)?,
+        conversation_id: uuid(row.try_get("conversation_id").map_err(map_sqlx)?)?,
+        lab_id: uuid(row.try_get("lab_id").map_err(map_sqlx)?)?,
+        project_id: optional_uuid(row.try_get("project_id").map_err(map_sqlx)?)?,
+        user_id: uuid(row.try_get("user_id").map_err(map_sqlx)?)?,
+        session_id: optional_uuid(row.try_get("session_id").map_err(map_sqlx)?)?,
+        mode: super::decode(row.try_get("mode").map_err(map_sqlx)?)?,
+        allowed_categories: serde_json::from_str(
+            row.try_get::<String, _>("allowed_categories_json")
+                .map_err(map_sqlx)?
+                .as_str(),
+        )
+        .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        batch_limit: row.try_get::<i64, _>("batch_limit").map_err(map_sqlx)? as u32,
+        step_up_verified_at: row.try_get("step_up_verified_at").map_err(map_sqlx)?,
+        last_used_at: row.try_get("last_used_at").map_err(map_sqlx)?,
+        expires_at: row.try_get("expires_at").map_err(map_sqlx)?,
+        revoked_at: row.try_get("revoked_at").map_err(map_sqlx)?,
+        meta: meta(row)?,
+    })
+}
+
+fn validate_autonomy_grant(value: &AiAutonomyGrant) -> StoreResult<()> {
+    if value.id.is_nil()
+        || value.conversation_id.is_nil()
+        || value.lab_id.is_nil()
+        || value.user_id.is_nil()
+        || value.allowed_categories.is_empty()
+        || value.batch_limit != value.mode.batch_limit()
+        || value.batch_limit > 100
+        || (value.mode == muriarc_core::AiAutonomyMode::Full && value.expires_at.is_none())
+    {
+        return Err(StoreError::Validation(
+            "invalid AI autonomy grant".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_conversation(value: &AiConversation) -> StoreResult<()> {
@@ -522,6 +564,104 @@ impl AiOperationStore for SqliteStore {
         .map_err(map_sqlx)?;
         rows.reverse();
         rows.iter().map(message_from_row).collect()
+    }
+
+    async fn get_ai_autonomy_grant(
+        &self,
+        conversation_id: Uuid,
+    ) -> StoreResult<Option<AiAutonomyGrant>> {
+        let row = sqlx::query(&format!(
+            "SELECT {AUTONOMY_GRANT_COLUMNS} FROM ai_autonomy_grants WHERE conversation_id = ? AND deleted_at IS NULL"
+        ))
+        .bind(conversation_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        row.as_ref().map(autonomy_grant_from_row).transpose()
+    }
+
+    async fn save_ai_autonomy_grant(
+        &self,
+        grant: &AiAutonomyGrant,
+        expected_revision: Option<i64>,
+        audit: &AuditContext,
+    ) -> StoreResult<()> {
+        validate_autonomy_grant(grant)?;
+        if audit.actor.user_id != Some(grant.user_id) {
+            return Err(StoreError::Validation(
+                "AI autonomy grant actor must match its owner".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let conversation = conversation_in_tx(&mut tx, grant.conversation_id).await?;
+        if conversation.lab_id != grant.lab_id
+            || conversation.project_id != grant.project_id
+            || conversation.user_id != grant.user_id
+        {
+            return Err(StoreError::Validation(
+                "AI autonomy grant scope differs from its conversation".to_owned(),
+            ));
+        }
+        let before_row = sqlx::query(&format!(
+            "SELECT {AUTONOMY_GRANT_COLUMNS} FROM ai_autonomy_grants WHERE conversation_id = ? AND deleted_at IS NULL"
+        ))
+        .bind(grant.conversation_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let before = before_row
+            .as_ref()
+            .map(autonomy_grant_from_row)
+            .transpose()?;
+        if before.as_ref().map(|value| value.meta.revision) != expected_revision
+            || expected_revision.is_some_and(|revision| grant.meta.revision != revision + 1)
+            || (expected_revision.is_none() && grant.meta.revision != 1)
+            || before.as_ref().is_some_and(|value| value.id != grant.id)
+        {
+            return Err(StoreError::Conflict(
+                "AI autonomy grant revision changed".to_owned(),
+            ));
+        }
+        let categories = serde_json::to_string(&grant.allowed_categories)
+            .map_err(|error| StoreError::Serialization(error.to_string()))?;
+        if before.is_some() {
+            let result = sqlx::query("UPDATE ai_autonomy_grants SET session_id = ?, mode = ?, allowed_categories_json = ?, batch_limit = ?, step_up_verified_at = ?, last_used_at = ?, expires_at = ?, revoked_at = ?, updated_at = ?, deleted_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL")
+                .bind(grant.session_id.map(|id| id.to_string())).bind(encode(&grant.mode)?).bind(categories)
+                .bind(i64::from(grant.batch_limit)).bind(grant.step_up_verified_at).bind(grant.last_used_at)
+                .bind(grant.expires_at).bind(grant.revoked_at).bind(grant.meta.updated_at).bind(grant.meta.deleted_at)
+                .bind(grant.meta.revision).bind(grant.id.to_string()).bind(expected_revision)
+                .execute(&mut *tx).await.map_err(map_sqlx)?;
+            if result.rows_affected() != 1 {
+                return Err(StoreError::Conflict(
+                    "AI autonomy grant revision changed".to_owned(),
+                ));
+            }
+        } else {
+            sqlx::query("INSERT INTO ai_autonomy_grants (id, conversation_id, lab_id, project_id, user_id, session_id, mode, allowed_categories_json, batch_limit, step_up_verified_at, last_used_at, expires_at, revoked_at, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(grant.id.to_string()).bind(grant.conversation_id.to_string()).bind(grant.lab_id.to_string())
+                .bind(grant.project_id.map(|id| id.to_string())).bind(grant.user_id.to_string())
+                .bind(grant.session_id.map(|id| id.to_string())).bind(encode(&grant.mode)?).bind(categories)
+                .bind(i64::from(grant.batch_limit)).bind(grant.step_up_verified_at).bind(grant.last_used_at)
+                .bind(grant.expires_at).bind(grant.revoked_at).bind(grant.meta.created_at).bind(grant.meta.updated_at)
+                .bind(grant.meta.deleted_at).bind(grant.meta.revision).execute(&mut *tx).await.map_err(map_sqlx)?;
+        }
+        write_audit(
+            &mut tx,
+            grant.lab_id,
+            grant.project_id,
+            EntityType::AiAutonomyGrant,
+            grant.id,
+            if before.is_some() {
+                AuditAction::Update
+            } else {
+                AuditAction::Create
+            },
+            audit,
+            before.as_ref().map(snapshot).transpose()?,
+            Some(snapshot(grant)?),
+        )
+        .await?;
+        tx.commit().await.map_err(map_sqlx)
     }
 
     async fn create_tool_run(&self, tool_run: &ToolRun, audit: &AuditContext) -> StoreResult<()> {

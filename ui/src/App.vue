@@ -9,6 +9,7 @@ import {
   availableProjects,
   currentProjectId,
   hasLabRegistryAccess,
+  isActiveProjectAdmin,
   isLabAdmin as sessionIsLabAdmin,
   setCurrentProject,
 } from '@/services/projectContext'
@@ -29,38 +30,34 @@ const themeOverrides: GlobalThemeOverrides = {
 
 const labRegistryAvailable = computed(() => gateway.mode === 'local' || hasLabRegistryAccess())
 const animalItems = computed(() => [
-  ...(labRegistryAvailable.value ? [{ to: '/cages', label: '笼位视图', icon: Boxes }] : []),
-  { to: '/animals', label: '小鼠档案', icon: Rat },
+  { to: '/cages', label: '笼位视图', icon: Boxes },
+  { to: '/animals', label: '动物档案', icon: Rat },
   ...(labRegistryAvailable.value ? [{ to: '/breeding', label: '繁育管理', icon: Dna }] : []),
 ])
 const isLabAdmin = computed(() => gateway.mode === 'remote' && sessionIsLabAdmin())
-const mainItems = computed(() => [
+const canManageMembers = computed(() => gateway.mode === 'remote'
+  && (sessionIsLabAdmin() || isActiveProjectAdmin()))
+const experimentItems = [
   { to: '/experiments', label: '实验管理', icon: FlaskConical },
   { to: '/data', label: '数据中心', icon: TableProperties },
   { to: '/library', label: '项目资料库', icon: BookOpen },
-  { to: '/operations', label: '操作与审计', icon: ScrollText },
+]
+const toolItems = computed(() => [
+  { to: '/operations', label: '活动记录', icon: ScrollText },
   { to: '/ai', label: 'AI 助手', icon: Bot },
   { to: '/ai/images', label: '私人 AI 图片', icon: Images },
+  ...(canManageMembers.value ? [{ to: '/members', label: '成员管理', icon: Users }] : []),
   ...(isLabAdmin.value ? [
-    { to: '/members', label: '成员管理', icon: Users },
     { to: '/admin/ai', label: 'AI 管理', icon: Bot },
   ] : []),
 ])
-const mobileItems = computed(() => labRegistryAvailable.value
-  ? [
-      { to: '/cages', label: '笼位', icon: Boxes },
-      { to: '/animals', label: '小鼠', icon: Rat },
-      { to: '/experiments', label: '实验', icon: FlaskConical },
-      { to: '/ai', label: 'AI', icon: Bot },
-      { to: '/settings', label: '更多', icon: Menu },
-    ]
-  : [
-      { to: '/animals', label: '小鼠', icon: Rat },
-      { to: '/experiments', label: '实验', icon: FlaskConical },
-      { to: '/data', label: '数据', icon: TableProperties },
-      { to: '/ai', label: 'AI', icon: Bot },
-      { to: '/settings', label: '更多', icon: Menu },
-    ])
+const mobileItems = [
+  { to: '/cages', label: '笼位', icon: Boxes },
+  { to: '/animals', label: '动物', icon: Rat },
+  { to: '/experiments', label: '实验', icon: FlaskConical },
+  { to: '/ai', label: 'AI', icon: Bot },
+  { to: '/settings', label: '更多', icon: Menu },
+]
 const LAB_REGISTRY = '__lab_registry__'
 const projectOptions = computed(() => [
   ...(labRegistryAvailable.value ? [{ label: '实验室 Animal Registry', value: LAB_REGISTRY }] : []),
@@ -81,7 +78,7 @@ async function changeProject(value: string) {
   delete query.animal
   if (projectId) query.project_id = projectId
   else delete query.project_id
-  const path = projectId && (route.name === 'cages' || route.name === 'breeding')
+  const path = projectId && route.name === 'breeding'
     ? '/animals'
     : route.path
   await router.replace({ path, query })
@@ -104,8 +101,12 @@ async function changeProject(value: string) {
             <router-link v-for="item in animalItems" :key="item.to" :to="item.to" class="nav-item" :class="{ active: isActive(item.to) }">
               <component :is="item.icon" :size="18" /><span>{{ item.label }}</span>
             </router-link>
-            <div class="nav-label nav-gap">工作区</div>
-            <router-link v-for="item in mainItems" :key="item.to" :to="item.to" class="nav-item" :class="{ active: isActive(item.to) }">
+            <div class="nav-label nav-gap">实验与数据</div>
+            <router-link v-for="item in experimentItems" :key="item.to" :to="item.to" class="nav-item" :class="{ active: isActive(item.to) }">
+              <component :is="item.icon" :size="18" /><span>{{ item.label }}</span>
+            </router-link>
+            <div class="nav-label nav-gap">管理与工具</div>
+            <router-link v-for="item in toolItems" :key="item.to" :to="item.to" class="nav-item" :class="{ active: isActive(item.to) }">
               <component :is="item.icon" :size="18" /><span>{{ item.label }}</span>
             </router-link>
           </nav>

@@ -8,6 +8,7 @@
 
 pub mod approval;
 pub mod assistant;
+pub mod autonomy;
 pub mod data_tools;
 pub mod provider;
 pub mod query;
@@ -25,6 +26,7 @@ pub use assistant::{
     AssistantService, AssistantUsage, Citation, DomainToolExecutor, DomainToolOutput,
     DomainToolRequest, ToolExecutionError, ToolRunOutcome, ToolRunTrace, fixed_tool_definitions,
 };
+pub use autonomy::AiActionPolicy;
 pub use data_tools::{
     AiDataAccessContext, AiDataApplyResult, AiDataToolBackend, AiExportFormat, AiExportResource,
     ExportCreateArguments, ImportCommitDraftArguments, ImportCommitDraftPayload,
@@ -46,9 +48,9 @@ pub use query::{
 pub use scopes::{AccessGrant, ScopeSet, ToolAuthorizationError, ToolName, ToolScope};
 pub use store_executor::{StoreDomainToolExecutor, StoreToolAccessContext};
 pub use transport::{
-    AssistantConversationDetail, AssistantConversationMessage, AssistantConversationSummary,
-    AssistantTrace, AssistantTurnRequest, AssistantTurnResponse, DraftDecisionRequest,
-    WriteDraftSummary,
+    AiAutonomyUpdateRequest, AiAutonomyView, AssistantConversationDetail,
+    AssistantConversationMessage, AssistantConversationSummary, AssistantTrace,
+    AssistantTurnRequest, AssistantTurnResponse, DraftDecisionRequest, WriteDraftSummary,
 };
 
 pub use workflow::{AiExecutionContext, AiWorkflowError, AiWorkflowService, DraftDecisionResponse};

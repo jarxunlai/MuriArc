@@ -303,7 +303,7 @@ onMounted(() => {
       <router-link v-if="labRegistryAvailable" to="/breeding" class="surface"><Dna :size="18" /><span>繁育管理</span><ChevronRight :size="16" /></router-link>
       <router-link to="/data" class="surface"><Database :size="18" /><span>数据中心</span><ChevronRight :size="16" /></router-link>
       <router-link to="/library" class="surface"><FolderKanban :size="18" /><span>项目资料库</span><ChevronRight :size="16" /></router-link>
-      <router-link to="/operations" class="surface"><ShieldCheck :size="18" /><span>操作与审计</span><ChevronRight :size="16" /></router-link>
+      <router-link to="/operations" class="surface"><ShieldCheck :size="18" /><span>活动记录</span><ChevronRight :size="16" /></router-link>
       <router-link to="/ai/images" class="surface"><Bot :size="18" /><span>私人 AI 图片</span><ChevronRight :size="16" /></router-link>
       <router-link v-if="canManageMembers" to="/members" class="surface"><Users :size="18" /><span>成员管理</span><ChevronRight :size="16" /></router-link>
       <router-link v-if="canManageMembers" to="/admin/ai" class="surface"><Bot :size="18" /><span>AI 管理</span><ChevronRight :size="16" /></router-link>

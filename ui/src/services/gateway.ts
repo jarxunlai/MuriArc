@@ -1,5 +1,8 @@
 import { invoke } from '@tauri-apps/api/core'
 import type {
+  AiAutonomyMode,
+  AiAutonomyUpdateInput,
+  AiAutonomyView,
   AiConversationDetail,
   AiConversationSummary,
   AiDraftDecisionInput,
@@ -52,6 +55,7 @@ import type {
   PedigreeRelation,
   Procedure,
   ProjectRole,
+  ProjectAnimalAssignment,
   ProjectSummary,
   RecordedObservation,
   RegisteredAnimalDraft,
@@ -353,6 +357,7 @@ export interface OperationRecord {
   before?: unknown
   after?: unknown
   occurredAt: string
+  batchCount: number
 }
 export interface AttachmentLinkRecord {
   id: string
@@ -406,6 +411,18 @@ export interface AiLabSettings {
   enabledUserCount: number
   visionUserCount: number
   revision: number
+  maxAutonomyMode: AiAutonomyMode
+}
+export interface TechnicalLogPolicy {
+  maxRows: number
+  minRetentionDays: number
+  revision: number
+}
+export interface TechnicalLogCleanupPreview {
+  totalRows: number
+  eligibleRows: number
+  cutoff: string
+  policyRevision: number
 }
 
 export interface ChangePasswordInput {
@@ -480,7 +497,7 @@ export interface MuriArcGateway {
   readonly displayName: string
   readonly currentSession?: AuthSession
   readonly requiresLocalWelcome?: boolean
-  listCages(): Promise<Cage[]>
+  listCages(context?: AnimalAccessContext): Promise<Cage[]>
   createCage(input: CreateCageInput): Promise<Cage>
   createAnimal(input: CreateAnimalInput): Promise<Animal>
   listAnimals(context?: AnimalAccessContext): Promise<Animal[]>
@@ -515,6 +532,9 @@ export interface MuriArcGateway {
   moveAnimals(animalIds: string[], targetCageId: string): Promise<void>
   createProject(input: CreateProjectInput): Promise<ProjectSummary>
   listProjects(): Promise<ProjectSummary[]>
+  listProjectAnimalAssignments?(projectId: string): Promise<ProjectAnimalAssignment[]>
+  assignAnimalsToProject?(projectId: string, animalIds: string[], reason?: string): Promise<ProjectAnimalAssignment[]>
+  removeAnimalsFromProject?(projectId: string, assignments: Array<{ assignmentId: string; expectedRevision: number }>): Promise<ProjectAnimalAssignment[]>
   listPublishedTemplates(): Promise<ExperimentTemplateSummary[]>
   createPublishedTemplate(input: CreatePublishedTemplateInput): Promise<ExperimentTemplateSummary>
   createExperiment(input: CreateExperimentInput): Promise<Experiment>
@@ -549,8 +569,12 @@ export interface MuriArcGateway {
   testAiSettings?(): Promise<{ ok: boolean; latencyMs: number; errorCode?: string }>
   getAiDiagnostics?(): Promise<AiDiagnostics>
   getAiLabSettings?(): Promise<AiLabSettings>
-  saveAiLabSettings?(input: { enabled: boolean; customUrlApprovalRequired: boolean }): Promise<AiLabSettings>
+  saveAiLabSettings?(input: { enabled: boolean; customUrlApprovalRequired: boolean; maxAutonomyMode: AiAutonomyMode }): Promise<AiLabSettings>
   listOperations?(query?: URLSearchParams): Promise<OperationRecord[]>
+  getTechnicalLogPolicy?(): Promise<TechnicalLogPolicy>
+  saveTechnicalLogPolicy?(input: { maxRows: number; minRetentionDays: number; expectedRevision: number }): Promise<TechnicalLogPolicy>
+  previewTechnicalLogCleanup?(): Promise<TechnicalLogCleanupPreview>
+  cleanupTechnicalLogs?(input: { expectedPolicyRevision: number; expectedEligibleRows: number }): Promise<TechnicalLogCleanupPreview>
   listLibrary?(projectId: string, experimentId?: string): Promise<LibraryRecord[]>
   listPrivateImages?(): Promise<PrivateImageRecord[]>
   uploadPrivateImage?(file: File, conversationId?: string): Promise<PrivateImageRecord>
@@ -561,6 +585,8 @@ export interface MuriArcGateway {
   aiTurn(input: AiTurnInput): Promise<AiTurnResponse>
   listAiConversations(projectId?: string, limit?: number): Promise<AiConversationSummary[]>
   getAiConversation(conversationId: string, limit?: number): Promise<AiConversationDetail>
+  getAiAutonomy?(conversationId: string): Promise<AiAutonomyView>
+  setAiAutonomy?(conversationId: string, input: AiAutonomyUpdateInput): Promise<AiAutonomyView>
   listAiDrafts(projectId?: string, status?: AiDraftStatus): Promise<AiWriteDraft[]>
   getAiDraft(draftId: string): Promise<AiWriteDraft>
   decideAiDraft(draftId: string, input: AiDraftDecisionInput): Promise<AiDraftDecisionResponse>
@@ -569,7 +595,7 @@ export interface MuriArcGateway {
   logout?(): Promise<void>
   changePassword?(input: ChangePasswordInput): Promise<AuthSession>
   updateProfile?(input: UpdateProfileInput): Promise<AuthSession>
-  listManagedUsers?(): Promise<ManagedUser[]>
+  listManagedUsers?(projectId?: string): Promise<ManagedUser[]>
   createManagedUser?(input: CreateManagedUserInput): Promise<ManagedUser>
   updateManagedUserProfile?(userId: string, input: UpdateManagedUserProfileInput): Promise<ManagedUser>
   resetManagedUserPassword?(userId: string, input: ResetManagedUserPasswordInput): Promise<ManagedUser>
@@ -613,7 +639,7 @@ export class LocalTauriGateway implements MuriArcGateway {
     }
   }
 
-  listCages() { return this.call<Cage[]>('list_cages') }
+  listCages(_context?: AnimalAccessContext) { return this.call<Cage[]>('list_cages') }
   createCage(input: CreateCageInput) { return this.call<Cage>('create_cage', { input }) }
   createAnimal(input: CreateAnimalInput) { return this.call<Animal>('create_animal', { input }) }
   listAnimals(_context?: AnimalAccessContext) { return this.call<Animal[]>('list_animals') }
@@ -857,6 +883,19 @@ export class LocalTauriGateway implements MuriArcGateway {
     })
     return mapAiConversationDetail(detail)
   }
+  getAiAutonomy(conversationId: string) {
+    return this.call<AiAutonomyView>('get_ai_autonomy', { conversationId })
+  }
+  setAiAutonomy(conversationId: string, input: AiAutonomyUpdateInput) {
+    return this.call<AiAutonomyView>('set_ai_autonomy', {
+      conversationId,
+      input: {
+        mode: input.mode,
+        expectedRevision: input.expectedRevision,
+        declared: Boolean(input.declared),
+      },
+    })
+  }
   listAiDrafts(projectId?: string, status?: AiDraftStatus) {
     return this.call<AiWriteDraft[]>('list_ai_drafts', { projectId, status })
   }
@@ -882,6 +921,18 @@ interface RawCage {
   display_id: string
   location?: string | null
   capacity: number
+}
+
+interface RawProjectAnimalAssignment {
+  id: string
+  project_id: string
+  animal_id: string
+  assigned_by?: string | null
+  reason?: string | null
+  meta: {
+    created_at: string
+    revision: number
+  }
 }
 
 interface RawAnimal {
@@ -1355,6 +1406,7 @@ interface RawAiTurnResponse {
       total_tokens: number
     }
   }
+  autonomy?: AiAutonomyView
 }
 
 interface RawAiConversationMessage {
@@ -1556,9 +1608,37 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return this.updateSessionUser(response.data)
   }
 
-  async listManagedUsers(): Promise<ManagedUser[]> {
-    const response = await this.request<ApiCollection<ManagedUser>>('/admin/users')
+  async listManagedUsers(projectId?: string): Promise<ManagedUser[]> {
+    const suffix = projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''
+    const response = await this.request<ApiCollection<ManagedUser>>(`/admin/users${suffix}`)
     return response.data
+  }
+
+  async getTechnicalLogPolicy(): Promise<TechnicalLogPolicy> {
+    return (await this.request<ApiItem<TechnicalLogPolicy>>('/admin/technical-logs/policy')).data
+  }
+
+  async saveTechnicalLogPolicy(
+    input: { maxRows: number; minRetentionDays: number; expectedRevision: number },
+  ): Promise<TechnicalLogPolicy> {
+    return (await this.request<ApiItem<TechnicalLogPolicy>>('/admin/technical-logs/policy', {
+      method: 'PUT', body: JSON.stringify(input),
+    })).data
+  }
+
+  async previewTechnicalLogCleanup(): Promise<TechnicalLogCleanupPreview> {
+    return (await this.request<ApiItem<TechnicalLogCleanupPreview>>(
+      '/admin/technical-logs/cleanup/preview',
+    )).data
+  }
+
+  async cleanupTechnicalLogs(
+    input: { expectedPolicyRevision: number; expectedEligibleRows: number },
+  ): Promise<TechnicalLogCleanupPreview> {
+    return (await this.request<ApiItem<TechnicalLogCleanupPreview>>(
+      '/admin/technical-logs/cleanup',
+      { method: 'POST', body: JSON.stringify(input) },
+    )).data
   }
 
   async createManagedUser(input: CreateManagedUserInput): Promise<ManagedUser> {
@@ -1651,12 +1731,57 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return response.data
   }
 
-  async listCages(): Promise<Cage[]> {
+  async listCages(context?: AnimalAccessContext): Promise<Cage[]> {
+    const projectId = activeProjectId(context?.projectId)
+    const query = projectId
+      ? `?project_id=${encodeURIComponent(projectId)}`
+      : ''
     const [cages, animals] = await Promise.all([
-      this.request<ApiCollection<RawCage>>('/cages'),
-      this.request<ApiCollection<RawAnimal>>('/animals'),
+      this.request<ApiCollection<RawCage>>(`/cages${query}`),
+      this.request<ApiCollection<RawAnimal>>(`/animals${query}`),
     ])
     return mapCages(cages.data, animals.data)
+  }
+
+  async listProjectAnimalAssignments(projectId: string): Promise<ProjectAnimalAssignment[]> {
+    const response = await this.request<ApiCollection<RawProjectAnimalAssignment>>(
+      `/projects/${encodeURIComponent(projectId)}/animal-assignments`,
+    )
+    return response.data.map(mapProjectAnimalAssignment)
+  }
+
+  async assignAnimalsToProject(
+    projectId: string,
+    animalIds: string[],
+    reason?: string,
+  ): Promise<ProjectAnimalAssignment[]> {
+    const response = await this.request<ApiItem<RawProjectAnimalAssignment[]>>(
+      `/projects/${encodeURIComponent(projectId)}/animal-assignments`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ animal_ids: animalIds, reason: reason || null }),
+      },
+    )
+    return response.data.map(mapProjectAnimalAssignment)
+  }
+
+  async removeAnimalsFromProject(
+    projectId: string,
+    assignments: Array<{ assignmentId: string; expectedRevision: number }>,
+  ): Promise<ProjectAnimalAssignment[]> {
+    const response = await this.request<ApiItem<RawProjectAnimalAssignment[]>>(
+      `/projects/${encodeURIComponent(projectId)}/animal-assignments`,
+      {
+        method: 'DELETE',
+        body: JSON.stringify({
+          assignments: assignments.map((assignment) => ({
+            assignment_id: assignment.assignmentId,
+            expected_revision: assignment.expectedRevision,
+          })),
+        }),
+      },
+    )
+    return response.data.map(mapProjectAnimalAssignment)
   }
 
   async createCage(input: CreateCageInput): Promise<Cage> {
@@ -1718,8 +1843,8 @@ export class RemoteHttpGateway implements MuriArcGateway {
       const query = projectId
         ? `?project_id=${encodeURIComponent(projectId)}`
         : ''
-      const cagesRequest = !currentAuthSession.value || hasLabRegistryAccess()
-        ? this.request<ApiCollection<RawCage>>('/cages')
+      const cagesRequest = !currentAuthSession.value || hasLabRegistryAccess() || projectId
+        ? this.request<ApiCollection<RawCage>>(`/cages${query}`)
         : Promise.resolve({ data: [], count: 0, request_id: '' })
       const [response, events, cages] = await Promise.all([
         this.request<ApiItem<RawAnimal>>(`/animals/${pathId}${query}`),
@@ -2439,8 +2564,11 @@ export class RemoteHttpGateway implements MuriArcGateway {
   }
 
   async listOperations(query = new URLSearchParams()): Promise<OperationRecord[]> {
-    if (!query.has('limit')) query.set('limit', '200')
-    const response = await this.request<ApiCollection<OperationRecord>>('/operations?' + query.toString())
+    const scopedQuery = new URLSearchParams(query)
+    const projectId = activeProjectId()
+    if (projectId && !scopedQuery.has('project_id')) scopedQuery.set('project_id', projectId)
+    if (!scopedQuery.has('limit')) scopedQuery.set('limit', '200')
+    const response = await this.request<ApiCollection<OperationRecord>>('/operations?' + scopedQuery.toString())
     return response.data
   }
 
@@ -2506,7 +2634,7 @@ export class RemoteHttpGateway implements MuriArcGateway {
   async getAiLabSettings(): Promise<AiLabSettings> {
     return (await this.request<ApiItem<AiLabSettings>>('/admin/ai')).data
   }
-  async saveAiLabSettings(input: { enabled: boolean; customUrlApprovalRequired: boolean }) {
+  async saveAiLabSettings(input: { enabled: boolean; customUrlApprovalRequired: boolean; maxAutonomyMode: AiAutonomyMode }) {
     return (await this.request<ApiItem<AiLabSettings>>('/admin/ai',
       { method: 'PUT', body: JSON.stringify(input) })).data
   }
@@ -2557,6 +2685,31 @@ export class RemoteHttpGateway implements MuriArcGateway {
       `/ai/conversations/${encodeURIComponent(conversationId)}?${query.toString()}`,
     )
     return mapAiConversationDetail(response.data)
+  }
+
+  async getAiAutonomy(conversationId: string): Promise<AiAutonomyView> {
+    const response = await this.request<ApiItem<AiAutonomyView>>(
+      `/ai/conversations/${encodeURIComponent(conversationId)}/autonomy`,
+    )
+    return response.data
+  }
+
+  async setAiAutonomy(
+    conversationId: string,
+    input: AiAutonomyUpdateInput,
+  ): Promise<AiAutonomyView> {
+    const response = await this.request<ApiItem<AiAutonomyView>>(
+      `/ai/conversations/${encodeURIComponent(conversationId)}/autonomy`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          mode: input.mode,
+          expectedRevision: input.expectedRevision,
+          ...(input.currentPassword ? { currentPassword: input.currentPassword } : {}),
+        }),
+      },
+    )
+    return response.data
   }
 
   async listAiDrafts(projectId?: string, status?: AiDraftStatus): Promise<AiWriteDraft[]> {
@@ -2648,6 +2801,25 @@ function mapAiTurn(raw: RawAiTurnResponse): AiTurnResponse {
         totalTokens: raw.trace.usage.total_tokens,
       },
     },
+    autonomy: raw.autonomy ?? defaultAiAutonomy(),
+  }
+}
+
+function defaultAiAutonomy(): AiAutonomyView {
+  return {
+    mode: 'ask',
+    effectiveMode: 'ask',
+    maxMode: 'full',
+    batchLimit: 1,
+    revision: 0,
+    requiresHumanApproval: [
+      'research_signature',
+      'animal_transfer_or_death',
+      'delete_or_bulk_import',
+      'permissions_and_accounts',
+      'audit_or_log_cleanup',
+      'breeding_scientific_facts',
+    ],
   }
 }
 
@@ -3116,6 +3288,20 @@ function mapCages(cages: RawCage[], animals: RawAnimal[]): Cage[] {
   })
 }
 
+function mapProjectAnimalAssignment(
+  raw: RawProjectAnimalAssignment,
+): ProjectAnimalAssignment {
+  return {
+    id: raw.id,
+    projectId: raw.project_id,
+    animalId: raw.animal_id,
+    assignedBy: raw.assigned_by ?? undefined,
+    reason: raw.reason ?? undefined,
+    assignedAt: raw.meta.created_at,
+    revision: raw.meta.revision,
+  }
+}
+
 function mapTemplate(raw: RawTemplate): ExperimentTemplateSummary {
   return { id: raw.id, name: raw.name, version: raw.version }
 }
@@ -3388,7 +3574,7 @@ export class DemoGateway implements MuriArcGateway {
   private readonly store = new DemoDomainStore()
   private readonly aiConversations = new Map<string, AiConversationDetail>()
 
-  async listCages() { await pause(20); return clone(this.store.cages) }
+  async listCages(_context?: AnimalAccessContext) { await pause(20); return clone(this.store.cages) }
   async createCage(input: CreateCageInput) { await pause(20); return this.store.createCage(input) }
   async createAnimal(input: CreateAnimalInput) { await pause(20); return this.store.createAnimal(input) }
   async listAnimals(_context?: AnimalAccessContext) { await pause(20); return clone(this.store.animals) }

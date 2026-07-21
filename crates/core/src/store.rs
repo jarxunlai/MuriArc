@@ -7,8 +7,9 @@ use uuid::Uuid;
 use crate::{
     Animal, AnimalEvent, AnimalOverview, AnimalStatus, AnimalTransfer, AuditContext, AuditEntry,
     Cage, Experiment, ExperimentStatus, ImportCommitOptions, ImportCommitResult, ImportPlan, Lab,
-    Measurement, Membership, Participation, ParticipationStatus, Pedigree, Project, Provenance,
-    ProvenanceSource, Sample, User,
+    Measurement, Membership, Participation, ParticipationStatus, Pedigree, Project,
+    ProjectAnimalAssignment, ProjectAnimalAssignmentRemoval, Provenance, ProvenanceSource, Sample,
+    User,
 };
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -47,6 +48,13 @@ pub struct MembershipFilter {
     pub lab_id: Uuid,
     pub user_id: Option<Uuid>,
     pub project_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectAnimalAssignmentFilter {
+    pub lab_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub animal_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,9 +161,33 @@ pub trait MuriArcStore: crate::WorkspaceStore + Send + Sync {
     async fn get_project(&self, id: Uuid) -> StoreResult<Project>;
     async fn list_projects(&self, lab_id: Uuid) -> StoreResult<Vec<Project>>;
 
+    /// Assigns a bounded selection atomically. Any invalid, duplicate, or
+    /// cross-lab item rejects the complete batch.
+    async fn assign_animals_to_project(
+        &self,
+        assignments: &[ProjectAnimalAssignment],
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>>;
+    async fn list_project_animal_assignments(
+        &self,
+        filter: &ProjectAnimalAssignmentFilter,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>>;
+    /// Soft-deletes a bounded selection atomically using optimistic revisions.
+    async fn remove_animals_from_project(
+        &self,
+        removals: &[ProjectAnimalAssignmentRemoval],
+        deleted_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>>;
+
     async fn create_cage(&self, cage: &Cage, audit: &AuditContext) -> StoreResult<()>;
     async fn get_cage(&self, id: Uuid) -> StoreResult<Cage>;
     async fn list_cages(&self, lab_id: Uuid) -> StoreResult<Vec<Cage>>;
+    async fn list_cages_for_project(
+        &self,
+        lab_id: Uuid,
+        project_id: Uuid,
+    ) -> StoreResult<Vec<Cage>>;
 
     async fn create_animal(&self, animal: &Animal, audit: &AuditContext) -> StoreResult<()>;
     async fn get_animal(&self, id: Uuid) -> StoreResult<Animal>;

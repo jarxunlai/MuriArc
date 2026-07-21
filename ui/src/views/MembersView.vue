@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import { FolderKey, KeyRound, Pencil, RefreshCw, ShieldCheck, Trash2, UserPlus } from '@lucide/vue'
 import PageHeader from '@/components/PageHeader.vue'
@@ -12,6 +12,7 @@ import type {
 } from '@/domain/models'
 import { currentAuthSession, gateway } from '@/services/gateway'
 import { passwordPolicyError, passwordStrength } from '@/services/passwordStrength'
+import { currentProjectId, isLabAdmin } from '@/services/projectContext'
 
 type PendingAction =
   | { kind: 'status'; user: ManagedUser; status: ManagedUser['status'] }
@@ -41,11 +42,17 @@ const currentUserId = computed(() => currentAuthSession.value?.user.id)
 const currentIsEnvironmentRoot = computed(
   () => currentAuthSession.value?.user.isEnvironmentRoot === true,
 )
-const available = typeof gateway.listManagedUsers === 'function'
-  && typeof gateway.createManagedUser === 'function'
-  && typeof gateway.setManagedUserStatus === 'function'
-  && typeof gateway.updateManagedUserProfile === 'function'
-  && typeof gateway.resetManagedUserPassword === 'function'
+const labAdminMode = computed(() => isLabAdmin())
+const projectAdminMode = computed(() => !labAdminMode.value && Boolean(currentProjectId.value))
+const available = computed(() => typeof gateway.listManagedUsers === 'function'
+  && (labAdminMode.value
+    ? typeof gateway.createManagedUser === 'function'
+      && typeof gateway.setManagedUserStatus === 'function'
+      && typeof gateway.updateManagedUserProfile === 'function'
+      && typeof gateway.resetManagedUserPassword === 'function'
+    : typeof gateway.grantProjectRole === 'function'
+      && typeof gateway.updateProjectRole === 'function'
+      && typeof gateway.revokeMembership === 'function'))
 
 const createForm = reactive<{
   email: string
@@ -110,6 +117,7 @@ function errorMessage(error: unknown): string {
 
 function canGovern(user: ManagedUser): boolean {
   if (user.id === currentUserId.value || user.isEnvironmentRoot) return false
+  if (projectAdminMode.value) return true
   if (user.labRole === 'lab_admin' && !currentIsEnvironmentRoot.value) return false
   return true
 }
@@ -125,11 +133,13 @@ async function load() {
   loading.value = true
   try {
     const [loadedUsers, loadedProjects] = await Promise.all([
-      gateway.listManagedUsers(),
+      gateway.listManagedUsers(projectAdminMode.value ? currentProjectId.value : undefined),
       gateway.listProjects(),
     ])
     users.value = loadedUsers
-    projects.value = loadedProjects
+    projects.value = projectAdminMode.value
+      ? loadedProjects.filter((project) => project.id === currentProjectId.value)
+      : loadedProjects
   } catch (error) {
     message.error(`无法读取成员：${errorMessage(error)}`)
   } finally {
@@ -411,19 +421,24 @@ async function resetPassword() {
 }
 
 onMounted(() => void load())
+watch(currentProjectId, () => {
+  if (projectAdminMode.value) void load()
+})
 </script>
 
 <template>
   <div class="page members-page">
-    <PageHeader title="成员管理" description="按 Environment Root、LabAdmin 与项目层级管理共享实验室账号。">
+    <PageHeader title="成员管理" :description="projectAdminMode ? '管理当前项目成员及项目角色；不能修改实验室账号或其他项目。' : '按 Environment Root、LabAdmin 与项目层级管理共享实验室账号。'">
       <template #actions>
         <n-button secondary :loading="loading" @click="load"><template #icon><RefreshCw :size="16" /></template>刷新</n-button>
-        <n-button type="primary" :disabled="!available" @click="createOpen = true"><template #icon><UserPlus :size="16" /></template>新建成员</n-button>
+        <n-button v-if="labAdminMode" type="primary" :disabled="!available" @click="createOpen = true"><template #icon><UserPlus :size="16" /></template>新建成员</n-button>
       </template>
     </PageHeader>
 
     <n-alert type="info" :bordered="false" class="security-alert">
-      账号治理要求当前管理员密码。只有 Environment Root 能创建或治理 LabAdmin；管理员永远不能查看任何用户的现有密码。
+      {{ projectAdminMode
+        ? '项目权限变更要求当前密码并写入审计；最后一名有效 ProjectAdmin 不能被移除或降级。'
+        : '账号治理要求当前管理员密码。只有 Environment Root 能创建或治理 LabAdmin；管理员永远不能查看任何用户的现有密码。' }}
     </n-alert>
 
     <section class="toolbar surface">
@@ -445,7 +460,7 @@ onMounted(() => void load())
           </div>
         </div>
 
-        <div class="role-block">
+        <div v-if="labAdminMode" class="role-block">
           <label>实验室角色</label>
           <n-select
             :value="user.labRole ?? null"
@@ -476,7 +491,7 @@ onMounted(() => void load())
           <span v-else class="empty-grants">尚未加入科研项目</span>
         </div>
 
-        <div class="member-actions">
+        <div v-if="labAdminMode" class="member-actions">
           <n-button secondary :disabled="!canGovern(user)" @click="beginProfile(user)"><template #icon><Pencil :size="15" /></template>编辑账号</n-button>
           <n-button secondary :disabled="!canGovern(user)" @click="beginPasswordReset(user)"><template #icon><KeyRound :size="15" /></template>重置密码</n-button>
           <n-button secondary :type="user.status === 'active' ? 'warning' : 'primary'" :disabled="!canGovern(user)" @click="beginStatus(user)">{{ user.status === 'active' ? '停用账号' : '重新启用' }}</n-button>

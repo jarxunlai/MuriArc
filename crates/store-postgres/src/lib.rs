@@ -141,6 +141,18 @@ fn membership_from_row(row: &PgRow) -> StoreResult<Membership> {
     })
 }
 
+fn project_animal_assignment_from_row(row: &PgRow) -> StoreResult<ProjectAnimalAssignment> {
+    Ok(ProjectAnimalAssignment {
+        id: row.try_get("id").map_err(map_sqlx)?,
+        lab_id: row.try_get("lab_id").map_err(map_sqlx)?,
+        project_id: row.try_get("project_id").map_err(map_sqlx)?,
+        animal_id: row.try_get("animal_id").map_err(map_sqlx)?,
+        assigned_by: row.try_get("assigned_by").map_err(map_sqlx)?,
+        reason: row.try_get("reason").map_err(map_sqlx)?,
+        meta: meta(row)?,
+    })
+}
+
 fn project_from_row(row: &PgRow) -> StoreResult<Project> {
     Ok(Project {
         id: row.try_get("id").map_err(map_sqlx)?,
@@ -946,6 +958,7 @@ const LAB_COLUMNS: &str = "id, name, created_at, updated_at, deleted_at, revisio
 const USER_COLUMNS: &str =
     "id, lab_id, email, display_name, status, created_at, updated_at, deleted_at, revision";
 const MEMBERSHIP_COLUMNS: &str = "id, lab_id, project_id, user_id, lab_role, project_role, created_at, updated_at, deleted_at, revision";
+const PROJECT_ANIMAL_ASSIGNMENT_COLUMNS: &str = "id, lab_id, project_id, animal_id, assigned_by, reason, created_at, updated_at, deleted_at, revision";
 const PROJECT_COLUMNS: &str =
     "id, lab_id, name, description, status, created_at, updated_at, deleted_at, revision";
 const CAGE_COLUMNS: &str = "id, lab_id, section, display_id, location, kind, capacity, sort_order, created_at, updated_at, deleted_at, revision";
@@ -2217,6 +2230,202 @@ impl MuriArcStore for PostgresStore {
         rows.iter().map(project_from_row).collect()
     }
 
+    async fn assign_animals_to_project(
+        &self,
+        assignments: &[ProjectAnimalAssignment],
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>> {
+        if assignments.is_empty() || assignments.len() > 100 {
+            return Err(StoreError::Validation(
+                "project animal assignment batch must contain 1-100 items".to_owned(),
+            ));
+        }
+        let first = &assignments[0];
+        if assignments.iter().any(|assignment| {
+            assignment.lab_id != first.lab_id
+                || assignment.project_id != first.project_id
+                || assignment.meta.deleted_at.is_some()
+                || assignment.meta.revision != 1
+        }) {
+            return Err(StoreError::Validation(
+                "project animal assignments must be one new lab/project batch".to_owned(),
+            ));
+        }
+        if audit.actor.actor_type == ActorType::Human
+            && assignments
+                .iter()
+                .any(|assignment| assignment.assigned_by != audit.actor.user_id)
+        {
+            return Err(StoreError::Validation(
+                "assignment actor must match the human audit actor".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let project_lab: Uuid =
+            sqlx::query_scalar("SELECT lab_id FROM projects WHERE id = $1 AND deleted_at IS NULL")
+                .bind(first.project_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_sqlx)?
+                .ok_or(StoreError::NotFound {
+                    entity: "project",
+                    id: first.project_id,
+                })?;
+        if project_lab != first.lab_id {
+            return Err(StoreError::Validation(
+                "project animal assignment belongs to a different lab".to_owned(),
+            ));
+        }
+        for assignment in assignments {
+            ensure_animal_in_lab(&mut tx, assignment.animal_id, first.lab_id).await?;
+        }
+        for assignment in assignments {
+            sqlx::query("INSERT INTO project_animal_assignments (id, lab_id, project_id, animal_id, assigned_by, reason, created_at, updated_at, deleted_at, revision) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
+                .bind(assignment.id)
+                .bind(assignment.lab_id)
+                .bind(assignment.project_id)
+                .bind(assignment.animal_id)
+                .bind(assignment.assigned_by)
+                .bind(&assignment.reason)
+                .bind(assignment.meta.created_at)
+                .bind(assignment.meta.updated_at)
+                .bind(assignment.meta.deleted_at)
+                .bind(assignment.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            write_audit(
+                &mut tx,
+                assignment.lab_id,
+                Some(assignment.project_id),
+                EntityType::ProjectAnimalAssignment,
+                assignment.id,
+                AuditAction::Create,
+                audit,
+                None,
+                Some(snapshot(assignment)?),
+            )
+            .await?;
+            insert_provenance(
+                &mut tx,
+                &Provenance::from_audit(
+                    assignment.lab_id,
+                    Some(assignment.project_id),
+                    EntityType::ProjectAnimalAssignment,
+                    assignment.id,
+                    audit,
+                    assignment.meta.created_at,
+                ),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(assignments.to_vec())
+    }
+
+    async fn list_project_animal_assignments(
+        &self,
+        filter: &ProjectAnimalAssignmentFilter,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>> {
+        let mut query = QueryBuilder::<Postgres>::new(format!(
+            "SELECT {PROJECT_ANIMAL_ASSIGNMENT_COLUMNS} FROM project_animal_assignments WHERE lab_id = "
+        ));
+        query
+            .push_bind(filter.lab_id)
+            .push(" AND deleted_at IS NULL");
+        if let Some(project_id) = filter.project_id {
+            query.push(" AND project_id = ").push_bind(project_id);
+        }
+        if let Some(animal_id) = filter.animal_id {
+            query.push(" AND animal_id = ").push_bind(animal_id);
+        }
+        query.push(" ORDER BY project_id, created_at, id");
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter()
+            .map(project_animal_assignment_from_row)
+            .collect()
+    }
+
+    async fn remove_animals_from_project(
+        &self,
+        removals: &[ProjectAnimalAssignmentRemoval],
+        deleted_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>> {
+        if removals.is_empty() || removals.len() > 100 {
+            return Err(StoreError::Validation(
+                "project animal removal batch must contain 1-100 items".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let mut assignments = Vec::with_capacity(removals.len());
+        for removal in removals {
+            let row = sqlx::query(&format!(
+                "SELECT {PROJECT_ANIMAL_ASSIGNMENT_COLUMNS} FROM project_animal_assignments WHERE id = $1 AND deleted_at IS NULL FOR UPDATE"
+            ))
+            .bind(removal.assignment_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "project_animal_assignment",
+                id: removal.assignment_id,
+            })?;
+            let assignment = project_animal_assignment_from_row(&row)?;
+            if assignment.meta.revision != removal.expected_revision {
+                return Err(StoreError::Conflict(
+                    "project animal assignment revision changed before removal".to_owned(),
+                ));
+            }
+            assignments.push(assignment);
+        }
+        let scope = (assignments[0].lab_id, assignments[0].project_id);
+        if assignments
+            .iter()
+            .any(|assignment| (assignment.lab_id, assignment.project_id) != scope)
+        {
+            return Err(StoreError::Validation(
+                "project animal removals must belong to one lab/project".to_owned(),
+            ));
+        }
+        for (assignment, removal) in assignments.iter_mut().zip(removals) {
+            let before = assignment.clone();
+            assignment.soft_delete(deleted_at);
+            let result = sqlx::query("UPDATE project_animal_assignments SET updated_at = $1, deleted_at = $1, revision = $2 WHERE id = $3 AND revision = $4 AND deleted_at IS NULL")
+                .bind(assignment.meta.updated_at)
+                .bind(assignment.meta.revision)
+                .bind(assignment.id)
+                .bind(removal.expected_revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            if result.rows_affected() != 1 {
+                return Err(StoreError::Conflict(
+                    "project animal assignment revision changed before removal".to_owned(),
+                ));
+            }
+            write_audit(
+                &mut tx,
+                assignment.lab_id,
+                Some(assignment.project_id),
+                EntityType::ProjectAnimalAssignment,
+                assignment.id,
+                AuditAction::SoftDelete,
+                audit,
+                Some(snapshot(&before)?),
+                Some(snapshot(assignment)?),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(assignments)
+    }
+
     async fn create_cage(&self, cage: &Cage, audit: &AuditContext) -> StoreResult<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let mut q = QueryBuilder::<Postgres>::new(
@@ -2276,6 +2485,22 @@ impl MuriArcStore for PostgresStore {
         q.push_bind(lab_id)
             .push(" AND deleted_at IS NULL ORDER BY sort_order, section, display_id");
         let rows = q.build().fetch_all(&self.pool).await.map_err(map_sqlx)?;
+        rows.iter().map(cage_from_row).collect()
+    }
+
+    async fn list_cages_for_project(
+        &self,
+        lab_id: Uuid,
+        project_id: Uuid,
+    ) -> StoreResult<Vec<Cage>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT c.* FROM cages c JOIN animals a ON a.current_cage_id = c.id AND a.deleted_at IS NULL JOIN project_animal_assignments paa ON paa.animal_id = a.id AND paa.deleted_at IS NULL WHERE c.lab_id = $1 AND c.deleted_at IS NULL AND paa.project_id = $2 ORDER BY c.sort_order, c.section, c.display_id",
+        )
+        .bind(lab_id)
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         rows.iter().map(cage_from_row).collect()
     }
 
@@ -2366,7 +2591,7 @@ impl MuriArcStore for PostgresStore {
         ));
         q.push_bind(filter.lab_id).push(" AND a.deleted_at IS NULL");
         if let Some(project_id) = filter.project_id {
-            q.push(" AND EXISTS (SELECT 1 FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id WHERE ep.animal_id = a.id AND ep.deleted_at IS NULL AND e.deleted_at IS NULL AND e.project_id = ").push_bind(project_id).push(")");
+            q.push(" AND EXISTS (SELECT 1 FROM project_animal_assignments paa WHERE paa.animal_id = a.id AND paa.deleted_at IS NULL AND paa.project_id = ").push_bind(project_id).push(")");
         }
         if let Some(cage_id) = filter.cage_id {
             q.push(" AND a.current_cage_id = ").push_bind(cage_id);
@@ -2415,7 +2640,7 @@ impl MuriArcStore for PostgresStore {
             .push_bind(filter.lab_id)
             .push(" AND a.deleted_at IS NULL");
         if let Some(project_id) = filter.project_id {
-            query.push(" AND EXISTS (SELECT 1 FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id WHERE ep.animal_id = a.id AND ep.deleted_at IS NULL AND e.deleted_at IS NULL AND e.project_id = ");
+            query.push(" AND EXISTS (SELECT 1 FROM project_animal_assignments paa WHERE paa.animal_id = a.id AND paa.deleted_at IS NULL AND paa.project_id = ");
             query.push_bind(project_id);
             query.push(")");
         }
@@ -2511,17 +2736,17 @@ impl MuriArcStore for PostgresStore {
         }
 
         let mut project_query = QueryBuilder::<Postgres>::new(
-            "SELECT DISTINCT ep.animal_id, p.id AS project_id, p.name AS project_name FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id AND e.deleted_at IS NULL JOIN projects p ON p.id = e.project_id AND p.deleted_at IS NULL WHERE ep.deleted_at IS NULL AND p.lab_id = ",
+            "SELECT paa.animal_id, p.id AS project_id, p.name AS project_name FROM project_animal_assignments paa JOIN projects p ON p.id = paa.project_id AND p.deleted_at IS NULL WHERE paa.deleted_at IS NULL AND p.lab_id = ",
         );
         project_query
             .push_bind(filter.lab_id)
-            .push(" AND ep.animal_id IN (");
+            .push(" AND paa.animal_id IN (");
         {
             let mut separated = project_query.separated(", ");
             for id in &ids {
                 separated.push_bind(*id);
             }
-            separated.push_unseparated(") ORDER BY ep.animal_id, p.name, p.id");
+            separated.push_unseparated(") ORDER BY paa.animal_id, p.name, p.id");
         }
         for row in project_query
             .build()
@@ -2590,7 +2815,7 @@ impl MuriArcStore for PostgresStore {
         ));
         query.push_bind(lab_id).push(" AND deleted_at IS NULL");
         if let Some(project_id) = project_id {
-            query.push(" AND EXISTS (SELECT 1 FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id WHERE ep.animal_id = animals.id AND ep.deleted_at IS NULL AND e.deleted_at IS NULL AND e.project_id = ");
+            query.push(" AND EXISTS (SELECT 1 FROM project_animal_assignments paa WHERE paa.animal_id = animals.id AND paa.deleted_at IS NULL AND paa.project_id = ");
             query.push_bind(project_id);
             query.push(")");
         }
@@ -3060,6 +3285,62 @@ impl MuriArcStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let (lab_id, project_id) = experiment_scope(&mut tx, participation.experiment_id).await?;
         ensure_animal_in_lab(&mut tx, participation.animal_id, lab_id).await?;
+        let assigned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM project_animal_assignments WHERE project_id = $1 AND animal_id = $2 AND deleted_at IS NULL",
+        )
+        .bind(project_id)
+        .bind(participation.animal_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if assigned == 0 {
+            let assignment = ProjectAnimalAssignment::new(
+                lab_id,
+                project_id,
+                participation.animal_id,
+                audit.actor.user_id,
+                Some("Assigned during local experiment enrollment".to_owned()),
+                participation.enrolled_at,
+            );
+            sqlx::query("INSERT INTO project_animal_assignments (id, lab_id, project_id, animal_id, assigned_by, reason, created_at, updated_at, deleted_at, revision) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)")
+                .bind(assignment.id)
+                .bind(assignment.lab_id)
+                .bind(assignment.project_id)
+                .bind(assignment.animal_id)
+                .bind(assignment.assigned_by)
+                .bind(&assignment.reason)
+                .bind(assignment.meta.created_at)
+                .bind(assignment.meta.updated_at)
+                .bind(assignment.meta.deleted_at)
+                .bind(assignment.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            write_audit(
+                &mut tx,
+                assignment.lab_id,
+                Some(assignment.project_id),
+                EntityType::ProjectAnimalAssignment,
+                assignment.id,
+                AuditAction::Create,
+                audit,
+                None,
+                Some(snapshot(&assignment)?),
+            )
+            .await?;
+            insert_provenance(
+                &mut tx,
+                &Provenance::from_audit(
+                    assignment.lab_id,
+                    Some(assignment.project_id),
+                    EntityType::ProjectAnimalAssignment,
+                    assignment.id,
+                    audit,
+                    assignment.meta.created_at,
+                ),
+            )
+            .await?;
+        }
         if let Some(cohort_id) = participation.cohort_id {
             let cohort_experiment: Uuid = sqlx::query_scalar(
                 "SELECT experiment_id FROM cohorts WHERE id = $1 AND deleted_at IS NULL",
@@ -6528,7 +6809,7 @@ mod tests {
                 .expect("fresh migration ledger must be readable");
         assert_eq!(
             fresh_versions,
-            (i64::try_from(MIGRATOR.iter().count()).unwrap(), Some(18))
+            (i64::try_from(MIGRATOR.iter().count()).unwrap(), Some(21))
         );
         let fresh_columns: Vec<String> = sqlx::query_scalar(
             "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'user_credentials' ORDER BY column_name",
@@ -6592,7 +6873,7 @@ mod tests {
         MIGRATOR
             .run(&incremental_pool)
             .await
-            .expect("0017 to 0018 migration must succeed");
+            .expect("0017 to current migration must succeed");
         MIGRATOR
             .run(&incremental_pool)
             .await
@@ -6611,6 +6892,13 @@ mod tests {
                 .await
                 .expect("0018 migration ledger entry must be readable");
         assert_eq!(lifecycle_migration_count, 1);
+        let current_migration_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM _sqlx_migrations WHERE version IN (19, 20, 21)",
+        )
+        .fetch_one(&incremental_pool)
+        .await
+        .expect("current migration ledger entries must be readable");
+        assert_eq!(current_migration_count, 3);
         drop_migration_test_database(&admin_pool, &incremental_name, incremental_pool).await;
         admin_pool.close().await;
     }

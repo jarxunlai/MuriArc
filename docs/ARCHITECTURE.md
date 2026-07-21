@@ -19,7 +19,9 @@ Desktop 与 Server 共享核心领域模型、主要业务用例和同一套响�
 ## Domain invariants
 
 - `AnimalId` 为 UUID；旧编号只是带命名空间的 identifier。
-- Animal 属于实验室统一 Registry，通过 Participation 进入 Project/Experiment。
+- Animal 属于实验室统一 Registry。`ProjectAnimalAssignment` 是项目可见性的显式授权关系，
+  只能由实验室动物管理角色批量建立或移除；已分配动物再通过 Participation 进入具体
+  Experiment。Participation 不再承担隐式项目授权。
 - AnimalEvent 是状态变化事实；Animal.current_state 是可重建的查询投影。
 - 已发布 ExperimentTemplateVersion 不可修改，新定义必须创建新版本。
 - Measurement 必须有显式 value type；数值测量同时记录 unit。
@@ -35,6 +37,9 @@ Desktop 与 Server 共享核心领域模型、主要业务用例和同一套响�
   只追加 ObservationValueRecord 并推进 current version，不覆盖历史值。
 - Participation 入组在与基因检测写入相同的 animal-scoped 锁/事务序列中，捕获每个
   GenotypeDefinition 当时最新的检测记录；快照之后不可被新检测回写。
+- 项目成员可读取本项目已分配动物、这些动物所在笼位及本项目实验。项目笼位投影不得暴露
+  同笼但未分配给该项目的动物或由它们推导出的占用统计。ProjectAdmin 可治理本项目成员和
+  实验，但动物跨项目分配、笼位转移等实验室级动作仍由 LabAdmin/AnimalManager 执行。
 
 ## API boundaries
 
@@ -50,6 +55,20 @@ Desktop 与 Server 共享核心领域模型、主要业务用例和同一套响�
   实体、Audit、Provenance 和附件；当前只生成和校验，不支持 restore/apply。
 - MCP/AI 工具只能调用 application use case；禁止数据库连接、raw SQL、任意 HTTP、自动
   MatingEvent 和直接 Animal 修改。当前 MutationDraft 仅能提出结构化 Measurement 草稿。
+- AI 自主度是绑定 conversation、user、project 与运行时 session 的持久授权，不是角色。
+  有效能力取角色权限、项目范围、实验室上限、会话授权和外部 token scope 的交集。Ask 为
+  默认；Auto 只放行受控读取、产物和可逆草稿；Full 需要 step-up，30 分钟空闲后失效。
+  所有 AI 写入仍必须经过结构化 draft/preview/approval，不得把 Full 解释为最终签署权限。
+
+## Operational records
+
+- 面向成员的“操作动态”只投影动物分配/移除、转移、实验入组、测量/样本等关键业务事件，
+  同一 request 的批量动作聚合展示，不直接暴露原始 JSON diff 或内部 UUID。
+- Audit 与 Provenance 是正式不可变记录，不能由保留策略或 root 清理动作删除。
+- Server 技术访问日志与正式审计分表存储。默认最多保留 20,000 行且至少保留 30 天；自动
+  清理和 Environment Root 的手动清理都只能删除“超过数量上限且已超过最短天数”的交集，
+  手动清理必须先预览并用同一 policy revision 确认。Desktop 继续使用固定滚动日志文件，
+  不把技术日志并入业务数据库或 snapshot。
 
 ## Runtime identity hierarchy
 
@@ -57,7 +76,8 @@ Server 的身份层级固定为：
 
 1. **Environment Root**：由宿主机 `.env` 和部署生命周期管理；在应用权限上拥有 LabAdmin 能力，只有它能创建、修改、停用、降级或重置其他 LabAdmin。
 2. **LabAdmin**：治理实验室业务与所有非 LabAdmin 账号，不能修改环境、代码、Environment Root 或同级 LabAdmin。
-3. **ProjectAdmin**：只在获授权 Project 内拥有项目管理和业务权限。
+3. **ProjectAdmin**：只在获授权 Project 内拥有项目管理和业务权限，可管理该项目成员并授予
+   ProjectAdmin；不得管理实验室账号或其他项目，且系统必须阻止移除最后一名有效项目管理员。
 4. **AnimalManager / Editor / Viewer**：分别承担 Lab Animal Registry、项目写入和项目只读职责。
 
 Environment Root 不是新增的领域角色枚举，而是“配置声明的唯一 User ID + 实时 LabAdmin membership”的部署身份。这样现有 Permission/Store contract 保持共享，同时用户治理层能在 LabAdmin 之上实施不可绕过的层级检查。Server 启动同步、Session/external token、Argon2id 凭据和 PostgreSQL 属于 Server adapter；Desktop 不依赖这些组件。

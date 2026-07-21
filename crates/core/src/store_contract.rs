@@ -10,6 +10,29 @@ fn contract_now() -> chrono::DateTime<Utc> {
         .expect("the current UTC timestamp is representable")
 }
 
+async fn assign_project_animal(
+    store: &dyn MuriArcStore,
+    lab_id: uuid::Uuid,
+    project_id: uuid::Uuid,
+    animal_id: uuid::Uuid,
+    audit: &AuditContext,
+    now: chrono::DateTime<Utc>,
+) -> ProjectAnimalAssignment {
+    let assignment = ProjectAnimalAssignment::new(
+        lab_id,
+        project_id,
+        animal_id,
+        audit.actor.user_id,
+        Some("store contract fixture".to_owned()),
+        now,
+    );
+    store
+        .assign_animals_to_project(std::slice::from_ref(&assignment), audit)
+        .await
+        .expect("project animal assignment succeeds");
+    assignment
+}
+
 /// Runs the behavior contract shared by every persistence adapter.
 /// The target store must already be connected to an isolated database.
 pub async fn run_store_contract(store: &dyn MuriArcStore) {
@@ -164,6 +187,33 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
         Err(StoreError::Validation(_))
     ));
 
+    let removable_assignment =
+        assign_project_animal(store, lab.id, project.id, scoped_animal.id, &audit, now).await;
+    let removed_assignments = store
+        .remove_animals_from_project(
+            &[ProjectAnimalAssignmentRemoval {
+                assignment_id: removable_assignment.id,
+                expected_revision: removable_assignment.meta.revision,
+            }],
+            now + Duration::milliseconds(1),
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(removed_assignments.len(), 1);
+    assert!(removed_assignments[0].meta.deleted_at.is_some());
+    assert!(
+        store
+            .list_project_animal_assignments(&ProjectAnimalAssignmentFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                animal_id: Some(scoped_animal.id),
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
     let mut project_membership =
         Membership::project(lab.id, project.id, user.id, ProjectRole::Viewer, now);
     store
@@ -225,6 +275,25 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
     animal.current_cage_id = Some(cage.id);
     store.create_animal(&animal, &audit).await.unwrap();
     assert_eq!(store.get_animal(animal.id).await.unwrap(), animal);
+    let assignment = assign_project_animal(store, lab.id, project.id, animal.id, &audit, now).await;
+    assert_eq!(
+        store
+            .list_project_animal_assignments(&ProjectAnimalAssignmentFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                animal_id: Some(animal.id),
+            })
+            .await
+            .unwrap(),
+        vec![assignment.clone()]
+    );
+    assert_eq!(
+        store
+            .list_cages_for_project(lab.id, project.id)
+            .await
+            .unwrap(),
+        vec![cage.clone()]
+    );
 
     let event = AnimalEvent::new(
         lab.id,
@@ -689,6 +758,7 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
         .create_animal(&lifecycle_animal, &audit)
         .await
         .unwrap();
+    assign_project_animal(store, lab.id, project.id, lifecycle_animal.id, &audit, now).await;
     let mut completed_experiment =
         Experiment::new(lab.id, project.id, "Completed study", now).unwrap();
     completed_experiment.status = ExperimentStatus::Active;
@@ -753,6 +823,7 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
     )
     .unwrap();
     store.create_animal(&terminal_animal, &audit).await.unwrap();
+    assign_project_animal(store, lab.id, project.id, terminal_animal.id, &audit, now).await;
     let mut terminal_experiment =
         Experiment::new(lab.id, project.id, "Terminal status study", now).unwrap();
     terminal_experiment.status = ExperimentStatus::Active;
@@ -1056,6 +1127,7 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         .create_experiment(&experiment, &human_audit)
         .await
         .unwrap();
+    assign_project_animal(store, lab.id, project.id, female.id, &human_audit, now).await;
     let enrollment = Participation::enroll(experiment.id, female.id, now);
     let enrollment = store
         .create_participation(&enrollment, &human_audit)
@@ -1618,6 +1690,66 @@ where
         .unwrap();
     assert_eq!(project_only, vec![conversation.clone()]);
 
+    let mut autonomy = AiAutonomyGrant {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: conversation.id,
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        session_id: Some(uuid::Uuid::new_v4()),
+        mode: AiAutonomyMode::Full,
+        allowed_categories: vec![
+            AiActionCategory::Read,
+            AiActionCategory::Artifact,
+            AiActionCategory::ReversibleDraft,
+        ],
+        batch_limit: 100,
+        step_up_verified_at: Some(now),
+        last_used_at: now,
+        expires_at: Some(now + Duration::minutes(30)),
+        revoked_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .save_ai_autonomy_grant(&autonomy, None, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        Some(autonomy.clone())
+    );
+    let autonomy_revision = autonomy.meta.revision;
+    autonomy.mode = AiAutonomyMode::Auto;
+    autonomy.batch_limit = 20;
+    autonomy.session_id = None;
+    autonomy.step_up_verified_at = None;
+    autonomy.expires_at = None;
+    autonomy.meta.touch(now + Duration::seconds(1));
+    store
+        .save_ai_autonomy_grant(&autonomy, Some(autonomy_revision), &audit)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .save_ai_autonomy_grant(&autonomy, Some(autonomy_revision), &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let autonomy_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_id: Some(autonomy.id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(autonomy_audits.len(), 2);
+    assert!(
+        autonomy_audits
+            .iter()
+            .all(|entry| entry.entity_type == EntityType::AiAutonomyGrant)
+    );
+
     let user_message = AiConversationMessage::new(
         conversation.id,
         lab.id,
@@ -1775,6 +1907,15 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         .create_animal(&measurement_animal, &fixture_audit)
         .await
         .unwrap();
+    assign_project_animal(
+        store,
+        lab.id,
+        project.id,
+        measurement_animal.id,
+        &fixture_audit,
+        now,
+    )
+    .await;
     let measurement_participation =
         Participation::enroll(experiment.id, measurement_animal.id, now);
     store
@@ -2325,6 +2466,9 @@ async fn run_relationship_contract(store: &dyn MuriArcStore, now: chrono::DateTi
         &experiment_b,
     ] {
         store.create_experiment(experiment, &audit).await.unwrap();
+    }
+    for animal_id in [animal_a.id, animal_a_peer.id] {
+        assign_project_animal(store, lab_a.id, project_a.id, animal_id, &audit, now).await;
     }
     for animal_id in [animal_a.id, animal_a_peer.id] {
         let participation = Participation::enroll(experiment_a.id, animal_id, now);

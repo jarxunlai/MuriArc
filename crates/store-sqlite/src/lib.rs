@@ -158,6 +158,18 @@ fn membership_from_row(row: &SqliteRow) -> StoreResult<Membership> {
     })
 }
 
+fn project_animal_assignment_from_row(row: &SqliteRow) -> StoreResult<ProjectAnimalAssignment> {
+    Ok(ProjectAnimalAssignment {
+        id: uuid(row.try_get("id").map_err(map_sqlx)?)?,
+        lab_id: uuid(row.try_get("lab_id").map_err(map_sqlx)?)?,
+        project_id: uuid(row.try_get("project_id").map_err(map_sqlx)?)?,
+        animal_id: uuid(row.try_get("animal_id").map_err(map_sqlx)?)?,
+        assigned_by: optional_uuid(row.try_get("assigned_by").map_err(map_sqlx)?)?,
+        reason: row.try_get("reason").map_err(map_sqlx)?,
+        meta: meta(row)?,
+    })
+}
+
 fn project_from_row(row: &SqliteRow) -> StoreResult<Project> {
     Ok(Project {
         id: uuid(row.try_get("id").map_err(map_sqlx)?)?,
@@ -520,6 +532,7 @@ const LAB_COLUMNS: &str = "id, name, created_at, updated_at, deleted_at, revisio
 const USER_COLUMNS: &str =
     "id, lab_id, email, display_name, status, created_at, updated_at, deleted_at, revision";
 const MEMBERSHIP_COLUMNS: &str = "id, lab_id, project_id, user_id, lab_role, project_role, created_at, updated_at, deleted_at, revision";
+const PROJECT_ANIMAL_ASSIGNMENT_COLUMNS: &str = "id, lab_id, project_id, animal_id, assigned_by, reason, created_at, updated_at, deleted_at, revision";
 const PROJECT_COLUMNS: &str =
     "id, lab_id, name, description, status, created_at, updated_at, deleted_at, revision";
 const CAGE_COLUMNS: &str = "id, lab_id, section, display_id, location, kind, capacity, sort_order, created_at, updated_at, deleted_at, revision";
@@ -1658,6 +1671,196 @@ impl MuriArcStore for SqliteStore {
         rows.iter().map(project_from_row).collect()
     }
 
+    async fn assign_animals_to_project(
+        &self,
+        assignments: &[ProjectAnimalAssignment],
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>> {
+        if assignments.is_empty() || assignments.len() > 100 {
+            return Err(StoreError::Validation(
+                "project animal assignment batch must contain 1-100 items".to_owned(),
+            ));
+        }
+        let first = &assignments[0];
+        if assignments.iter().any(|assignment| {
+            assignment.lab_id != first.lab_id
+                || assignment.project_id != first.project_id
+                || assignment.meta.deleted_at.is_some()
+                || assignment.meta.revision != 1
+        }) {
+            return Err(StoreError::Validation(
+                "project animal assignments must be one new lab/project batch".to_owned(),
+            ));
+        }
+        if audit.actor.actor_type == ActorType::Human
+            && assignments
+                .iter()
+                .any(|assignment| assignment.assigned_by != audit.actor.user_id)
+        {
+            return Err(StoreError::Validation(
+                "assignment actor must match the human audit actor".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let project_lab = required_lab_id(&mut tx, "projects", first.project_id, "project").await?;
+        require_same_uuid(project_lab, first.lab_id, "project animal assignment")?;
+        for assignment in assignments {
+            let animal_lab =
+                required_lab_id(&mut tx, "animals", assignment.animal_id, "animal").await?;
+            require_same_uuid(animal_lab, first.lab_id, "project animal assignment")?;
+        }
+        for assignment in assignments {
+            sqlx::query("INSERT INTO project_animal_assignments (id, lab_id, project_id, animal_id, assigned_by, reason, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(assignment.id.to_string())
+                .bind(assignment.lab_id.to_string())
+                .bind(assignment.project_id.to_string())
+                .bind(assignment.animal_id.to_string())
+                .bind(assignment.assigned_by.map(|id| id.to_string()))
+                .bind(&assignment.reason)
+                .bind(assignment.meta.created_at)
+                .bind(assignment.meta.updated_at)
+                .bind(assignment.meta.deleted_at)
+                .bind(assignment.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            write_audit(
+                &mut tx,
+                assignment.lab_id,
+                Some(assignment.project_id),
+                EntityType::ProjectAnimalAssignment,
+                assignment.id,
+                AuditAction::Create,
+                audit,
+                None,
+                Some(snapshot(assignment)?),
+            )
+            .await?;
+            insert_provenance_tx(
+                &mut tx,
+                &Provenance::from_audit(
+                    assignment.lab_id,
+                    Some(assignment.project_id),
+                    EntityType::ProjectAnimalAssignment,
+                    assignment.id,
+                    audit,
+                    assignment.meta.created_at,
+                ),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(assignments.to_vec())
+    }
+
+    async fn list_project_animal_assignments(
+        &self,
+        filter: &ProjectAnimalAssignmentFilter,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>> {
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT {PROJECT_ANIMAL_ASSIGNMENT_COLUMNS} FROM project_animal_assignments WHERE lab_id = "
+        ));
+        query
+            .push_bind(filter.lab_id.to_string())
+            .push(" AND deleted_at IS NULL");
+        if let Some(project_id) = filter.project_id {
+            query
+                .push(" AND project_id = ")
+                .push_bind(project_id.to_string());
+        }
+        if let Some(animal_id) = filter.animal_id {
+            query
+                .push(" AND animal_id = ")
+                .push_bind(animal_id.to_string());
+        }
+        query.push(" ORDER BY project_id, created_at, id");
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter()
+            .map(project_animal_assignment_from_row)
+            .collect()
+    }
+
+    async fn remove_animals_from_project(
+        &self,
+        removals: &[ProjectAnimalAssignmentRemoval],
+        deleted_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>> {
+        if removals.is_empty() || removals.len() > 100 {
+            return Err(StoreError::Validation(
+                "project animal removal batch must contain 1-100 items".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let mut assignments = Vec::with_capacity(removals.len());
+        for removal in removals {
+            let row = sqlx::query(&format!(
+                "SELECT {PROJECT_ANIMAL_ASSIGNMENT_COLUMNS} FROM project_animal_assignments WHERE id = ? AND deleted_at IS NULL"
+            ))
+            .bind(removal.assignment_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "project_animal_assignment",
+                id: removal.assignment_id,
+            })?;
+            let assignment = project_animal_assignment_from_row(&row)?;
+            if assignment.meta.revision != removal.expected_revision {
+                return Err(StoreError::Conflict(
+                    "project animal assignment revision changed before removal".to_owned(),
+                ));
+            }
+            assignments.push(assignment);
+        }
+        let scope = (assignments[0].lab_id, assignments[0].project_id);
+        if assignments
+            .iter()
+            .any(|assignment| (assignment.lab_id, assignment.project_id) != scope)
+        {
+            return Err(StoreError::Validation(
+                "project animal removals must belong to one lab/project".to_owned(),
+            ));
+        }
+        for (assignment, removal) in assignments.iter_mut().zip(removals) {
+            let before = assignment.clone();
+            assignment.soft_delete(deleted_at);
+            let result = sqlx::query("UPDATE project_animal_assignments SET updated_at = ?, deleted_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL")
+                .bind(assignment.meta.updated_at)
+                .bind(assignment.meta.deleted_at)
+                .bind(assignment.meta.revision)
+                .bind(assignment.id.to_string())
+                .bind(removal.expected_revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            if result.rows_affected() != 1 {
+                return Err(StoreError::Conflict(
+                    "project animal assignment revision changed before removal".to_owned(),
+                ));
+            }
+            write_audit(
+                &mut tx,
+                assignment.lab_id,
+                Some(assignment.project_id),
+                EntityType::ProjectAnimalAssignment,
+                assignment.id,
+                AuditAction::SoftDelete,
+                audit,
+                Some(snapshot(&before)?),
+                Some(snapshot(assignment)?),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(assignments)
+    }
+
     async fn create_cage(&self, cage: &Cage, audit: &AuditContext) -> StoreResult<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         sqlx::query("INSERT INTO cages (id, lab_id, section, display_id, location, kind, capacity, sort_order, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -1709,6 +1912,22 @@ impl MuriArcStore for SqliteStore {
             .fetch_all(&self.pool)
             .await
             .map_err(map_sqlx)?;
+        rows.iter().map(cage_from_row).collect()
+    }
+
+    async fn list_cages_for_project(
+        &self,
+        lab_id: Uuid,
+        project_id: Uuid,
+    ) -> StoreResult<Vec<Cage>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT c.* FROM cages c JOIN animals a ON a.current_cage_id = c.id AND a.deleted_at IS NULL JOIN project_animal_assignments paa ON paa.animal_id = a.id AND paa.deleted_at IS NULL WHERE c.lab_id = ? AND c.deleted_at IS NULL AND paa.project_id = ? ORDER BY c.sort_order, c.section, c.display_id"
+        )
+        .bind(lab_id.to_string())
+        .bind(project_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
         rows.iter().map(cage_from_row).collect()
     }
 
@@ -1780,7 +1999,7 @@ impl MuriArcStore for SqliteStore {
         query.push_bind(filter.lab_id.to_string());
         query.push(" AND a.deleted_at IS NULL");
         if let Some(project_id) = filter.project_id {
-            query.push(" AND EXISTS (SELECT 1 FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id WHERE ep.animal_id = a.id AND ep.deleted_at IS NULL AND e.deleted_at IS NULL AND e.project_id = ");
+            query.push(" AND EXISTS (SELECT 1 FROM project_animal_assignments paa WHERE paa.animal_id = a.id AND paa.deleted_at IS NULL AND paa.project_id = ");
             query.push_bind(project_id.to_string());
             query.push(")");
         }
@@ -1835,7 +2054,7 @@ impl MuriArcStore for SqliteStore {
         query.push_bind(filter.lab_id.to_string());
         query.push(" AND a.deleted_at IS NULL");
         if let Some(project_id) = filter.project_id {
-            query.push(" AND EXISTS (SELECT 1 FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id WHERE ep.animal_id = a.id AND ep.deleted_at IS NULL AND e.deleted_at IS NULL AND e.project_id = ");
+            query.push(" AND EXISTS (SELECT 1 FROM project_animal_assignments paa WHERE paa.animal_id = a.id AND paa.deleted_at IS NULL AND paa.project_id = ");
             query.push_bind(project_id.to_string());
             query.push(")");
         }
@@ -1931,17 +2150,17 @@ impl MuriArcStore for SqliteStore {
         }
 
         let mut project_query = QueryBuilder::<Sqlite>::new(
-            "SELECT DISTINCT ep.animal_id, p.id AS project_id, p.name AS project_name FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id AND e.deleted_at IS NULL JOIN projects p ON p.id = e.project_id AND p.deleted_at IS NULL WHERE ep.deleted_at IS NULL AND p.lab_id = ",
+            "SELECT paa.animal_id, p.id AS project_id, p.name AS project_name FROM project_animal_assignments paa JOIN projects p ON p.id = paa.project_id AND p.deleted_at IS NULL WHERE paa.deleted_at IS NULL AND p.lab_id = ",
         );
         project_query
             .push_bind(filter.lab_id.to_string())
-            .push(" AND ep.animal_id IN (");
+            .push(" AND paa.animal_id IN (");
         {
             let mut separated = project_query.separated(", ");
             for id in &ids {
                 separated.push_bind(id.to_string());
             }
-            separated.push_unseparated(") ORDER BY ep.animal_id, p.name, p.id");
+            separated.push_unseparated(") ORDER BY paa.animal_id, p.name, p.id");
         }
         for row in project_query
             .build()
@@ -2012,7 +2231,7 @@ impl MuriArcStore for SqliteStore {
             .push_bind(lab_id.to_string())
             .push(" AND deleted_at IS NULL");
         if let Some(project_id) = project_id {
-            query.push(" AND EXISTS (SELECT 1 FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id WHERE ep.animal_id = animals.id AND ep.deleted_at IS NULL AND e.deleted_at IS NULL AND e.project_id = ");
+            query.push(" AND EXISTS (SELECT 1 FROM project_animal_assignments paa WHERE paa.animal_id = animals.id AND paa.deleted_at IS NULL AND paa.project_id = ");
             query.push_bind(project_id.to_string());
             query.push(")");
         }
@@ -2433,6 +2652,62 @@ impl MuriArcStore for SqliteStore {
         let animal_lab =
             required_lab_id(&mut tx, "animals", participation.animal_id, "animal").await?;
         require_same_uuid(animal_lab, experiment_lab, "participation animal")?;
+        let assigned = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_animal_assignments WHERE project_id = ? AND animal_id = ? AND deleted_at IS NULL",
+        )
+        .bind(experiment_project.to_string())
+        .bind(participation.animal_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if assigned == 0 {
+            let assignment = ProjectAnimalAssignment::new(
+                experiment_lab,
+                experiment_project,
+                participation.animal_id,
+                audit.actor.user_id,
+                Some("Assigned during local experiment enrollment".to_owned()),
+                participation.enrolled_at,
+            );
+            sqlx::query("INSERT INTO project_animal_assignments (id, lab_id, project_id, animal_id, assigned_by, reason, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(assignment.id.to_string())
+                .bind(assignment.lab_id.to_string())
+                .bind(assignment.project_id.to_string())
+                .bind(assignment.animal_id.to_string())
+                .bind(assignment.assigned_by.map(|id| id.to_string()))
+                .bind(&assignment.reason)
+                .bind(assignment.meta.created_at)
+                .bind(assignment.meta.updated_at)
+                .bind(assignment.meta.deleted_at)
+                .bind(assignment.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            write_audit(
+                &mut tx,
+                assignment.lab_id,
+                Some(assignment.project_id),
+                EntityType::ProjectAnimalAssignment,
+                assignment.id,
+                AuditAction::Create,
+                audit,
+                None,
+                Some(snapshot(&assignment)?),
+            )
+            .await?;
+            insert_provenance_tx(
+                &mut tx,
+                &Provenance::from_audit(
+                    assignment.lab_id,
+                    Some(assignment.project_id),
+                    EntityType::ProjectAnimalAssignment,
+                    assignment.id,
+                    audit,
+                    assignment.meta.created_at,
+                ),
+            )
+            .await?;
+        }
         if let Some(cohort_id) = participation.cohort_id {
             let cohort_experiment = sqlx::query_scalar::<_, String>(
                 "SELECT experiment_id FROM cohorts WHERE id = ? AND deleted_at IS NULL",

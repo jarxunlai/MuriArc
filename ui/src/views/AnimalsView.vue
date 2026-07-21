@@ -12,11 +12,13 @@ import type {
   GeneAllele,
   GeneLocus,
   PedigreeRelation,
+  ProjectAnimalAssignment,
   ProjectSummary,
 } from '@/domain/models'
 import { gateway } from '@/services/gateway'
 import {
   canManageBreeding,
+  canManageProjectAnimals,
   canWriteAnimal,
   canWriteProjectData,
   currentProjectId,
@@ -54,6 +56,14 @@ const attachmentUploading = ref(false)
 const attachmentDownloadingId = ref<string | null>(null)
 const attachmentProjectId = ref<string | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
+const selectedAnimalIds = ref<string[]>([])
+const showProjectBatch = ref(false)
+const projectBatchMode = ref<'assign' | 'remove'>('assign')
+const projectBatchId = ref<string | null>(null)
+const projectBatchReason = ref('')
+const projectBatchAssignments = ref<ProjectAnimalAssignment[]>([])
+const projectBatchLoading = ref(false)
+const projectBatchSaving = ref(false)
 
 const newAnimal = reactive({
   displayId: '',
@@ -93,6 +103,11 @@ const projectOnly = computed(() => gateway.mode === 'remote' && !hasLabRegistryA
 const animalWriteAllowed = computed(() => gateway.mode === 'local' || canWriteAnimal())
 const projectDataWriteAllowed = computed(() => gateway.mode === 'local' || canWriteProjectData())
 const genotypeWriteAllowed = computed(() => gateway.mode === 'local' || canManageBreeding())
+const projectBatchAvailable = computed(() => gateway.mode === 'remote'
+  && canManageProjectAnimals()
+  && !!gateway.listProjectAnimalAssignments
+  && !!gateway.assignAnimalsToProject
+  && !!gateway.removeAnimalsFromProject)
 
 const statusMeta: Record<AnimalStatus, { label: string; type: 'default' | 'success' | 'info' | 'warning' }> = {
   active: { label: '在养', type: 'success' },
@@ -157,6 +172,16 @@ const filtered = computed(() => {
     || animal.strain.toLowerCase().includes(query)
     || animal.projectNames.some((project) => project.toLowerCase().includes(query))))
 })
+const projectBatchAssignmentByAnimal = computed(() => new Map(
+  projectBatchAssignments.value.map((assignment) => [assignment.animalId, assignment]),
+))
+const projectBatchEligibleIds = computed(() => selectedAnimalIds.value.filter((animalId) => {
+  const assigned = projectBatchAssignmentByAnimal.value.has(animalId)
+  return projectBatchMode.value === 'assign' ? !assigned : assigned
+}))
+const projectBatchSkippedIds = computed(() => selectedAnimalIds.value.filter(
+  (animalId) => !projectBatchEligibleIds.value.includes(animalId),
+))
 
 function sexLabel(sex: Animal['sex']) {
   return sex === 'male' ? '雄' : sex === 'female' ? '雌' : '未知'
@@ -260,7 +285,8 @@ function closeAnimal() {
   void router.replace({ query })
 }
 
-const columns: DataTableColumns<Animal> = [
+const columns = computed<DataTableColumns<Animal>>(() => [
+  ...(projectBatchAvailable.value ? [{ type: 'selection' as const, width: 42 }] : []),
   { title: '编号', key: 'code', width: 130, render: (row) => h('button', { class: 'table-link', onClick: () => openAnimal(row) }, row.code) },
   { title: '性别', key: 'sex', width: 70, render: (row) => sexLabel(row.sex) },
   { title: '品系', key: 'strain', minWidth: 130 },
@@ -269,16 +295,83 @@ const columns: DataTableColumns<Animal> = [
   { title: '状态', key: 'status', width: 100, render: (row) => h(NTag, { size: 'small', bordered: false, round: true, type: statusMeta[row.status].type }, { default: () => statusMeta[row.status].label }) },
   { title: '关联项目', key: 'projectNames', minWidth: 150, render: (row) => row.projectNames.join('、') || '未关联' },
   { title: '', key: 'actions', width: 70, render: (row) => h(NButton, { size: 'small', quaternary: true, onClick: () => openAnimal(row) }, { default: () => '查看' }) },
-]
+])
+
+function updateSelectedAnimalIds(keys: Array<string | number>) {
+  selectedAnimalIds.value = keys.map(String)
+}
+
+async function loadProjectBatchPreview() {
+  if (!projectBatchId.value || !gateway.listProjectAnimalAssignments) {
+    projectBatchAssignments.value = []
+    return
+  }
+  projectBatchLoading.value = true
+  try {
+    projectBatchAssignments.value = await gateway.listProjectAnimalAssignments(projectBatchId.value)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '无法生成项目分配预览')
+    showProjectBatch.value = false
+  } finally {
+    projectBatchLoading.value = false
+  }
+}
+
+async function openProjectBatch(mode: 'assign' | 'remove') {
+  if (!selectedAnimalIds.value.length) return
+  if (selectedAnimalIds.value.length > 100) {
+    message.warning('单次批量操作最多选择 100 只动物')
+    return
+  }
+  projectBatchMode.value = mode
+  projectBatchId.value = mode === 'remove'
+    ? projectId.value ?? null
+    : projectId.value ?? projects.value[0]?.id ?? null
+  projectBatchReason.value = ''
+  showProjectBatch.value = true
+  await loadProjectBatchPreview()
+}
+
+async function confirmProjectBatch() {
+  const targetProjectId = projectBatchId.value
+  if (!targetProjectId || !projectBatchEligibleIds.value.length) return
+  projectBatchSaving.value = true
+  try {
+    if (projectBatchMode.value === 'assign' && gateway.assignAnimalsToProject) {
+      await gateway.assignAnimalsToProject(
+        targetProjectId,
+        projectBatchEligibleIds.value,
+        projectBatchReason.value.trim() || undefined,
+      )
+    } else if (projectBatchMode.value === 'remove' && gateway.removeAnimalsFromProject) {
+      await gateway.removeAnimalsFromProject(
+        targetProjectId,
+        projectBatchEligibleIds.value.map((animalId) => {
+          const assignment = projectBatchAssignmentByAnimal.value.get(animalId)!
+          return { assignmentId: assignment.id, expectedRevision: assignment.revision }
+        }),
+      )
+    }
+    const completed = projectBatchEligibleIds.value.length
+    showProjectBatch.value = false
+    selectedAnimalIds.value = []
+    await load()
+    message.success(projectBatchMode.value === 'assign'
+      ? `已将 ${completed} 只动物分配到项目`
+      : `已从项目移除 ${completed} 只动物`)
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '批量项目操作失败')
+  } finally {
+    projectBatchSaving.value = false
+  }
+}
 
 async function load() {
   loading.value = true
   try {
     const [animalRows, cageRows, projectRows] = await Promise.all([
       gateway.listAnimals(accessContext.value),
-      gateway.mode === 'local' || hasLabRegistryAccess()
-        ? gateway.listCages()
-        : Promise.resolve([]),
+      gateway.listCages(accessContext.value),
       gateway.listProjects(),
     ])
     animals.value = animalRows
@@ -567,12 +660,15 @@ watch(() => newGenotype.locusValue, () => {
   newGenotype.allele1WildType = false
   newGenotype.allele2WildType = false
 })
+watch(projectBatchId, () => {
+  if (showProjectBatch.value) void loadProjectBatchPreview()
+})
 onMounted(load)
 </script>
 
 <template>
   <div class="page animals-page">
-    <PageHeader title="小鼠档案" section="动物管理" description="查看每只小鼠的身份、当前位置、实验数据与完整可追溯记录。">
+    <PageHeader title="动物档案" section="动物管理" description="查看每只动物的身份、当前位置、实验数据与完整可追溯记录。">
       <template #actions>
         <n-button v-if="animalWriteAllowed" type="primary" @click="openCreate"><template #icon><Plus :size="17" /></template>新增小鼠</n-button>
       </template>
@@ -591,17 +687,51 @@ onMounted(load)
     </section>
 
     <section class="surface desktop-only table-wrap">
-      <n-data-table :columns="columns" :data="filtered" :loading="loading" :row-key="(row: Animal) => row.id" :bordered="false" :single-line="false" :pagination="{ pageSize: 12 }" />
+      <n-data-table :columns="columns" :data="filtered" :loading="loading" :row-key="(row: Animal) => row.id" :checked-row-keys="selectedAnimalIds" :bordered="false" :single-line="false" :pagination="{ pageSize: 12 }" @update:checked-row-keys="updateSelectedAnimalIds" />
     </section>
 
     <section class="mobile-list mobile-only" aria-label="小鼠卡片列表">
-      <button v-for="animal in filtered" :key="animal.id" type="button" class="animal-card surface" :aria-label="`查看小鼠 ${animal.code}`" @click="openAnimal(animal)">
-        <div class="card-title"><strong>{{ animal.code }}</strong><n-tag :type="statusMeta[animal.status].type" size="small" round :bordered="false">{{ statusMeta[animal.status].label }}</n-tag></div>
+      <button v-for="animal in filtered" :key="animal.id" type="button" class="animal-card surface" :aria-label="`查看动物 ${animal.code}`" @click="openAnimal(animal)">
+        <div class="card-title"><span><n-checkbox v-if="projectBatchAvailable" :checked="selectedAnimalIds.includes(animal.id)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animal.id] : selectedAnimalIds.filter((id) => id !== animal.id)" /><strong>{{ animal.code }}</strong></span><n-tag :type="statusMeta[animal.status].type" size="small" round :bordered="false">{{ statusMeta[animal.status].label }}</n-tag></div>
         <div class="card-grid"><span>性别</span><b>{{ sexLabel(animal.sex) }}</b><span>基因型</span><b>{{ animal.genotype }}</b><span>笼位</span><b>{{ animal.cageId ? cages.get(animal.cageId) : '未分配' }}</b></div>
         <small>{{ animal.strain }} · {{ animal.projectNames.join('、') || '未关联项目' }}</small>
       </button>
       <n-empty v-if="!loading && !filtered.length" description="没有匹配的小鼠" />
     </section>
+
+    <transition name="selection">
+      <div v-if="projectBatchAvailable && selectedAnimalIds.length" class="selection-bar">
+        <span>已选择 <strong>{{ selectedAnimalIds.length }}</strong> 只动物</span>
+        <n-button quaternary size="small" @click="selectedAnimalIds = []">取消</n-button>
+        <n-button secondary size="small" @click="openProjectBatch('assign')">分配到项目</n-button>
+        <n-button v-if="projectId" secondary size="small" type="warning" @click="openProjectBatch('remove')">从当前项目移除</n-button>
+      </div>
+    </transition>
+
+    <n-modal v-model:show="showProjectBatch" preset="card" :title="projectBatchMode === 'assign' ? '批量分配到项目' : '批量从项目移除'" class="dialog-card" :bordered="false">
+      <n-spin :show="projectBatchLoading">
+        <n-form label-placement="top">
+          <n-form-item label="目标项目" required>
+            <n-select v-model:value="projectBatchId" :disabled="projectBatchMode === 'remove'" filterable :options="projectOptions" placeholder="选择项目" />
+          </n-form-item>
+          <n-form-item v-if="projectBatchMode === 'assign'" label="分配原因">
+            <n-input v-model:value="projectBatchReason" type="textarea" :maxlength="2000" show-count placeholder="可选；会进入正式审计记录" />
+          </n-form-item>
+        </n-form>
+        <section class="batch-preview">
+          <div><span>已选择</span><strong>{{ selectedAnimalIds.length }}</strong></div>
+          <div class="eligible"><span>{{ projectBatchMode === 'assign' ? '可分配' : '可移除' }}</span><strong>{{ projectBatchEligibleIds.length }}</strong></div>
+          <div><span>{{ projectBatchMode === 'assign' ? '已在项目中' : '不在项目中' }}</span><strong>{{ projectBatchSkippedIds.length }}</strong></div>
+        </section>
+        <n-alert v-if="projectBatchSkippedIds.length" type="info" :show-icon="false">
+          {{ projectBatchSkippedIds.length }} 只动物属于无变化项，将被跳过；正式写入仍以一个原子批次完成。
+        </n-alert>
+        <n-alert v-if="projectBatchMode === 'remove'" type="warning" :show-icon="false">
+          移除只撤销项目访问关系，不删除动物、实验历史或正式审计。
+        </n-alert>
+      </n-spin>
+      <template #footer><div class="dialog-actions"><n-button @click="showProjectBatch = false">取消</n-button><n-button :type="projectBatchMode === 'remove' ? 'warning' : 'primary'" :disabled="!projectBatchId || !projectBatchEligibleIds.length" :loading="projectBatchSaving" @click="confirmProjectBatch">确认{{ projectBatchMode === 'assign' ? '分配' : '移除' }}</n-button></div></template>
+    </n-modal>
 
     <n-modal v-model:show="showCreate" preset="card" title="登记小鼠" class="dialog-card" :bordered="false">
       <n-form label-placement="top">
@@ -812,11 +942,20 @@ onMounted(load)
 .mobile-list { display: none; flex-direction: column; gap: 9px; }
 .animal-card { padding: 13px; text-align: left; background: white; }
 .card-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
+.card-title > span { display: flex; align-items: center; gap: 8px; }
 .card-title strong { font-size: 16px; }
 .card-grid { display: grid; grid-template-columns: auto 1fr auto 1fr auto 1fr; gap: 5px; color: var(--muri-text-tertiary); font-size: 12px; }
 .card-grid b { color: var(--muri-text); font-weight: 500; }
 .animal-card > small { display: block; margin-top: 8px; color: var(--muri-text-secondary); }
 .dialog-card { width: min(590px, calc(100vw - 28px)); }
+.selection-bar { position: fixed; z-index: 40; inset: auto 24px 22px calc(var(--muri-sidebar-width) + 24px); display: flex; width: fit-content; max-width: calc(100% - var(--muri-sidebar-width) - 48px); margin: auto; align-items: center; gap: 9px; padding: 9px 10px 9px 15px; border: 1px solid var(--muri-border-strong); border-radius: 10px; background: white; box-shadow: var(--muri-shadow); }
+.batch-preview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+.batch-preview > div { display: flex; flex-direction: column; gap: 3px; padding: 11px; border-radius: 7px; background: var(--muri-surface-muted); }
+.batch-preview span { color: var(--muri-text-tertiary); font-size: 12px; }
+.batch-preview strong { font-size: 20px; }
+.batch-preview .eligible strong { color: var(--muri-primary); }
+.selection-enter-active,.selection-leave-active { transition: opacity var(--muri-transition-panel), transform var(--muri-transition-panel); }
+.selection-enter-from,.selection-leave-to { opacity: 0; transform: translateY(8px); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .quantity-grid { grid-template-columns: 2fr 1fr; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
@@ -896,3 +1035,4 @@ onMounted(load)
   :deep(.n-tabs-pane-wrapper), .relation-row { transition: none; }
 }
 </style>
+  .selection-bar { inset: auto 12px 73px; width: calc(100% - 24px); max-width: none; overflow-x: auto; }

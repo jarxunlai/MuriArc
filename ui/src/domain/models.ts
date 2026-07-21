@@ -45,6 +45,16 @@ export interface ProjectSummary {
   name: string
 }
 
+export interface ProjectAnimalAssignment {
+  id: string
+  projectId: string
+  animalId: string
+  assignedBy?: string
+  reason?: string
+  assignedAt: string
+  revision: number
+}
+
 export type TemplateFieldValueType = 'number' | 'text' | 'boolean' | 'date' | 'category'
 
 export interface ExperimentTemplateSummary {
@@ -657,6 +667,26 @@ export interface AiTurnResponse {
   toolRuns: AiToolRun[]
   drafts: AiWriteDraft[]
   trace: AiAssistantTrace
+  autonomy?: AiAutonomyView
+}
+
+export type AiAutonomyMode = 'ask' | 'auto' | 'full'
+
+export interface AiAutonomyView {
+  mode: AiAutonomyMode
+  effectiveMode: AiAutonomyMode
+  maxMode: AiAutonomyMode
+  batchLimit: number
+  revision: number
+  expiresAt?: string
+  requiresHumanApproval: string[]
+}
+
+export interface AiAutonomyUpdateInput {
+  mode: AiAutonomyMode
+  expectedRevision: number
+  currentPassword?: string
+  declared?: boolean
 }
 
 export interface AiConversationSummary {

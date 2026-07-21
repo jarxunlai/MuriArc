@@ -77,7 +77,7 @@ Environment Root 不是新增的领域角色枚举，而是“配置声明的唯
 
 ## Deployment
 
-- Desktop：SQLite 和附件目录位于 OS application data；密钥位于 OS keyring。
+- Desktop：Windows Tauri WebView 安装包为正式本地交付目标；SQLite 和附件目录位于 OS application data，密钥位于 OS keyring。Desktop 不通过 VNC/noVNC、浏览器远程桌面或 Server Docker 交付。
 - Server：PostgreSQL、附件 volume、加密 secret store；Axum 位于 HTTPS reverse proxy 后。
-- V1 不做 Desktop 与 Server 的实时同步。当前 snapshot 用于版本化完整业务归档、离线留存与
+- V1 不做 Local Web、本地 Axum+SQLite 浏览器服务，也不做 Desktop 与 Server 的实时同步。当前 snapshot 用于版本化完整业务归档、离线留存与
   完整性校验，不提供自动合并、导入或恢复入口；CSV/XLSX Export 也不能替代部署备份。

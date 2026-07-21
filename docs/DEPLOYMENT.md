@@ -2,6 +2,12 @@
 
 The shared edition is an Axum server backed by PostgreSQL and serving the same responsive Vue application used by the desktop edition. Axum listens on the container network, while the provided Compose file publishes its host port only on loopback by default; terminate TLS in Caddy, Nginx, or an equivalent reverse proxy.
 
+This document is only for the shared Server deployment. The personal Desktop
+edition is delivered as a Windows Tauri WebView installer backed by local SQLite
+and OS keyring storage; it is not deployed through Docker, VNC, noVNC, or a
+browser remote desktop. See [DESKTOP_DELIVERY.md](DESKTOP_DELIVERY.md) for the
+Desktop local delivery boundary.
+
 The shared edition uses persistent Argon2id credentials and revocable PostgreSQL
 sessions. Browser session secrets are held only in an HttpOnly, SameSite=Strict
 cookie; PostgreSQL stores SHA-256 token and CSRF digests, never their plaintext.

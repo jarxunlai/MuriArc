@@ -32,10 +32,14 @@ CSRF 可在有效会话内安全恢复但不持久化明文，外部 token 仅�
 - AI key：Desktop 存 OS keyring；Server 使用环境注入的 32-byte master key，
   以 AES-256-GCM、随机 nonce 和绑定 user/key-version 的 AAD 对每位用户的 key
   独立加密。数据库不保存 master key。
+- `MURIARC_AI_MASTER_KEY` 是部署级密钥材料；生成一次后保持稳定。只有在完成所有既有用户
+  AI 凭据重新加密后才递增 `MURIARC_AI_MASTER_KEY_VERSION`。
 - AI key 不进入项目数据库、日志、审计、快照或错误响应。
 - Server 未配置有效 master key 时所有 AI settings、turn 和 approval 路由 fail closed，
-  不允许回退到明文存储。`LocalHttp` Provider 只允许管理员配置的精确 URL allowlist。
-- Non-official OpenAI-compatible Provider URLs require an exact server allowlist entry; the official OpenAI v1 URL is the only built-in cloud endpoint, and Provider HTTP redirects are disabled.
+  不允许回退到明文存储。
+- Provider 出口由 LabAdmin 在产品内管理，并以实验室级数据库记录保存。非官方
+  OpenAI-compatible Provider URL 和 LocalHttp Provider URL 都必须精确匹配已启用出口；
+  官方 OpenAI v1 是唯一内置云端出口，Provider HTTP redirects 被禁用。
 - Lab-wide AI 会话只读；产生写入草稿前必须显式绑定 Project。客户端声明的
   step-up 状态不受信任，外部 token 不得修改 AI 设置或代替研究者审批。
 - 附件名称不得决定磁盘路径；使用 UUID/hash，阻止目录穿越。

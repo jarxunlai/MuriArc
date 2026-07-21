@@ -315,6 +315,7 @@ export interface AttachmentMetadata {
   sizeBytes: number
   sha256: string
   version: number
+  revision: number
   contentHref: string
   previewSupported: boolean
   previewHref?: string
@@ -332,6 +333,12 @@ export interface UploadAttachmentInput extends AttachmentScope {
   fileName: string
   mediaType?: string
   content: Blob
+}
+
+export interface DeleteAttachmentInput {
+  id: string
+  expectedRevision: number
+  reason?: string
 }
 
 export interface OperationRecord {
@@ -541,6 +548,7 @@ export interface MuriArcGateway {
   listAttachments?(scope: AttachmentScope): Promise<AttachmentMetadata[]>
   uploadAttachment?(input: UploadAttachmentInput): Promise<AttachmentMetadata>
   downloadAttachment?(id: string): Promise<Blob>
+  deleteAttachment?(input: DeleteAttachmentInput): Promise<AttachmentMetadata>
   getWorkspaceSettings?(): Promise<WorkspaceSettings>
   saveWorkspaceSettings?(input: WorkspaceSettings): Promise<WorkspaceSettings>
   getAiSettings?(): Promise<AiSettings>
@@ -833,6 +841,9 @@ export class LocalTauriGateway implements MuriArcGateway {
     return new Blob([bytes.buffer], {
       type: result.metadata.mediaType ?? 'application/octet-stream',
     })
+  }
+  deleteAttachment(input: DeleteAttachmentInput): Promise<AttachmentMetadata> {
+    return this.call<AttachmentMetadata>('delete_attachment', { input })
   }
   getWorkspaceSettings() { return this.call<WorkspaceSettings>('get_workspace_settings') }
   saveWorkspaceSettings(input: WorkspaceSettings) {
@@ -1295,7 +1306,7 @@ interface RawAttachment {
   preview_supported: boolean
   preview_href?: string | null
   preview_reason?: string | null
-  meta: { created_at: string }
+  meta: { created_at: string; revision?: number }
 }
 
 interface RawAuthUser {
@@ -2438,6 +2449,20 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return response.blob()
   }
 
+  async deleteAttachment(input: DeleteAttachmentInput): Promise<AttachmentMetadata> {
+    const response = await this.request<ApiItem<RawAttachment>>(
+      `/attachments/${encodeURIComponent(input.id)}`,
+      {
+        method: 'DELETE',
+        body: JSON.stringify({
+          expected_revision: input.expectedRevision,
+          reason: input.reason ?? null,
+        }),
+      },
+    )
+    return mapAttachment(response.data)
+  }
+
   async listOperations(query = new URLSearchParams()): Promise<OperationRecord[]> {
     if (!query.has('limit')) query.set('limit', '200')
     const response = await this.request<ApiCollection<OperationRecord>>('/operations?' + query.toString())
@@ -2448,7 +2473,7 @@ export class RemoteHttpGateway implements MuriArcGateway {
     const query = new URLSearchParams({ project_id: projectId, limit: '500' })
     if (experimentId) query.set('experiment_id', experimentId)
     const response = await this.request<ApiCollection<{
-      attachment: { id: string; project_id?: string | null; entity_type: AttachmentTarget; entity_id: string; file_name: string; media_type?: string | null; size_bytes: number; sha256: string; version: number; meta: { created_at: string } }
+      attachment: { id: string; project_id?: string | null; entity_type: AttachmentTarget; entity_id: string; file_name: string; media_type?: string | null; size_bytes: number; sha256: string; version: number; meta: { created_at: string; revision?: number } }
       links: AttachmentLinkRecord[]
       derivatives: Array<Record<string, unknown>>
       previewSupported: boolean
@@ -2462,7 +2487,7 @@ export class RemoteHttpGateway implements MuriArcGateway {
         entityType: entry.attachment.entity_type, entityId: entry.attachment.entity_id,
         fileName: entry.attachment.file_name, mediaType: entry.attachment.media_type ?? undefined,
         sizeBytes: entry.attachment.size_bytes, sha256: entry.attachment.sha256,
-        version: entry.attachment.version,
+        version: entry.attachment.version, revision: entry.attachment.meta.revision ?? entry.attachment.version,
         contentHref: '/api/v1/attachments/' + entry.attachment.id + '/content',
         previewSupported: entry.previewSupported, previewHref: entry.previewHref,
         previewReason: entry.previewReason, createdAt: entry.attachment.meta.created_at,
@@ -3226,6 +3251,7 @@ function mapAttachment(raw: RawAttachment): AttachmentMetadata {
     sizeBytes: raw.size_bytes,
     sha256: raw.sha256,
     version: raw.version,
+    revision: raw.meta.revision ?? raw.version,
     contentHref: raw.content_href,
     previewSupported: raw.preview_supported,
     previewHref: raw.preview_href ?? undefined,

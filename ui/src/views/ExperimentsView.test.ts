@@ -65,6 +65,7 @@ const stubs = {
   NDrawer: { props: ['show'], template: '<div v-if="show"><slot /></div>' },
   NDrawerContent: { template: '<div><slot /></div>' },
   NModal: { props: ['show'], template: '<div v-if="show"><slot /><slot name="footer" /></div>' },
+  NPopconfirm: { template: '<span><slot name="trigger" /><slot /></span>' },
   NSpin: { template: '<div><slot /></div>' },
   NTag: { template: '<span><slot /></span>' },
   NProgress: true,

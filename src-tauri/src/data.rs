@@ -228,6 +228,34 @@ impl DesktopDataState {
         })
     }
 
+    pub(crate) async fn delete_attachment(
+        &self,
+        input: DeleteAttachmentInput,
+    ) -> Result<AttachmentView, DesktopDataError> {
+        let id = parse_id("attachment", &input.id)?;
+        let attachment = self.store.get_attachment(id).await?;
+        if attachment.lab_id != LOCAL_LAB_ID {
+            return Err(DesktopDataError::ScopeMismatch);
+        }
+        let entity_type = AttachmentTargetInput::from_stored(&attachment.entity_type)
+            .ok_or(DesktopDataError::ScopeMismatch)?;
+        let effective_project = self
+            .authorize_attachment_target(entity_type, attachment.entity_id, attachment.project_id)
+            .await?;
+        if effective_project != attachment.project_id {
+            return Err(DesktopDataError::ScopeMismatch);
+        }
+        let mut audit = self.audit("delete_attachment").await?;
+        if let Some(reason) = input.reason {
+            audit.reason = Some(validate_attachment_reason(reason)?);
+        }
+        let deleted = self
+            .store
+            .soft_delete_attachment(id, input.expected_revision, Utc::now(), &audit)
+            .await?;
+        Ok(AttachmentView::from(&deleted))
+    }
+
     async fn commit_attachment(
         &self,
         attachment: &Attachment,
@@ -1051,6 +1079,17 @@ fn validate_attachment_media_type(
     Ok(value)
 }
 
+fn validate_attachment_reason(value: String) -> Result<String, DesktopDataError> {
+    let value = value.trim().to_owned();
+    if value.is_empty() || value.len() > 1024 || value.chars().any(char::is_control) {
+        return Err(StoreError::Validation(
+            "attachment deletion reason must contain 1-1024 non-control characters".to_owned(),
+        )
+        .into());
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AttachmentTargetInput {
@@ -1103,6 +1142,14 @@ pub(crate) struct UploadAttachmentInput {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DeleteAttachmentInput {
+    pub id: String,
+    pub expected_revision: i64,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AttachmentView {
@@ -1115,7 +1162,11 @@ pub(crate) struct AttachmentView {
     pub size_bytes: i64,
     pub sha256: String,
     pub version: i32,
+    pub revision: i64,
     pub content_href: String,
+    pub preview_supported: bool,
+    pub preview_href: Option<String>,
+    pub preview_reason: Option<String>,
     pub created_at: String,
 }
 
@@ -1131,7 +1182,11 @@ impl From<&Attachment> for AttachmentView {
             size_bytes: attachment.size_bytes,
             sha256: attachment.sha256.clone(),
             version: attachment.version,
+            revision: attachment.meta.revision,
             content_href: format!("muriarc-ipc://attachments/{}", attachment.id),
+            preview_supported: false,
+            preview_href: None,
+            preview_reason: Some("local preview is not available".to_owned()),
             created_at: attachment.meta.created_at.to_rfc3339(),
         }
     }

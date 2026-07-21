@@ -446,6 +446,13 @@ pub trait MuriArcStore: crate::WorkspaceStore + Send + Sync {
         audit: &AuditContext,
     ) -> StoreResult<()>;
     async fn get_attachment(&self, id: Uuid) -> StoreResult<crate::Attachment>;
+    async fn soft_delete_attachment(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        deleted_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::Attachment>;
     async fn list_attachments(
         &self,
         lab_id: Uuid,

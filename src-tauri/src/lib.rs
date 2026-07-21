@@ -25,8 +25,8 @@ use application::{
 use data::{
     AttachmentDownloadView, AttachmentScopeInput, AttachmentView, CancelDataImportInput,
     ConfirmDataImportInput, CreateDataExportInput, CreateDataSnapshotInput, DataArtifactView,
-    DesktopDataError, DesktopDataState, ImportReceiptView, PreviewDataImportInput,
-    RemapDataImportInput, UploadAttachmentInput,
+    DeleteAttachmentInput, DesktopDataError, DesktopDataState, ImportReceiptView,
+    PreviewDataImportInput, RemapDataImportInput, UploadAttachmentInput,
 };
 use muriarc_ai::{
     AssistantConversationDetail, AssistantConversationSummary, AssistantTurnRequest,
@@ -810,6 +810,14 @@ async fn download_attachment(
     state.download_attachment(&id).await.map_err(Into::into)
 }
 
+#[tauri::command]
+async fn delete_attachment(
+    state: tauri::State<'_, DesktopDataState>,
+    input: DeleteAttachmentInput,
+) -> CommandResult<AttachmentView> {
+    state.delete_attachment(input).await.map_err(Into::into)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -912,6 +920,7 @@ pub fn run() {
             list_attachments,
             upload_attachment,
             download_attachment,
+            delete_attachment,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run MuriArc desktop application");

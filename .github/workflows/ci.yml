@@ -139,8 +139,7 @@ jobs:
       - name: Desktop Rust tests
         run: cargo test --locked -p muriarc-desktop --all-features
       - name: Tauri no-bundle smoke build
-        working-directory: ui
-        run: pnpm exec tauri build --debug --no-bundle
+        run: ui/node_modules/.bin/tauri.cmd build --debug --no-bundle
 
   container:
     name: Container and Compose build

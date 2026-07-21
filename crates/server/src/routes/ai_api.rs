@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use muriarc_ai::{
     AccessGrant, AiExecutionContext, AiProvider, AiWorkflowError, AiWorkflowService,
@@ -20,10 +20,10 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderSettingsView, AiProviderStoreError,
-    ApiError, AppState, AuthError, AuthPrincipal, AuthenticationMethod, RequestMetadata,
-    ResolvedAiProvider, SaveAiLabSettingsInput, SaveAiProviderSettingsInput,
-    ai_data_tools::ServerAiDataTools, ai_step_up::AiStepUpLimit,
+    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderEndpointView, AiProviderSettingsView,
+    AiProviderStoreError, ApiError, AppState, AuthError, AuthPrincipal, AuthenticationMethod,
+    RequestMetadata, ResolvedAiProvider, SaveAiLabSettingsInput, SaveAiProviderEndpointInput,
+    SaveAiProviderSettingsInput, ai_data_tools::ServerAiDataTools, ai_step_up::AiStepUpLimit,
 };
 
 use super::{
@@ -39,6 +39,15 @@ pub(super) fn router() -> Router<AppState> {
         .route("/ai/settings/test", post(test_settings))
         .route("/ai/diagnostics", get(diagnostics))
         .route("/admin/ai", get(get_lab_ai).put(save_lab_ai))
+        .route(
+            "/admin/ai/endpoints",
+            get(list_provider_endpoints).post(create_provider_endpoint),
+        )
+        .route("/admin/ai/endpoints/{id}", put(update_provider_endpoint))
+        .route(
+            "/admin/ai/endpoints/{id}/disable",
+            post(disable_provider_endpoint),
+        )
         .route("/ai/turns", post(run_turn))
         .route("/ai/conversations", get(list_conversations))
         .route("/ai/conversations/{id}", get(get_conversation))
@@ -178,6 +187,80 @@ async fn save_lab_ai(
         .await
         .map_err(|error| provider_settings_error(error, &metadata))?;
     Ok(item(settings, &metadata))
+}
+
+async fn list_provider_endpoints(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+) -> Result<Json<CollectionResponse<AiProviderEndpointView>>, ApiError> {
+    ensure_lab_admin(&principal, &metadata)?;
+    let endpoints = state
+        .ai_providers
+        .list_provider_endpoints(principal.lab_id)
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(collection(endpoints, &metadata))
+}
+
+async fn create_provider_endpoint(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiJson(payload): ApiJson<SaveAiProviderEndpointInput>,
+) -> Result<Json<ItemResponse<AiProviderEndpointView>>, ApiError> {
+    ensure_lab_admin(&principal, &metadata)?;
+    let endpoint = state
+        .ai_providers
+        .save_provider_endpoint(
+            principal.lab_id,
+            None,
+            payload,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(endpoint, &metadata))
+}
+
+async fn update_provider_endpoint(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(endpoint_id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<SaveAiProviderEndpointInput>,
+) -> Result<Json<ItemResponse<AiProviderEndpointView>>, ApiError> {
+    ensure_lab_admin(&principal, &metadata)?;
+    let endpoint = state
+        .ai_providers
+        .save_provider_endpoint(
+            principal.lab_id,
+            Some(endpoint_id),
+            payload,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(endpoint, &metadata))
+}
+
+async fn disable_provider_endpoint(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(endpoint_id): ApiPath<Uuid>,
+) -> Result<Json<ItemResponse<AiProviderEndpointView>>, ApiError> {
+    ensure_lab_admin(&principal, &metadata)?;
+    let endpoint = state
+        .ai_providers
+        .disable_provider_endpoint(
+            principal.lab_id,
+            endpoint_id,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(endpoint, &metadata))
 }
 
 fn ensure_lab_admin(principal: &AuthPrincipal, metadata: &RequestMetadata) -> Result<(), ApiError> {

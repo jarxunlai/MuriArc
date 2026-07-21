@@ -6693,9 +6693,11 @@ mod tests {
                 .fetch_one(&fresh_pool)
                 .await
                 .expect("fresh migration ledger must be readable");
+        let expected_migration_count = i64::try_from(MIGRATOR.iter().count()).unwrap();
+        let latest_migration_version = MIGRATOR.iter().map(|migration| migration.version).max();
         assert_eq!(
             fresh_versions,
-            (i64::try_from(MIGRATOR.iter().count()).unwrap(), Some(18))
+            (expected_migration_count, latest_migration_version)
         );
         let fresh_columns: Vec<String> = sqlx::query_scalar(
             "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'user_credentials' ORDER BY column_name",

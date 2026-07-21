@@ -6,6 +6,7 @@ import type {
   AiDraftDecisionResponse,
   AiDraftStatus,
   AiEntityType,
+  AiProviderKind,
   AiSettings,
   AiTurnInput,
   AiTurnResponse,
@@ -396,15 +397,14 @@ export interface AiExtractionRecord {
 }
 export interface AiDiagnostics {
   runtimeConfigured: boolean
-  labEnabled: boolean
   providerConfigured: boolean
   providerEnabled: boolean
   credentialConfigured: boolean
   supportsVision: boolean
   textModelConfigured: boolean
   visionModelConfigured: boolean
-  localAllowlistCount: number
-  cloudAllowlistCount: number
+  localEndpointCount: number
+  cloudEndpointCount: number
 }
 export interface AiLabSettings {
   enabled: boolean
@@ -413,6 +413,23 @@ export interface AiLabSettings {
   enabledUserCount: number
   visionUserCount: number
   revision: number
+}
+
+export interface AiProviderEndpoint {
+  id: string
+  providerKind: AiProviderKind
+  label: string
+  baseUrl: string
+  enabled: boolean
+  builtin: boolean
+  revision: number
+}
+
+export interface SaveAiProviderEndpointInput {
+  providerKind: AiProviderKind
+  label: string
+  baseUrl: string
+  enabled: boolean
 }
 
 export interface ChangePasswordInput {
@@ -558,6 +575,9 @@ export interface MuriArcGateway {
   getAiDiagnostics?(): Promise<AiDiagnostics>
   getAiLabSettings?(): Promise<AiLabSettings>
   saveAiLabSettings?(input: { enabled: boolean; customUrlApprovalRequired: boolean }): Promise<AiLabSettings>
+  listAiProviderEndpoints?(): Promise<AiProviderEndpoint[]>
+  saveAiProviderEndpoint?(input: SaveAiProviderEndpointInput, id?: string): Promise<AiProviderEndpoint>
+  disableAiProviderEndpoint?(id: string): Promise<AiProviderEndpoint>
   listOperations?(query?: URLSearchParams): Promise<OperationRecord[]>
   listLibrary?(projectId: string, experimentId?: string): Promise<LibraryRecord[]>
   listPrivateImages?(): Promise<PrivateImageRecord[]>
@@ -2535,6 +2555,18 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return (await this.request<ApiItem<AiLabSettings>>('/admin/ai',
       { method: 'PUT', body: JSON.stringify(input) })).data
   }
+  async listAiProviderEndpoints(): Promise<AiProviderEndpoint[]> {
+    return (await this.request<ApiCollection<AiProviderEndpoint>>('/admin/ai/endpoints')).data
+  }
+  async saveAiProviderEndpoint(input: SaveAiProviderEndpointInput, id?: string) {
+    const path = id ? `/admin/ai/endpoints/${encodeURIComponent(id)}` : '/admin/ai/endpoints'
+    return (await this.request<ApiItem<AiProviderEndpoint>>(path,
+      { method: id ? 'PUT' : 'POST', body: JSON.stringify(input) })).data
+  }
+  async disableAiProviderEndpoint(id: string) {
+    return (await this.request<ApiItem<AiProviderEndpoint>>(`/admin/ai/endpoints/${encodeURIComponent(id)}/disable`,
+      { method: 'POST' })).data
+  }
 
   async getAiSettings(): Promise<AiSettings> {
     const response = await this.request<ApiItem<AiSettings & { revision: number }>>('/ai/settings')
@@ -3305,6 +3337,17 @@ class DemoDomainStore {
     hasKey: false,
     supportsVision: false,
   }
+  aiProviderEndpoints: AiProviderEndpoint[] = [
+    {
+      id: '00000000-0000-0000-0000-000000000001',
+      providerKind: 'open_ai_compatible',
+      label: 'OpenAI API',
+      baseUrl: 'https://api.openai.com/v1',
+      enabled: true,
+      builtin: true,
+      revision: 1,
+    },
+  ]
 
   createCage(input: CreateCageInput) {
     if (this.cages.some((cage) => cage.room === input.room && cage.code.toLowerCase() === input.code.toLowerCase())) {
@@ -4094,6 +4137,39 @@ export class DemoGateway implements MuriArcGateway {
     await pause(20)
     this.store.aiSettings.hasKey = false
     return clone(this.store.aiSettings)
+  }
+  async listAiProviderEndpoints() {
+    await pause(20)
+    return clone(this.store.aiProviderEndpoints)
+  }
+  async saveAiProviderEndpoint(input: SaveAiProviderEndpointInput, id?: string) {
+    await pause(20)
+    if (id === '00000000-0000-0000-0000-000000000001') throw new Error('内置出口不能修改')
+    const existing = id ? this.store.aiProviderEndpoints.find((item) => item.id === id) : undefined
+    const endpoint: AiProviderEndpoint = existing ?? {
+      id: crypto.randomUUID(),
+      providerKind: input.providerKind,
+      label: input.label,
+      baseUrl: input.baseUrl,
+      enabled: input.enabled,
+      builtin: false,
+      revision: 0,
+    }
+    endpoint.providerKind = input.providerKind
+    endpoint.label = input.label
+    endpoint.baseUrl = input.baseUrl
+    endpoint.enabled = input.enabled
+    endpoint.revision += 1
+    if (!existing) this.store.aiProviderEndpoints.push(endpoint)
+    return clone(endpoint)
+  }
+  async disableAiProviderEndpoint(id: string) {
+    await pause(20)
+    const endpoint = this.store.aiProviderEndpoints.find((item) => item.id === id && !item.builtin)
+    if (!endpoint) throw new Error('Provider 出口不存在或不可停用')
+    endpoint.enabled = false
+    endpoint.revision += 1
+    return clone(endpoint)
   }
   async aiTurn(input: AiTurnInput): Promise<AiTurnResponse> {
     await pause(80)

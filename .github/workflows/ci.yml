@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-linux:
+    name: Rust core and server (Linux)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_DB: muriarc_test
+          POSTGRES_USER: muriarc_test
+          POSTGRES_PASSWORD: muriarc-test-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U muriarc_test -d muriarc_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      MURIARC_TEST_DATABASE_URL: postgresql://muriarc_test:muriarc-test-password@127.0.0.1:5432/muriarc_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Domain, data, migration, and Store clippy
+        run: >-
+          cargo clippy --locked
+          -p muriarc-core -p muriarc-ai
+          -p muriarc-store-sqlite -p muriarc-store-postgres
+          -p muriarc-importer -p muriarc-data -p muriarc-snapshot -p muriarc-legacy-migrator
+          --all-targets --all-features -- -D warnings
+      - name: Server clippy
+        run: cargo clippy --locked -p muriarc-server --all-targets --all-features -- -D warnings
+      - name: Domain, data, migration, and dual Store tests
+        run: >-
+          cargo test --locked
+          -p muriarc-core -p muriarc-ai
+          -p muriarc-store-sqlite -p muriarc-store-postgres
+          -p muriarc-importer -p muriarc-data -p muriarc-snapshot -p muriarc-legacy-migrator
+          --all-targets --all-features
+      - name: Server, MCP, Environment Root, and API tests
+        run: cargo test --locked -p muriarc-server --all-targets --all-features
+
+  ui:
+    name: Vue UI and branding
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.0
+          standalone: true
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Branding integrity
+        run: python branding/check_branding.py
+      - name: Install UI dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+      - name: Dependency audit
+        working-directory: ui
+        run: pnpm audit --audit-level=high
+      - name: UI unit tests
+        working-directory: ui
+        run: pnpm run test
+      - name: UI typecheck
+        working-directory: ui
+        run: pnpm run typecheck
+      - name: Responsive Web build
+        working-directory: ui
+        env:
+          VITE_MURIARC_GATEWAY: remote
+        run: pnpm run build
+      - name: Install Playwright browser
+        working-directory: ui
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Responsive end-to-end tests
+        working-directory: ui
+        run: pnpm run test:e2e
+
+  desktop-windows:
+    name: Tauri desktop smoke (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.0
+          standalone: true
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install UI dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+      - name: Build desktop UI
+        working-directory: ui
+        env:
+          VITE_MURIARC_GATEWAY: local
+        run: pnpm run build
+      - name: Desktop strict clippy
+        run: cargo clippy --locked -p muriarc-desktop --all-targets --all-features -- -D warnings
+      - name: Desktop Rust tests
+        run: cargo test --locked -p muriarc-desktop --all-features
+      - name: Tauri no-bundle smoke build
+        working-directory: ui
+        run: pnpm exec tauri build --debug --no-bundle
+
+  container:
+    name: Container and Compose build
+    runs-on: ubuntu-latest
+    needs: [rust-linux, ui]
+    env:
+      MURIARC_POSTGRES_PASSWORD: ci-compose-password
+      MURIARC_LAB_ID: 00000000-0000-4000-8000-000000000001
+      MURIARC_LAB_NAME: CI Lab
+      MURIARC_ROOT_USER_ID: 00000000-0000-4000-8000-000000000002
+      MURIARC_ROOT_USER_EMAIL: ci-root@example.org
+      MURIARC_ROOT_USER_NAME: CI Environment Root
+      MURIARC_ROOT_PASSWORD: ci-environment-root-password-not-for-production
+      MURIARC_BOOTSTRAP_TOKEN: ci-bootstrap-token-00000000000000000000000000000000
+      MURIARC_BOOTSTRAP_MCP_TOKEN: ci-mcp-token-000000000000000000000000000000000000
+      MURIARC_SESSION_COOKIE_SECURE: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - uses: docker/setup-buildx-action@v3
+      - name: Build Compose Server image
+        run: docker compose build server
+      - name: Start Compose stack and wait for health
+        run: docker compose up -d --wait --wait-timeout 180
+      - name: Health and persistent-login smoke
+        run: |
+          curl --fail --silent --show-error http://127.0.0.1:8787/api/v1/health
+          curl --fail --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"ci-root@example.org","password":"ci-environment-root-password-not-for-production"}' \
+            http://127.0.0.1:8787/api/v1/auth/login
+      - name: Compose diagnostics
+        if: always()
+        run: docker compose ps && docker compose logs --no-color
+      - name: Stop Compose stack
+        if: always()
+        run: docker compose down --volumes --remove-orphans

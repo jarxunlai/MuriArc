@@ -1,0 +1,81 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.codex/
+.agents/
+*.swp
+*.orig
+
+# Rust
+target/
+src-tauri/gen/
+**/*.rs.bk
+
+# Node
+node_modules/
+ui/node_modules/
+.pnpm-store/
+ui/dist/
+.vite/
+*.tsbuildinfo
+*.eslintcache
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# Python legacy/tool caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pixi/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+.envrc
+.direnv/
+.npmrc
+.cargo/credentials
+.cargo/credentials.toml
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+
+# Runtime data: never commit real animal records
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+/data/
+/var/
+/attachments/
+/uploads/
+/snapshots/
+/backups/
+/secrets/
+/tmp/
+
+# Generated test/browser artifacts
+coverage/
+playwright-report/
+test-results/
+
+# Legacy build outputs
+/dist/
+/public/
+/backend/
+/dos/
+backend/uploads/
+*.log

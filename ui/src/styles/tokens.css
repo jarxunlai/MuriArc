@@ -1,0 +1,34 @@
+:root {
+  color-scheme: light;
+  --muri-primary: #0f5faa;
+  --muri-primary-hover: #0b70c7;
+  --muri-primary-soft: #eaf3fb;
+  --muri-accent: #009ca6;
+  --muri-warning: #d98216;
+  --muri-danger: #c34b51;
+  --muri-success: #38866b;
+  --muri-bg: #f4f6f8;
+  --muri-surface: #ffffff;
+  --muri-surface-muted: #f8fafb;
+  --muri-border: #dfe5eb;
+  --muri-border-strong: #cbd4de;
+  --muri-text: #1d2935;
+  --muri-text-secondary: #5e6b78;
+  --muri-text-tertiary: #87929d;
+  --muri-radius-sm: 6px;
+  --muri-radius: 8px;
+  --muri-radius-lg: 12px;
+  --muri-shadow: 0 8px 28px rgba(30, 53, 76, 0.08);
+  --muri-sidebar-width: 224px;
+  --muri-topbar-height: 58px;
+  --muri-content-max: 1480px;
+  --muri-transition-fast: 140ms ease;
+  --muri-transition-panel: 180ms ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --muri-transition-fast: 0ms;
+    --muri-transition-panel: 0ms;
+  }
+}

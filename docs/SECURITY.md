@@ -1,0 +1,53 @@
+# Security
+
+## Trust boundaries
+
+- Browser、外部 REST/MCP 客户端和模型输出均视为不可信输入。
+- Server Web 使用持久安全 session；外部 REST/MCP 使用绑定用户和 scopes 的可撤销 token。
+- 本地模式不创建账号、密码或认证表；每次启动的“进入本地空间”只是操作者确认而非安全锁，但所有写入仍记录 LocalOperator。
+
+Server 普通用户密码以 Argon2id PHC hash 保存。随机 session、会话派生 CSRF 和外部 token
+只将 SHA-256 digest 写入 PostgreSQL；明文 session 仅存在于 HttpOnly cookie，
+CSRF 可在有效会话内安全恢复但不持久化明文，外部 token 仅在创建响应中显示一次。身份验证时实时读取 User、Credential 与 Membership，
+因此 suspended、软删除、角色调整、强制改密、token 到期或撤销立即生效。管理员和 API 永远不能读取任何用户的现有密码或 Argon2id hash。
+
+## Environment Root and account lifecycle
+
+- Server 必须配置 `MURIARC_LAB_NAME`、`MURIARC_ROOT_USER_ID`、`MURIARC_ROOT_USER_EMAIL`、`MURIARC_ROOT_USER_NAME` 和 `MURIARC_ROOT_PASSWORD`；`MURIARC_LAB_ID` 仍是 tenant ID。
+- Root 明文密码按产品决策保存在宿主机 `.env`，真实文件必须 Git ignore 且建议 `chmod 600 .env`。权限 600 只能限制普通本机用户：宿主机管理员、Docker daemon/`docker inspect`、进程环境采集和未加密备份仍可能看到它。备份 `.env` 时必须加密并限制访问。
+- Server 每次启动在 PostgreSQL 单事务和 advisory lock 内核对 Lab、Root User、唯一 LabAdmin membership 与 Argon2id credential。Root 邮箱或名称变化会同步；密码与 hash 不匹配会更新 hash、`password_changed_at` 和 revision；身份或凭据变化会撤销 Root Session。重复邮箱、跨 Lab User ID、软删除身份/Root membership 或不支持的 hash 会阻止启动。
+- Root 密码只能由 Environment Root 操作者编辑 `.env` 后重启修改。应用内禁止修改 Root profile/password，禁止停用、降级、重置或撤销 Root membership。
+- Root 是配置声明的唯一 User ID，不新增第二套 Permission 枚举。只有 Root 能治理 LabAdmin；LabAdmin 只能治理非 LabAdmin 账号；ProjectAdmin 仅治理获授权项目。
+- 新账号只接受临时密码并设置 `must_change_password=true`。强制期只开放登录后的 Session/CSRF 查询、退出和自助改密；业务 API 与 external bearer token 返回稳定的 `password_change_required`。
+- 密码验收仅要求至少 8 个 Unicode 字符、最多 1024 bytes、无控制字符且新旧不同；不强制字符组合，也不定期过期。前端“弱/中/强”只是建议。
+- 自助改密撤销除当前 Session 以外的其他 Session。管理员重置设置新临时密码、强制下次改密，并撤销目标全部 Session 与 external token；每次凭据与撤销写入使用稳定 operation code 和脱敏 Audit。
+
+## Required controls
+
+- 密码使用 Argon2id；生产 cookie 默认设置 Secure、HttpOnly、SameSite=Strict。
+- 所有 cookie-auth mutation 强制验证 `X-CSRF-Token`；bearer token 不从 cookie 读取，避免混淆代理问题。
+- 页面刷新后只可通过有效 HttpOnly session 调用安全的 `GET /api/v1/auth/csrf` 恢复 CSRF；该端点拒绝 bearer 身份并返回 `Cache-Control: no-store`。
+- 登录失败统一返回安全错误，不区分未知 email、错误密码、停用或删除账号。
+- 持久外部 token 具有 scopes、到期时间和撤销时间；有效权限始终为用户实时角色与 scopes 的交集，数据库不保存明文 token。
+- AI key：Desktop 存 OS keyring；Server 使用环境注入的 32-byte master key，
+  以 AES-256-GCM、随机 nonce 和绑定 user/key-version 的 AAD 对每位用户的 key
+  独立加密。数据库不保存 master key。
+- AI key 不进入项目数据库、日志、审计、快照或错误响应。
+- Server 未配置有效 master key 时所有 AI settings、turn 和 approval 路由 fail closed，
+  不允许回退到明文存储。`LocalHttp` Provider 只允许管理员配置的精确 URL allowlist。
+- Non-official OpenAI-compatible Provider URLs require an exact server allowlist entry; the official OpenAI v1 URL is the only built-in cloud endpoint, and Provider HTTP redirects are disabled.
+- Lab-wide AI 会话只读；产生写入草稿前必须显式绑定 Project。客户端声明的
+  step-up 状态不受信任，外部 token 不得修改 AI 设置或代替研究者审批。
+- 附件名称不得决定磁盘路径；使用 UUID/hash，阻止目录穿越。
+- 查询 DSL 使用资源、字段、操作符 allowlist，并限制分页和执行成本。
+- MCP 仅接受带 AI scopes 的外部身份，普通 Web session 不可隐式升级；浏览器 `Origin` 默认拒绝并只支持精确 allowlist。
+- MCP 首版只暴露固定只读领域工具，不接受任意 SQL 或任意 HTTP 请求。
+- 普通 JSON API 请求体显式限制为 1 MiB，MCP 限制为 128 KiB；CSV/XLSX 导入使用已实现的专用流式上传端点，单文件独立限制为 32 MiB。
+- 旧持久管理员 bootstrap seed 已从生产启动面移除；升级部署必须显式提供新的 Root 环境变量，不能静默复用遗留 bootstrap 密码。
+- 可选 bootstrap bearer 只供受控预览，正常运行应留空；它不创建持久管理员、不替代 Root、持久账号或可撤销 external token。
+- 高风险操作（删除、批量导入、权限、迁移）必须加强确认。
+- 科研测量由 AI 提取时先进入 draft，只有授权研究者可签署为正式记录。
+
+## Reporting
+
+请不要在公开 Issue 中提交真实动物数据、数据库、密钥或附件。安全问题应通过仓库维护者提供的私下渠道报告。

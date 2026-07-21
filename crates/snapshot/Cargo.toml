@@ -1,0 +1,17 @@
+[package]
+name = "muriarc-snapshot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Versioned, checksummed MuriArc transfer snapshots"
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+uuid.workspace = true
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

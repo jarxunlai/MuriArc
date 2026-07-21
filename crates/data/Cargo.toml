@@ -1,0 +1,24 @@
+[package]
+name = "muriarc-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared bounded import, export, artifact and snapshot workflows for MuriArc transports"
+
+[dependencies]
+chrono.workspace = true
+muriarc-core = { path = "../core" }
+muriarc-importer = { path = "../importer" }
+muriarc-snapshot = { path = "../snapshot" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+uuid.workspace = true
+
+[dev-dependencies]
+muriarc-store-sqlite = { path = "../store-sqlite" }
+tempfile = "3.23.0"

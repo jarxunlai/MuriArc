@@ -1,0 +1,86 @@
+name: muriarc
+
+services:
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MURIARC_POSTGRES_DB:-muriarc}
+      POSTGRES_USER: ${MURIARC_POSTGRES_USER:-muriarc}
+      POSTGRES_PASSWORD: ${MURIARC_POSTGRES_PASSWORD:?set MURIARC_POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: muriarc/server:0.1.0
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MURIARC_DATABASE_URL: postgresql://${MURIARC_POSTGRES_USER:-muriarc}:${MURIARC_POSTGRES_PASSWORD:?set MURIARC_POSTGRES_PASSWORD}@db:5432/${MURIARC_POSTGRES_DB:-muriarc}
+      MURIARC_BIND_ADDR: 0.0.0.0:8787
+      MURIARC_UI_DIR: /opt/muriarc/ui
+      MURIARC_DATA_ROOT: /var/lib/muriarc/data
+      MURIARC_ATTACHMENT_ROOT: /var/lib/muriarc/attachments
+      MURIARC_LAB_ID: ${MURIARC_LAB_ID:?set MURIARC_LAB_ID}
+      MURIARC_LAB_NAME: ${MURIARC_LAB_NAME:?set MURIARC_LAB_NAME}
+      MURIARC_ROOT_USER_ID: ${MURIARC_ROOT_USER_ID:?set MURIARC_ROOT_USER_ID}
+      MURIARC_ROOT_USER_EMAIL: ${MURIARC_ROOT_USER_EMAIL:?set MURIARC_ROOT_USER_EMAIL}
+      MURIARC_ROOT_USER_NAME: ${MURIARC_ROOT_USER_NAME:?set MURIARC_ROOT_USER_NAME}
+      MURIARC_ROOT_PASSWORD: ${MURIARC_ROOT_PASSWORD:?set MURIARC_ROOT_PASSWORD}
+      MURIARC_SESSION_COOKIE_SECURE: ${MURIARC_SESSION_COOKIE_SECURE:-true}
+      MURIARC_SESSION_TTL_HOURS: ${MURIARC_SESSION_TTL_HOURS:-12}
+      MURIARC_AI_MASTER_KEY: ${MURIARC_AI_MASTER_KEY:-}
+      MURIARC_AI_MASTER_KEY_VERSION: ${MURIARC_AI_MASTER_KEY_VERSION:-1}
+      MURIARC_AI_LOCAL_URL_ALLOWLIST: ${MURIARC_AI_LOCAL_URL_ALLOWLIST:-}
+      MURIARC_AI_OPENAI_URL_ALLOWLIST: ${MURIARC_AI_OPENAI_URL_ALLOWLIST:-}
+      MURIARC_BOOTSTRAP_TOKEN: ${MURIARC_BOOTSTRAP_TOKEN:-}
+      MURIARC_BOOTSTRAP_MCP_TOKEN: ${MURIARC_BOOTSTRAP_MCP_TOKEN:-}
+      MURIARC_MCP_ALLOWED_ORIGINS: ${MURIARC_MCP_ALLOWED_ORIGINS:-}
+      RUST_LOG: ${RUST_LOG:-muriarc_server=info,tower_http=info}
+    ports:
+      - "127.0.0.1:8787:8787"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8787/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    read_only: true
+    volumes:
+      - server_data:/var/lib/muriarc
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    networks:
+      - backend
+      - edge
+
+volumes:
+  postgres_data:
+  server_data:
+
+networks:
+  backend:
+    internal: true
+  edge:

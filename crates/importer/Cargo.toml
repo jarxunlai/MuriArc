@@ -1,0 +1,22 @@
+[package]
+name = "muriarc-importer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Safe preview-first tabular import and export for MuriArc"
+
+[dependencies]
+calamine = { version = "0.31.0", default-features = false, features = ["dates"] }
+chrono.workspace = true
+csv = "1.4.0"
+muriarc-core = { path = "../core" }
+rust_xlsxwriter = "0.93.0"
+serde.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.24.0"

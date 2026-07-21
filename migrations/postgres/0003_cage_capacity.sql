@@ -1,0 +1,1 @@
+ALTER TABLE cages ADD COLUMN capacity INTEGER NOT NULL DEFAULT 5 CHECK (capacity > 0);

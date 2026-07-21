@@ -1,0 +1,13 @@
+{
+  "productName": "MuriArc",
+  "shortName": "MuriArc",
+  "tagline": "动物管理优先 · 实验数据原生关联 · AI 辅助操作",
+  "bundleIdentifier": "org.muriarc.desktop",
+  "primaryColor": "#0f5faa",
+  "accentColor": "#009ca6",
+  "sourceNotice": "MuriArc 基于 MurisPro / animal_lab 继续开发。",
+  "logoMarkPath": "/logo-mark.png",
+  "version": "0.1.0",
+  "releaseStage": "预发布",
+  "logoMasterSha256": "9973d3c11403850d71df87b324ea15e4a35745894c7f6c9058268ce198124070"
+}

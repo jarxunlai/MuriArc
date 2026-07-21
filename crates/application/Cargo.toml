@@ -1,0 +1,19 @@
+[package]
+name = "muriarc-application"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared application use cases for MuriArc transports"
+
+[dependencies]
+chrono.workspace = true
+muriarc-core = { path = "../core" }
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+muriarc-store-sqlite = { path = "../store-sqlite" }
+tokio.workspace = true

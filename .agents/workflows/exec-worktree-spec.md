@@ -31,6 +31,6 @@ description: 检查当前 worktree 的 git-worktree-spec.md 是否存在，读�
 ## 验收
 
 6. 实现完成后，逐项检查「验收标准」：
-   - 能跑测试的就跑测试
+   - 能跑测试的就跑测试：**必须在当前 worktree 目录内**执行，遵守根目录 `AGENTS.md`「Git Worktree 与测试环境」（先 `source ~/.cargo/env`、设置仓库外的 `CARGO_TARGET_DIR`、`pnpm --dir ui install`）；**禁止**回到 main 工作树借用其 `target/` 做验证
    - 能通过 dev server 验证的就启动验证
    - 将验收结果汇报给用户

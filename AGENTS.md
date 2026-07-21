@@ -24,24 +24,57 @@ MuriArc 以动物全生命周期管理为核心。实验、测量、样本、附
 
 ## Git Worktree 与测试环境
 
-Worktree 是完整可编译、可测试的工作副本；在对应目录内可正常跑与主仓相同的检查（`cargo test`、`pnpm --dir ui run test` 等）。拆分与执行流程见 `.agents/skills/git-worktree-design` 与 `.agents/workflows/exec-worktree-spec.md`。
+Worktree 是**独立工作树**，不是“缺编译环境的半成品”。对该 feature 的编译与测试必须在**该 worktree 目录内**完成，不得回到 `main` 工作树去编译/测试别的 worktree 的改动。
 
-### 共享与不共享
+拆分与执行流程见 `.agents/skills/git-worktree-design` 与 `.agents/workflows/exec-worktree-spec.md`。Git 相关 skills 也在 `.agents/`。
 
-- **机器级共享（无需每个 worktree 重装）**：`rustup` / `rust-toolchain.toml`、Node、Corepack、pnpm 版本、系统依赖。
-- **每个 worktree 各自一份（被 `.gitignore`）**：`target/`、`ui/node_modules`、本地 `.env`、测试用数据库与附件路径。
-- 不要把 `target/`、`node_modules` 移出 `.gitignore` 或跨分支提交构建产物。
-- 不要多个 worktree 共用同一可写 SQLite / 附件目录做写测试，以免互相污染。
+### 严禁的错误做法
 
-### 降低冗余（AI 建 worktree 或跑测试时照做）
+- **禁止**为了“借用 main 的编译环境”而 `cd` 到 main 工作树跑 `cargo`/`pnpm` 来验证 worktree 改动：测到的是 main 的源码与产物，会污染 main 的 `target/`，并掩盖 worktree 分支的真实结果。
+- **禁止**把 main 的 `./target` 或 `./ui/node_modules` 符号链接/复制进 worktree 当“环境”。
+- **禁止**多个 worktree（含 main）共用同一可写 SQLite / 附件目录做写测试。
 
-1. **Cargo 共享编译缓存**（优先）：在当前 shell 设置统一目录后再跑测试，例如
-   `export CARGO_TARGET_DIR="$HOME/.cache/muriarc-cargo-target"`。
-   多个 worktree **同时** `cargo build/test` 可能争用同一 `target` 锁；并行时改为按分支分流，例如
-   `CARGO_TARGET_DIR="$HOME/.cache/muriarc-cargo-target/<branch-slug>"`，或串行跑测试。
-2. **前端**：每个 worktree 在该目录执行一次 `pnpm --dir ui install`。pnpm 全局 store 已 content-addressable，安装主要是建链接，不要跨 worktree 硬链整个 `node_modules`（分支间 lock 可能不同）。
-3. **可选加速**：已安装 `sccache` 时可设 `RUSTC_WRAPPER=sccache`，可与共享 `CARGO_TARGET_DIR` 叠加。
-4. 建 worktree 后若需跑 Rust/前端检查，先确认上述缓存与 `pnpm install`，再执行 `docs/ENVIRONMENTS.md` 中的 check 命令。
+### 正确心智模型
+
+| 层级 | 内容 | 是否每个 worktree 重装 |
+|------|------|------------------------|
+| 工具链 | `rustup`/`cargo`/`rustc`、Node、Corepack、pnpm、系统库 | 否，机器级共享 |
+| 工作树源码 | 该 worktree 检出的分支文件 | 是，本来就独立 |
+| 构建产物 | `target/`、`ui/node_modules`、本地 `.env`、测试库 | 各自或共享**缓存目录**（见下），但 cwd 必须是该 worktree |
+
+缺少的是该 worktree 下的**产物/依赖链接**，不是“只能用 main 才能编译”。`target/` 被 ignore 不代表没有编译能力。
+
+### Worktree 内跑测试前的引导（AI 必须照做）
+
+在**该 worktree 的绝对路径**下执行（Cursor/Codex 会话的 cwd 也必须是该路径）：
+
+```bash
+# 1) 确保 cargo 在 PATH（非登录 shell 常见缺失）
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+command -v cargo >/dev/null || { echo "cargo not found; install rustup first"; exit 1; }
+
+# 2) 编译缓存：共享到 main 工作树之外，切勿指向 main 的 ./target
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/muriarc-cargo-target}"
+# 多个 worktree 同时 cargo 时改为按分支分流，避免 target 锁冲突：
+# export CARGO_TARGET_DIR="$HOME/.cache/muriarc-cargo-target/<branch-slug>"
+
+# 3) 前端依赖（每个 worktree 执行一次；pnpm 全局 store 已去重）
+corepack enable
+corepack prepare pnpm@11.5.0 --activate
+pnpm --dir ui install
+
+# 4) 再跑检查（命令与 docs/ENVIRONMENTS.md 一致）
+cargo test --workspace --all-features
+pnpm --dir ui run test
+```
+
+可选：已安装 `sccache` 时设 `RUSTC_WRAPPER=sccache`。
+
+### 共享与不共享（补充）
+
+- 不要把 `target/`、`node_modules` 移出 `.gitignore` 或提交构建产物。
+- `CARGO_TARGET_DIR` 必须落在**仓库工作树以外**的缓存路径；这样 worktree 无需自带庞大 `target/`，也不依赖 main 目录。
+- 本地 `.env` 按需从 main 或 `.env.example` 复制到**当前** worktree，不要共享可写运行时数据文件。
 
 ## 数据与 Git 边界
 
@@ -49,7 +82,6 @@ Worktree 是完整可编译、可测试的工作副本；在对应目录内可�
 - Git 不跟踪数据库、附件、快照、密钥、构建产物、缓存和真实动物数据。
 - 旧数据库只读；迁移必须写入新目标并生成报告。
 - 不在日志、审计、测试快照或前端状态中记录 API key。
-- Git相关的skills请读取home\ljx\Github\animal_lab\.agents目录下的内容
 
 ## 品牌与上游
 

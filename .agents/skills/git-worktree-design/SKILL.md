@@ -130,13 +130,17 @@ git worktree add -b <branch_name> <worktree_path>
 
 环境与缓存约定以仓库根目录 `AGENTS.md` 的「Git Worktree 与测试环境」为准。摘要：
 
-- **无需每个 worktree 重装**：Rust toolchain、Node、Corepack、pnpm。
-- **Cargo**：在跑 `cargo test/build` 前设置共享
-  `CARGO_TARGET_DIR="$HOME/.cache/muriarc-cargo-target"`（并行 worktree 同时编译时按分支分流或串行）。
-- **前端**：每个 worktree 各自执行一次安装（pnpm 全局 store 已共享内容，勿跨 worktree 硬链整个 `node_modules`）：
+- **严禁**回到 main 工作树编译/测试该 worktree 的改动；**严禁**把 main 的 `./target` 或 `node_modules` 链进 worktree。
+- **cwd 必须是该 worktree 绝对路径**；先 `source "$HOME/.cargo/env"`（若存在），再确认 `command -v cargo`。
+- **Cargo 缓存**指向仓库外：`CARGO_TARGET_DIR="$HOME/.cache/muriarc-cargo-target"`（并行时按分支分流）；不要指向 main 的 `./target`。
+- **前端**：在该 worktree 内执行一次：
 
 ```bash
-cd <worktree_path> && pnpm --dir ui install
+cd <worktree_path>
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/muriarc-cargo-target}"
+corepack enable && corepack prepare pnpm@11.5.0 --activate
+pnpm --dir ui install
 ```
 
 - 不要把 `target/`、`node_modules` 移出 `.gitignore`；不要共用可写测试数据库/附件目录。

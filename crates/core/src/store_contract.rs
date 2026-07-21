@@ -474,7 +474,10 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
     assert!(procedure_events.iter().any(|event| {
         event.event_key == format!("procedure_{}", procedure.id)
             && event.label == procedure.name
-            && event.details.get("procedure_id").and_then(|value| value.as_str())
+            && event
+                .details
+                .get("procedure_id")
+                .and_then(|value| value.as_str())
                 == Some(procedure_id.as_str())
     }));
 

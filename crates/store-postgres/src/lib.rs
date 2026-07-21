@@ -6001,9 +6001,12 @@ impl MuriArcStore for PostgresStore {
                 "attachment revision changed before deletion".to_owned(),
             ));
         }
-        if attachment.entity_type != "project" || attachment.project_id != Some(attachment.entity_id) {
+        if attachment.entity_type != "project"
+            || attachment.project_id != Some(attachment.entity_id)
+        {
             return Err(StoreError::Conflict(
-                "attachments linked to research records must be unlinked before deletion".to_owned(),
+                "attachments linked to research records must be unlinked before deletion"
+                    .to_owned(),
             ));
         }
         let link_count: i64 = sqlx::query_scalar(

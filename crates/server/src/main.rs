@@ -105,7 +105,10 @@ fn configure_ai(state: AppState, store: Arc<PostgresStore>) -> Result<AppState, 
     let encoded_key = Zeroizing::new(encoded_key);
     let key_version = optional_positive_i32_env("MURIARC_AI_MASTER_KEY_VERSION", 1)?;
     let master_key = AiMasterKey::from_base64(encoded_key.as_str(), key_version)?;
-    let providers = Arc::new(PostgresAiProviderStore::new(store.as_ref().clone(), master_key));
+    let providers = Arc::new(PostgresAiProviderStore::new(
+        store.as_ref().clone(),
+        master_key,
+    ));
     let operations: Arc<dyn AiOperationStore> = store;
     tracing::info!(
         key_version,

@@ -20,11 +20,10 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderEndpointView,
-    AiProviderSettingsView, AiProviderStoreError, ApiError, AppState, AuthError, AuthPrincipal,
-    AuthenticationMethod, RequestMetadata, ResolvedAiProvider, SaveAiLabSettingsInput,
-    SaveAiProviderEndpointInput, SaveAiProviderSettingsInput,
-    ai_data_tools::ServerAiDataTools, ai_step_up::AiStepUpLimit,
+    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderEndpointView, AiProviderSettingsView,
+    AiProviderStoreError, ApiError, AppState, AuthError, AuthPrincipal, AuthenticationMethod,
+    RequestMetadata, ResolvedAiProvider, SaveAiLabSettingsInput, SaveAiProviderEndpointInput,
+    SaveAiProviderSettingsInput, ai_data_tools::ServerAiDataTools, ai_step_up::AiStepUpLimit,
 };
 
 use super::{
@@ -44,10 +43,7 @@ pub(super) fn router() -> Router<AppState> {
             "/admin/ai/endpoints",
             get(list_provider_endpoints).post(create_provider_endpoint),
         )
-        .route(
-            "/admin/ai/endpoints/{id}",
-            put(update_provider_endpoint),
-        )
+        .route("/admin/ai/endpoints/{id}", put(update_provider_endpoint))
         .route(
             "/admin/ai/endpoints/{id}/disable",
             post(disable_provider_endpoint),

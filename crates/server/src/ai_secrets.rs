@@ -507,7 +507,9 @@ mod postgres {
                 .try_get("provider_kind")
                 .map_err(|_| AiProviderStoreError::Storage)?;
             Ok(AiProviderEndpointView {
-                id: row.try_get("id").map_err(|_| AiProviderStoreError::Storage)?,
+                id: row
+                    .try_get("id")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
                 provider_kind: Self::provider_kind_from_db(&kind)?,
                 label: row
                     .try_get("label")

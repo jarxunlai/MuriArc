@@ -25,10 +25,9 @@ use muriarc_data::DataFiles;
 use tokio::sync::RwLock;
 
 pub use ai_secrets::{
-    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderEndpointView,
-    AiProviderSettingsView, AiProviderStoreError, DisabledAiProviderStore, ResolvedAiProvider,
-    SaveAiLabSettingsInput, SaveAiProviderEndpointInput, SaveAiProviderSettingsInput,
-    SensitiveSecret, UserAiProviderStore,
+    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderEndpointView, AiProviderSettingsView,
+    AiProviderStoreError, DisabledAiProviderStore, ResolvedAiProvider, SaveAiLabSettingsInput,
+    SaveAiProviderEndpointInput, SaveAiProviderSettingsInput, SensitiveSecret, UserAiProviderStore,
 };
 #[cfg(feature = "postgres")]
 pub use ai_secrets::{AiMasterKey, PostgresAiProviderStore};

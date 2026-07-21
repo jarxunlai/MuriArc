@@ -126,25 +126,20 @@ git worktree add -b <branch_name> <worktree_path>
 
 ---
 
-### 4. 安装依赖
+### 4. 安装依赖与共享缓存
 
-检测项目使用的包管理器并安装依赖：
+环境与缓存约定以仓库根目录 `AGENTS.md` 的「Git Worktree 与测试环境」为准。摘要：
 
-```bash
-# 检测 lock file 判断包管理器
-# pnpm-lock.yaml → pnpm install
-# yarn.lock → yarn install
-# package-lock.json → npm install
-# bun.lockb → bun install
-```
-
-对每个 worktree 执行：
+- **无需每个 worktree 重装**：Rust toolchain、Node、Corepack、pnpm。
+- **Cargo**：在跑 `cargo test/build` 前设置共享
+  `CARGO_TARGET_DIR="$HOME/.cache/muriarc-cargo-target"`（并行 worktree 同时编译时按分支分流或串行）。
+- **前端**：每个 worktree 各自执行一次安装（pnpm 全局 store 已共享内容，勿跨 worktree 硬链整个 `node_modules`）：
 
 ```bash
-cd <worktree_path> && <package_manager> install
+cd <worktree_path> && pnpm --dir ui install
 ```
 
-> **注意**：每个 worktree 有独立的工作目录，`node_modules` 不会共享，必须各自安装。
+- 不要把 `target/`、`node_modules` 移出 `.gitignore`；不要共用可写测试数据库/附件目录。
 
 ---
 

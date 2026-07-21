@@ -469,6 +469,17 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
     assert!(store.list_animal_events(animal.id).await.unwrap().iter().any(|event| {
         matches!(event.kind, AnimalEventKind::ProcedurePerformed { procedure_id } if procedure_id == procedure.id)
     }));
+    let procedure_events = store.list_experiment_events(experiment.id).await.unwrap();
+    let procedure_id = procedure.id.to_string();
+    assert!(procedure_events.iter().any(|event| {
+        event.event_key == format!("procedure_{}", procedure.id)
+            && event.label == procedure.name
+            && event
+                .details
+                .get("procedure_id")
+                .and_then(|value| value.as_str())
+                == Some(procedure_id.as_str())
+    }));
 
     let mut measurement = Measurement::draft(
         lab.id,
@@ -573,6 +584,101 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
         store.get_attachment(attachment.id).await.unwrap(),
         attachment
     );
+    assert!(matches!(
+        store
+            .soft_delete_attachment(
+                attachment.id,
+                attachment.meta.revision,
+                now + Duration::seconds(1),
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let deletable_attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        entity_type: "project".to_owned(),
+        entity_id: project.id,
+        file_name: "delete-me.txt".to_owned(),
+        media_type: Some("text/plain".to_owned()),
+        relative_path: format!("attachments/{}.txt", uuid::Uuid::new_v4()),
+        size_bytes: 1,
+        sha256: "b".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_attachment(&deletable_attachment, &audit)
+        .await
+        .unwrap();
+    let deleted_attachment = store
+        .soft_delete_attachment(
+            deletable_attachment.id,
+            deletable_attachment.meta.revision,
+            now + Duration::seconds(2),
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted_attachment.meta.revision,
+        deletable_attachment.meta.revision + 1
+    );
+    assert!(deleted_attachment.meta.deleted_at.is_some());
+    assert!(matches!(
+        store.get_attachment(deletable_attachment.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert!(
+        store
+            .list_project_attachments(lab.id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|item| item.id != deletable_attachment.id)
+    );
+    let linked_attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        entity_type: "project".to_owned(),
+        entity_id: project.id,
+        file_name: "linked.txt".to_owned(),
+        media_type: Some("text/plain".to_owned()),
+        relative_path: format!("attachments/{}.txt", uuid::Uuid::new_v4()),
+        size_bytes: 1,
+        sha256: "c".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_attachment(&linked_attachment, &audit)
+        .await
+        .unwrap();
+    let link = AttachmentLink {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: project.id,
+        attachment_id: linked_attachment.id,
+        target_type: AttachmentLinkTarget::Project,
+        target_id: project.id,
+        created_by: user.id,
+        meta: RecordMeta::new(now),
+    };
+    store.create_attachment_link(&link, &audit).await.unwrap();
+    assert!(matches!(
+        store
+            .soft_delete_attachment(
+                linked_attachment.id,
+                linked_attachment.meta.revision,
+                now + Duration::seconds(3),
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
     for (entity_type, entity_id) in [
         (EntityType::Participation, participation.id),
         (EntityType::Procedure, procedure.id),

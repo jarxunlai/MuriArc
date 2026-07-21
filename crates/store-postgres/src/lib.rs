@@ -5799,6 +5799,66 @@ impl MuriArcStore for PostgresStore {
             procedure.meta.created_at,
         );
         insert_provenance(&mut tx, &provenance).await?;
+        let event = ExperimentEvent {
+            id: Uuid::new_v4(),
+            lab_id,
+            project_id,
+            experiment_id: procedure.experiment_id,
+            event_key: format!("procedure_{}", procedure.id),
+            label: procedure.name.clone(),
+            occurred_at: procedure
+                .performed_at
+                .or(procedure.scheduled_at)
+                .unwrap_or(procedure.meta.created_at),
+            details: serde_json::json!({
+                "source": "procedure",
+                "procedure_id": procedure.id,
+                "procedure_status": procedure.status,
+            }),
+            meta: RecordMeta::new(procedure.meta.created_at),
+        };
+        event
+            .validate()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        sqlx::query(
+            "INSERT INTO experiment_events (id, lab_id, project_id, experiment_id, event_key, label, occurred_at, details_json, created_at, updated_at, deleted_at, revision) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+        )
+        .bind(event.id)
+        .bind(event.lab_id)
+        .bind(event.project_id)
+        .bind(event.experiment_id)
+        .bind(&event.event_key)
+        .bind(&event.label)
+        .bind(event.occurred_at)
+        .bind(&event.details)
+        .bind(event.meta.created_at)
+        .bind(event.meta.updated_at)
+        .bind(event.meta.deleted_at)
+        .bind(event.meta.revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        write_audit(
+            &mut tx,
+            event.lab_id,
+            Some(event.project_id),
+            EntityType::ExperimentEvent,
+            event.id,
+            AuditAction::Create,
+            audit,
+            None,
+            Some(snapshot(&event)?),
+        )
+        .await?;
+        let provenance = Provenance::from_audit(
+            event.lab_id,
+            Some(event.project_id),
+            EntityType::ExperimentEvent,
+            event.id,
+            audit,
+            event.meta.created_at,
+        );
+        insert_provenance(&mut tx, &provenance).await?;
         if procedure.status == ProcedureStatus::Completed
             && let Some(animal_id) = procedure.animal_id
         {
@@ -5914,6 +5974,113 @@ impl MuriArcStore for PostgresStore {
                 id,
             })?;
         attachment_from_row(&row)
+    }
+
+    async fn soft_delete_attachment(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        deleted_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Attachment> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let row = sqlx::query(&format!(
+            "SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE id = $1 AND deleted_at IS NULL FOR UPDATE"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "attachment",
+            id,
+        })?;
+        let mut attachment = attachment_from_row(&row)?;
+        if attachment.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "attachment revision changed before deletion".to_owned(),
+            ));
+        }
+        if attachment.entity_type != "project"
+            || attachment.project_id != Some(attachment.entity_id)
+        {
+            return Err(StoreError::Conflict(
+                "attachments linked to research records must be unlinked before deletion"
+                    .to_owned(),
+            ));
+        }
+        let link_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM attachment_links WHERE attachment_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if link_count > 0 {
+            return Err(StoreError::Conflict(
+                "linked attachments must be unlinked before deletion".to_owned(),
+            ));
+        }
+        let private_image_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ai_private_images WHERE attachment_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let extraction_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM ai_extraction_drafts WHERE attachment_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if private_image_count > 0 || extraction_count > 0 {
+            return Err(StoreError::Conflict(
+                "AI evidence attachments cannot be deleted from the project library".to_owned(),
+            ));
+        }
+        let before = attachment.clone();
+        attachment.meta.soft_delete(deleted_at);
+        let updated = sqlx::query(
+            "UPDATE attachments SET updated_at = $1, deleted_at = $2, revision = $3 WHERE id = $4 AND revision = $5 AND deleted_at IS NULL",
+        )
+        .bind(attachment.meta.updated_at)
+        .bind(attachment.meta.deleted_at)
+        .bind(attachment.meta.revision)
+        .bind(id)
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "attachment revision changed before deletion".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            attachment.lab_id,
+            attachment.project_id,
+            EntityType::Attachment,
+            attachment.id,
+            AuditAction::SoftDelete,
+            audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&attachment)?),
+        )
+        .await?;
+        let provenance = Provenance::from_audit(
+            attachment.lab_id,
+            attachment.project_id,
+            EntityType::Attachment,
+            attachment.id,
+            audit,
+            attachment.meta.updated_at,
+        );
+        insert_provenance(&mut tx, &provenance).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(attachment)
     }
 
     async fn list_attachments(

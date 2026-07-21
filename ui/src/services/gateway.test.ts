@@ -744,7 +744,7 @@ describe('MuriArc gateway selection', () => {
       id: 'attachment-1', project_id: 'project-1', entity_type: 'animal', entity_id: 'animal-1',
       file_name: 'weight.csv', media_type: 'text/csv', size_bytes: 7, sha256: 'a'.repeat(64),
       version: 1, content_href: '/api/v1/attachments/attachment-1/content',
-      meta: { created_at: '2026-07-19T01:00:00Z' },
+      meta: { created_at: '2026-07-19T01:00:00Z', revision: 3 },
     }
     const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input)
@@ -763,6 +763,11 @@ describe('MuriArc gateway selection', () => {
       if (url.endsWith('/attachments/attachment-1/content')) {
         return new Response('a,b\n1,2', { status: 200, headers: { 'Content-Type': 'text/csv' } })
       }
+      if (url.endsWith('/attachments/attachment-1') && init?.method === 'DELETE') {
+        return new Response(JSON.stringify({ data: attachment, request_id: 'req-delete' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
       return new Response(JSON.stringify({ data: [attachment], count: 1, request_id: 'req-list' }), {
         status: 200, headers: { 'Content-Type': 'application/json' },
       })
@@ -779,8 +784,14 @@ describe('MuriArc gateway selection', () => {
       entityType: 'animal', entityId: 'animal-1', projectId: 'project-1',
     })
     const downloaded = await gateway.downloadAttachment('attachment-1')
+    await gateway.deleteAttachment({
+      id: 'attachment-1',
+      expectedRevision: uploaded.revision,
+      reason: 'remove duplicate',
+    })
 
     expect(uploaded).toEqual(expect.objectContaining({ id: 'attachment-1', sizeBytes: 7, version: 1 }))
+    expect(uploaded.revision).toBe(3)
     expect(listed).toHaveLength(1)
     expect(downloaded).toEqual(expect.objectContaining({ size: 7, type: 'text/csv' }))
     const upload = requests.find((request) => request.url.includes('/attachments/upload?'))!
@@ -793,6 +804,12 @@ describe('MuriArc gateway selection', () => {
     const uploadHeaders = new Headers(upload.init?.headers)
     expect(uploadHeaders.get('Content-Type')).toBe('text/csv')
     expect(uploadHeaders.get('X-CSRF-Token')).toBe('csrf-attachment')
+    const deleted = requests.find((request) => request.url.endsWith('/attachments/attachment-1') && request.init?.method === 'DELETE')!
+    expect(JSON.parse(String(deleted.init?.body))).toEqual({
+      expected_revision: 3,
+      reason: 'remove duplicate',
+    })
+    expect(new Headers(deleted.init?.headers).get('X-CSRF-Token')).toBe('csrf-attachment')
   })
 
   it('maps the scoped animal detail resource without exposing audit snapshots', async () => {

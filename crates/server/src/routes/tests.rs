@@ -352,6 +352,13 @@ async fn project_viewer_animal_detail_is_isolated_and_audit_summaries_are_redact
         now,
     )
     .unwrap();
+    let second_visible_experiment = Experiment::new(
+        fixture.lab_id,
+        fixture.project_id,
+        "Second visible detail experiment",
+        now,
+    )
+    .unwrap();
     let hidden_experiment = Experiment::new(
         fixture.lab_id,
         hidden_project.id,
@@ -362,6 +369,11 @@ async fn project_viewer_animal_detail_is_isolated_and_audit_summaries_are_redact
     fixture
         .store
         .create_experiment(&visible_experiment, &audit)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .create_experiment(&second_visible_experiment, &audit)
         .await
         .unwrap();
     fixture
@@ -385,6 +397,7 @@ async fn project_viewer_animal_detail_is_isolated_and_audit_summaries_are_redact
 
     for (experiment_id, animal_id) in [
         (visible_experiment.id, animal.id),
+        (second_visible_experiment.id, animal.id),
         (hidden_experiment.id, animal.id),
         (visible_experiment.id, visible_parent.id),
         (hidden_experiment.id, hidden_parent.id),
@@ -420,20 +433,22 @@ async fn project_viewer_animal_detail_is_isolated_and_audit_summaries_are_redact
             .unwrap();
     }
 
-    for (project_id, experiment_id, key, label, value) in [
+    for (project_id, experiment_id, key, label, value, measured_at) in [
         (
             fixture.project_id,
             visible_experiment.id,
-            "visible_weight",
+            "body_weight",
             "Visible detail measurement",
             21.5,
+            now,
         ),
         (
             hidden_project.id,
             hidden_experiment.id,
-            "hidden_weight",
+            "body_weight",
             "Hidden detail measurement",
             27.5,
+            now + chrono::Duration::seconds(1),
         ),
     ] {
         let mut measurement = Measurement::draft(
@@ -443,7 +458,7 @@ async fn project_viewer_animal_detail_is_isolated_and_audit_summaries_are_redact
             key,
             label,
             MeasurementValue::Number(value),
-            now,
+            measured_at,
             now,
         )
         .unwrap();
@@ -525,6 +540,78 @@ async fn project_viewer_animal_detail_is_isolated_and_audit_summaries_are_redact
         .oneshot(fixture.request(
             Method::GET,
             &format!(
+                "/api/v1/animal-overviews?project_id={}&limit=500",
+                fixture.project_id
+            ),
+            PROJECT_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let overviews = response_json(response).await;
+    let overview_rows = overviews["data"].as_array().unwrap();
+    let overview_animal_ids = overview_rows
+        .iter()
+        .map(|overview| serde_json::from_value::<Uuid>(overview["animal"]["id"].clone()).unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        overview_animal_ids,
+        std::collections::BTreeSet::from([animal.id, visible_parent.id])
+    );
+    let subject_overview = overview_rows
+        .iter()
+        .find(|overview| overview["animal"]["id"] == json!(animal.id))
+        .unwrap();
+    let subject_project_ids = subject_overview["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|project| serde_json::from_value::<Uuid>(project["id"].clone()).unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        (
+            subject_project_ids,
+            subject_overview["latest_weight"]["value"].as_f64().unwrap(),
+        ),
+        (std::collections::BTreeSet::from([fixture.project_id]), 21.5,)
+    );
+    for overview in overview_rows {
+        let projects = overview["projects"].as_array().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["id"], json!(fixture.project_id));
+    }
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::GET,
+            &format!("/api/v1/experiments?project_id={}", fixture.project_id),
+            PROJECT_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let experiments = response_json(response).await;
+    let experiment_ids = experiments["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|experiment| serde_json::from_value::<Uuid>(experiment["id"].clone()).unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        experiment_ids,
+        std::collections::BTreeSet::from([visible_experiment.id, second_visible_experiment.id,])
+    );
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::GET,
+            &format!(
                 "/api/v1/animals/{}/detail?project_id={}&limit=500",
                 animal.id, fixture.project_id
             ),
@@ -543,10 +630,21 @@ async fn project_viewer_animal_detail_is_isolated_and_audit_summaries_are_redact
             .iter()
             .all(|event| event["project_id"] == json!(fixture.project_id))
     );
-    assert_eq!(data["experiments"].as_array().unwrap().len(), 1);
+    let detail_experiments = data["experiments"].as_array().unwrap();
+    assert!(
+        detail_experiments
+            .iter()
+            .all(|experiment| experiment["project"]["id"] == json!(fixture.project_id))
+    );
+    let detail_experiment_ids = detail_experiments
+        .iter()
+        .map(|experiment| {
+            serde_json::from_value::<Uuid>(experiment["experiment"]["id"].clone()).unwrap()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        data["experiments"][0]["project"]["id"],
-        json!(fixture.project_id)
+        detail_experiment_ids,
+        std::collections::BTreeSet::from([visible_experiment.id, second_visible_experiment.id,])
     );
     assert_eq!(data["measurements"].as_array().unwrap().len(), 1);
     assert_eq!(

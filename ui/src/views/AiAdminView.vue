@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useMessage } from 'naive-ui'
-import { Plug, Save, XCircle } from '@lucide/vue'
+import { ExternalLink, Plug, Save, XCircle } from '@lucide/vue'
 import PageHeader from '@/components/PageHeader.vue'
+import type { AiProviderPreset } from '@/domain/models'
 import {
   gateway,
   type AiDiagnostics,
@@ -26,6 +27,7 @@ const settings = reactive<AiLabSettings>({
   maxAutonomyMode: 'full',
 })
 const endpoints = ref<AiProviderEndpoint[]>([])
+const presets = ref<AiProviderPreset[]>([])
 const editingId = ref<string>()
 const draft = reactive<SaveAiProviderEndpointInput>({
   enabled: true,
@@ -61,14 +63,16 @@ function resetDraft() {
 async function load() {
   loading.value = true
   try {
-    const [loadedDiagnostics, loadedSettings, loadedEndpoints] = await Promise.all([
+    const [loadedDiagnostics, loadedSettings, loadedEndpoints, loadedPresets] = await Promise.all([
       gateway.getAiDiagnostics?.(),
       gateway.getAiLabSettings?.(),
       gateway.listAiProviderEndpoints?.(),
+      gateway.listAiProviderPresets?.(),
     ])
     diagnostics.value = loadedDiagnostics
     if (loadedSettings) Object.assign(settings, loadedSettings)
     endpoints.value = loadedEndpoints ?? []
+    presets.value = loadedPresets ?? []
   } catch (error) {
     msg.error(`无法读取 AI 管理状态：${errorMessage(error)}`)
   } finally {
@@ -154,8 +158,8 @@ onMounted(load)
       description="管理实验室 AI 策略与 Provider 出口；个人模型配置和 API Key 始终归用户私有。"
     />
 
-    <n-alert type="warning" :bordered="false">
-      普通用户受实验室总开关和会话授权上限约束；LabAdmin 的个人 AI 配置不受总开关限制。自定义地址仍受 Server allowlist 与批准策略约束。
+    <n-alert type="info" :bordered="false">
+      所有用户（包括 Environment Root 与 LabAdmin）都受实验室总开关约束。管理员只能维护非敏感策略、预设目录与批准出口，不能读取任何用户的 API Key、个人模型或 Token 参数。
     </n-alert>
 
     <section class="cards">
@@ -175,6 +179,11 @@ onMounted(load)
         <small>启用 supports_vision</small>
       </article>
       <article class="surface">
+        <span>Provider 预设</span>
+        <strong>{{ presets.filter((item) => item.enabled).length }}</strong>
+        <small>内置推荐与实验室自定义目录</small>
+      </article>
+      <article class="surface">
         <span>Provider 出口</span>
         <strong>{{ enabledEndpointCount }}</strong>
         <small>{{ diagnostics?.localEndpointCount ?? 0 }} 本地 + {{ diagnostics?.cloudEndpointCount ?? 0 }} 云端</small>
@@ -186,11 +195,11 @@ onMounted(load)
         <h2>实验室 AI 策略</h2>
       </div>
       <div class="policy-row">
-        <div><strong>实验室 AI 总开关</strong><span>关闭后普通用户不能解析 Provider；LabAdmin 保留管理与个人使用能力。</span></div>
+        <div><strong>实验室 AI 总开关</strong><span>关闭后所有用户都不能发起 Provider 请求；非敏感管理页面仍可用于重新启用。</span></div>
         <n-switch v-model:value="settings.enabled" :disabled="loading || policySaving" />
       </div>
       <div class="policy-row">
-        <div><strong>自定义 URL 必须管理员批准</strong><span>实验室出口和预置 Provider 仍按 Server allowlist 精确匹配。</span></div>
+        <div><strong>自定义 URL 必须管理员批准</strong><span>开启时仅允许官方推荐出口或管理员登记的精确 URL；关闭时用户可保存通过协议安全校验的个人出口。</span></div>
         <n-switch v-model:value="settings.customUrlApprovalRequired" :disabled="loading || policySaving" />
       </div>
       <div class="policy-row">
@@ -201,6 +210,22 @@ onMounted(load)
         <template #icon><Save :size="16" /></template>
         保存策略
       </n-button>
+    </section>
+
+    <section class="preset-catalog surface">
+      <div class="section-title">
+        <Plug :size="18" />
+        <h2>Provider 预设目录</h2>
+      </div>
+      <p class="catalog-intro">预设只提供显示名称、推荐出口、模型目录和官方文档，不包含或共享任何用户凭据与个人选择。</p>
+      <div class="preset-grid">
+        <article v-for="preset in presets" :key="preset.id" class="preset-card">
+          <div><strong>{{ preset.displayName }}</strong><n-tag size="small" :type="preset.enabled ? 'success' : 'default'">{{ preset.enabled ? '启用' : '停用' }}</n-tag><n-tag v-if="preset.builtin" size="small">内置</n-tag></div>
+          <code>{{ preset.recommendedBaseUrl || '由用户填写出口' }}</code>
+          <span>{{ preset.models.length ? preset.models.map((model) => model.displayName).join(' · ') : '兼容模型由用户填写' }}</span>
+          <a v-if="preset.documentationUrl" :href="preset.documentationUrl" target="_blank" rel="noreferrer">官方文档<ExternalLink :size="13" /></a>
+        </article>
+      </div>
     </section>
 
     <section class="endpoint-editor surface">
@@ -260,18 +285,18 @@ onMounted(load)
 </template>
 
 <style scoped>
-.cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 14px 0; }
+.cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 14px 0; }
 .cards article { display: flex; padding: 16px; flex-direction: column; }
 .cards strong { font-size: 25px; }
 .cards span, .cards small, .policy span, .endpoint-row span, .boundary p { color: var(--muri-text-tertiary); }
-.policy, .endpoint-editor, .boundary { padding: 18px; }
+.policy, .preset-catalog, .endpoint-editor, .boundary { padding: 18px; }
 .policy { display: grid; gap: 16px; margin-bottom: 12px; }
 .policy-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: center; }
 .policy-row > div { display: flex; flex-direction: column; }
 .autonomy-select { width: 150px; }
 .section-title { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 .section-title h2 { margin: 0; font-size: 17px; }
-.endpoint-editor { margin-bottom: 12px; }
+.preset-catalog, .endpoint-editor { margin-bottom: 12px; }.catalog-intro { margin: -4px 0 14px; color: var(--muri-text-tertiary); }.preset-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }.preset-card { display: flex; min-width: 0; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; }.preset-card > div { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }.preset-card code, .preset-card span { overflow-wrap: anywhere; color: var(--muri-text-secondary); font-size: 11px; }.preset-card a { display: inline-flex; width: fit-content; align-items: center; gap: 4px; color: var(--muri-primary); text-decoration: none; }
 .endpoint-form { display: grid; grid-template-columns: 220px 1fr 120px; gap: 0 14px; align-items: end; }
 .endpoint-form .full-row { grid-column: 1 / -1; }
 .button-row, .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -284,6 +309,7 @@ onMounted(load)
 .boundary p { margin: 0; }
 @media (max-width: 800px) {
   .cards { grid-template-columns: 1fr 1fr; }
+  .preset-grid { grid-template-columns: 1fr; }
   .endpoint-form { grid-template-columns: 1fr; }
   .endpoint-row { grid-template-columns: 1fr; }
 }

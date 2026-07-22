@@ -2,14 +2,15 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useDialog, useMessage } from 'naive-ui'
 import { useRouter } from 'vue-router'
-import { Archive, Bot, ChevronRight, Database, Dna, FolderKanban, KeyRound, Save, ShieldCheck, Users } from '@lucide/vue'
+import { Archive, Bot, ChevronRight, Database, Dna, ExternalLink, FolderKanban, KeyRound, Save, ShieldCheck, SlidersHorizontal, Users } from '@lucide/vue'
 import { branding } from '@/branding'
-import { currentAuthSession, gateway } from '@/services/gateway'
-import type { AiProviderKind, SaveAiSettingsInput, WorkspaceSettings } from '@/domain/models'
+import { currentAuthSession, gateway, HttpGatewayError } from '@/services/gateway'
+import type { AiProviderPreset, SaveAiSettingsInput, WorkspaceSettings } from '@/domain/models'
 import { createDataGateway } from '@/services/dataGateway'
 import { passwordPolicyError, passwordStrength } from '@/services/passwordStrength'
 import { hasLabRegistryAccess } from '@/services/projectContext'
 import PageHeader from '@/components/PageHeader.vue'
+import { builtinAiProviderPresets } from '@/services/aiProviderPresets'
 
 const message = useMessage()
 const dataGateway = createDataGateway(gateway)
@@ -27,15 +28,52 @@ const workspace = reactive<WorkspaceSettings>({
   labName: '',
 })
 const ai = reactive<SaveAiSettingsInput>({
-  enabled: false,
+  enabled: true,
   providerKind: 'open_ai_compatible',
-  model: 'gpt-4.1-mini',
-  baseUrl: 'https://api.openai.com/v1',
+  providerPresetId: 'deepseek',
+  model: 'deepseek-chat',
+  baseUrl: 'https://api.deepseek.com',
   supportsVision: false,
   visionModel: undefined,
+  contextWindowTokens: 131072,
+  maxInputTokens: 65536,
+  maxOutputTokens: 4096,
+  historyTokenBudget: 32768,
+  historyTurns: 20,
+  temperature: 0,
+  timeoutMs: 120000,
 })
 const apiKey = ref('')
-const hasApiKey = ref(false)
+const hasStoredApiKey = ref(false)
+const storedCredentialBinding = ref('')
+const providerPresets = ref<AiProviderPreset[]>(structuredClone(builtinAiProviderPresets))
+const credentialBinding = computed(() => [
+  ai.providerKind,
+  ai.providerPresetId,
+  ai.baseUrl.trim().replace(/\/$/, ''),
+].join('|'))
+const hasApiKey = computed(() => hasStoredApiKey.value
+  && storedCredentialBinding.value === credentialBinding.value)
+const savedAiFingerprint = ref('')
+function aiFingerprint() {
+  return JSON.stringify({
+    enabled: ai.enabled,
+    providerKind: ai.providerKind,
+    providerPresetId: ai.providerPresetId,
+    model: ai.model.trim(),
+    baseUrl: ai.baseUrl.trim().replace(/\/$/, ''),
+    supportsVision: ai.supportsVision,
+    visionModel: ai.supportsVision ? ai.visionModel?.trim() ?? '' : '',
+    contextWindowTokens: ai.contextWindowTokens,
+    maxInputTokens: ai.maxInputTokens,
+    maxOutputTokens: ai.maxOutputTokens,
+    historyTokenBudget: ai.historyTokenBudget,
+    historyTurns: ai.historyTurns,
+    temperature: ai.temperature,
+    timeoutMs: ai.timeoutMs,
+  })
+}
+const isAiDirty = computed(() => apiKey.value.trim().length > 0 || aiFingerprint() !== savedAiFingerprint.value)
 const loadingWorkspace = ref(false)
 const loadingAi = ref(false)
 const savingWorkspace = ref(false)
@@ -58,10 +96,41 @@ const canManageAi = typeof gateway.getAiSettings === 'function'
 const canManageMembers = gateway.mode === 'remote'
   && currentAuthSession.value?.user.labRoles.includes('lab_admin') === true
 const labRegistryAvailable = gateway.mode === 'local' || hasLabRegistryAccess()
-const providerOptions: Array<{ label: string; value: AiProviderKind }> = [
-  { label: 'OpenAI-compatible', value: 'open_ai_compatible' },
-  { label: '本地 HTTP 模型', value: 'local_http' },
-]
+const enabledProviderPresets = computed(() => providerPresets.value.filter((preset) => preset.enabled))
+const providerOptions = computed(() => enabledProviderPresets.value.map((preset) => ({
+  label: preset.displayName,
+  value: preset.id,
+})))
+const selectedPreset = computed(() => enabledProviderPresets.value.find(
+  (preset) => preset.id === ai.providerPresetId,
+))
+const modelOptions = computed(() => (selectedPreset.value?.models ?? []).map((model) => ({
+  label: model.displayName,
+  value: model.id,
+})))
+const selectedModel = computed(() => selectedPreset.value?.models.find((model) => model.id === ai.model))
+const allocatedTokens = computed(() => ai.maxInputTokens + ai.maxOutputTokens)
+const unallocatedTokens = computed(() => ai.contextWindowTokens - allocatedTokens.value)
+const budgetPercent = computed(() => Math.min(100, Math.max(0, Math.round(allocatedTokens.value / Math.max(1, ai.contextWindowTokens) * 100))))
+const budgetError = computed(() => {
+  if (ai.contextWindowTokens < 4096 || ai.contextWindowTokens > 2000000) return '上下文窗口必须在 4,096–2,000,000 Token 之间。'
+  if (ai.maxInputTokens < 1024 || ai.maxInputTokens > 1900000) return '最大输入必须在 1,024–1,900,000 Token 之间。'
+  if (ai.maxOutputTokens < 1 || ai.maxOutputTokens > 131072) return '最大输出必须在 1–131,072 Token 之间。'
+  if (allocatedTokens.value > ai.contextWindowTokens) return `输入预算与输出预留合计超出上下文 ${allocatedTokens.value - ai.contextWindowTokens} Token。请降低最大输入或最大输出。`
+  if (ai.historyTokenBudget < 0 || ai.historyTokenBudget > ai.maxInputTokens) return '历史消息预算不能超过最大输入 Token。'
+  if (ai.historyTurns < 0 || ai.historyTurns > 100) return '历史保留轮数必须在 0–100 之间。'
+  if (ai.temperature < 0 || ai.temperature > 2) return 'Temperature 必须在 0–2 之间。'
+  if (ai.timeoutMs < 100 || ai.timeoutMs > 600000) return '请求超时必须在 100–600,000 ms 之间。'
+  return ''
+})
+const basicAiError = computed(() => {
+  if (!ai.providerPresetId) return '请选择 Provider。'
+  if (!ai.baseUrl.trim()) return 'API 出口不能为空。'
+  if (!ai.model.trim()) return '模型不能为空。'
+  if (ai.supportsVision && !ai.visionModel?.trim()) return '启用视觉能力后必须填写视觉模型。'
+  return ''
+})
+const canSaveAi = computed(() => canManageAi && !budgetError.value && !basicAiError.value)
 const menu = computed(() => [
   { key: 'workspace', label: '工作空间', icon: Database },
   { key: 'account', label: '账号与安全', icon: KeyRound },
@@ -91,22 +160,97 @@ async function loadAi() {
   if (!gateway.getAiSettings) return
   loadingAi.value = true
   try {
-    const loaded = await gateway.getAiSettings()
+    const [loaded, presets] = await Promise.all([
+      gateway.getAiSettings(),
+      gateway.listAiProviderPresets
+        ? gateway.listAiProviderPresets()
+        : Promise.resolve(structuredClone(builtinAiProviderPresets)),
+    ])
+    providerPresets.value = presets.length ? presets : structuredClone(builtinAiProviderPresets)
     Object.assign(ai, {
       enabled: loaded.enabled,
       providerKind: loaded.providerKind,
+      providerPresetId: loaded.providerPresetId,
       model: loaded.model,
       baseUrl: loaded.baseUrl,
       supportsVision: loaded.supportsVision,
       visionModel: loaded.visionModel,
+      contextWindowTokens: loaded.contextWindowTokens,
+      maxInputTokens: loaded.maxInputTokens,
+      maxOutputTokens: loaded.maxOutputTokens,
+      historyTokenBudget: loaded.historyTokenBudget,
+      historyTurns: loaded.historyTurns,
+      temperature: loaded.temperature,
+      timeoutMs: loaded.timeoutMs,
     })
-    hasApiKey.value = loaded.hasKey
+    hasStoredApiKey.value = loaded.hasKey
+    storedCredentialBinding.value = credentialBinding.value
     apiKey.value = ''
+    savedAiFingerprint.value = aiFingerprint()
   } catch (error) {
     message.error(`无法读取 AI 设置：${errorMessage(error)}`)
   } finally {
     loadingAi.value = false
   }
+}
+
+function selectProvider(presetId: string) {
+  const preset = enabledProviderPresets.value.find((item) => item.id === presetId)
+  if (!preset) return
+  ai.providerPresetId = preset.id
+  ai.providerKind = preset.providerKind
+  if (preset.recommendedBaseUrl) ai.baseUrl = preset.recommendedBaseUrl
+  const model = preset.models[0]
+  if (model) {
+    ai.model = model.id
+    ai.contextWindowTokens = model.contextWindowTokens
+    ai.maxInputTokens = Math.min(65536, model.contextWindowTokens - Math.min(4096, model.maxOutputTokens))
+    ai.maxOutputTokens = Math.min(4096, model.maxOutputTokens)
+    ai.supportsVision = model.supportsVision
+    ai.visionModel = model.supportsVision ? model.id : undefined
+  } else {
+    ai.model = ''
+    ai.supportsVision = false
+    ai.visionModel = undefined
+  }
+  apiKey.value = ''
+}
+
+function selectModel(modelId: string) {
+  ai.model = modelId
+  const model = selectedPreset.value?.models.find((item) => item.id === modelId)
+  if (!model) return
+  ai.contextWindowTokens = model.contextWindowTokens
+  ai.maxOutputTokens = Math.min(ai.maxOutputTokens, model.maxOutputTokens)
+  ai.maxInputTokens = Math.min(ai.maxInputTokens, model.contextWindowTokens - ai.maxOutputTokens)
+  if (model.supportsVision) {
+    ai.supportsVision = true
+    ai.visionModel ||= model.id
+  }
+}
+
+function connectionErrorLabel(code?: string) {
+  const labels: Record<string, string> = {
+    ai_runtime_not_configured: 'AI 运行时未配置',
+    ai_lab_disabled: '实验室 AI 已关闭',
+    ai_user_disabled: '当前用户已关闭 AI',
+    ai_provider_not_selected: '尚未选择 Provider',
+    ai_api_key_missing: '尚未填写个人 API Key',
+    provider_exit_not_approved: 'API 出口未获实验室批准',
+    invalid_provider: 'Provider 配置无效',
+    api_key_rejected: 'API Key 被 Provider 拒绝',
+    model_not_found: '模型不存在或无权访问',
+    provider_http_error: 'Provider 返回 HTTP 错误',
+    provider_unreachable: 'API 出口无法连接',
+    provider_transport_error: 'Provider 请求传输失败',
+    request_timeout: '请求超时',
+    context_exceeded: '上下文超限',
+    response_format_incompatible: '响应格式不兼容',
+    output_budget_exhausted: '推理模型输出额度不足',
+    response_too_large: 'Provider 响应超过安全上限',
+    provider_unavailable: 'Provider 当前不可用',
+  }
+  return labels[code ?? ''] ?? code ?? '未知 Provider 错误'
 }
 
 async function saveWorkspace() {
@@ -195,13 +339,26 @@ async function changeAccountPassword() {
 
 async function saveAi() {
   if (!gateway.saveAiSettings) return
+  const validation = basicAiError.value || budgetError.value
+  if (validation) {
+    message.warning(validation)
+    return
+  }
   const input: SaveAiSettingsInput = {
     enabled: ai.enabled,
     providerKind: ai.providerKind,
+    providerPresetId: ai.providerPresetId,
     model: ai.model.trim(),
     baseUrl: ai.baseUrl.trim(),
     supportsVision: ai.supportsVision,
     visionModel: ai.supportsVision ? ai.visionModel?.trim() : undefined,
+    contextWindowTokens: ai.contextWindowTokens,
+    maxInputTokens: ai.maxInputTokens,
+    maxOutputTokens: ai.maxOutputTokens,
+    historyTokenBudget: ai.historyTokenBudget,
+    historyTurns: ai.historyTurns,
+    temperature: ai.temperature,
+    timeoutMs: ai.timeoutMs,
   }
   if (apiKey.value.trim()) input.apiKey = apiKey.value.trim()
   savingAi.value = true
@@ -210,14 +367,24 @@ async function saveAi() {
     Object.assign(ai, {
       enabled: saved.enabled,
       providerKind: saved.providerKind,
+      providerPresetId: saved.providerPresetId,
       model: saved.model,
       baseUrl: saved.baseUrl,
       supportsVision: saved.supportsVision,
       visionModel: saved.visionModel,
+      contextWindowTokens: saved.contextWindowTokens,
+      maxInputTokens: saved.maxInputTokens,
+      maxOutputTokens: saved.maxOutputTokens,
+      historyTokenBudget: saved.historyTokenBudget,
+      historyTurns: saved.historyTurns,
+      temperature: saved.temperature,
+      timeoutMs: saved.timeoutMs,
     })
-    hasApiKey.value = saved.hasKey
+    hasStoredApiKey.value = saved.hasKey
+    storedCredentialBinding.value = credentialBinding.value
     apiKey.value = ''
-    message.success('AI 设置已保存')
+    savedAiFingerprint.value = aiFingerprint()
+    message.success(saved.hasKey ? 'AI 设置已保存' : 'AI 已启用，等待配置个人 API')
   } catch (error) {
     message.error(`保存失败：${errorMessage(error)}`)
   } finally {
@@ -231,9 +398,10 @@ async function testAiConnection() {
   try {
     const result = await gateway.testAiSettings()
     if (result.ok) message.success(`连接成功（${result.latencyMs} ms）`)
-    else message.error(`连接失败：${result.errorCode ?? 'provider_error'}`)
+    else message.error(`连接失败：${connectionErrorLabel(result.errorCode)}`)
   } catch (error) {
-    message.error(`连接失败：${errorMessage(error)}`)
+    const code = error instanceof HttpGatewayError ? error.code : undefined
+    message.error(`连接失败：${connectionErrorLabel(code)}${code ? '' : `（${errorMessage(error)}）`}`)
   } finally {
     testingAi.value = false
   }
@@ -250,7 +418,8 @@ function clearAiKey() {
       clearingKey.value = true
       try {
         const saved = await gateway.clearAiApiKey!()
-        hasApiKey.value = saved.hasKey
+        hasStoredApiKey.value = saved.hasKey
+        storedCredentialBinding.value = credentialBinding.value
         apiKey.value = ''
         message.success(gateway.mode === 'local' ? 'API Key 已从 OS keyring 清除' : 'API Key 已从个人加密 secret store 清除')
       } catch (error) {
@@ -362,27 +531,91 @@ onMounted(() => {
         </template>
 
         <template v-else-if="active === 'ai'">
-          <div class="section-heading"><h2>AI 与模型</h2><p>凭据属于当前用户，不进入项目数据库、审计日志或快照。</p></div>
+          <div class="section-heading"><h2>AI 与模型</h2><p>Provider、出口、模型、Token 参数和加密凭据仅属于当前用户，Root 配置不会共享。</p></div>
           <n-alert v-if="!canManageAi" type="info" :bordered="false" class="availability-alert">当前运行出口未提供 AI 凭据管理；界面不会读取或保存演示密钥。</n-alert>
-          <div class="toggle-row"><div><strong>启用内置 AI 助手</strong><span>可随时关闭；关闭后已有数据不受影响。</span></div><n-switch v-model:value="ai.enabled" :disabled="loadingAi || !canManageAi" /></div>
-          <n-form label-placement="top" class="settings-form" :disabled="loadingAi || !canManageAi || !ai.enabled">
-            <n-form-item label="Provider"><n-select v-model:value="ai.providerKind" :options="providerOptions" /></n-form-item>
-            <n-form-item label="模型"><n-input v-model:value="ai.model" maxlength="256" placeholder="例如 gpt-4.1-mini" /></n-form-item>
-            <n-form-item label="API URL" class="full-row"><n-input v-model:value="ai.baseUrl" maxlength="2048" placeholder="https://api.example.com/v1" /></n-form-item>
-            <n-form-item label="视觉能力" class="full-row"><n-switch v-model:value="ai.supportsVision">支持图片理解</n-switch></n-form-item>
-            <n-form-item v-if="ai.supportsVision" label="视觉模型" class="full-row"><n-input v-model:value="ai.visionModel" maxlength="256" placeholder="例如 gpt-4.1-mini" /></n-form-item>
-            <n-form-item label="API Key" class="full-row">
-              <n-input v-model:value="apiKey" type="password" show-password-on="click" autocomplete="new-password" :placeholder="hasApiKey ? '已安全保存；留空可保留现有密钥' : (gateway.mode === 'local' ? '将安全存入 OS keyring' : '将加密存入个人 secret store')" />
+          <n-alert v-else-if="ai.enabled && !hasApiKey && !apiKey.trim()" type="info" :bordered="false" title="AI 已启用，等待配置个人 API" class="availability-alert">选择 Provider，填写你自己的 API Key 并保存后即可调用；在此之前不会发出任何外部请求或产生费用。</n-alert>
+          <n-alert v-if="hasStoredApiKey && !hasApiKey" type="warning" :bordered="false" title="Provider 已变更，旧密钥不会复用" class="availability-alert">为避免把一个服务的凭据发给另一个服务，请输入新 Provider 的 API Key。保存后，原 Provider 的密钥绑定会被删除。</n-alert>
+
+          <div class="toggle-row"><div><strong>启用内置 AI 助手</strong><span>新用户默认启用；关闭只影响当前用户，不删除配置或已有数据。</span></div><n-switch v-model:value="ai.enabled" :disabled="loadingAi || !canManageAi" /></div>
+          <n-form label-placement="top" class="settings-form ai-settings-form" :disabled="loadingAi || !canManageAi || !ai.enabled">
+            <n-form-item label="Provider">
+              <n-select v-model:value="ai.providerPresetId" :options="providerOptions" @update:value="selectProvider" />
             </n-form-item>
+            <n-form-item label="模型">
+              <n-select v-model:value="ai.model" :options="modelOptions" filterable tag placeholder="选择推荐模型或输入兼容模型 ID" @update:value="selectModel" />
+            </n-form-item>
+            <n-form-item label="API 出口" class="full-row">
+              <n-input v-model:value="ai.baseUrl" maxlength="2048" placeholder="https://api.example.com/v1" />
+              <template #feedback>推荐出口可按个人需要覆盖；自定义 URL 仍受实验室审批策略约束。</template>
+            </n-form-item>
+            <div v-if="selectedPreset" class="provider-meta full-row">
+              <div><strong>{{ selectedPreset.displayName }}</strong><span>{{ selectedPreset.builtin ? '内置预设' : '实验室预设' }} · {{ selectedPreset.supportsVision ? '包含视觉模型' : '文本模型' }}</span></div>
+              <a v-if="selectedPreset.documentationUrl" :href="selectedPreset.documentationUrl" target="_blank" rel="noreferrer">官方文档<ExternalLink :size="14" /></a>
+            </div>
+            <n-form-item label="个人 API Key" class="full-row">
+              <n-input v-model:value="apiKey" type="password" show-password-on="click" autocomplete="new-password" :placeholder="hasApiKey ? '已配置；留空保持现有密钥' : (gateway.mode === 'local' ? '将安全存入 OS keyring' : '将使用部署级 Master Key 加密后按用户保存')" />
+              <template #feedback>读取 API 只返回“已配置/未配置”，绝不回显明文；更新其他参数不会删除同一 Provider 的密钥。</template>
+            </n-form-item>
+
+            <n-collapse class="advanced-settings full-row" arrow-placement="right">
+              <n-collapse-item name="advanced">
+                <template #header><span class="advanced-title"><SlidersHorizontal :size="16" />高级设置</span></template>
+                <div class="token-budget-card">
+                  <div class="token-budget-heading"><strong>上下文预算</strong><span>已分配 {{ allocatedTokens.toLocaleString() }} / {{ ai.contextWindowTokens.toLocaleString() }} Token</span></div>
+                  <n-progress type="line" :percentage="budgetPercent" :show-indicator="false" :status="budgetError ? 'error' : 'success'" />
+                  <div class="token-budget-breakdown"><span>输入预算 {{ ai.maxInputTokens.toLocaleString() }}</span><span>输出预留 {{ ai.maxOutputTokens.toLocaleString() }}</span><span>未分配 {{ Math.max(0, unallocatedTokens).toLocaleString() }}</span></div>
+                  <p>最大输入包含系统提示、历史、工具结果与当前问题。超限时只裁剪最旧的完整历史轮次，不会静默截断当前问题。</p>
+                  <n-alert v-if="budgetError" type="error" :bordered="false">{{ budgetError }}</n-alert>
+                </div>
+                <div class="advanced-grid">
+                  <n-form-item label="上下文窗口 Token">
+                    <n-input-number v-model:value="ai.contextWindowTokens" :min="4096" :max="2000000" :step="1024" />
+                    <template #feedback>Provider 模型可接收的总上下文，范围 4,096–2,000,000。</template>
+                  </n-form-item>
+                  <n-form-item label="最大输入 Token">
+                    <n-input-number v-model:value="ai.maxInputTokens" :min="1024" :max="1900000" :step="1024" />
+                    <template #feedback>调用前允许的估算输入上限，范围 1,024–1,900,000。</template>
+                  </n-form-item>
+                  <n-form-item label="最大输出 Token">
+                    <n-input-number v-model:value="ai.maxOutputTokens" :min="1" :max="131072" :step="256" />
+                    <template #feedback>作为 max_tokens 真实发送给 Provider，范围 1–131,072。</template>
+                  </n-form-item>
+                  <n-form-item label="历史消息预算">
+                    <n-input-number v-model:value="ai.historyTokenBudget" :min="0" :max="ai.maxInputTokens" :step="1024" />
+                    <template #feedback>最多为历史保留的估算 Token；0 表示不保留历史消息。</template>
+                  </n-form-item>
+                  <n-form-item label="历史保留轮数">
+                    <n-input-number v-model:value="ai.historyTurns" :min="0" :max="100" />
+                    <template #feedback>优先保留最近 0–100 个完整 user/assistant 轮次。</template>
+                  </n-form-item>
+                  <n-form-item label="请求超时（毫秒）">
+                    <n-input-number v-model:value="ai.timeoutMs" :min="100" :max="600000" :step="1000" />
+                    <template #feedback>等待 Provider 响应的最长时间，范围 100–600,000 ms。</template>
+                  </n-form-item>
+                  <n-form-item label="Temperature" class="full-row">
+                    <div class="temperature-control"><n-slider v-model:value="ai.temperature" :min="0" :max="2" :step="0.1" /><n-input-number v-model:value="ai.temperature" :min="0" :max="2" :step="0.1" /></div>
+                    <template #feedback>0 更稳定，2 更发散；部分推理模型可能忽略此参数。</template>
+                  </n-form-item>
+                  <n-form-item label="视觉能力" class="full-row"><n-switch v-model:value="ai.supportsVision">允许当前配置处理图片</n-switch></n-form-item>
+                  <n-form-item v-if="ai.supportsVision" label="视觉模型" class="full-row">
+                    <n-input v-model:value="ai.visionModel" maxlength="256" placeholder="输入支持视觉的模型 ID" />
+                    <template #feedback>{{ selectedModel?.supportsVision ? '当前推荐模型支持视觉，可使用同一模型。' : '请确认该模型在当前 Provider 中支持图片输入。' }}</template>
+                  </n-form-item>
+                </div>
+              </n-collapse-item>
+            </n-collapse>
           </n-form>
+
           <div class="secret-note"><KeyRound :size="17" /><span>{{ hasApiKey
-            ? (gateway.mode === 'local' ? '已在 OS keyring 中保存凭据。' : '已在当前用户的加密 secret store 中保存凭据。') + '界面和读取接口永不回显密钥。'
-            : '尚未保存 API Key。凭据不会进入业务数据库响应、审计正文或快照。' }}</span></div>
+            ? (gateway.mode === 'local' ? 'API Key 已配置并保存在 OS keyring。' : 'API Key 已配置并按当前用户加密保存。') + '界面、日志、错误响应和读取接口均不会回显密钥。'
+            : 'API Key 未配置。个人设置仍会保存，但任何 AI 操作都会明确提示等待个人 API，不会请求外部服务。' }}</span></div>
+          <div v-if="basicAiError" class="validation-message">{{ basicAiError }}</div>
           <div class="button-row">
-            <n-button type="primary" :disabled="!canManageAi" :loading="savingAi || loadingAi" @click="saveAi">保存 AI 设置</n-button>
-            <n-button v-if="gateway.testAiSettings" secondary :disabled="!canManageAi" :loading="testingAi" @click="testAiConnection">测试连接</n-button>
+            <n-button type="primary" :disabled="!canSaveAi" :loading="savingAi || loadingAi" @click="saveAi"><template #icon><Save :size="16" /></template>保存 AI 设置</n-button>
+            <n-button v-if="gateway.testAiSettings" secondary :disabled="!canManageAi || !ai.enabled || !hasApiKey || isAiDirty" :loading="testingAi" @click="testAiConnection">测试已保存配置</n-button>
             <n-button v-if="hasApiKey" type="error" secondary :disabled="!canManageAi" :loading="clearingKey" @click="clearAiKey">清除 API Key</n-button>
           </div>
+          <p v-if="gateway.testAiSettings && isAiDirty" class="test-hint">请先保存当前设置，再测试连接；连接测试只使用已保存的个人配置。</p>
         </template>
 
         <template v-else-if="active === 'backup'">
@@ -417,11 +650,14 @@ onMounted(() => {
 .subsection-heading { margin: 6px 0 14px; }.subsection-heading h3 { margin: 0 0 3px; font-size: 15px; }.subsection-heading p { margin: 0; color: var(--muri-text-secondary); font-size: 11px; }.password-heading { margin-top: 28px; padding-top: 22px; border-top: 1px solid var(--muri-border); }
 .account-identity { display: grid; gap: 8px; }.account-identity > div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 12px; padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; }.account-identity span { color: var(--muri-text-tertiary); font-size: 11px; }.account-identity strong { overflow-wrap: anywhere; }
 .password-strength { display: grid; grid-template-columns: auto minmax(120px, 1fr); align-items: center; gap: 12px; margin: -10px 0 12px; color: var(--muri-text-tertiary); font-size: 11px; }.password-strength .n-progress { width: 100%; }
-.toggle-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; padding: 13px; border: 1px solid var(--muri-border); border-radius: 7px; }.toggle-row > div { display: flex; flex-direction: column; }.toggle-row span { color: var(--muri-text-secondary); font-size: 11px; }.secret-note { display: flex; align-items: center; gap: 8px; margin: 0 0 18px; padding: 10px; color: var(--muri-text-secondary); background: var(--muri-primary-soft); font-size: 11px; }.secret-note svg { color: var(--muri-primary); }
+.toggle-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; padding: 13px; border: 1px solid var(--muri-border); border-radius: 7px; }.toggle-row > div { display: flex; flex-direction: column; }.toggle-row span { color: var(--muri-text-secondary); font-size: 11px; }
+.provider-meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: -4px 0 16px; padding: 10px 12px; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }.provider-meta > div { display: flex; flex-direction: column; }.provider-meta span { color: var(--muri-text-tertiary); font-size: 11px; }.provider-meta a { display: inline-flex; align-items: center; gap: 5px; color: var(--muri-primary); text-decoration: none; white-space: nowrap; }
+.advanced-settings { margin: 2px 0 16px; border-top: 1px solid var(--muri-border); border-bottom: 1px solid var(--muri-border); }.advanced-title { display: inline-flex; align-items: center; gap: 7px; font-weight: 650; }.token-budget-card { margin: 4px 0 16px; padding: 13px; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }.token-budget-heading, .token-budget-breakdown { display: flex; justify-content: space-between; gap: 12px; }.token-budget-heading { margin-bottom: 8px; }.token-budget-heading span, .token-budget-breakdown, .token-budget-card p { color: var(--muri-text-secondary); font-size: 11px; }.token-budget-breakdown { flex-wrap: wrap; margin-top: 7px; }.token-budget-card p { margin: 9px 0 0; line-height: 1.6; }.token-budget-card .n-alert { margin-top: 10px; }.advanced-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 15px; }.advanced-grid :deep(.n-input-number) { width: 100%; }.temperature-control { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) 110px; align-items: center; gap: 18px; }
+.secret-note { display: flex; align-items: center; gap: 8px; margin: 0 0 18px; padding: 10px; color: var(--muri-text-secondary); background: var(--muri-primary-soft); font-size: 11px; }.secret-note svg { flex: 0 0 auto; color: var(--muri-primary); }.validation-message { margin: -8px 0 14px; color: var(--muri-danger, #c2413b); font-size: 12px; }.test-hint { margin: 9px 0 0; color: var(--muri-text-tertiary); font-size: 11px; }
 .availability-alert { margin-bottom: 16px; }.button-row { display: flex; flex-wrap: wrap; gap: 9px; }
 .session-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 13px; border: 1px solid var(--muri-border); border-radius: 7px; }.session-actions > div { display: flex; flex-direction: column; }.session-actions span { color: var(--muri-text-secondary); font-size: 11px; }
 .action-card { display: grid; grid-template-columns: 32px 1fr auto; align-items: center; gap: 10px; margin-bottom: 10px; padding: 13px; border: 1px solid var(--muri-border); border-radius: 7px; }.action-card > svg { color: var(--muri-primary); }.action-card div { display: flex; flex-direction: column; }.action-card span { color: var(--muri-text-secondary); font-size: 11px; }
 .policy-list { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }.policy-list > div { display: flex; align-items: flex-start; gap: 9px; padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; color: var(--muri-text-secondary); }.policy-list svg { flex: 0 0 auto; color: var(--muri-success); }.policy-list strong { display: block; color: var(--muri-text); }
 .about-panel { display: flex; min-height: 470px; align-items: center; justify-content: center; flex-direction: column; text-align: center; }.about-panel img { width: 122px; height: 122px; object-fit: contain; }.about-panel h2 { margin: 12px 0 2px; font-size: 27px; }.about-panel p { margin: 0 0 13px; color: var(--muri-text-secondary); }.about-panel small { max-width: 460px; margin-top: 20px; color: var(--muri-text-tertiary); line-height: 1.6; }
-@media (max-width: 900px) { .settings-layout { grid-template-columns: 1fr; }.settings-layout > nav { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--muri-border); }.settings-layout nav button { width: auto; flex: 0 0 auto; }.settings-content { padding: 19px 15px; }.settings-form { grid-template-columns: 1fr; }.settings-form :deep(.n-form-item) { grid-column: 1 !important; }.action-card { grid-template-columns: 28px 1fr; }.action-card button { grid-column: 2; justify-self: start; } }
+@media (max-width: 900px) { .advanced-grid { grid-template-columns: 1fr; }.advanced-grid :deep(.n-form-item) { grid-column: 1 !important; }.provider-meta { align-items: flex-start; flex-direction: column; }.temperature-control { grid-template-columns: minmax(0, 1fr) 92px; }.settings-layout { grid-template-columns: 1fr; }.settings-layout > nav { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--muri-border); }.settings-layout nav button { width: auto; flex: 0 0 auto; }.settings-content { padding: 19px 15px; }.settings-form { grid-template-columns: 1fr; }.settings-form :deep(.n-form-item) { grid-column: 1 !important; }.action-card { grid-template-columns: 28px 1fr; }.action-card button { grid-column: 2; justify-self: start; } }
 </style>

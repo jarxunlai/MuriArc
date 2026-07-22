@@ -37,6 +37,7 @@ const turnResponse = (conversationId = 'conversation-1'): AiTurnResponse => ({
   trace: {
     providerId: 'test-provider', model: 'test-model',
     usage: { providerCalls: 1, toolCalls: 1, inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+    context: { estimatedInputTokens: 3, inputTokenCountIsEstimate: true, contextTrimmed: false, trimmedHistoryTurns: 0, trimReasons: [] },
   },
 })
 

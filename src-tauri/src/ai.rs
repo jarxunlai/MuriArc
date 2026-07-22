@@ -52,11 +52,12 @@ impl DesktopAiState {
         let resolved = self.settings.resolve_provider()?;
         let context = self.context().await?;
         self.workflow
-            .run_turn(
+            .run_turn_with_config(
                 resolved.provider,
                 resolved.api_key.as_ref().map(|secret| secret.as_str()),
                 &context,
                 request,
+                resolved.runtime,
             )
             .await
             .map_err(Into::into)

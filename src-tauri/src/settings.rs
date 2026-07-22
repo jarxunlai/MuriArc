@@ -6,14 +6,15 @@ use std::{
 };
 
 use muriarc_ai::{
-    BuiltinProvider, ProviderConfig, ProviderConfigError, ProviderCredentials, ProviderKind,
+    AssistantRuntimeConfig, BuiltinProvider, ProviderConfig, ProviderConfigError,
+    ProviderCredentials, ProviderKind,
 };
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-const SETTINGS_SCHEMA_VERSION: u32 = 1;
+const SETTINGS_SCHEMA_VERSION: u32 = 2;
 const PROVIDER_ID: &str = "desktop-user-provider";
 const KEYRING_SERVICE: &str = concat!(env!("MURIARC_BUNDLE_IDENTIFIER"), ".ai");
 const KEYRING_ACCOUNT: &str = "local-user-provider-api-key";
@@ -133,20 +134,23 @@ impl SettingsService {
     }
 
     pub(crate) fn save(&self, input: SaveAiSettingsInput) -> Result<AiSettingsView, SettingsError> {
-        let provider = match input.provider_kind {
-            ProviderKind::OpenAiCompatible => {
-                ProviderConfig::openai_compatible(PROVIDER_ID, input.model, input.base_url)
-            }
+        let runtime = input.runtime()?;
+        let provider_preset_id = validated_preset_id(&input.provider_preset_id)?;
+        let mut provider = match input.provider_kind {
+            ProviderKind::OpenAiCompatible => ProviderConfig::openai_compatible(
+                PROVIDER_ID,
+                input.model.clone(),
+                input.base_url.clone(),
+            ),
             ProviderKind::LocalHttp => {
-                ProviderConfig::local_http(PROVIDER_ID, input.model, input.base_url)
+                ProviderConfig::local_http(PROVIDER_ID, input.model.clone(), input.base_url.clone())
             }
         };
+        provider.timeout_ms = runtime.timeout_ms;
         BuiltinProvider::from_config(provider.clone()).map_err(SettingsError::InvalidProvider)?;
-
         if let Some(secret) = input.api_key.as_deref() {
             ProviderCredentials::bearer(secret).map_err(|_| SettingsError::InvalidCredential)?;
         }
-
         let vision_model = input
             .vision_model
             .as_deref()
@@ -159,17 +163,33 @@ impl SettingsService {
             BuiltinProvider::from_config(vision_provider)
                 .map_err(SettingsError::InvalidProvider)?;
         }
+
+        let _guard = self.write_lock.lock().map_err(|_| SettingsError::Storage)?;
+        let current = self.read_or_default()?;
+        let identity_matches = current.provider.kind == provider.kind
+            && normalized_url(&current.provider.base_url) == normalized_url(&provider.base_url)
+            && current.provider_preset_id == provider_preset_id;
+        if let Some(secret) = input.api_key.as_deref() {
+            self.secrets.set_secret(secret)?;
+        } else if !identity_matches {
+            self.secrets.clear_secret()?;
+        }
         let file = AiSettingsFile {
             schema_version: SETTINGS_SCHEMA_VERSION,
             enabled: input.enabled,
             provider,
+            provider_preset_id,
             supports_vision: input.supports_vision,
             vision_model,
+            context_window_tokens: runtime.context_window_tokens,
+            max_input_tokens: runtime.max_input_tokens,
+            max_output_tokens: runtime.max_output_tokens,
+            history_token_budget: runtime.history_token_budget,
+            history_turns: runtime.history_turns,
+            temperature: runtime.temperature,
+            timeout_ms: runtime.timeout_ms,
+            revision: current.revision.saturating_add(1),
         };
-        let _guard = self.write_lock.lock().map_err(|_| SettingsError::Storage)?;
-        if let Some(secret) = input.api_key.as_deref() {
-            self.secrets.set_secret(secret)?;
-        }
         self.write_atomic(&file)?;
         Ok(AiSettingsView::from_file(file, self.secrets.has_secret()?))
     }
@@ -185,7 +205,11 @@ impl SettingsService {
         if settings.provider.kind == ProviderKind::OpenAiCompatible && api_key.is_none() {
             return Err(SettingsError::MissingCredential);
         }
-        Ok(ResolvedAiProvider { provider, api_key })
+        Ok(ResolvedAiProvider {
+            provider,
+            api_key,
+            runtime: settings.runtime()?,
+        })
     }
 
     // Kept as the validated local multimodal boundary; the current desktop commands
@@ -196,21 +220,32 @@ impl SettingsService {
         if !settings.enabled || !settings.supports_vision {
             return Err(SettingsError::Disabled);
         }
+        let runtime = settings.runtime()?;
+        let provider_kind = settings.provider.kind;
         let mut config = settings.provider.clone();
-        config.model = settings.vision_model.ok_or(SettingsError::InvalidFile)?;
+        config.model = settings
+            .vision_model
+            .clone()
+            .ok_or(SettingsError::InvalidFile)?;
         let provider =
             BuiltinProvider::from_config(config).map_err(SettingsError::InvalidProvider)?;
         let api_key = self.secrets.get_secret()?.map(AiSecret::new);
-        if settings.provider.kind == ProviderKind::OpenAiCompatible && api_key.is_none() {
+        if provider_kind == ProviderKind::OpenAiCompatible && api_key.is_none() {
             return Err(SettingsError::MissingCredential);
         }
-        Ok(ResolvedAiProvider { provider, api_key })
+        Ok(ResolvedAiProvider {
+            provider,
+            api_key,
+            runtime,
+        })
     }
 
     pub(crate) fn clear_key(&self) -> Result<AiSettingsView, SettingsError> {
         let _guard = self.write_lock.lock().map_err(|_| SettingsError::Storage)?;
         self.secrets.clear_secret()?;
-        let settings = self.read_or_default()?;
+        let mut settings = self.read_or_default()?;
+        settings.revision = settings.revision.saturating_add(1);
+        self.write_atomic(&settings)?;
         Ok(AiSettingsView::from_file(settings, false))
     }
 
@@ -219,11 +254,16 @@ impl SettingsService {
             return Ok(AiSettingsFile::default());
         }
         let bytes = fs::read(&self.path).map_err(|_| SettingsError::Storage)?;
-        let settings: AiSettingsFile =
+        let mut settings: AiSettingsFile =
             serde_json::from_slice(&bytes).map_err(|_| SettingsError::InvalidFile)?;
-        if settings.schema_version != SETTINGS_SCHEMA_VERSION {
+        if !matches!(settings.schema_version, 1 | SETTINGS_SCHEMA_VERSION) {
             return Err(SettingsError::InvalidFile);
         }
+        if settings.schema_version == 1 {
+            settings.provider_preset_id = infer_preset_id(&settings.provider.base_url).to_owned();
+            settings.schema_version = SETTINGS_SCHEMA_VERSION;
+        }
+        settings.runtime()?;
         BuiltinProvider::from_config(settings.provider.clone())
             .map_err(SettingsError::InvalidProvider)?;
         Ok(settings)
@@ -256,24 +296,68 @@ struct AiSettingsFile {
     schema_version: u32,
     enabled: bool,
     provider: ProviderConfig,
+    #[serde(default = "default_provider_preset_id")]
+    provider_preset_id: String,
     #[serde(default)]
     supports_vision: bool,
     #[serde(default)]
     vision_model: Option<String>,
+    #[serde(default = "default_context_window_tokens")]
+    context_window_tokens: u32,
+    #[serde(default = "default_max_input_tokens")]
+    max_input_tokens: u32,
+    #[serde(default = "default_max_output_tokens")]
+    max_output_tokens: u32,
+    #[serde(default = "default_history_token_budget")]
+    history_token_budget: u32,
+    #[serde(default = "default_history_turns")]
+    history_turns: u32,
+    #[serde(default = "default_temperature")]
+    temperature: f32,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default)]
+    revision: u64,
+}
+
+impl AiSettingsFile {
+    fn runtime(&self) -> Result<AssistantRuntimeConfig, SettingsError> {
+        AssistantRuntimeConfig {
+            context_window_tokens: self.context_window_tokens,
+            max_input_tokens: self.max_input_tokens,
+            max_output_tokens: self.max_output_tokens,
+            history_token_budget: self.history_token_budget,
+            history_turns: self.history_turns,
+            temperature: self.temperature,
+            timeout_ms: self.timeout_ms,
+        }
+        .validate()
+        .map_err(|_| SettingsError::InvalidFile)
+    }
 }
 
 impl Default for AiSettingsFile {
     fn default() -> Self {
+        let runtime = AssistantRuntimeConfig::default();
         Self {
             schema_version: SETTINGS_SCHEMA_VERSION,
-            enabled: false,
+            enabled: true,
             provider: ProviderConfig::openai_compatible(
                 PROVIDER_ID,
-                "gpt-4.1-mini",
-                "https://api.openai.com/v1",
+                "deepseek-chat",
+                "https://api.deepseek.com",
             ),
+            provider_preset_id: default_provider_preset_id(),
             supports_vision: false,
             vision_model: None,
+            context_window_tokens: runtime.context_window_tokens,
+            max_input_tokens: runtime.max_input_tokens,
+            max_output_tokens: runtime.max_output_tokens,
+            history_token_budget: runtime.history_token_budget,
+            history_turns: runtime.history_turns,
+            temperature: runtime.temperature,
+            timeout_ms: runtime.timeout_ms,
+            revision: 0,
         }
     }
 }
@@ -299,6 +383,7 @@ impl fmt::Debug for AiSecret {
 pub(crate) struct ResolvedAiProvider {
     pub(crate) provider: BuiltinProvider,
     pub(crate) api_key: Option<AiSecret>,
+    pub(crate) runtime: AssistantRuntimeConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -306,11 +391,20 @@ pub(crate) struct ResolvedAiProvider {
 pub(crate) struct AiSettingsView {
     pub enabled: bool,
     pub provider_kind: ProviderKind,
+    pub provider_preset_id: String,
     pub model: String,
     pub base_url: String,
     pub has_key: bool,
     pub supports_vision: bool,
     pub vision_model: Option<String>,
+    pub context_window_tokens: u32,
+    pub max_input_tokens: u32,
+    pub max_output_tokens: u32,
+    pub history_token_budget: u32,
+    pub history_turns: u32,
+    pub temperature: f32,
+    pub timeout_ms: u64,
+    pub revision: u64,
 }
 
 impl AiSettingsView {
@@ -318,11 +412,20 @@ impl AiSettingsView {
         Self {
             enabled: file.enabled,
             provider_kind: file.provider.kind,
+            provider_preset_id: file.provider_preset_id,
             model: file.provider.model,
             base_url: file.provider.base_url,
             has_key,
             supports_vision: file.supports_vision,
             vision_model: file.vision_model,
+            context_window_tokens: file.context_window_tokens,
+            max_input_tokens: file.max_input_tokens,
+            max_output_tokens: file.max_output_tokens,
+            history_token_budget: file.history_token_budget,
+            history_turns: file.history_turns,
+            temperature: file.temperature,
+            timeout_ms: file.timeout_ms,
+            revision: file.revision,
         }
     }
 }
@@ -332,14 +435,103 @@ impl AiSettingsView {
 pub(crate) struct SaveAiSettingsInput {
     pub enabled: bool,
     pub provider_kind: ProviderKind,
+    #[serde(default = "default_provider_preset_id")]
+    pub provider_preset_id: String,
     pub model: String,
     pub base_url: String,
     #[serde(default)]
     pub supports_vision: bool,
     #[serde(default)]
     pub vision_model: Option<String>,
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: u32,
+    #[serde(default = "default_max_input_tokens")]
+    pub max_input_tokens: u32,
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
+    #[serde(default = "default_history_token_budget")]
+    pub history_token_budget: u32,
+    #[serde(default = "default_history_turns")]
+    pub history_turns: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+fn default_provider_preset_id() -> String {
+    "deepseek".to_owned()
+}
+const fn default_context_window_tokens() -> u32 {
+    131_072
+}
+const fn default_max_input_tokens() -> u32 {
+    65_536
+}
+const fn default_max_output_tokens() -> u32 {
+    4_096
+}
+const fn default_history_token_budget() -> u32 {
+    32_768
+}
+const fn default_history_turns() -> u32 {
+    20
+}
+const fn default_temperature() -> f32 {
+    0.0
+}
+const fn default_timeout_ms() -> u64 {
+    120_000
+}
+
+impl SaveAiSettingsInput {
+    fn runtime(&self) -> Result<AssistantRuntimeConfig, SettingsError> {
+        AssistantRuntimeConfig {
+            context_window_tokens: self.context_window_tokens,
+            max_input_tokens: self.max_input_tokens,
+            max_output_tokens: self.max_output_tokens,
+            history_token_budget: self.history_token_budget,
+            history_turns: self.history_turns,
+            temperature: self.temperature,
+            timeout_ms: self.timeout_ms,
+        }
+        .validate()
+        .map_err(|_| SettingsError::InvalidFile)
+    }
+}
+
+fn validated_preset_id(value: &str) -> Result<String, SettingsError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.'))
+    {
+        Err(SettingsError::InvalidFile)
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+fn normalized_url(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_owned()
+}
+
+fn infer_preset_id(base_url: &str) -> &'static str {
+    if base_url.starts_with("https://api.deepseek.com") {
+        "deepseek"
+    } else if base_url.starts_with("https://open.bigmodel.cn/") {
+        "zhipu-glm"
+    } else if base_url.starts_with("https://api.moonshot.cn/") {
+        "moonshot-kimi"
+    } else if base_url.starts_with("https://api.openai.com/") {
+        "openai"
+    } else {
+        "custom-openai-compatible"
+    }
 }
 
 #[cfg(test)]
@@ -386,10 +578,18 @@ mod tests {
             .save(SaveAiSettingsInput {
                 enabled: true,
                 provider_kind: ProviderKind::OpenAiCompatible,
+                provider_preset_id: "custom-openai-compatible".to_owned(),
                 model: "gpt-4.1-mini".to_owned(),
                 base_url: "https://api.openai.com/v1".to_owned(),
                 supports_vision: false,
                 vision_model: None,
+                context_window_tokens: default_context_window_tokens(),
+                max_input_tokens: default_max_input_tokens(),
+                max_output_tokens: default_max_output_tokens(),
+                history_token_budget: default_history_token_budget(),
+                history_turns: default_history_turns(),
+                temperature: default_temperature(),
+                timeout_ms: default_timeout_ms(),
                 api_key: Some("test-secret-value".to_owned()),
             })
             .unwrap();
@@ -406,10 +606,18 @@ mod tests {
             .save(SaveAiSettingsInput {
                 enabled: false,
                 provider_kind: ProviderKind::LocalHttp,
+                provider_preset_id: "custom-openai-compatible".to_owned(),
                 model: "local-model".to_owned(),
                 base_url: "http://127.0.0.1:11434/v1".to_owned(),
                 supports_vision: false,
                 vision_model: None,
+                context_window_tokens: default_context_window_tokens(),
+                max_input_tokens: default_max_input_tokens(),
+                max_output_tokens: default_max_output_tokens(),
+                history_token_budget: default_history_token_budget(),
+                history_turns: default_history_turns(),
+                temperature: default_temperature(),
+                timeout_ms: default_timeout_ms(),
                 api_key: None,
             })
             .unwrap();
@@ -426,10 +634,18 @@ mod tests {
             service.save(SaveAiSettingsInput {
                 enabled: true,
                 provider_kind: ProviderKind::OpenAiCompatible,
+                provider_preset_id: "custom-openai-compatible".to_owned(),
                 model: "model".to_owned(),
                 base_url: "http://example.org/v1".to_owned(),
                 supports_vision: false,
                 vision_model: None,
+                context_window_tokens: default_context_window_tokens(),
+                max_input_tokens: default_max_input_tokens(),
+                max_output_tokens: default_max_output_tokens(),
+                history_token_budget: default_history_token_budget(),
+                history_turns: default_history_turns(),
+                temperature: default_temperature(),
+                timeout_ms: default_timeout_ms(),
                 api_key: None,
             }),
             Err(SettingsError::InvalidProvider(_))
@@ -439,10 +655,18 @@ mod tests {
                 .save(SaveAiSettingsInput {
                     enabled: true,
                     provider_kind: ProviderKind::LocalHttp,
+                    provider_preset_id: "custom-openai-compatible".to_owned(),
                     model: "model".to_owned(),
                     base_url: "http://127.0.0.1:11434/v1".to_owned(),
                     supports_vision: false,
                     vision_model: None,
+                    context_window_tokens: default_context_window_tokens(),
+                    max_input_tokens: default_max_input_tokens(),
+                    max_output_tokens: default_max_output_tokens(),
+                    history_token_budget: default_history_token_budget(),
+                    history_turns: default_history_turns(),
+                    temperature: default_temperature(),
+                    timeout_ms: default_timeout_ms(),
                     api_key: None,
                 })
                 .is_ok()
@@ -456,10 +680,18 @@ mod tests {
             .save(SaveAiSettingsInput {
                 enabled: true,
                 provider_kind: ProviderKind::OpenAiCompatible,
+                provider_preset_id: "custom-openai-compatible".to_owned(),
                 model: "model".to_owned(),
                 base_url: "https://example.org/v1".to_owned(),
                 supports_vision: false,
                 vision_model: None,
+                context_window_tokens: default_context_window_tokens(),
+                max_input_tokens: default_max_input_tokens(),
+                max_output_tokens: default_max_output_tokens(),
+                history_token_budget: default_history_token_budget(),
+                history_turns: default_history_turns(),
+                temperature: default_temperature(),
+                timeout_ms: default_timeout_ms(),
                 api_key: Some("secret".to_owned()),
             })
             .unwrap();

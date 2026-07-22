@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, io::Cursor, path::PathBuf, sync::Arc};
 
 use axum::{
     Router,
@@ -14,6 +14,7 @@ use muriarc_core::{
     RecordStatus, Sample, Sex, TemplateField, User, WriteSource,
 };
 use muriarc_data::DataFiles;
+use muriarc_importer::read_xlsx;
 use muriarc_store_sqlite::SqliteStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1799,6 +1800,82 @@ async fn research_handlers_hide_resources_from_other_labs() {
         .unwrap();
     assert_eq!(animals.status(), StatusCode::OK);
     assert_eq!(response_json(animals).await["count"], 0);
+}
+
+#[tokio::test]
+async fn animal_import_template_transport_supports_blank_example_and_legacy_default() {
+    let fixture = Fixture::new(None).await;
+    let download = |query: &'static str, token: &'static str| {
+        let app = fixture.app.clone();
+        let request = fixture.request(
+            Method::GET,
+            &format!("/api/v1/data/animal-import/template?{query}"),
+            token,
+            json!({}),
+        );
+        async move { app.oneshot(request).await.unwrap() }
+    };
+
+    let legacy = download("format=csv", HUMAN_TOKEN).await;
+    assert_eq!(legacy.status(), StatusCode::OK);
+    assert_eq!(
+        legacy.headers()[header::CONTENT_DISPOSITION],
+        "attachment; filename=\"muriarc-animal-import.csv\""
+    );
+    let legacy_bytes = legacy.into_body().collect().await.unwrap().to_bytes();
+
+    let example = download("format=csv&variant=example", HUMAN_TOKEN).await;
+    assert_eq!(example.status(), StatusCode::OK);
+    assert_eq!(
+        example.headers()[header::CONTENT_DISPOSITION],
+        "attachment; filename=\"muriarc-animal-import.csv\""
+    );
+    let example_bytes = example.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(legacy_bytes, example_bytes);
+    assert_eq!(String::from_utf8_lossy(&example_bytes).lines().count(), 5);
+
+    let blank = download("format=csv&variant=blank", HUMAN_TOKEN).await;
+    assert_eq!(blank.status(), StatusCode::OK);
+    assert_eq!(
+        blank.headers()[header::CONTENT_DISPOSITION],
+        "attachment; filename=\"muriarc-animal-import-blank.csv\""
+    );
+    let blank_bytes = blank.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(String::from_utf8_lossy(&blank_bytes).lines().count(), 1);
+
+    let legacy_xlsx = download("format=xlsx", HUMAN_TOKEN).await;
+    assert_eq!(legacy_xlsx.status(), StatusCode::OK);
+    assert_eq!(
+        legacy_xlsx.headers()[header::CONTENT_TYPE],
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    assert_eq!(
+        legacy_xlsx.headers()[header::CONTENT_DISPOSITION],
+        "attachment; filename=\"muriarc-animal-import.xlsx\""
+    );
+    let legacy_xlsx = legacy_xlsx.into_body().collect().await.unwrap().to_bytes();
+    let legacy_table = read_xlsx(Cursor::new(legacy_xlsx)).unwrap();
+    assert_eq!(legacy_table.rows.len(), 4);
+
+    let blank_xlsx = download("format=xlsx&variant=blank", HUMAN_TOKEN).await;
+    assert_eq!(blank_xlsx.status(), StatusCode::OK);
+    assert_eq!(
+        blank_xlsx.headers()[header::CONTENT_DISPOSITION],
+        "attachment; filename=\"muriarc-animal-import-blank.xlsx\""
+    );
+    let blank_xlsx = blank_xlsx.into_body().collect().await.unwrap().to_bytes();
+    let blank_table = read_xlsx(Cursor::new(blank_xlsx)).unwrap();
+    assert!(blank_table.rows.is_empty());
+
+    let unsupported = download("format=csv&variant=unsupported", HUMAN_TOKEN).await;
+    assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+    let unknown_query = download("format=csv&unexpected=true", HUMAN_TOKEN).await;
+    assert_eq!(unknown_query.status(), StatusCode::BAD_REQUEST);
+
+    let animal_manager = download("format=csv&variant=blank", ANIMAL_MANAGER_TOKEN).await;
+    assert_eq!(animal_manager.status(), StatusCode::OK);
+    let viewer = download("format=csv&variant=blank", PROJECT_TOKEN).await;
+    assert_eq!(viewer.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

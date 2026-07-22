@@ -12,8 +12,9 @@ use muriarc_data::{
     export_animals_scoped_with_options,
 };
 use muriarc_importer::{
-    AnimalExportOptions, AnimalImportSchema, FieldMapping, MeasurementFieldMapping,
-    animal_import_schema, animal_import_template_csv, animal_import_template_xlsx,
+    AnimalExportOptions, AnimalImportSchema, AnimalImportTemplateVariant, FieldMapping,
+    MeasurementFieldMapping, animal_import_schema, animal_import_template_csv_with_variant,
+    animal_import_template_xlsx_with_variant,
 };
 use muriarc_store_sqlite::SqliteStore;
 use serde::{Deserialize, Serialize};
@@ -115,21 +116,24 @@ impl DesktopDataState {
         &self,
         input: AnimalImportTemplateInput,
     ) -> Result<AnimalImportTemplateView, DesktopDataError> {
+        let file_name = animal_import_template_file_name(input.format, input.variant).to_owned();
         match input.format {
             ExportFormat::Csv => {
                 let mut bytes = Vec::new();
-                animal_import_template_csv(&mut bytes).map_err(DataError::from)?;
+                animal_import_template_csv_with_variant(&mut bytes, input.variant)
+                    .map_err(DataError::from)?;
                 Ok(AnimalImportTemplateView {
-                    file_name: "muriarc-animal-import.csv".to_owned(),
+                    file_name,
                     media_type: "text/csv;charset=utf-8".to_owned(),
                     bytes,
                 })
             }
             ExportFormat::Xlsx => Ok(AnimalImportTemplateView {
-                file_name: "muriarc-animal-import.xlsx".to_owned(),
+                file_name,
                 media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     .to_owned(),
-                bytes: animal_import_template_xlsx().map_err(DataError::from)?,
+                bytes: animal_import_template_xlsx_with_variant(input.variant)
+                    .map_err(DataError::from)?,
             }),
         }
     }
@@ -1301,6 +1305,8 @@ pub(crate) struct CreateDataExportInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AnimalImportTemplateInput {
     pub format: ExportFormat,
+    #[serde(default)]
+    pub variant: AnimalImportTemplateVariant,
 }
 
 #[derive(Debug, Serialize)]
@@ -1309,6 +1315,22 @@ pub(crate) struct AnimalImportTemplateView {
     pub file_name: String,
     pub media_type: String,
     pub bytes: Vec<u8>,
+}
+
+fn animal_import_template_file_name(
+    format: ExportFormat,
+    variant: AnimalImportTemplateVariant,
+) -> &'static str {
+    match (format, variant) {
+        (ExportFormat::Csv, AnimalImportTemplateVariant::Blank) => {
+            "muriarc-animal-import-blank.csv"
+        }
+        (ExportFormat::Xlsx, AnimalImportTemplateVariant::Blank) => {
+            "muriarc-animal-import-blank.xlsx"
+        }
+        (ExportFormat::Csv, AnimalImportTemplateVariant::Example) => "muriarc-animal-import.csv",
+        (ExportFormat::Xlsx, AnimalImportTemplateVariant::Example) => "muriarc-animal-import.xlsx",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1395,11 +1417,58 @@ mod tests {
         Participation, Project, ProvenanceFilter, ProvenanceSource, RecordStatus, Sex,
         TemplateField, WriteSource,
     };
+    use muriarc_importer::read_xlsx;
     use muriarc_snapshot::verify_bundle;
     use tempfile::tempdir;
 
     use super::*;
     use crate::application::DesktopState;
+
+    #[tokio::test]
+    async fn local_animal_import_templates_support_variants_and_legacy_input_default() {
+        let legacy: AnimalImportTemplateInput = serde_json::from_value(serde_json::json!({
+            "format": "csv"
+        }))
+        .unwrap();
+        assert_eq!(legacy.variant, AnimalImportTemplateVariant::Example);
+        assert!(
+            serde_json::from_value::<AnimalImportTemplateInput>(serde_json::json!({
+                "format": "csv",
+                "unexpected": true
+            }))
+            .is_err()
+        );
+
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("muriarc.sqlite3");
+        let _domain = DesktopState::initialize(&database).await.unwrap();
+        let state = DesktopDataState::initialize(&database, temp.path())
+            .await
+            .unwrap();
+
+        let blank = state
+            .animal_import_template(AnimalImportTemplateInput {
+                format: ExportFormat::Csv,
+                variant: AnimalImportTemplateVariant::Blank,
+            })
+            .unwrap();
+        assert_eq!(blank.file_name, "muriarc-animal-import-blank.csv");
+        assert_eq!(String::from_utf8(blank.bytes).unwrap().lines().count(), 1);
+
+        let example = state.animal_import_template(legacy).unwrap();
+        assert_eq!(example.file_name, "muriarc-animal-import.csv");
+        assert_eq!(String::from_utf8(example.bytes).unwrap().lines().count(), 5);
+
+        let blank_xlsx = state
+            .animal_import_template(AnimalImportTemplateInput {
+                format: ExportFormat::Xlsx,
+                variant: AnimalImportTemplateVariant::Blank,
+            })
+            .unwrap();
+        assert_eq!(blank_xlsx.file_name, "muriarc-animal-import-blank.xlsx");
+        let blank_xlsx_table = read_xlsx(Cursor::new(blank_xlsx.bytes)).unwrap();
+        assert!(blank_xlsx_table.rows.is_empty());
+    }
 
     #[tokio::test]
     async fn preview_confirm_export_and_snapshot_form_a_real_local_vertical_flow() {

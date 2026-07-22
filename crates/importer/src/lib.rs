@@ -9,8 +9,9 @@ mod plan;
 
 pub use animal_schema::{
     ANIMAL_IMPORT_HEADERS, AnimalImportExample, AnimalImportFieldSpec, AnimalImportFieldType,
-    AnimalImportSchema, animal_import_schema, animal_import_template_csv,
-    animal_import_template_xlsx,
+    AnimalImportSchema, AnimalImportTemplateVariant, animal_import_schema,
+    animal_import_template_csv, animal_import_template_csv_with_variant,
+    animal_import_template_xlsx, animal_import_template_xlsx_with_variant,
 };
 pub use cancellation::{CancellationCheck, CancellationToken, NoCancellation};
 pub use catalog::{
@@ -406,16 +407,19 @@ where
             ));
             continue;
         }
-        let sex = value("sex").map(|sex| normalize_sex(&sex));
-        if matches!(sex.as_deref(), Some("unknown")) {
-            issues.push(row_issue(
-                source_row,
-                "sex",
-                IssueSeverity::Warning,
-                "unknown_sex",
-                "性别无法识别，将作为 unknown 导入",
-            ));
-        }
+        let sex = value("sex").map(|sex| match normalize_sex(&sex) {
+            Some(normalized) => normalized.to_owned(),
+            None => {
+                issues.push(row_issue(
+                    source_row,
+                    "sex",
+                    IssueSeverity::Warning,
+                    "unknown_sex",
+                    "性别无法识别，将作为 unknown 导入",
+                ));
+                "unknown".to_owned()
+            }
+        });
         let birth_raw = value("birth_date");
         let birth_date = birth_raw.as_deref().and_then(parse_date);
         if birth_raw.is_some() && birth_date.is_none() {
@@ -541,11 +545,12 @@ fn normalize_header(value: &str) -> String {
 fn strip_bom(value: &str) -> &str {
     value.strip_prefix('\u{feff}').unwrap_or(value)
 }
-fn normalize_sex(value: &str) -> String {
+fn normalize_sex(value: &str) -> Option<&'static str> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "m" | "male" | "雄" | "雄性" => "male".to_owned(),
-        "f" | "female" | "雌" | "雌性" => "female".to_owned(),
-        _ => "unknown".to_owned(),
+        "m" | "male" | "雄" | "雄性" => Some("male"),
+        "f" | "female" | "雌" | "雌性" => Some("female"),
+        "unknown" => Some("unknown"),
+        _ => None,
     }
 }
 fn parse_date(value: &str) -> Option<NaiveDate> {
@@ -664,6 +669,17 @@ mod tests {
         let preview = preview_animals(&table, &FieldMapping::infer(&table.headers));
         assert!(preview.can_confirm());
         assert_eq!(preview.issues[0].severity, IssueSeverity::Warning);
+        assert_eq!(preview.issues[0].code, "unknown_sex");
+        assert_eq!(preview.accepted_rows[0].sex.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn explicit_unknown_sex_is_legal_without_a_warning() {
+        let table = read_csv("id,sex\nA1,unknown\n".as_bytes()).unwrap();
+        let preview = preview_animals(&table, &FieldMapping::infer(&table.headers));
+        assert!(preview.can_confirm());
+        assert!(preview.issues.is_empty());
+        assert_eq!(preview.accepted_rows[0].sex.as_deref(), Some("unknown"));
     }
 
     #[test]

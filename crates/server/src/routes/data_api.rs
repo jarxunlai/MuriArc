@@ -17,8 +17,9 @@ use muriarc_data::{
     export_animals_scoped_with_options,
 };
 use muriarc_importer::{
-    AnimalExportOptions, AnimalImportSchema, FieldMapping, MeasurementFieldMapping,
-    animal_import_schema, animal_import_template_csv, animal_import_template_xlsx,
+    AnimalExportOptions, AnimalImportSchema, AnimalImportTemplateVariant, FieldMapping,
+    MeasurementFieldMapping, animal_import_schema, animal_import_template_csv_with_variant,
+    animal_import_template_xlsx_with_variant,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -68,6 +69,8 @@ async fn get_animal_import_schema(
 #[serde(deny_unknown_fields)]
 struct AnimalImportTemplateQuery {
     format: ExportFormat,
+    #[serde(default)]
+    variant: AnimalImportTemplateVariant,
 }
 
 async fn download_animal_import_template(
@@ -76,18 +79,18 @@ async fn download_animal_import_template(
     ApiQuery(query): ApiQuery<AnimalImportTemplateQuery>,
 ) -> Result<Response, ApiError> {
     authorize(&principal, Permission::ImportData, None, &metadata)?;
-    let (file_name, media_type, bytes) = match query.format {
+    let file_name = animal_import_template_file_name(query.format, query.variant);
+    let (media_type, bytes) = match query.format {
         ExportFormat::Csv => {
             let mut bytes = Vec::new();
-            animal_import_template_csv(&mut bytes)
+            animal_import_template_csv_with_variant(&mut bytes, query.variant)
                 .map_err(DataError::from)
                 .map_err(|error| data_error(error, &metadata))?;
-            ("muriarc-animal-import.csv", "text/csv;charset=utf-8", bytes)
+            ("text/csv;charset=utf-8", bytes)
         }
         ExportFormat::Xlsx => (
-            "muriarc-animal-import.xlsx",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            animal_import_template_xlsx()
+            animal_import_template_xlsx_with_variant(query.variant)
                 .map_err(DataError::from)
                 .map_err(|error| data_error(error, &metadata))?,
         ),
@@ -102,6 +105,22 @@ async fn download_animal_import_template(
             .map_err(|_| validation("invalid template file name", &metadata))?,
     );
     Ok(response)
+}
+
+fn animal_import_template_file_name(
+    format: ExportFormat,
+    variant: AnimalImportTemplateVariant,
+) -> &'static str {
+    match (format, variant) {
+        (ExportFormat::Csv, AnimalImportTemplateVariant::Blank) => {
+            "muriarc-animal-import-blank.csv"
+        }
+        (ExportFormat::Xlsx, AnimalImportTemplateVariant::Blank) => {
+            "muriarc-animal-import-blank.xlsx"
+        }
+        (ExportFormat::Csv, AnimalImportTemplateVariant::Example) => "muriarc-animal-import.csv",
+        (ExportFormat::Xlsx, AnimalImportTemplateVariant::Example) => "muriarc-animal-import.xlsx",
+    }
 }
 
 #[derive(Debug, Deserialize)]

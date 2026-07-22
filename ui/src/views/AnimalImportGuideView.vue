@@ -151,6 +151,7 @@ onMounted(async () => {
                 secondary
                 size="small"
                 :data-testid="`download-${item.key}`"
+                :aria-label="`下载 ${item.title}`"
                 :disabled="item.format === 'xlsx' && !supportsXlsx"
                 :loading="downloading === item.key"
                 @click="downloadTemplate(item.format, item.variant)"

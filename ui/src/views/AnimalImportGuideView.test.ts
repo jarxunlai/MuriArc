@@ -97,6 +97,10 @@ describe('AnimalImportGuideView', () => {
     expect(wrapper.text()).toContain('示例可编辑，但不能当作真实实验室数据直接提交')
     expect(wrapper.text()).toContain('EXAMPLE-PUP-002')
     expect(wrapper.text()).toContain('来自当前生产导入契约')
+    expect(wrapper.get('[data-testid="download-csv-blank"]').attributes('aria-label')).toBe('下载 空白 CSV')
+    expect(wrapper.get('[data-testid="download-csv-example"]').attributes('aria-label')).toBe('下载 示例 CSV')
+    expect(wrapper.get('[data-testid="download-xlsx-blank"]').attributes('aria-label')).toBe('下载 空白 XLSX')
+    expect(wrapper.get('[data-testid="download-xlsx-example"]').attributes('aria-label')).toBe('下载 示例 XLSX')
   })
 
   it('passes an explicit blank/example variant for all four downloads', async () => {

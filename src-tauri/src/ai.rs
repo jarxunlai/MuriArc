@@ -287,6 +287,7 @@ impl DesktopAiError {
             Self::Store(StoreError::NotFound { .. }) => "not_found",
             Self::Store(StoreError::Conflict(_)) => "conflict",
             Self::Store(StoreError::Validation(_))
+            | Self::Workflow(AiWorkflowError::Config(_))
             | Self::Workflow(AiWorkflowError::Approval(_))
             | Self::Workflow(AiWorkflowError::InvalidStoredDraft)
             | Self::Workflow(AiWorkflowError::UnsupportedDraftOperation)

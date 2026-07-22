@@ -1,5 +1,5 @@
 import { flushPromises, mount } from '@vue/test-utils'
-import { create, NAlert, NButton, NCheckbox, NInput, NTag } from 'naive-ui'
+import { create, NAlert, NButton, NCheckbox, NInput, NModal, NSelect, NTag } from 'naive-ui'
 import { computed, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -44,9 +44,20 @@ function assistantFixture(mode: 'local' | 'remote' = 'local') {
     pendingDrafts,
     contextTitle: ref('实验数据'),
     selectedProject: computed(() => ({ id: 'project-1', name: 'DEMO' })),
+    conversationId: ref('conversation-1'),
+    autonomy: ref({
+      mode: 'ask' as const,
+      effectiveMode: 'ask' as const,
+      maxMode: 'full' as const,
+      batchLimit: 1,
+      revision: 0,
+      requiresHumanApproval: [],
+    }),
+    autonomyBusy: ref(false),
     busy: ref(false),
     reinforcedPasswordRequired: computed(() => mode === 'remote'),
     send: vi.fn(),
+    updateAutonomy: vi.fn(),
     decideDraft: vi.fn().mockResolvedValue({
       draft: { ...pendingDrafts.value[0], status: 'applied', revision: 3 },
       jobId: 'job-1',
@@ -55,7 +66,7 @@ function assistantFixture(mode: 'local' | 'remote' = 'local') {
   }
 }
 
-const naive = create({ components: [NAlert, NButton, NCheckbox, NInput, NTag] })
+const naive = create({ components: [NAlert, NButton, NCheckbox, NInput, NModal, NSelect, NTag] })
 
 async function fillStatementAndCheckbox(wrapper: ReturnType<typeof mount>) {
   await wrapper

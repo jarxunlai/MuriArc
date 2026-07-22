@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use muriarc_core::{AiConversation, AiConversationMessageRole};
+use muriarc_core::{AiAutonomyMode, AiConversation, AiConversationMessageRole};
 
 use crate::{
     ApprovalRequirement, AssistantResponse, AssistantUsage, Citation, DraftKind, DraftStatus,
@@ -31,6 +31,56 @@ pub struct AssistantTurnResponse {
     pub tool_runs: Vec<ToolRunTrace>,
     pub drafts: Vec<WriteDraftSummary>,
     pub trace: AssistantTrace,
+    #[serde(default)]
+    pub autonomy: AiAutonomyView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AiAutonomyView {
+    pub mode: AiAutonomyMode,
+    pub effective_mode: AiAutonomyMode,
+    pub max_mode: AiAutonomyMode,
+    pub batch_limit: u32,
+    pub revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    pub requires_human_approval: Vec<String>,
+}
+
+impl Default for AiAutonomyView {
+    fn default() -> Self {
+        Self {
+            mode: AiAutonomyMode::Ask,
+            effective_mode: AiAutonomyMode::Ask,
+            max_mode: AiAutonomyMode::Full,
+            batch_limit: AiAutonomyMode::Ask.batch_limit(),
+            revision: 0,
+            expires_at: None,
+            requires_human_approval: hard_boundaries(),
+        }
+    }
+}
+
+pub fn hard_boundaries() -> Vec<String> {
+    [
+        "research_signature",
+        "animal_transfer_or_death",
+        "delete_or_bulk_import",
+        "permissions_and_accounts",
+        "audit_or_log_cleanup",
+        "breeding_scientific_facts",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AiAutonomyUpdateRequest {
+    pub mode: AiAutonomyMode,
+    pub expected_revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,7 +165,11 @@ impl From<&WriteDraft> for WriteDraftSummary {
 }
 
 impl AssistantTurnResponse {
-    pub fn from_service(conversation_id: Uuid, response: AssistantResponse) -> Self {
+    pub fn from_service(
+        conversation_id: Uuid,
+        response: AssistantResponse,
+        autonomy: AiAutonomyView,
+    ) -> Self {
         Self {
             conversation_id,
             content: response.content,
@@ -131,6 +185,7 @@ impl AssistantTurnResponse {
                 model: response.model,
                 usage: response.usage,
             },
+            autonomy,
         }
     }
 }

@@ -157,11 +157,15 @@ describe('MuriArc gateway selection', () => {
     await gateway.completeParticipation('participation-1', 5)
     await gateway.withdrawParticipation('participation-2', 6)
 
-    expect(calls).toContainEqual(['list_gene_loci', { projectId: 'project-1' }])
+    expect(calls).toContainEqual(['list_gene_loci', {
+      projectId: 'project-1', includeArchived: false,
+    }])
     expect(calls).toContainEqual(['create_gene_locus', {
       input: { projectId: 'project-1', symbol: 'GeneA' },
     }])
-    expect(calls).toContainEqual(['list_alleles', { locusId: 'locus-1', projectId: 'project-1' }])
+    expect(calls).toContainEqual(['list_alleles', {
+      locusId: 'locus-1', projectId: 'project-1', includeArchived: false,
+    }])
     expect(calls).toContainEqual(['create_genotype', { input: expect.objectContaining({
       animalId: 'animal-1', locusId: 'locus-1', allele1Id: 'allele-1', allele2Id: 'allele-2',
     }) }])
@@ -544,7 +548,7 @@ describe('MuriArc gateway selection', () => {
               },
               genotype: '待确认', projects: [], latest_weight: null,
             }]
-        : url.endsWith('/cages')
+        : url.includes('/cages')
           ? [{ id: 'cage-1', section: 'SPF-A', display_id: 'A01', location: 'R1', capacity: 5 }]
           : {
               id: 'animal-1', display_id: 'M-001', strain: 'C57BL/6J', sex: 'male',

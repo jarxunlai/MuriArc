@@ -24,6 +24,8 @@ mod projects;
 mod research;
 mod samples;
 mod scope;
+#[cfg(feature = "postgres")]
+mod technical_logs;
 #[cfg(test)]
 mod tests;
 mod validation;
@@ -116,7 +118,9 @@ fn base_router(state: AppState) -> Router {
         .merge(jobs_api::router())
         .merge(library::router());
     #[cfg(feature = "postgres")]
-    let ready_json = ready_json.merge(admin_users::router());
+    let ready_json = ready_json
+        .merge(admin_users::router())
+        .merge(technical_logs::router());
     let ready = Router::new()
         .merge(ready_json.layer(DefaultBodyLimit::max(MAX_API_JSON_BYTES)))
         .merge(attachments::router())

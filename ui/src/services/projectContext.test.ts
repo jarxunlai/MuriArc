@@ -41,13 +41,13 @@ describe('current Project context', () => {
     sessionStorage.clear()
   })
 
-  it('requires a Project Viewer to remain in an allowed project and grants scoped export only', async () => {
+  it('requires a Project Viewer to remain in an allowed project without bulk export', async () => {
     const session = projectSession('viewer')
     await initializeProjectContext(session, async () => projects)
 
     expect(currentProjectId.value).toBe('project-1')
     expect(hasLabRegistryAccess(session)).toBe(false)
-    expect(canExportData(session)).toBe(true)
+    expect(canExportData(session)).toBe(false)
     expect(canImportData(session)).toBe(false)
     expect(canWriteAnimal(session)).toBe(false)
     expect(canManageBreeding(session)).toBe(false)

@@ -1,7 +1,11 @@
 mod ai_operations;
 mod workspace;
 
-use std::{collections::BTreeMap, path::Path, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    str::FromStr,
+};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use muriarc_core::*;
@@ -108,6 +112,11 @@ fn optional_uuid(value: Option<String>) -> StoreResult<Option<Uuid>> {
     value.map(|value| uuid(&value)).transpose()
 }
 
+fn checked_count(value: i64, label: &'static str) -> StoreResult<usize> {
+    usize::try_from(value)
+        .map_err(|_| StoreError::Database(format!("invalid {label} reference count")))
+}
+
 fn meta(row: &SqliteRow) -> StoreResult<RecordMeta> {
     Ok(RecordMeta {
         created_at: row.try_get("created_at").map_err(map_sqlx)?,
@@ -154,6 +163,18 @@ fn membership_from_row(row: &SqliteRow) -> StoreResult<Membership> {
         user_id: uuid(row.try_get("user_id").map_err(map_sqlx)?)?,
         lab_role,
         project_role,
+        meta: meta(row)?,
+    })
+}
+
+fn project_animal_assignment_from_row(row: &SqliteRow) -> StoreResult<ProjectAnimalAssignment> {
+    Ok(ProjectAnimalAssignment {
+        id: uuid(row.try_get("id").map_err(map_sqlx)?)?,
+        lab_id: uuid(row.try_get("lab_id").map_err(map_sqlx)?)?,
+        project_id: uuid(row.try_get("project_id").map_err(map_sqlx)?)?,
+        animal_id: uuid(row.try_get("animal_id").map_err(map_sqlx)?)?,
+        assigned_by: optional_uuid(row.try_get("assigned_by").map_err(map_sqlx)?)?,
+        reason: row.try_get("reason").map_err(map_sqlx)?,
         meta: meta(row)?,
     })
 }
@@ -520,6 +541,7 @@ const LAB_COLUMNS: &str = "id, name, created_at, updated_at, deleted_at, revisio
 const USER_COLUMNS: &str =
     "id, lab_id, email, display_name, status, created_at, updated_at, deleted_at, revision";
 const MEMBERSHIP_COLUMNS: &str = "id, lab_id, project_id, user_id, lab_role, project_role, created_at, updated_at, deleted_at, revision";
+const PROJECT_ANIMAL_ASSIGNMENT_COLUMNS: &str = "id, lab_id, project_id, animal_id, assigned_by, reason, created_at, updated_at, deleted_at, revision";
 const PROJECT_COLUMNS: &str =
     "id, lab_id, name, description, status, created_at, updated_at, deleted_at, revision";
 const CAGE_COLUMNS: &str = "id, lab_id, section, display_id, location, kind, capacity, sort_order, created_at, updated_at, deleted_at, revision";
@@ -1658,6 +1680,196 @@ impl MuriArcStore for SqliteStore {
         rows.iter().map(project_from_row).collect()
     }
 
+    async fn assign_animals_to_project(
+        &self,
+        assignments: &[ProjectAnimalAssignment],
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>> {
+        if assignments.is_empty() || assignments.len() > 100 {
+            return Err(StoreError::Validation(
+                "project animal assignment batch must contain 1-100 items".to_owned(),
+            ));
+        }
+        let first = &assignments[0];
+        if assignments.iter().any(|assignment| {
+            assignment.lab_id != first.lab_id
+                || assignment.project_id != first.project_id
+                || assignment.meta.deleted_at.is_some()
+                || assignment.meta.revision != 1
+        }) {
+            return Err(StoreError::Validation(
+                "project animal assignments must be one new lab/project batch".to_owned(),
+            ));
+        }
+        if audit.actor.actor_type == ActorType::Human
+            && assignments
+                .iter()
+                .any(|assignment| assignment.assigned_by != audit.actor.user_id)
+        {
+            return Err(StoreError::Validation(
+                "assignment actor must match the human audit actor".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let project_lab = required_lab_id(&mut tx, "projects", first.project_id, "project").await?;
+        require_same_uuid(project_lab, first.lab_id, "project animal assignment")?;
+        for assignment in assignments {
+            let animal_lab =
+                required_lab_id(&mut tx, "animals", assignment.animal_id, "animal").await?;
+            require_same_uuid(animal_lab, first.lab_id, "project animal assignment")?;
+        }
+        for assignment in assignments {
+            sqlx::query("INSERT INTO project_animal_assignments (id, lab_id, project_id, animal_id, assigned_by, reason, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(assignment.id.to_string())
+                .bind(assignment.lab_id.to_string())
+                .bind(assignment.project_id.to_string())
+                .bind(assignment.animal_id.to_string())
+                .bind(assignment.assigned_by.map(|id| id.to_string()))
+                .bind(&assignment.reason)
+                .bind(assignment.meta.created_at)
+                .bind(assignment.meta.updated_at)
+                .bind(assignment.meta.deleted_at)
+                .bind(assignment.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            write_audit(
+                &mut tx,
+                assignment.lab_id,
+                Some(assignment.project_id),
+                EntityType::ProjectAnimalAssignment,
+                assignment.id,
+                AuditAction::Create,
+                audit,
+                None,
+                Some(snapshot(assignment)?),
+            )
+            .await?;
+            insert_provenance_tx(
+                &mut tx,
+                &Provenance::from_audit(
+                    assignment.lab_id,
+                    Some(assignment.project_id),
+                    EntityType::ProjectAnimalAssignment,
+                    assignment.id,
+                    audit,
+                    assignment.meta.created_at,
+                ),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(assignments.to_vec())
+    }
+
+    async fn list_project_animal_assignments(
+        &self,
+        filter: &ProjectAnimalAssignmentFilter,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>> {
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT {PROJECT_ANIMAL_ASSIGNMENT_COLUMNS} FROM project_animal_assignments WHERE lab_id = "
+        ));
+        query
+            .push_bind(filter.lab_id.to_string())
+            .push(" AND deleted_at IS NULL");
+        if let Some(project_id) = filter.project_id {
+            query
+                .push(" AND project_id = ")
+                .push_bind(project_id.to_string());
+        }
+        if let Some(animal_id) = filter.animal_id {
+            query
+                .push(" AND animal_id = ")
+                .push_bind(animal_id.to_string());
+        }
+        query.push(" ORDER BY project_id, created_at, id");
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter()
+            .map(project_animal_assignment_from_row)
+            .collect()
+    }
+
+    async fn remove_animals_from_project(
+        &self,
+        removals: &[ProjectAnimalAssignmentRemoval],
+        deleted_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<ProjectAnimalAssignment>> {
+        if removals.is_empty() || removals.len() > 100 {
+            return Err(StoreError::Validation(
+                "project animal removal batch must contain 1-100 items".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let mut assignments = Vec::with_capacity(removals.len());
+        for removal in removals {
+            let row = sqlx::query(&format!(
+                "SELECT {PROJECT_ANIMAL_ASSIGNMENT_COLUMNS} FROM project_animal_assignments WHERE id = ? AND deleted_at IS NULL"
+            ))
+            .bind(removal.assignment_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "project_animal_assignment",
+                id: removal.assignment_id,
+            })?;
+            let assignment = project_animal_assignment_from_row(&row)?;
+            if assignment.meta.revision != removal.expected_revision {
+                return Err(StoreError::Conflict(
+                    "project animal assignment revision changed before removal".to_owned(),
+                ));
+            }
+            assignments.push(assignment);
+        }
+        let scope = (assignments[0].lab_id, assignments[0].project_id);
+        if assignments
+            .iter()
+            .any(|assignment| (assignment.lab_id, assignment.project_id) != scope)
+        {
+            return Err(StoreError::Validation(
+                "project animal removals must belong to one lab/project".to_owned(),
+            ));
+        }
+        for (assignment, removal) in assignments.iter_mut().zip(removals) {
+            let before = assignment.clone();
+            assignment.soft_delete(deleted_at);
+            let result = sqlx::query("UPDATE project_animal_assignments SET updated_at = ?, deleted_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL")
+                .bind(assignment.meta.updated_at)
+                .bind(assignment.meta.deleted_at)
+                .bind(assignment.meta.revision)
+                .bind(assignment.id.to_string())
+                .bind(removal.expected_revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            if result.rows_affected() != 1 {
+                return Err(StoreError::Conflict(
+                    "project animal assignment revision changed before removal".to_owned(),
+                ));
+            }
+            write_audit(
+                &mut tx,
+                assignment.lab_id,
+                Some(assignment.project_id),
+                EntityType::ProjectAnimalAssignment,
+                assignment.id,
+                AuditAction::SoftDelete,
+                audit,
+                Some(snapshot(&before)?),
+                Some(snapshot(assignment)?),
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(assignments)
+    }
+
     async fn create_cage(&self, cage: &Cage, audit: &AuditContext) -> StoreResult<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         sqlx::query("INSERT INTO cages (id, lab_id, section, display_id, location, kind, capacity, sort_order, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
@@ -1712,7 +1924,33 @@ impl MuriArcStore for SqliteStore {
         rows.iter().map(cage_from_row).collect()
     }
 
+    async fn list_cages_for_project(
+        &self,
+        lab_id: Uuid,
+        project_id: Uuid,
+    ) -> StoreResult<Vec<Cage>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT c.* FROM cages c JOIN animals a ON a.current_cage_id = c.id AND a.deleted_at IS NULL JOIN project_animal_assignments paa ON paa.animal_id = a.id AND paa.deleted_at IS NULL WHERE c.lab_id = ? AND c.deleted_at IS NULL AND paa.project_id = ? ORDER BY c.sort_order, c.section, c.display_id"
+        )
+        .bind(lab_id.to_string())
+        .bind(project_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(cage_from_row).collect()
+    }
+
     async fn create_animal(&self, animal: &Animal, audit: &AuditContext) -> StoreResult<()> {
+        self.create_animal_with_genotyping_records(animal, &[], audit)
+            .await
+    }
+
+    async fn create_animal_with_genotyping_records(
+        &self,
+        animal: &Animal,
+        genotyping_records: &[GenotypingRecord],
+        audit: &AuditContext,
+    ) -> StoreResult<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         insert_animal_tx(&mut tx, animal, audit, AuditAction::Create).await?;
         let mut events = vec![AnimalEvent::new(
@@ -1756,6 +1994,104 @@ impl MuriArcStore for SqliteStore {
             animal.meta.created_at,
         );
         insert_provenance_tx(&mut tx, &provenance).await?;
+        let mut definition_ids = BTreeSet::new();
+        for record in genotyping_records {
+            record
+                .validate()
+                .map_err(|error| StoreError::Validation(error.to_string()))?;
+            if record.lab_id != animal.lab_id
+                || record.animal_id != animal.id
+                || record.supersedes_record_id.is_some()
+                || record.is_voided()
+                || record.meta.deleted_at.is_some()
+                || !definition_ids.insert(record.genotype_definition_id)
+            {
+                return Err(StoreError::Validation(
+                    "initial genotyping record has incompatible identity or lifecycle fields"
+                        .to_owned(),
+                ));
+            }
+            let definition_lab = sqlx::query_scalar::<_, String>(
+                "SELECT lab_id FROM genotype_definitions WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(record.genotype_definition_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "genotype_definition",
+                id: record.genotype_definition_id,
+            })?;
+            require_same_uuid(
+                uuid(&definition_lab)?,
+                animal.lab_id,
+                "initial genotyping record definition",
+            )?;
+            if let Some(project_id) = record.project_id {
+                let project_lab =
+                    required_lab_id(&mut tx, "projects", project_id, "project").await?;
+                require_same_uuid(
+                    project_lab,
+                    animal.lab_id,
+                    "initial genotyping record project",
+                )?;
+            }
+            sqlx::query("INSERT INTO genotyping_records (id, lab_id, project_id, animal_id, genotype_definition_id, state, assessed_at, method, notes, supersedes_record_id, voided_at, void_reason, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(record.id.to_string())
+                .bind(record.lab_id.to_string())
+                .bind(record.project_id.map(|id| id.to_string()))
+                .bind(record.animal_id.to_string())
+                .bind(record.genotype_definition_id.to_string())
+                .bind(encode(&record.state)?)
+                .bind(record.assessed_at)
+                .bind(&record.method)
+                .bind(&record.notes)
+                .bind(record.supersedes_record_id.map(|id| id.to_string()))
+                .bind(record.voided_at)
+                .bind(&record.void_reason)
+                .bind(record.meta.created_at)
+                .bind(record.meta.updated_at)
+                .bind(record.meta.deleted_at)
+                .bind(record.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            write_audit(
+                &mut tx,
+                record.lab_id,
+                record.project_id,
+                EntityType::GenotypingRecord,
+                record.id,
+                AuditAction::Create,
+                audit,
+                None,
+                Some(snapshot(record)?),
+            )
+            .await?;
+            let provenance = Provenance::from_audit(
+                record.lab_id,
+                record.project_id,
+                EntityType::GenotypingRecord,
+                record.id,
+                audit,
+                record.meta.created_at,
+            );
+            insert_provenance_tx(&mut tx, &provenance).await?;
+            let mut event = AnimalEvent::new(
+                record.lab_id,
+                record.animal_id,
+                AnimalEventKind::GenotypingRecorded {
+                    record_id: record.id,
+                    genotype_definition_id: record.genotype_definition_id,
+                    state: record.state,
+                },
+                record.assessed_at.unwrap_or(record.meta.created_at),
+                record.meta.created_at,
+            );
+            event.project_id = record.project_id;
+            event.recorded_by = audit.actor.user_id;
+            append_derived_animal_event_tx(&mut tx, &event, audit).await?;
+        }
         tx.commit().await.map_err(map_sqlx)
     }
     async fn get_animal(&self, id: Uuid) -> StoreResult<Animal> {
@@ -1780,7 +2116,7 @@ impl MuriArcStore for SqliteStore {
         query.push_bind(filter.lab_id.to_string());
         query.push(" AND a.deleted_at IS NULL");
         if let Some(project_id) = filter.project_id {
-            query.push(" AND EXISTS (SELECT 1 FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id WHERE ep.animal_id = a.id AND ep.deleted_at IS NULL AND e.deleted_at IS NULL AND e.project_id = ");
+            query.push(" AND EXISTS (SELECT 1 FROM project_animal_assignments paa WHERE paa.animal_id = a.id AND paa.deleted_at IS NULL AND paa.project_id = ");
             query.push_bind(project_id.to_string());
             query.push(")");
         }
@@ -1835,7 +2171,7 @@ impl MuriArcStore for SqliteStore {
         query.push_bind(filter.lab_id.to_string());
         query.push(" AND a.deleted_at IS NULL");
         if let Some(project_id) = filter.project_id {
-            query.push(" AND EXISTS (SELECT 1 FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id WHERE ep.animal_id = a.id AND ep.deleted_at IS NULL AND e.deleted_at IS NULL AND e.project_id = ");
+            query.push(" AND EXISTS (SELECT 1 FROM project_animal_assignments paa WHERE paa.animal_id = a.id AND paa.deleted_at IS NULL AND paa.project_id = ");
             query.push_bind(project_id.to_string());
             query.push(")");
         }
@@ -1897,14 +2233,14 @@ impl MuriArcStore for SqliteStore {
             .collect::<BTreeMap<_, _>>();
 
         let mut genotype_query = QueryBuilder::<Sqlite>::new(
-            "SELECT g.animal_id, l.symbol AS locus_symbol, a1.symbol AS allele_1_symbol, a2.symbol AS allele_2_symbol FROM genotypes g JOIN gene_loci l ON l.id = g.locus_id AND l.deleted_at IS NULL LEFT JOIN alleles a1 ON a1.id = g.allele_1_id AND a1.deleted_at IS NULL LEFT JOIN alleles a2 ON a2.id = g.allele_2_id AND a2.deleted_at IS NULL WHERE g.deleted_at IS NULL AND g.animal_id IN (",
+            "SELECT current_records.animal_id, current_records.state, definitions.name AS definition_name FROM (SELECT records.animal_id, records.genotype_definition_id, records.state, ROW_NUMBER() OVER (PARTITION BY records.animal_id, records.genotype_definition_id ORDER BY records.created_at DESC, records.id DESC) AS current_rank FROM genotyping_records records WHERE records.deleted_at IS NULL AND records.voided_at IS NULL AND records.animal_id IN (",
         );
         {
             let mut separated = genotype_query.separated(", ");
             for id in &ids {
                 separated.push_bind(id.to_string());
             }
-            separated.push_unseparated(") ORDER BY g.animal_id, l.symbol, g.id");
+            separated.push_unseparated(") ) current_records JOIN genotype_definitions definitions ON definitions.id = current_records.genotype_definition_id WHERE current_records.current_rank = 1 ORDER BY current_records.animal_id, definitions.name, current_records.genotype_definition_id");
         }
         for row in genotype_query
             .build()
@@ -1913,35 +2249,33 @@ impl MuriArcStore for SqliteStore {
             .map_err(map_sqlx)?
         {
             let animal_id = uuid(row.try_get("animal_id").map_err(map_sqlx)?)?;
-            let locus: String = row.try_get("locus_symbol").map_err(map_sqlx)?;
-            let allele_1: Option<String> = row.try_get("allele_1_symbol").map_err(map_sqlx)?;
-            let allele_2: Option<String> = row.try_get("allele_2_symbol").map_err(map_sqlx)?;
-            let alleles = [allele_1, allele_2]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
-            let label = if alleles.is_empty() {
-                locus
-            } else {
-                format!("{locus} {}", alleles.join("/"))
+            let definition_name: String = row.try_get("definition_name").map_err(map_sqlx)?;
+            let state_value: String = row.try_get("state").map_err(map_sqlx)?;
+            let state: GenotypingState = decode(&state_value)?;
+            let state_label = match state {
+                GenotypingState::Unknown => "unknown",
+                GenotypingState::Expected => "expected",
+                GenotypingState::Confirmed => "confirmed",
+                GenotypingState::Rejected => "rejected",
             };
+            let label = format!("{definition_name} [{state_label}]");
             if let Some(overview) = overviews.get_mut(&animal_id) {
                 overview.genotype_labels.push(label);
             }
         }
 
         let mut project_query = QueryBuilder::<Sqlite>::new(
-            "SELECT DISTINCT ep.animal_id, p.id AS project_id, p.name AS project_name FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id AND e.deleted_at IS NULL JOIN projects p ON p.id = e.project_id AND p.deleted_at IS NULL WHERE ep.deleted_at IS NULL AND p.lab_id = ",
+            "SELECT paa.animal_id, p.id AS project_id, p.name AS project_name FROM project_animal_assignments paa JOIN projects p ON p.id = paa.project_id AND p.deleted_at IS NULL WHERE paa.deleted_at IS NULL AND p.lab_id = ",
         );
         project_query
             .push_bind(filter.lab_id.to_string())
-            .push(" AND ep.animal_id IN (");
+            .push(" AND paa.animal_id IN (");
         {
             let mut separated = project_query.separated(", ");
             for id in &ids {
                 separated.push_bind(id.to_string());
             }
-            separated.push_unseparated(") ORDER BY ep.animal_id, p.name, p.id");
+            separated.push_unseparated(") ORDER BY paa.animal_id, p.name, p.id");
         }
         for row in project_query
             .build()
@@ -2012,7 +2346,7 @@ impl MuriArcStore for SqliteStore {
             .push_bind(lab_id.to_string())
             .push(" AND deleted_at IS NULL");
         if let Some(project_id) = project_id {
-            query.push(" AND EXISTS (SELECT 1 FROM experiment_participations ep JOIN experiments e ON e.id = ep.experiment_id WHERE ep.animal_id = animals.id AND ep.deleted_at IS NULL AND e.deleted_at IS NULL AND e.project_id = ");
+            query.push(" AND EXISTS (SELECT 1 FROM project_animal_assignments paa WHERE paa.animal_id = animals.id AND paa.deleted_at IS NULL AND paa.project_id = ");
             query.push_bind(project_id.to_string());
             query.push(")");
         }
@@ -2433,6 +2767,62 @@ impl MuriArcStore for SqliteStore {
         let animal_lab =
             required_lab_id(&mut tx, "animals", participation.animal_id, "animal").await?;
         require_same_uuid(animal_lab, experiment_lab, "participation animal")?;
+        let assigned = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM project_animal_assignments WHERE project_id = ? AND animal_id = ? AND deleted_at IS NULL",
+        )
+        .bind(experiment_project.to_string())
+        .bind(participation.animal_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if assigned == 0 {
+            let assignment = ProjectAnimalAssignment::new(
+                experiment_lab,
+                experiment_project,
+                participation.animal_id,
+                audit.actor.user_id,
+                Some("Assigned during local experiment enrollment".to_owned()),
+                participation.enrolled_at,
+            );
+            sqlx::query("INSERT INTO project_animal_assignments (id, lab_id, project_id, animal_id, assigned_by, reason, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(assignment.id.to_string())
+                .bind(assignment.lab_id.to_string())
+                .bind(assignment.project_id.to_string())
+                .bind(assignment.animal_id.to_string())
+                .bind(assignment.assigned_by.map(|id| id.to_string()))
+                .bind(&assignment.reason)
+                .bind(assignment.meta.created_at)
+                .bind(assignment.meta.updated_at)
+                .bind(assignment.meta.deleted_at)
+                .bind(assignment.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            write_audit(
+                &mut tx,
+                assignment.lab_id,
+                Some(assignment.project_id),
+                EntityType::ProjectAnimalAssignment,
+                assignment.id,
+                AuditAction::Create,
+                audit,
+                None,
+                Some(snapshot(&assignment)?),
+            )
+            .await?;
+            insert_provenance_tx(
+                &mut tx,
+                &Provenance::from_audit(
+                    assignment.lab_id,
+                    Some(assignment.project_id),
+                    EntityType::ProjectAnimalAssignment,
+                    assignment.id,
+                    audit,
+                    assignment.meta.created_at,
+                ),
+            )
+            .await?;
+        }
         if let Some(cohort_id) = participation.cohort_id {
             let cohort_experiment = sqlx::query_scalar::<_, String>(
                 "SELECT experiment_id FROM cohorts WHERE id = ? AND deleted_at IS NULL",
@@ -2459,7 +2849,7 @@ impl MuriArcStore for SqliteStore {
             .await
             .map_err(map_sqlx)?;
         let genotype_rows = sqlx::query(&format!(
-            "SELECT {GENOTYPING_RECORD_COLUMNS} FROM genotyping_records WHERE animal_id = ? AND deleted_at IS NULL ORDER BY created_at, id"
+            "SELECT {GENOTYPING_RECORD_COLUMNS} FROM genotyping_records WHERE animal_id = ? AND deleted_at IS NULL AND voided_at IS NULL ORDER BY created_at, id"
         ))
         .bind(participation.animal_id.to_string())
         .fetch_all(&mut *tx)
@@ -3230,13 +3620,72 @@ impl MuriArcStore for SqliteStore {
             provenance.import_commit_id = Some(plan.commit_id);
             insert_provenance_tx(&mut tx, &provenance).await?;
         }
-        for genotype in &plan.genotypes {
-            insert_genotype_tx(&mut tx, genotype, None, audit, AuditAction::Import).await?;
+        for record in &plan.genotyping_records {
+            let animal_lab =
+                required_lab_id(&mut tx, "animals", record.animal_id, "animal").await?;
+            require_same_uuid(animal_lab, plan.lab_id, "imported genotyping record animal")?;
+            let definition_lab = sqlx::query_scalar::<_, String>(
+                "SELECT lab_id FROM genotype_definitions WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(record.genotype_definition_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "genotype_definition",
+                id: record.genotype_definition_id,
+            })?;
+            require_same_uuid(
+                uuid(&definition_lab)?,
+                plan.lab_id,
+                "imported genotyping record definition",
+            )?;
+            if let Some(project_id) = record.project_id {
+                let project_lab =
+                    required_lab_id(&mut tx, "projects", project_id, "project").await?;
+                require_same_uuid(
+                    project_lab,
+                    plan.lab_id,
+                    "imported genotyping record project",
+                )?;
+            }
+            sqlx::query("INSERT INTO genotyping_records (id, lab_id, project_id, animal_id, genotype_definition_id, state, assessed_at, method, notes, supersedes_record_id, voided_at, void_reason, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                .bind(record.id.to_string())
+                .bind(record.lab_id.to_string())
+                .bind(record.project_id.map(|id| id.to_string()))
+                .bind(record.animal_id.to_string())
+                .bind(record.genotype_definition_id.to_string())
+                .bind(encode(&record.state)?)
+                .bind(record.assessed_at)
+                .bind(&record.method)
+                .bind(&record.notes)
+                .bind(record.supersedes_record_id.map(|id| id.to_string()))
+                .bind(record.voided_at)
+                .bind(&record.void_reason)
+                .bind(record.meta.created_at)
+                .bind(record.meta.updated_at)
+                .bind(record.meta.deleted_at)
+                .bind(record.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            write_audit(
+                &mut tx,
+                plan.lab_id,
+                record.project_id,
+                EntityType::GenotypingRecord,
+                record.id,
+                AuditAction::Import,
+                audit,
+                None,
+                Some(snapshot(record)?),
+            )
+            .await?;
             let mut provenance = Provenance::from_audit(
                 plan.lab_id,
-                None,
-                EntityType::Genotype,
-                genotype.id,
+                record.project_id,
+                EntityType::GenotypingRecord,
+                record.id,
                 audit,
                 committed_at,
             );
@@ -3380,7 +3829,7 @@ impl MuriArcStore for SqliteStore {
     }
     async fn get_gene_locus(&self, id: Uuid) -> StoreResult<GeneLocus> {
         let row = sqlx::query(&format!(
-            "SELECT {LOCUS_COLUMNS} FROM gene_loci WHERE id = ? AND deleted_at IS NULL"
+            "SELECT {LOCUS_COLUMNS} FROM gene_loci WHERE id = ?"
         ))
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -3397,8 +3846,200 @@ impl MuriArcStore for SqliteStore {
         rows.iter().map(locus_from_row).collect()
     }
 
+    async fn list_gene_loci_including_archived(&self, lab_id: Uuid) -> StoreResult<Vec<GeneLocus>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {LOCUS_COLUMNS} FROM gene_loci WHERE lab_id = ? ORDER BY deleted_at IS NOT NULL, symbol, id"
+        ))
+        .bind(lab_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(locus_from_row).collect()
+    }
+
+    async fn gene_locus_reference_counts(&self, id: Uuid) -> StoreResult<GeneticsReferenceCounts> {
+        self.get_gene_locus(id).await?;
+        let id = id.to_string();
+        let active_genotype_definitions = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT gd.id) FROM genotype_components gc JOIN genotype_definitions gd ON gd.id = gc.genotype_definition_id WHERE gc.locus_id = ? AND gc.deleted_at IS NULL AND gd.deleted_at IS NULL",
+        )
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let genotype_definitions = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT genotype_definition_id) FROM genotype_components WHERE locus_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let genotyping_records = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT gr.id) FROM genotyping_records gr JOIN genotype_components gc ON gc.genotype_definition_id = gr.genotype_definition_id WHERE gc.locus_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let breeding_lines = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT blgd.breeding_line_id) FROM breeding_line_genotype_definitions blgd JOIN genotype_components gc ON gc.genotype_definition_id = blgd.genotype_definition_id WHERE gc.locus_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(GeneticsReferenceCounts {
+            active_genotype_definitions: checked_count(
+                active_genotype_definitions,
+                "active genotype definition",
+            )?,
+            genotype_definitions: checked_count(genotype_definitions, "genotype definition")?,
+            genotyping_records: checked_count(genotyping_records, "genotyping record")?,
+            breeding_lines: checked_count(breeding_lines, "breeding line")?,
+        })
+    }
+
+    async fn archive_gene_locus(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        archived_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<GeneLocus> {
+        let before = self.get_gene_locus(id).await?;
+        if before.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "gene locus revision changed before archival".to_owned(),
+            ));
+        }
+        if before.meta.deleted_at.is_some() {
+            return Err(StoreError::Conflict(
+                "gene locus is already archived".to_owned(),
+            ));
+        }
+        if self
+            .gene_locus_reference_counts(id)
+            .await?
+            .active_genotype_definitions
+            > 0
+        {
+            return Err(StoreError::Validation(
+                "gene locus is referenced by an active genotype definition".to_owned(),
+            ));
+        }
+        let mut after = before.clone();
+        after.meta.soft_delete(archived_at);
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let result = sqlx::query(
+            "UPDATE gene_loci SET deleted_at = ?, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL",
+        )
+        .bind(after.meta.deleted_at)
+        .bind(after.meta.updated_at)
+        .bind(after.meta.revision)
+        .bind(id.to_string())
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "gene locus revision changed before archival".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            after.lab_id,
+            None,
+            EntityType::GeneLocus,
+            id,
+            AuditAction::Archive,
+            audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&after)?),
+        )
+        .await?;
+        let provenance = Provenance::from_audit(
+            after.lab_id,
+            None,
+            EntityType::GeneLocus,
+            id,
+            audit,
+            archived_at,
+        );
+        insert_provenance_tx(&mut tx, &provenance).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after)
+    }
+
+    async fn restore_gene_locus(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        restored_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<GeneLocus> {
+        let before = self.get_gene_locus(id).await?;
+        if before.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "gene locus revision changed before restoration".to_owned(),
+            ));
+        }
+        if before.meta.deleted_at.is_none() {
+            return Err(StoreError::Conflict(
+                "gene locus is not archived".to_owned(),
+            ));
+        }
+        let mut after = before.clone();
+        after.meta.deleted_at = None;
+        after.meta.touch(restored_at);
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let result = sqlx::query(
+            "UPDATE gene_loci SET deleted_at = NULL, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL",
+        )
+        .bind(after.meta.updated_at)
+        .bind(after.meta.revision)
+        .bind(id.to_string())
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "gene locus revision changed before restoration".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            after.lab_id,
+            None,
+            EntityType::GeneLocus,
+            id,
+            AuditAction::Update,
+            audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&after)?),
+        )
+        .await?;
+        let provenance = Provenance::from_audit(
+            after.lab_id,
+            None,
+            EntityType::GeneLocus,
+            id,
+            audit,
+            restored_at,
+        );
+        insert_provenance_tx(&mut tx, &provenance).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after)
+    }
+
     async fn create_allele(&self, allele: &Allele, audit: &AuditContext) -> StoreResult<()> {
         let locus = self.get_gene_locus(allele.locus_id).await?;
+        if locus.meta.deleted_at.is_some() {
+            return Err(StoreError::Validation(
+                "allele locus is archived".to_owned(),
+            ));
+        }
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         sqlx::query("INSERT INTO alleles (id, locus_id, symbol, description, is_wild_type, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(allele.id.to_string()).bind(allele.locus_id.to_string()).bind(&allele.symbol).bind(&allele.description).bind(i64::from(allele.is_wild_type)).bind(allele.meta.created_at).bind(allele.meta.updated_at).bind(allele.meta.deleted_at).bind(allele.meta.revision)
@@ -3428,7 +4069,7 @@ impl MuriArcStore for SqliteStore {
     }
     async fn get_allele(&self, id: Uuid) -> StoreResult<Allele> {
         let row = sqlx::query(&format!(
-            "SELECT {ALLELE_COLUMNS} FROM alleles WHERE id = ? AND deleted_at IS NULL"
+            "SELECT {ALLELE_COLUMNS} FROM alleles WHERE id = ?"
         ))
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -3443,6 +4084,203 @@ impl MuriArcStore for SqliteStore {
     async fn list_alleles(&self, locus_id: Uuid) -> StoreResult<Vec<Allele>> {
         let rows = sqlx::query(&format!("SELECT {ALLELE_COLUMNS} FROM alleles WHERE locus_id = ? AND deleted_at IS NULL ORDER BY symbol, id")).bind(locus_id.to_string()).fetch_all(&self.pool).await.map_err(map_sqlx)?;
         rows.iter().map(allele_from_row).collect()
+    }
+
+    async fn list_alleles_including_archived(&self, locus_id: Uuid) -> StoreResult<Vec<Allele>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {ALLELE_COLUMNS} FROM alleles WHERE locus_id = ? ORDER BY deleted_at IS NOT NULL, symbol, id"
+        ))
+        .bind(locus_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        rows.iter().map(allele_from_row).collect()
+    }
+
+    async fn allele_reference_counts(&self, id: Uuid) -> StoreResult<GeneticsReferenceCounts> {
+        self.get_allele(id).await?;
+        let id = id.to_string();
+        let component_match = "(gc.allele_1_id = ? OR gc.allele_2_id = ?)";
+        let active_genotype_definitions = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(DISTINCT gd.id) FROM genotype_components gc JOIN genotype_definitions gd ON gd.id = gc.genotype_definition_id WHERE {component_match} AND gc.deleted_at IS NULL AND gd.deleted_at IS NULL"
+        ))
+        .bind(&id)
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let genotype_definitions = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(DISTINCT gc.genotype_definition_id) FROM genotype_components gc WHERE {component_match}"
+        ))
+        .bind(&id)
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let genotyping_records = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(DISTINCT gr.id) FROM genotyping_records gr JOIN genotype_components gc ON gc.genotype_definition_id = gr.genotype_definition_id WHERE {component_match}"
+        ))
+        .bind(&id)
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let breeding_lines = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(DISTINCT blgd.breeding_line_id) FROM breeding_line_genotype_definitions blgd JOIN genotype_components gc ON gc.genotype_definition_id = blgd.genotype_definition_id WHERE {component_match}"
+        ))
+        .bind(&id)
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(GeneticsReferenceCounts {
+            active_genotype_definitions: checked_count(
+                active_genotype_definitions,
+                "active genotype definition",
+            )?,
+            genotype_definitions: checked_count(genotype_definitions, "genotype definition")?,
+            genotyping_records: checked_count(genotyping_records, "genotyping record")?,
+            breeding_lines: checked_count(breeding_lines, "breeding line")?,
+        })
+    }
+
+    async fn archive_allele(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        archived_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Allele> {
+        let before = self.get_allele(id).await?;
+        if before.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "allele revision changed before archival".to_owned(),
+            ));
+        }
+        if before.meta.deleted_at.is_some() {
+            return Err(StoreError::Conflict(
+                "allele is already archived".to_owned(),
+            ));
+        }
+        if self
+            .allele_reference_counts(id)
+            .await?
+            .active_genotype_definitions
+            > 0
+        {
+            return Err(StoreError::Validation(
+                "allele is referenced by an active genotype definition".to_owned(),
+            ));
+        }
+        let locus = self.get_gene_locus(before.locus_id).await?;
+        let mut after = before.clone();
+        after.meta.soft_delete(archived_at);
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let result = sqlx::query(
+            "UPDATE alleles SET deleted_at = ?, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL",
+        )
+        .bind(after.meta.deleted_at)
+        .bind(after.meta.updated_at)
+        .bind(after.meta.revision)
+        .bind(id.to_string())
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "allele revision changed before archival".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            locus.lab_id,
+            None,
+            EntityType::Allele,
+            id,
+            AuditAction::Archive,
+            audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&after)?),
+        )
+        .await?;
+        let provenance = Provenance::from_audit(
+            locus.lab_id,
+            None,
+            EntityType::Allele,
+            id,
+            audit,
+            archived_at,
+        );
+        insert_provenance_tx(&mut tx, &provenance).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after)
+    }
+
+    async fn restore_allele(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        restored_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Allele> {
+        let before = self.get_allele(id).await?;
+        if before.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "allele revision changed before restoration".to_owned(),
+            ));
+        }
+        if before.meta.deleted_at.is_none() {
+            return Err(StoreError::Conflict("allele is not archived".to_owned()));
+        }
+        let locus = self.get_gene_locus(before.locus_id).await?;
+        if locus.meta.deleted_at.is_some() {
+            return Err(StoreError::Validation(
+                "allele cannot be restored while its locus is archived".to_owned(),
+            ));
+        }
+        let mut after = before.clone();
+        after.meta.deleted_at = None;
+        after.meta.touch(restored_at);
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let result = sqlx::query(
+            "UPDATE alleles SET deleted_at = NULL, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL",
+        )
+        .bind(after.meta.updated_at)
+        .bind(after.meta.revision)
+        .bind(id.to_string())
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "allele revision changed before restoration".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            locus.lab_id,
+            None,
+            EntityType::Allele,
+            id,
+            AuditAction::Update,
+            audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&after)?),
+        )
+        .await?;
+        let provenance = Provenance::from_audit(
+            locus.lab_id,
+            None,
+            EntityType::Allele,
+            id,
+            audit,
+            restored_at,
+        );
+        insert_provenance_tx(&mut tx, &provenance).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after)
     }
 
     async fn create_genotype(
@@ -3532,8 +4370,18 @@ impl MuriArcStore for SqliteStore {
                     "genotype component belongs to a different definition".to_owned(),
                 ));
             }
-            let locus_lab =
-                required_lab_id(&mut tx, "gene_loci", component.locus_id, "gene_locus").await?;
+            let locus_lab = sqlx::query_scalar::<_, String>(
+                "SELECT lab_id FROM gene_loci WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(component.locus_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "gene_locus",
+                id: component.locus_id,
+            })?;
+            let locus_lab = uuid(&locus_lab)?;
             require_same_uuid(locus_lab, definition.lab_id, "genotype definition locus")?;
             for allele_id in [Some(component.allele_1_id), component.allele_2_id]
                 .into_iter()
@@ -3598,7 +4446,7 @@ impl MuriArcStore for SqliteStore {
 
     async fn get_genotype_definition(&self, id: Uuid) -> StoreResult<GenotypeDefinition> {
         let row = sqlx::query(&format!(
-            "SELECT {GENOTYPE_DEFINITION_COLUMNS} FROM genotype_definitions WHERE id = ? AND deleted_at IS NULL"
+            "SELECT {GENOTYPE_DEFINITION_COLUMNS} FROM genotype_definitions WHERE id = ?"
         ))
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -3634,6 +4482,192 @@ impl MuriArcStore for SqliteStore {
         Ok(definitions)
     }
 
+    async fn list_genotype_definitions_including_archived(
+        &self,
+        lab_id: Uuid,
+    ) -> StoreResult<Vec<GenotypeDefinition>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {GENOTYPE_DEFINITION_COLUMNS} FROM genotype_definitions WHERE lab_id = ? ORDER BY deleted_at IS NOT NULL, name, id"
+        ))
+        .bind(lab_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let mut definitions = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut definition = genotype_definition_from_row(row)?;
+            definition.components =
+                load_genotype_components_sqlite(&self.pool, definition.id).await?;
+            definitions.push(definition);
+        }
+        Ok(definitions)
+    }
+
+    async fn genotype_definition_reference_counts(
+        &self,
+        id: Uuid,
+    ) -> StoreResult<GeneticsReferenceCounts> {
+        self.get_genotype_definition(id).await?;
+        let id = id.to_string();
+        let genotyping_records = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM genotyping_records WHERE genotype_definition_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let breeding_lines = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM breeding_line_genotype_definitions WHERE genotype_definition_id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(GeneticsReferenceCounts {
+            active_genotype_definitions: 0,
+            genotype_definitions: 0,
+            genotyping_records: checked_count(genotyping_records, "genotyping record")?,
+            breeding_lines: checked_count(breeding_lines, "breeding line")?,
+        })
+    }
+
+    async fn archive_genotype_definition(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        archived_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<GenotypeDefinition> {
+        let before = self.get_genotype_definition(id).await?;
+        if before.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "genotype definition revision changed before archival".to_owned(),
+            ));
+        }
+        if before.meta.deleted_at.is_some() {
+            return Err(StoreError::Conflict(
+                "genotype definition is already archived".to_owned(),
+            ));
+        }
+        let mut after = before.clone();
+        after.meta.soft_delete(archived_at);
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let result = sqlx::query(
+            "UPDATE genotype_definitions SET deleted_at = ?, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL",
+        )
+        .bind(after.meta.deleted_at)
+        .bind(after.meta.updated_at)
+        .bind(after.meta.revision)
+        .bind(id.to_string())
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "genotype definition revision changed before archival".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            after.lab_id,
+            None,
+            EntityType::GenotypeDefinition,
+            id,
+            AuditAction::Archive,
+            audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&after)?),
+        )
+        .await?;
+        let provenance = Provenance::from_audit(
+            after.lab_id,
+            None,
+            EntityType::GenotypeDefinition,
+            id,
+            audit,
+            archived_at,
+        );
+        insert_provenance_tx(&mut tx, &provenance).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after)
+    }
+
+    async fn restore_genotype_definition(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        restored_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<GenotypeDefinition> {
+        let before = self.get_genotype_definition(id).await?;
+        if before.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "genotype definition revision changed before restoration".to_owned(),
+            ));
+        }
+        if before.meta.deleted_at.is_none() {
+            return Err(StoreError::Conflict(
+                "genotype definition is not archived".to_owned(),
+            ));
+        }
+        let inactive_components = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM genotype_components gc JOIN gene_loci gl ON gl.id = gc.locus_id JOIN alleles a1 ON a1.id = gc.allele_1_id LEFT JOIN alleles a2 ON a2.id = gc.allele_2_id WHERE gc.genotype_definition_id = ? AND gc.deleted_at IS NULL AND (gl.deleted_at IS NOT NULL OR a1.deleted_at IS NOT NULL OR (gc.allele_2_id IS NOT NULL AND a2.deleted_at IS NOT NULL))",
+        )
+        .bind(id.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if inactive_components > 0 {
+            return Err(StoreError::Validation(
+                "genotype definition cannot be restored while a locus or allele is archived"
+                    .to_owned(),
+            ));
+        }
+        let mut after = before.clone();
+        after.meta.deleted_at = None;
+        after.meta.touch(restored_at);
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let result = sqlx::query(
+            "UPDATE genotype_definitions SET deleted_at = NULL, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NOT NULL",
+        )
+        .bind(after.meta.updated_at)
+        .bind(after.meta.revision)
+        .bind(id.to_string())
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "genotype definition revision changed before restoration".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            after.lab_id,
+            None,
+            EntityType::GenotypeDefinition,
+            id,
+            AuditAction::Update,
+            audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&after)?),
+        )
+        .await?;
+        let provenance = Provenance::from_audit(
+            after.lab_id,
+            None,
+            EntityType::GenotypeDefinition,
+            id,
+            audit,
+            restored_at,
+        );
+        insert_provenance_tx(&mut tx, &provenance).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after)
+    }
+
     async fn create_genotyping_record(
         &self,
         record: &GenotypingRecord,
@@ -3642,6 +4676,11 @@ impl MuriArcStore for SqliteStore {
         record
             .validate()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
+        if record.supersedes_record_id.is_some() || record.is_voided() {
+            return Err(StoreError::Validation(
+                "standard genotyping record creation cannot set lifecycle fields".to_owned(),
+            ));
+        }
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         sqlx::query("UPDATE animals SET updated_at = updated_at WHERE id = ?")
             .bind(record.animal_id.to_string())
@@ -3650,13 +4689,18 @@ impl MuriArcStore for SqliteStore {
             .map_err(map_sqlx)?;
         let animal_lab = required_lab_id(&mut tx, "animals", record.animal_id, "animal").await?;
         require_same_uuid(animal_lab, record.lab_id, "genotyping record animal")?;
-        let definition_lab = required_lab_id(
-            &mut tx,
-            "genotype_definitions",
-            record.genotype_definition_id,
-            "genotype_definition",
+        let definition_lab = sqlx::query_scalar::<_, String>(
+            "SELECT lab_id FROM genotype_definitions WHERE id = ? AND deleted_at IS NULL",
         )
-        .await?;
+        .bind(record.genotype_definition_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "genotype_definition",
+            id: record.genotype_definition_id,
+        })?;
+        let definition_lab = uuid(&definition_lab)?;
         require_same_uuid(
             definition_lab,
             record.lab_id,
@@ -3666,7 +4710,7 @@ impl MuriArcStore for SqliteStore {
             let project_lab = required_lab_id(&mut tx, "projects", project_id, "project").await?;
             require_same_uuid(project_lab, record.lab_id, "genotyping record project")?;
         }
-        sqlx::query("INSERT INTO genotyping_records (id, lab_id, project_id, animal_id, genotype_definition_id, state, assessed_at, method, notes, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO genotyping_records (id, lab_id, project_id, animal_id, genotype_definition_id, state, assessed_at, method, notes, supersedes_record_id, voided_at, void_reason, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(record.id.to_string())
             .bind(record.lab_id.to_string())
             .bind(record.project_id.map(|id| id.to_string()))
@@ -3676,6 +4720,9 @@ impl MuriArcStore for SqliteStore {
             .bind(record.assessed_at)
             .bind(&record.method)
             .bind(&record.notes)
+            .bind(record.supersedes_record_id.map(|id| id.to_string()))
+            .bind(record.voided_at)
+            .bind(&record.void_reason)
             .bind(record.meta.created_at)
             .bind(record.meta.updated_at)
             .bind(record.meta.deleted_at)
@@ -3723,7 +4770,7 @@ impl MuriArcStore for SqliteStore {
 
     async fn get_genotyping_record(&self, id: Uuid) -> StoreResult<GenotypingRecord> {
         let row = sqlx::query(&format!(
-            "SELECT {GENOTYPING_RECORD_COLUMNS} FROM genotyping_records WHERE id = ? AND deleted_at IS NULL"
+            "SELECT {GENOTYPING_RECORD_COLUMNS} FROM genotyping_records WHERE id = ?"
         ))
         .bind(id.to_string())
         .fetch_optional(&self.pool)
@@ -3738,13 +4785,256 @@ impl MuriArcStore for SqliteStore {
 
     async fn list_genotyping_records(&self, animal_id: Uuid) -> StoreResult<Vec<GenotypingRecord>> {
         let rows = sqlx::query(&format!(
-            "SELECT {GENOTYPING_RECORD_COLUMNS} FROM genotyping_records WHERE animal_id = ? AND deleted_at IS NULL ORDER BY created_at, id"
+            "SELECT {GENOTYPING_RECORD_COLUMNS} FROM genotyping_records WHERE animal_id = ? ORDER BY created_at, id"
         ))
         .bind(animal_id.to_string())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
         rows.iter().map(genotyping_record_from_row).collect()
+    }
+
+    async fn list_current_genotyping_records(
+        &self,
+        animal_id: Uuid,
+    ) -> StoreResult<Vec<GenotypingRecord>> {
+        let rows = sqlx::query(&format!(
+            "SELECT {GENOTYPING_RECORD_COLUMNS} FROM genotyping_records WHERE animal_id = ? AND deleted_at IS NULL AND voided_at IS NULL ORDER BY created_at, id"
+        ))
+        .bind(animal_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        let mut latest = BTreeMap::<Uuid, GenotypingRecord>::new();
+        for row in &rows {
+            let record = genotyping_record_from_row(row)?;
+            latest.insert(record.genotype_definition_id, record);
+        }
+        Ok(latest.into_values().collect())
+    }
+
+    async fn void_genotyping_record(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        reason: &str,
+        voided_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<GenotypingRecord> {
+        let before = self.get_genotyping_record(id).await?;
+        if before.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "genotyping record revision changed before voiding".to_owned(),
+            ));
+        }
+        let mut after = before.clone();
+        after
+            .void(reason, voided_at)
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let mut operation_audit = audit.clone();
+        operation_audit.reason = Some(after.void_reason.clone().expect("void reason was set"));
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::query("UPDATE animals SET updated_at = updated_at WHERE id = ?")
+            .bind(after.animal_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        let result = sqlx::query(
+            "UPDATE genotyping_records SET voided_at = ?, void_reason = ?, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL AND voided_at IS NULL",
+        )
+        .bind(after.voided_at)
+        .bind(&after.void_reason)
+        .bind(after.meta.updated_at)
+        .bind(after.meta.revision)
+        .bind(id.to_string())
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "genotyping record revision changed before voiding".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            after.lab_id,
+            after.project_id,
+            EntityType::GenotypingRecord,
+            id,
+            AuditAction::Revoke,
+            &operation_audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&after)?),
+        )
+        .await?;
+        let provenance = Provenance::from_audit(
+            after.lab_id,
+            after.project_id,
+            EntityType::GenotypingRecord,
+            id,
+            &operation_audit,
+            voided_at,
+        );
+        insert_provenance_tx(&mut tx, &provenance).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after)
+    }
+
+    async fn correct_genotyping_record(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        reason: &str,
+        voided_at: DateTime<Utc>,
+        replacement: &GenotypingRecord,
+        audit: &AuditContext,
+    ) -> StoreResult<(GenotypingRecord, GenotypingRecord)> {
+        replacement
+            .validate()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let before = self.get_genotyping_record(id).await?;
+        if before.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "genotyping record revision changed before correction".to_owned(),
+            ));
+        }
+        if replacement.supersedes_record_id != Some(id)
+            || replacement.lab_id != before.lab_id
+            || replacement.project_id != before.project_id
+            || replacement.animal_id != before.animal_id
+            || replacement.is_voided()
+        {
+            return Err(StoreError::Validation(
+                "replacement genotyping record has incompatible identity or lifecycle fields"
+                    .to_owned(),
+            ));
+        }
+        let mut voided = before.clone();
+        voided
+            .void(reason, voided_at)
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let mut operation_audit = audit.clone();
+        operation_audit.reason = Some(voided.void_reason.clone().expect("void reason was set"));
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::query("UPDATE animals SET updated_at = updated_at WHERE id = ?")
+            .bind(before.animal_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        let definition_lab = sqlx::query_scalar::<_, String>(
+            "SELECT lab_id FROM genotype_definitions WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(replacement.genotype_definition_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "genotype_definition",
+            id: replacement.genotype_definition_id,
+        })?;
+        require_same_uuid(
+            uuid(&definition_lab)?,
+            replacement.lab_id,
+            "replacement genotyping record definition",
+        )?;
+        let result = sqlx::query(
+            "UPDATE genotyping_records SET voided_at = ?, void_reason = ?, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL AND voided_at IS NULL",
+        )
+        .bind(voided.voided_at)
+        .bind(&voided.void_reason)
+        .bind(voided.meta.updated_at)
+        .bind(voided.meta.revision)
+        .bind(id.to_string())
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "genotyping record revision changed before correction".to_owned(),
+            ));
+        }
+        sqlx::query("INSERT INTO genotyping_records (id, lab_id, project_id, animal_id, genotype_definition_id, state, assessed_at, method, notes, supersedes_record_id, voided_at, void_reason, created_at, updated_at, deleted_at, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(replacement.id.to_string())
+            .bind(replacement.lab_id.to_string())
+            .bind(replacement.project_id.map(|value| value.to_string()))
+            .bind(replacement.animal_id.to_string())
+            .bind(replacement.genotype_definition_id.to_string())
+            .bind(encode(&replacement.state)?)
+            .bind(replacement.assessed_at)
+            .bind(&replacement.method)
+            .bind(&replacement.notes)
+            .bind(replacement.supersedes_record_id.map(|value| value.to_string()))
+            .bind(replacement.voided_at)
+            .bind(&replacement.void_reason)
+            .bind(replacement.meta.created_at)
+            .bind(replacement.meta.updated_at)
+            .bind(replacement.meta.deleted_at)
+            .bind(replacement.meta.revision)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        write_audit(
+            &mut tx,
+            voided.lab_id,
+            voided.project_id,
+            EntityType::GenotypingRecord,
+            id,
+            AuditAction::Revoke,
+            &operation_audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&voided)?),
+        )
+        .await?;
+        let void_provenance = Provenance::from_audit(
+            voided.lab_id,
+            voided.project_id,
+            EntityType::GenotypingRecord,
+            id,
+            &operation_audit,
+            voided_at,
+        );
+        insert_provenance_tx(&mut tx, &void_provenance).await?;
+        write_audit(
+            &mut tx,
+            replacement.lab_id,
+            replacement.project_id,
+            EntityType::GenotypingRecord,
+            replacement.id,
+            AuditAction::Create,
+            &operation_audit,
+            None,
+            Some(snapshot(replacement)?),
+        )
+        .await?;
+        let replacement_provenance = Provenance::from_audit(
+            replacement.lab_id,
+            replacement.project_id,
+            EntityType::GenotypingRecord,
+            replacement.id,
+            &operation_audit,
+            replacement.meta.created_at,
+        );
+        insert_provenance_tx(&mut tx, &replacement_provenance).await?;
+        let mut event = AnimalEvent::new(
+            replacement.lab_id,
+            replacement.animal_id,
+            AnimalEventKind::GenotypingRecorded {
+                record_id: replacement.id,
+                genotype_definition_id: replacement.genotype_definition_id,
+                state: replacement.state,
+            },
+            replacement
+                .assessed_at
+                .unwrap_or(replacement.meta.created_at),
+            replacement.meta.created_at,
+        );
+        event.project_id = replacement.project_id;
+        event.recorded_by = operation_audit.actor.user_id;
+        append_derived_animal_event_tx(&mut tx, &event, &operation_audit).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok((voided, replacement.clone()))
     }
 
     async fn create_breeding_line(
@@ -5559,6 +6849,11 @@ fn genotyping_record_from_row(row: &SqliteRow) -> StoreResult<GenotypingRecord> 
         assessed_at: row.try_get("assessed_at").map_err(map_sqlx)?,
         method: row.try_get("method").map_err(map_sqlx)?,
         notes: row.try_get("notes").map_err(map_sqlx)?,
+        supersedes_record_id: optional_uuid(
+            row.try_get("supersedes_record_id").map_err(map_sqlx)?,
+        )?,
+        voided_at: row.try_get("voided_at").map_err(map_sqlx)?,
+        void_reason: row.try_get("void_reason").map_err(map_sqlx)?,
         meta: meta(row)?,
     })
 }
@@ -5936,7 +7231,7 @@ const GENOTYPE_COLUMNS: &str = "id, animal_id, locus_id, allele_1_id, allele_2_i
 const GENOTYPE_DEFINITION_COLUMNS: &str =
     "id, lab_id, name, description, created_at, updated_at, deleted_at, revision";
 const GENOTYPE_COMPONENT_COLUMNS: &str = "id, genotype_definition_id, locus_id, allele_1_id, allele_2_id, mode, display_order, created_at, updated_at, deleted_at, revision";
-const GENOTYPING_RECORD_COLUMNS: &str = "id, lab_id, project_id, animal_id, genotype_definition_id, state, assessed_at, method, notes, created_at, updated_at, deleted_at, revision";
+const GENOTYPING_RECORD_COLUMNS: &str = "id, lab_id, project_id, animal_id, genotype_definition_id, state, assessed_at, method, notes, supersedes_record_id, voided_at, void_reason, created_at, updated_at, deleted_at, revision";
 const BREEDING_LINE_COLUMNS: &str =
     "id, lab_id, name, description, created_at, updated_at, deleted_at, revision";
 const COLONY_COLUMNS: &str =

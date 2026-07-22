@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use axum::{Json, Router, extract::State, routing::get};
 use chrono::{DateTime, Utc};
 use muriarc_core::{
@@ -31,6 +33,7 @@ struct ListQuery {
     operation_code: Option<String>,
     scope: Option<OperationScope>,
     limit: Option<usize>,
+    include_technical: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -65,11 +68,12 @@ struct OperationView {
     before: Option<Value>,
     after: Option<Value>,
     occurred_at: DateTime<Utc>,
+    batch_count: usize,
 }
 
 impl From<AuditEntry> for OperationView {
     fn from(entry: AuditEntry) -> Self {
-        let title = operation_title(entry.entity_type, entry.action);
+        let title = operation_title(&entry);
         let summary = operation_summary(&entry, &title);
         Self {
             id: entry.id,
@@ -90,6 +94,7 @@ impl From<AuditEntry> for OperationView {
             before: entry.before,
             after: entry.after,
             occurred_at: entry.occurred_at,
+            batch_count: 1,
         }
     }
 }
@@ -113,7 +118,7 @@ async fn list(
         &principal,
         &metadata,
         query.project_id,
-        Permission::ReadAudit,
+        Permission::ReadActivity,
     )
     .await?;
 
@@ -144,21 +149,60 @@ async fn list(
                 .scope
                 .is_none_or(|value| in_scope(entry.entity_type, value))
     });
+    let include_audit_details = query.include_technical.unwrap_or(false);
+    if include_audit_details {
+        scope::optional_project_permission(
+            &state,
+            &principal,
+            &metadata,
+            query.project_id,
+            Permission::ReadAudit,
+        )
+        .await?;
+    } else {
+        entries.retain(is_key_activity);
+    }
     truncate(&mut entries, collection_limit(query.limit, &metadata)?);
-    Ok(collection(
-        entries.into_iter().map(OperationView::from).collect(),
-        &metadata,
-    ))
+    let mut views = Vec::<OperationView>::new();
+    let mut grouped = HashMap::<(String, String), usize>::new();
+    for entry in entries {
+        let group_key = entry.request_id.as_ref().map(|request_id| {
+            (
+                request_id.clone(),
+                activity_group(entry.entity_type, entry.action).to_owned(),
+            )
+        });
+        if let Some(index) = group_key.as_ref().and_then(|key| grouped.get(key)).copied() {
+            let view = &mut views[index];
+            view.batch_count += 1;
+            view.summary = format!(
+                "{} 批量完成 {} 项{}",
+                view.actor.display_name, view.batch_count, view.title
+            );
+            continue;
+        }
+        let mut view = OperationView::from(entry);
+        if !include_audit_details {
+            view.operation_params = Value::Object(Default::default());
+            view.before = None;
+            view.after = None;
+        }
+        if let Some(key) = group_key {
+            grouped.insert(key, views.len());
+        }
+        views.push(view);
+    }
+    Ok(collection(views, &metadata))
 }
 
 async fn catalog(
     principal: AuthPrincipal,
     metadata: RequestMetadata,
 ) -> Result<Json<CollectionResponse<CatalogItem>>, ApiError> {
-    if !principal.can(Permission::ReadAudit, None)
+    if !principal.can(Permission::ReadActivity, None)
         && !principal
             .project_ids()
-            .any(|project_id| principal.can(Permission::ReadAudit, Some(project_id)))
+            .any(|project_id| principal.can(Permission::ReadActivity, Some(project_id)))
     {
         return Err(ApiError::forbidden().with_request_id(metadata.request_id));
     }
@@ -198,6 +242,7 @@ fn in_scope(entity_type: EntityType, scope: OperationScope) -> bool {
             entity_type,
             EntityType::Project
                 | EntityType::Membership
+                | EntityType::ProjectAnimalAssignment
                 | EntityType::Attachment
                 | EntityType::AttachmentLink
                 | EntityType::AttachmentDerivative
@@ -247,8 +292,72 @@ fn in_scope(entity_type: EntityType, scope: OperationScope) -> bool {
     }
 }
 
-fn operation_title(entity_type: EntityType, action: AuditAction) -> String {
-    format!("{}{}", action_label(action), entity_label(entity_type))
+fn operation_title(entry: &AuditEntry) -> String {
+    match (entry.entity_type, entry.action) {
+        (EntityType::ProjectAnimalAssignment, AuditAction::Create) => "分配动物到项目".to_owned(),
+        (EntityType::ProjectAnimalAssignment, AuditAction::SoftDelete) => {
+            "从项目移除动物".to_owned()
+        }
+        (EntityType::Participation, AuditAction::Create) => "动物加入实验".to_owned(),
+        (EntityType::AnimalEvent, AuditAction::Create)
+            if entry
+                .after
+                .as_ref()
+                .and_then(|value| value.get("kind"))
+                .and_then(|kind| kind.get("transferred"))
+                .is_some() =>
+        {
+            "动物转笼".to_owned()
+        }
+        _ => format!(
+            "{}{}",
+            action_label(entry.action),
+            entity_label(entry.entity_type)
+        ),
+    }
+}
+
+fn activity_group(entity_type: EntityType, action: AuditAction) -> &'static str {
+    match (entity_type, action) {
+        (EntityType::ProjectAnimalAssignment, AuditAction::Create) => "project-animal-assign",
+        (EntityType::ProjectAnimalAssignment, AuditAction::SoftDelete) => "project-animal-remove",
+        (EntityType::AnimalEvent, AuditAction::Create) => "animal-event",
+        (EntityType::Participation, AuditAction::Create) => "experiment-enroll",
+        _ => entity_type.as_str(),
+    }
+}
+
+fn is_key_activity(entry: &AuditEntry) -> bool {
+    // Retention-policy changes and cleanup remain permanently auditable, but
+    // automatic cleanup must not recreate the noise that the activity view is
+    // designed to remove.
+    if entry.entity_type == EntityType::TechnicalLogPolicy {
+        return false;
+    }
+    matches!(
+        entry.entity_type,
+        EntityType::AnimalEvent
+            | EntityType::ProjectAnimalAssignment
+            | EntityType::BreedingPair
+            | EntityType::MatingEvent
+            | EntityType::Litter
+            | EntityType::AnimalDraft
+            | EntityType::Experiment
+            | EntityType::Participation
+            | EntityType::Procedure
+            | EntityType::Measurement
+            | EntityType::Sample
+            | EntityType::Attachment
+            | EntityType::Job
+            | EntityType::Approval
+    ) || matches!(
+        entry.action,
+        AuditAction::SoftDelete
+            | AuditAction::Sign
+            | AuditAction::Import
+            | AuditAction::Export
+            | AuditAction::Cleanup
+    )
 }
 
 fn operation_summary(entry: &AuditEntry, title: &str) -> String {
@@ -256,7 +365,7 @@ fn operation_summary(entry: &AuditEntry, title: &str) -> String {
         .entity_name_snapshot
         .as_deref()
         .map(str::to_owned)
-        .unwrap_or_else(|| format!("{}…", &entry.entity_id.to_string()[..8]));
+        .unwrap_or_else(|| entity_label(entry.entity_type).to_owned());
     format!(
         "{}：{}「{}」；来源 {}",
         entry.actor.display_name,
@@ -294,6 +403,7 @@ const fn entity_label(entity_type: EntityType) -> &'static str {
         EntityType::ExternalToken => "外部令牌",
         EntityType::Project => "项目",
         EntityType::Membership => "成员权限",
+        EntityType::ProjectAnimalAssignment => "项目动物分配",
         EntityType::Cage => "笼位",
         EntityType::Animal => "动物",
         EntityType::AnimalEvent => "动物事件",
@@ -328,9 +438,11 @@ const fn entity_label(entity_type: EntityType) -> &'static str {
         EntityType::AiExtractionDraft => "AI 提取草稿",
         EntityType::AiConversation => "AI 会话",
         EntityType::AiConversationMessage => "AI 消息",
+        EntityType::AiAutonomyGrant => "AI 会话授权",
         EntityType::AiProviderSettings => "AI Provider 设置",
         EntityType::AiProviderEndpoint => "AI Provider 端点",
         EntityType::AiLabSettings => "实验室 AI 设置",
+        EntityType::TechnicalLogPolicy => "技术日志策略",
         EntityType::ToolRun => "AI 工具执行",
         EntityType::Approval => "审批",
         EntityType::Job => "数据任务",
@@ -356,15 +468,46 @@ mod tests {
     #[test]
     fn operation_rendering_is_deterministic_and_human_readable() {
         assert_eq!(
-            operation_title(EntityType::AttachmentLink, AuditAction::Link),
+            format!(
+                "{}{}",
+                action_label(AuditAction::Link),
+                entity_label(EntityType::AttachmentLink)
+            ),
             "关联附件关联"
         );
         assert_eq!(source_label(WriteSource::Web), "Web");
-        assert_eq!(
-            operation_title(EntityType::AiProviderEndpoint, AuditAction::Create),
-            "新建AI Provider 端点"
-        );
         assert!(in_scope(EntityType::AiExtractionDraft, OperationScope::Ai));
         assert!(!in_scope(EntityType::Animal, OperationScope::Ai));
+
+        let mut entry = AuditEntry {
+            id: Uuid::new_v4(),
+            lab_id: Uuid::new_v4(),
+            project_id: None,
+            entity_type: EntityType::AiProviderEndpoint,
+            entity_id: Uuid::new_v4(),
+            action: AuditAction::Create,
+            actor: Actor::system("MuriArc"),
+            source: WriteSource::Web,
+            request_id: None,
+            reason: None,
+            before: None,
+            after: None,
+            operation_code: String::new(),
+            operation_version: 1,
+            operation_params: Value::Object(Default::default()),
+            entity_name_snapshot: None,
+            entity_revision: None,
+            occurred_at: Utc::now(),
+        };
+        assert_eq!(operation_title(&entry), "新建AI Provider 端点");
+
+        entry.entity_type = EntityType::AnimalEvent;
+        let summary = operation_summary(&entry, "记录动物事件");
+        assert!(summary.contains("动物事件"));
+        assert!(!summary.contains(&entry.entity_id.to_string()[..8]));
+
+        entry.entity_type = EntityType::TechnicalLogPolicy;
+        entry.action = AuditAction::Cleanup;
+        assert!(!is_key_activity(&entry));
     }
 }

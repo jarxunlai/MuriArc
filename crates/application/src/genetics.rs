@@ -193,6 +193,11 @@ pub async fn create_genotype_definition(
                 "genotype definition locus belongs to a different lab".to_owned(),
             ));
         }
+        if locus.meta.deleted_at.is_some() {
+            return Err(ApplicationError::Validation(
+                "genotype definition locus is archived".to_owned(),
+            ));
+        }
         for allele_id in [Some(input.allele_1_id), input.allele_2_id]
             .into_iter()
             .flatten()
@@ -201,6 +206,11 @@ pub async fn create_genotype_definition(
             if allele.locus_id != input.locus_id {
                 return Err(ApplicationError::Validation(
                     "genotype definition allele belongs to a different gene locus".to_owned(),
+                ));
+            }
+            if allele.meta.deleted_at.is_some() {
+                return Err(ApplicationError::Validation(
+                    "genotype definition allele is archived".to_owned(),
                 ));
             }
         }
@@ -221,6 +231,7 @@ pub async fn create_genotype_definition(
 
 pub const MAX_GENOTYPING_METHOD_BYTES: usize = 512;
 pub const MAX_GENOTYPING_NOTES_BYTES: usize = 8_000;
+pub const MAX_GENOTYPING_VOID_REASON_BYTES: usize = 2_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateGenotypingRecordCommand {
@@ -240,6 +251,19 @@ pub async fn create_genotyping_record(
     command: CreateGenotypingRecordCommand,
     audit: &AuditContext,
 ) -> ApplicationResult<GenotypingRecord> {
+    let definition = store
+        .get_genotype_definition(command.genotype_definition_id)
+        .await?;
+    if definition.lab_id != command.lab_id {
+        return Err(ApplicationError::Validation(
+            "genotyping record definition belongs to a different lab".to_owned(),
+        ));
+    }
+    if definition.meta.deleted_at.is_some() {
+        return Err(ApplicationError::Validation(
+            "genotyping record definition is archived".to_owned(),
+        ));
+    }
     let mut record = GenotypingRecord::new(
         command.lab_id,
         command.animal_id,
@@ -262,4 +286,157 @@ pub async fn create_genotyping_record(
     record.validate()?;
     store.create_genotyping_record(&record, audit).await?;
     Ok(record)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoidGenotypingRecordCommand {
+    pub record_id: Uuid,
+    pub expected_revision: i64,
+    pub reason: String,
+    pub now: DateTime<Utc>,
+}
+
+pub async fn void_genotyping_record(
+    store: &dyn MuriArcStore,
+    command: VoidGenotypingRecordCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<GenotypingRecord> {
+    let reason = normalized_required_bytes(
+        "genotyping_record.void_reason",
+        command.reason,
+        MAX_GENOTYPING_VOID_REASON_BYTES,
+    )?;
+    Ok(store
+        .void_genotyping_record(
+            command.record_id,
+            command.expected_revision,
+            &reason,
+            command.now,
+            audit,
+        )
+        .await?)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorrectGenotypingRecordCommand {
+    pub record_id: Uuid,
+    pub expected_revision: i64,
+    pub reason: String,
+    pub genotype_definition_id: Uuid,
+    pub state: GenotypingState,
+    pub assessed_at: Option<DateTime<Utc>>,
+    pub method: Option<String>,
+    pub notes: Option<String>,
+    pub now: DateTime<Utc>,
+}
+
+pub async fn correct_genotyping_record(
+    store: &dyn MuriArcStore,
+    command: CorrectGenotypingRecordCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<(GenotypingRecord, GenotypingRecord)> {
+    let original = store.get_genotyping_record(command.record_id).await?;
+    let reason = normalized_required_bytes(
+        "genotyping_record.void_reason",
+        command.reason,
+        MAX_GENOTYPING_VOID_REASON_BYTES,
+    )?;
+    let mut replacement = GenotypingRecord::new(
+        original.lab_id,
+        original.animal_id,
+        command.genotype_definition_id,
+        command.state,
+        command.assessed_at,
+        command.now,
+    )?;
+    replacement.project_id = original.project_id;
+    replacement.method = normalized_optional_bytes(
+        "genotyping_record.method",
+        command.method,
+        MAX_GENOTYPING_METHOD_BYTES,
+    )?;
+    replacement.notes = normalized_optional_bytes(
+        "genotyping_record.notes",
+        command.notes,
+        MAX_GENOTYPING_NOTES_BYTES,
+    )?;
+    replacement.supersedes_record_id = Some(original.id);
+    replacement.validate()?;
+    Ok(store
+        .correct_genotyping_record(
+            original.id,
+            command.expected_revision,
+            &reason,
+            command.now,
+            &replacement,
+            audit,
+        )
+        .await?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneticsArchiveCommand {
+    pub id: Uuid,
+    pub expected_revision: i64,
+    pub now: DateTime<Utc>,
+}
+
+pub async fn archive_gene_locus(
+    store: &dyn MuriArcStore,
+    command: GeneticsArchiveCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<GeneLocus> {
+    Ok(store
+        .archive_gene_locus(command.id, command.expected_revision, command.now, audit)
+        .await?)
+}
+
+pub async fn restore_gene_locus(
+    store: &dyn MuriArcStore,
+    command: GeneticsArchiveCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<GeneLocus> {
+    Ok(store
+        .restore_gene_locus(command.id, command.expected_revision, command.now, audit)
+        .await?)
+}
+
+pub async fn archive_allele(
+    store: &dyn MuriArcStore,
+    command: GeneticsArchiveCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<Allele> {
+    Ok(store
+        .archive_allele(command.id, command.expected_revision, command.now, audit)
+        .await?)
+}
+
+pub async fn restore_allele(
+    store: &dyn MuriArcStore,
+    command: GeneticsArchiveCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<Allele> {
+    Ok(store
+        .restore_allele(command.id, command.expected_revision, command.now, audit)
+        .await?)
+}
+
+pub async fn archive_genotype_definition(
+    store: &dyn MuriArcStore,
+    command: GeneticsArchiveCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<GenotypeDefinition> {
+    Ok(store
+        .archive_genotype_definition(command.id, command.expected_revision, command.now, audit)
+        .await?)
+}
+
+pub async fn restore_genotype_definition(
+    store: &dyn MuriArcStore,
+    command: GeneticsArchiveCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<GenotypeDefinition> {
+    Ok(store
+        .restore_genotype_definition(command.id, command.expected_revision, command.now, audit)
+        .await?)
 }

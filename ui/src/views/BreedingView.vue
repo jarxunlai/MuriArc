@@ -10,7 +10,7 @@ import {
   Search,
   TestTube2,
 } from '@lucide/vue'
-import { useMessage } from 'naive-ui'
+import { useDialog, useMessage } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import type {
   Animal,
@@ -30,6 +30,7 @@ import type {
   MatingEvent,
   PedigreeRelation,
 } from '@/domain/models'
+import { currentGenotypingRecords } from '@/domain/genetics'
 import { gateway } from '@/services/gateway'
 import { canManageBreeding, canWriteAnimal } from '@/services/projectContext'
 import PageHeader from '@/components/PageHeader.vue'
@@ -39,6 +40,7 @@ type WorkspaceTab = 'pedigree' | 'genetics' | 'lines' | 'pairs' | 'litters' | 'p
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
+const dialog = useDialog()
 
 const activeTab = ref<WorkspaceTab>('pedigree')
 const loading = ref(true)
@@ -68,12 +70,17 @@ const showCreateLocus = ref(false)
 const showCreateAllele = ref(false)
 const showCreateDefinition = ref(false)
 const showCreateRecord = ref(false)
+const showVoidRecord = ref(false)
+const showCorrectRecord = ref(false)
 const showCreateLine = ref(false)
 const showCreateColony = ref(false)
 const showCreatePair = ref(false)
 const showCreateMating = ref(false)
 const showCreateLitter = ref(false)
 const showRegisterDraft = ref(false)
+const showArchivedGenetics = ref(false)
+const lifecycleRecord = ref<GenotypingRecord | null>(null)
+const voidReason = ref('')
 
 const relationForm = reactive({
   parentId: null as string | null,
@@ -102,6 +109,14 @@ const recordForm = reactive({
   assessedAt: null as number | null,
   method: '',
   notes: '',
+})
+const correctionForm = reactive({
+  genotypeDefinitionId: null as string | null,
+  state: 'unknown' as GenotypingState,
+  assessedAt: null as number | null,
+  method: '',
+  notes: '',
+  reason: '',
 })
 const lineForm = reactive({
   name: '',
@@ -187,15 +202,28 @@ const alleleLabels = computed(
 const definitionLabels = computed(
   () => new Map(definitions.value.map((definition) => [definition.id, definition.name])),
 )
+const activeLoci = computed(() => loci.value.filter((locus) => !locus.archivedAt))
+const visibleLoci = computed(() => loci.value.filter(
+  (locus) => showArchivedGenetics.value || !locus.archivedAt,
+))
+const activeDefinitions = computed(() => definitions.value.filter(
+  (definition) => !definition.archivedAt,
+))
+const visibleDefinitions = computed(() => definitions.value.filter(
+  (definition) => showArchivedGenetics.value || !definition.archivedAt,
+))
+const currentRecordIds = computed(() => new Set(
+  currentGenotypingRecords(records.value).map((record) => record.id),
+))
 const lineLabels = computed(() => new Map(lines.value.map((line) => [line.id, line.name])))
 const colonyLabels = computed(
   () => new Map(colonies.value.map((colony) => [colony.id, colony.name])),
 )
-const definitionOptions = computed(() => definitions.value.map((definition) => ({
+const definitionOptions = computed(() => activeDefinitions.value.map((definition) => ({
   label: definition.name,
   value: definition.id,
 })))
-const locusOptions = computed(() => loci.value.map((locus) => ({
+const locusOptions = computed(() => activeLoci.value.map((locus) => ({
   label: locus.symbol,
   value: locus.id,
 })))
@@ -269,7 +297,7 @@ function instantValue(value: number | null) {
 function alleleOptionsFor(locusId: string | null) {
   if (!locusId) return []
   return alleles.value
-    .filter((allele) => allele.locusId === locusId)
+    .filter((allele) => allele.locusId === locusId && !allele.archivedAt)
     .map((allele) => ({
       value: allele.id,
       label: `${allele.symbol}${allele.isWildType ? ' · WT' : ''}`,
@@ -323,6 +351,16 @@ async function loadRecords(animalId?: string | null) {
   }
 }
 
+async function loadGeneticsCatalogs() {
+  ;[loci.value, definitions.value] = await Promise.all([
+    gateway.listGeneLoci(projectId.value, true),
+    gateway.listGenotypeDefinitions(projectId.value, true),
+  ])
+  alleles.value = (await Promise.all(
+    loci.value.map((locus) => gateway.listAlleles(locus.id, projectId.value, true)),
+  )).flat()
+}
+
 async function loadPairResources(pairId?: string | null) {
   if (!pairId) {
     matingEvents.value = []
@@ -372,8 +410,8 @@ async function load() {
   try {
     const base = await Promise.all([
       gateway.listAnimals(projectId.value ? { projectId: projectId.value } : undefined),
-      gateway.listGeneLoci(projectId.value),
-      gateway.listGenotypeDefinitions(projectId.value),
+      gateway.listGeneLoci(projectId.value, true),
+      gateway.listGenotypeDefinitions(projectId.value, true),
       gateway.listBreedingLines(),
       gateway.listColonies(),
       gateway.listBreedingPairs(),
@@ -387,7 +425,7 @@ async function load() {
       pairs.value,
     ] = base
     alleles.value = (await Promise.all(
-      loci.value.map((locus) => gateway.listAlleles(locus.id, projectId.value)),
+      loci.value.map((locus) => gateway.listAlleles(locus.id, projectId.value, true)),
     )).flat()
 
     const requested = typeof route.query.animal === 'string' ? route.query.animal : undefined
@@ -592,6 +630,181 @@ async function createRecord() {
     message.success('基因检测记录已保存')
   } catch (error) {
     message.error(error instanceof Error ? error.message : '保存基因检测记录失败')
+  } finally { busy.value = false }
+}
+
+function confirmCatalogMutation(
+  title: string,
+  content: string,
+  positiveText: string,
+  action: () => Promise<void>,
+) {
+  dialog.warning({
+    title,
+    content,
+    positiveText,
+    negativeText: '取消',
+    onPositiveClick: action,
+  })
+}
+
+async function toggleDefinitionArchive(definition: GenotypeDefinition) {
+  try {
+    const restoring = Boolean(definition.archivedAt)
+    const counts = await gateway.genotypeDefinitionReferences(definition.id, projectId.value)
+    confirmCatalogMutation(
+      restoring ? '恢复基因型定义' : '归档基因型定义',
+      restoring
+        ? `恢复后可用于新记录。历史检测 ${counts.genotypingRecords} 条，繁育品系引用 ${counts.breedingLines} 个。`
+        : `归档后不再进入新记录选择器，但保留历史。当前有检测 ${counts.genotypingRecords} 条、繁育品系引用 ${counts.breedingLines} 个。`,
+      restoring ? '确认恢复' : '确认归档',
+      async () => {
+        busy.value = true
+        try {
+          const input = {
+            id: definition.id,
+            expectedRevision: definition.revision,
+            projectId: projectId.value,
+          }
+          if (restoring) await gateway.restoreGenotypeDefinition(input)
+          else await gateway.archiveGenotypeDefinition(input)
+          await loadGeneticsCatalogs()
+          message.success(restoring ? '基因型定义已恢复' : '基因型定义已归档')
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : '更新基因型定义失败')
+        } finally { busy.value = false }
+      },
+    )
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '读取引用影响失败')
+  }
+}
+
+async function toggleLocusArchive(locus: GeneLocus) {
+  try {
+    const restoring = Boolean(locus.archivedAt)
+    const counts = await gateway.geneLocusReferences(locus.id, projectId.value)
+    if (!restoring && counts.activeGenotypeDefinitions > 0) {
+      message.warning(`该位点仍被 ${counts.activeGenotypeDefinitions} 个活动定义引用，请先归档定义`)
+      return
+    }
+    confirmCatalogMutation(
+      restoring ? '恢复基因位点' : '归档基因位点',
+      `关联定义 ${counts.genotypeDefinitions} 个、检测 ${counts.genotypingRecords} 条、繁育品系 ${counts.breedingLines} 个；历史引用不会被删除。`,
+      restoring ? '确认恢复' : '确认归档',
+      async () => {
+        busy.value = true
+        try {
+          const input = { id: locus.id, expectedRevision: locus.revision, projectId: projectId.value }
+          if (restoring) await gateway.restoreGeneLocus(input)
+          else await gateway.archiveGeneLocus(input)
+          await loadGeneticsCatalogs()
+          message.success(restoring ? '基因位点已恢复' : '基因位点已归档')
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : '更新基因位点失败')
+        } finally { busy.value = false }
+      },
+    )
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '读取引用影响失败')
+  }
+}
+
+async function toggleAlleleArchive(allele: GeneAllele) {
+  try {
+    const restoring = Boolean(allele.archivedAt)
+    const counts = await gateway.alleleReferences(allele.id, projectId.value)
+    if (!restoring && counts.activeGenotypeDefinitions > 0) {
+      message.warning(`该 allele 仍被 ${counts.activeGenotypeDefinitions} 个活动定义引用，请先归档定义`)
+      return
+    }
+    confirmCatalogMutation(
+      restoring ? '恢复 allele' : '归档 allele',
+      `关联定义 ${counts.genotypeDefinitions} 个、检测 ${counts.genotypingRecords} 条、繁育品系 ${counts.breedingLines} 个；历史引用不会被删除。`,
+      restoring ? '确认恢复' : '确认归档',
+      async () => {
+        busy.value = true
+        try {
+          const input = { id: allele.id, expectedRevision: allele.revision, projectId: projectId.value }
+          if (restoring) await gateway.restoreAllele(input)
+          else await gateway.archiveAllele(input)
+          await loadGeneticsCatalogs()
+          message.success(restoring ? 'allele 已恢复' : 'allele 已归档')
+        } catch (error) {
+          message.error(error instanceof Error ? error.message : '更新 allele 失败')
+        } finally { busy.value = false }
+      },
+    )
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '读取引用影响失败')
+  }
+}
+
+function openVoidRecord(record: GenotypingRecord) {
+  lifecycleRecord.value = record
+  voidReason.value = ''
+  showVoidRecord.value = true
+}
+
+async function submitVoidRecord() {
+  const record = lifecycleRecord.value
+  if (!record || !voidReason.value.trim()) return message.warning('请填写作废原因')
+  busy.value = true
+  try {
+    await gateway.voidGenotypingRecord({
+      recordId: record.id,
+      expectedRevision: record.revision,
+      reason: voidReason.value.trim(),
+      projectId: projectId.value,
+    })
+    showVoidRecord.value = false
+    await loadRecords(genotypingAnimalId.value)
+    message.success('检测记录已作废，历史仍完整保留')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '作废检测记录失败')
+  } finally { busy.value = false }
+}
+
+function openCorrectRecord(record: GenotypingRecord) {
+  lifecycleRecord.value = record
+  Object.assign(correctionForm, {
+    genotypeDefinitionId: record.genotypeDefinitionId,
+    state: record.state,
+    assessedAt: record.assessedAt ? new Date(record.assessedAt).getTime() : null,
+    method: record.method ?? '',
+    notes: record.notes ?? '',
+    reason: '',
+  })
+  showCorrectRecord.value = true
+}
+
+async function submitCorrectRecord() {
+  const record = lifecycleRecord.value
+  if (!record || !correctionForm.genotypeDefinitionId || !correctionForm.reason.trim()) {
+    return message.warning('请选择替代定义并填写更正原因')
+  }
+  if ((correctionForm.state === 'confirmed' || correctionForm.state === 'rejected')
+    && !correctionForm.assessedAt) {
+    return message.warning('确认或排除结果必须填写检测时间')
+  }
+  busy.value = true
+  try {
+    await gateway.correctGenotypingRecord({
+      recordId: record.id,
+      expectedRevision: record.revision,
+      reason: correctionForm.reason.trim(),
+      genotypeDefinitionId: correctionForm.genotypeDefinitionId,
+      state: correctionForm.state,
+      assessedAt: instantValue(correctionForm.assessedAt),
+      method: correctionForm.method.trim() || undefined,
+      notes: correctionForm.notes.trim() || undefined,
+      projectId: projectId.value,
+    })
+    showCorrectRecord.value = false
+    await loadRecords(genotypingAnimalId.value)
+    message.success('已原子作废原记录并创建替代记录')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '更正检测记录失败')
   } finally { busy.value = false }
 }
 
@@ -975,22 +1188,91 @@ onMounted(load)
           <article class="surface workspace-card">
             <header class="card-heading">
               <div><Dna :size="18" /><span><strong>结构化基因型定义</strong><small>支持多基因、Cre-lox 与条件性组件</small></span></div>
-              <n-space v-if="writeAllowed" size="small">
-                <n-button size="small" @click="showCreateLocus = true">新建位点</n-button>
-                <n-button size="small" @click="showCreateAllele = true">新建等位基因</n-button>
-                <n-button size="small" type="primary" @click="openDefinition">新建定义</n-button>
+              <n-space size="small" align="center">
+                <n-checkbox v-model:checked="showArchivedGenetics">显示已归档</n-checkbox>
+                <template v-if="writeAllowed">
+                  <n-button size="small" @click="showCreateLocus = true">新建位点</n-button>
+                  <n-button size="small" @click="showCreateAllele = true">新建等位基因</n-button>
+                  <n-button size="small" type="primary" @click="openDefinition">新建定义</n-button>
+                </template>
               </n-space>
             </header>
             <div class="entity-list">
-              <div v-for="definition in definitions" :key="definition.id" class="entity-row">
+              <div
+                v-for="definition in visibleDefinitions"
+                :key="definition.id"
+                class="entity-row"
+                :class="{ archived: definition.archivedAt }"
+              >
                 <div>
                   <strong>{{ definition.name }}</strong>
                   <span>{{ genotypeComponentLabel(definition) }}</span>
                   <small>{{ definition.description || '无说明' }} · revision {{ definition.revision }}</small>
                 </div>
-                <n-tag size="small" :bordered="false">{{ definition.components.length }} 组件</n-tag>
+                <div class="row-actions">
+                  <n-tag
+                    size="small"
+                    :type="definition.archivedAt ? 'default' : 'info'"
+                    :bordered="false"
+                  >
+                    {{ definition.archivedAt ? '已归档' : `${definition.components.length} 组件` }}
+                  </n-tag>
+                  <n-button
+                    v-if="writeAllowed"
+                    text
+                    size="tiny"
+                    :type="definition.archivedAt ? 'primary' : 'warning'"
+                    @click="toggleDefinitionArchive(definition)"
+                  >
+                    {{ definition.archivedAt ? '恢复' : '归档' }}
+                  </n-button>
+                </div>
               </div>
-              <n-empty v-if="!definitions.length" description="尚未创建基因型定义" size="small" />
+              <n-empty v-if="!visibleDefinitions.length" description="尚未创建基因型定义" size="small" />
+            </div>
+            <h3 class="subheading">位点与 allele 目录</h3>
+            <div class="catalog-list">
+              <div
+                v-for="locus in visibleLoci"
+                :key="locus.id"
+                class="catalog-locus"
+                :class="{ archived: locus.archivedAt }"
+              >
+                <header>
+                  <span><strong>{{ locus.symbol }}</strong><small>revision {{ locus.revision }}</small></span>
+                  <n-space size="small">
+                    <n-tag v-if="locus.archivedAt" size="tiny" :bordered="false">已归档</n-tag>
+                    <n-button
+                      v-if="writeAllowed"
+                      text
+                      size="tiny"
+                      :type="locus.archivedAt ? 'primary' : 'warning'"
+                      @click="toggleLocusArchive(locus)"
+                    >
+                      {{ locus.archivedAt ? '恢复位点' : '归档位点' }}
+                    </n-button>
+                  </n-space>
+                </header>
+                <div class="allele-chips">
+                  <span
+                    v-for="allele in alleles.filter((item) => item.locusId === locus.id
+                      && (showArchivedGenetics || !item.archivedAt))"
+                    :key="allele.id"
+                    :class="{ archived: allele.archivedAt }"
+                  >
+                    {{ allele.symbol }}{{ allele.isWildType ? ' · WT' : '' }}
+                    <n-button
+                      v-if="writeAllowed"
+                      text
+                      size="tiny"
+                      :type="allele.archivedAt ? 'primary' : 'warning'"
+                      @click="toggleAlleleArchive(allele)"
+                    >
+                      {{ allele.archivedAt ? '恢复' : '归档' }}
+                    </n-button>
+                  </span>
+                </div>
+              </div>
             </div>
           </article>
 
@@ -1001,7 +1283,7 @@ onMounted(load)
                 v-if="writeAllowed"
                 size="small"
                 type="primary"
-                :disabled="!genotypingAnimalId || !definitions.length"
+                :disabled="!genotypingAnimalId || !activeDefinitions.length"
                 @click="openRecord"
               >
                 记录检测
@@ -1016,21 +1298,39 @@ onMounted(load)
               />
             </n-form-item>
             <div class="entity-list">
-              <div v-for="record in records" :key="record.id" class="entity-row">
+              <div
+                v-for="record in records"
+                :key="record.id"
+                class="entity-row"
+                :class="{ voided: record.voidedAt }"
+              >
                 <div>
                   <strong>
                     {{ definitionLabels.get(record.genotypeDefinitionId) ?? record.genotypeDefinitionId }}
                   </strong>
                   <span>{{ record.method || '未记录方法' }} · {{ formatInstant(record.assessedAt) }}</span>
-                  <small>{{ record.notes || '无备注' }} · revision {{ record.revision }}</small>
+                  <small v-if="record.voidedAt">
+                    作废于 {{ formatInstant(record.voidedAt) }} · {{ record.voidReason }} · revision {{ record.revision }}
+                  </small>
+                  <small v-else>
+                    {{ record.notes || '无备注' }} · revision {{ record.revision }}
+                    <template v-if="record.supersedesRecordId"> · 更正自 {{ record.supersedesRecordId.slice(0, 8) }}</template>
+                  </small>
                 </div>
-                <n-tag
-                  size="small"
-                  :type="genotypeStateMeta[record.state].type"
-                  :bordered="false"
-                >
-                  {{ genotypeStateMeta[record.state].label }}
-                </n-tag>
+                <div class="row-actions">
+                  <n-tag v-if="currentRecordIds.has(record.id)" size="small" type="info" :bordered="false">当前</n-tag>
+                  <n-tag
+                    size="small"
+                    :type="record.voidedAt ? 'default' : genotypeStateMeta[record.state].type"
+                    :bordered="false"
+                  >
+                    {{ record.voidedAt ? '已作废' : genotypeStateMeta[record.state].label }}
+                  </n-tag>
+                  <n-space v-if="writeAllowed && !record.voidedAt" size="small">
+                    <n-button text size="tiny" type="warning" @click="openCorrectRecord(record)">更正</n-button>
+                    <n-button text size="tiny" type="error" @click="openVoidRecord(record)">作废</n-button>
+                  </n-space>
+                </div>
               </div>
               <n-empty v-if="!records.length" description="该动物尚无新式基因检测记录" size="small" />
             </div>
@@ -1406,6 +1706,73 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreateRecord = false">取消</n-button><n-button type="primary" :loading="busy" @click="createRecord">保存</n-button></div></template>
     </n-modal>
 
+    <n-modal v-model:show="showVoidRecord" preset="card" title="作废基因检测记录" class="small-dialog">
+      <n-alert type="warning" :show-icon="false">
+        作废不会删除历史；该记录将退出当前基因型投影，但既有实验快照保持不变。
+      </n-alert>
+      <n-form label-placement="top">
+        <n-form-item label="作废原因" required>
+          <n-input v-model:value="voidReason" type="textarea" placeholder="说明为什么这条检测事实不再有效" />
+        </n-form-item>
+      </n-form>
+      <template #footer>
+        <div class="dialog-actions">
+          <n-button @click="showVoidRecord = false">取消</n-button>
+          <n-popconfirm
+            positive-text="确认作废"
+            negative-text="返回"
+            :positive-button-props="{ type: 'error', loading: busy }"
+            @positive-click="submitVoidRecord"
+          >
+            <template #trigger>
+              <n-button type="error" :disabled="!voidReason.trim()">下一步确认</n-button>
+            </template>
+            确认作废该检测记录？提交后只能通过新记录更正，历史不会被删除。
+          </n-popconfirm>
+        </div>
+      </template>
+    </n-modal>
+
+    <n-modal v-model:show="showCorrectRecord" preset="card" title="更正基因检测记录" class="small-dialog">
+      <n-alert type="warning" :show-icon="false">
+        提交将在同一事务中作废原记录，并创建一条显式指向原记录的替代记录。
+      </n-alert>
+      <n-form label-placement="top">
+        <n-form-item label="更正原因" required>
+          <n-input v-model:value="correctionForm.reason" type="textarea" />
+        </n-form-item>
+        <n-form-item label="替代基因型定义" required>
+          <n-select v-model:value="correctionForm.genotypeDefinitionId" :options="definitionOptions" filterable />
+        </n-form-item>
+        <div class="form-grid">
+          <n-form-item label="替代状态" required>
+            <n-select v-model:value="correctionForm.state" :options="Object.entries(genotypeStateMeta).map(([value, meta]) => ({ value, label: meta.label }))" />
+          </n-form-item>
+          <n-form-item label="检测时间" :required="correctionForm.state === 'confirmed' || correctionForm.state === 'rejected'">
+            <n-date-picker v-model:value="correctionForm.assessedAt" type="datetime" clearable />
+          </n-form-item>
+        </div>
+        <n-form-item label="检测方法"><n-input v-model:value="correctionForm.method" /></n-form-item>
+        <n-form-item label="备注"><n-input v-model:value="correctionForm.notes" type="textarea" /></n-form-item>
+      </n-form>
+      <template #footer>
+        <div class="dialog-actions">
+          <n-button @click="showCorrectRecord = false">取消</n-button>
+          <n-popconfirm
+            positive-text="确认更正"
+            negative-text="返回"
+            :positive-button-props="{ type: 'warning', loading: busy }"
+            @positive-click="submitCorrectRecord"
+          >
+            <template #trigger>
+              <n-button type="warning" :disabled="!correctionForm.reason.trim()">下一步确认</n-button>
+            </template>
+            确认原子作废原记录并创建替代记录？
+          </n-popconfirm>
+        </div>
+      </template>
+    </n-modal>
+
     <n-modal v-model:show="showCreateLine" preset="card" title="新建繁育品系" class="small-dialog">
       <n-form label-placement="top">
         <n-form-item label="品系名称" required><n-input v-model:value="lineForm.name" /></n-form-item>
@@ -1525,6 +1892,15 @@ onMounted(load)
 .entity-row > div { display: flex; min-width: 0; flex-direction: column; }
 .entity-row span { margin-top: 2px; color: var(--muri-text-secondary); font-size: 12px; overflow-wrap: anywhere; }
 .entity-row small { margin-top: 5px; color: var(--muri-text-tertiary); font-size: 11px; }
+.entity-row.archived,.entity-row.voided,.catalog-locus.archived,.allele-chips > span.archived { background: var(--muri-surface-muted); opacity: .72; }
+.entity-row > .row-actions { align-items: flex-end; flex: none; gap: 5px; }
+.catalog-list { display: flex; flex-direction: column; gap: 7px; }
+.catalog-locus { padding: 9px 10px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.catalog-locus > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.catalog-locus > header > span { display: flex; flex-direction: column; }
+.catalog-locus small { color: var(--muri-text-tertiary); font-size: 10px; }
+.allele-chips { display: flex; margin-top: 7px; flex-wrap: wrap; gap: 5px; }
+.allele-chips > span { display: inline-flex; padding: 3px 6px; align-items: center; gap: 4px; border-radius: 5px; background: color-mix(in srgb, var(--muri-primary) 7%, white); color: var(--muri-text-secondary); font-size: 11px; }
 .member-grid,.draft-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 8px; }
 .member-grid > div,.draft-card { display: flex; padding: 10px; align-items: flex-start; flex-direction: column; gap: 5px; border: 1px solid var(--muri-border); border-radius: 7px; }
 .member-grid small,.draft-card small { color: var(--muri-text-tertiary); font-size: 11px; }

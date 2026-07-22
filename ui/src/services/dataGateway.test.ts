@@ -22,6 +22,7 @@ const validPreview: ImportPreview = {
   previewHash: PREVIEW_HASH,
   totalRows: 1,
   acceptedRows: 1,
+  previewRows: [{ display_id: 'M001' }],
   issues: [],
   canConfirm: true,
 }
@@ -41,11 +42,70 @@ function domainGatewayWithAnimals(
   } as unknown as MuriArcGateway
 }
 
+function captureDownloads() {
+  const downloads: Array<{ fileName: string; blob: Blob }> = []
+  let currentBlob: Blob | undefined
+  Object.defineProperty(URL, 'createObjectURL', {
+    configurable: true,
+    value: vi.fn((blob: Blob) => {
+      currentBlob = blob
+      return `blob:muriarc-test-${downloads.length}`
+    }),
+  })
+  Object.defineProperty(URL, 'revokeObjectURL', {
+    configurable: true,
+    value: vi.fn(),
+  })
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+    if (!currentBlob) throw new Error('download blob was not created')
+    downloads.push({ fileName: this.download, blob: currentBlob })
+  })
+  return downloads
+}
+
+function readBlobText(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.addEventListener('load', () => resolve(String(reader.result ?? '')))
+    reader.addEventListener('error', () => reject(reader.error ?? new Error('blob read failed')))
+    reader.readAsText(blob)
+  })
+}
+
 afterEach(() => {
   vi.restoreAllMocks()
 })
 
 describe('LocalDataGateway', () => {
+  it('passes template variants to Tauri and defaults omitted variants to example', async () => {
+    const downloads = captureDownloads()
+    const invokeCommand = vi.fn(async (_command: string, args?: Record<string, unknown>) => {
+      const input = args?.input as { variant: 'blank' | 'example' }
+      return {
+        fileName: `muriarc-animal-import${input.variant === 'blank' ? '-blank' : ''}.csv`,
+        mediaType: 'text/csv;charset=utf-8',
+        bytes: [65],
+      }
+    })
+    const gateway = new LocalDataGateway(invokeCommand as unknown as
+      <T>(command: string, args?: Record<string, unknown>) => Promise<T>)
+
+    expect(gateway.animalImportTemplateFormats).toEqual(['csv', 'xlsx'])
+    await gateway.downloadAnimalImportTemplate('csv', 'blank')
+    await gateway.downloadAnimalImportTemplate('csv')
+
+    expect(invokeCommand).toHaveBeenNthCalledWith(1, 'get_animal_import_template', {
+      input: { format: 'csv', variant: 'blank' },
+    })
+    expect(invokeCommand).toHaveBeenNthCalledWith(2, 'get_animal_import_template', {
+      input: { format: 'csv', variant: 'example' },
+    })
+    expect(downloads.map(({ fileName }) => fileName)).toEqual([
+      'muriarc-animal-import-blank.csv',
+      'muriarc-animal-import.csv',
+    ])
+  })
+
   it('uses byte-only camelCase DTOs for every Tauri data command', async () => {
     const calls: Array<[string, Record<string, unknown> | undefined]> = []
     const artifact: DataArtifact = {
@@ -89,7 +149,12 @@ describe('LocalDataGateway', () => {
     expect(calls[2]).toEqual(['cancel_data_import', { input: { jobId: 'job-1' } }])
     expect(calls[3]).toEqual([
       'create_data_export',
-      { input: { format: 'csv', idempotencyKey: expect.stringMatching(/^export-[0-9a-f-]+$/) } },
+      { input: expect.objectContaining({
+        format: 'csv',
+        projectId: undefined,
+        idempotencyKey: expect.stringMatching(/^export-[0-9a-f-]+$/),
+        options: expect.objectContaining({ include_genotype_details: true }),
+      }) },
     ])
     expect(calls[4]).toEqual([
       'create_data_snapshot',
@@ -164,6 +229,31 @@ describe('LocalDataGateway', () => {
 })
 
 describe('RemoteDataGateway', () => {
+  it('requests explicit template variants and keeps the example file name compatible', async () => {
+    const downloads = captureDownloads()
+    const requests: string[] = []
+    const fetchRequest = vi.fn(async (input: string | URL | Request) => {
+      requests.push(String(input))
+      return new Response('display_id\n', {
+        headers: { 'Content-Type': 'text/csv;charset=utf-8' },
+      })
+    }) as unknown as typeof fetch
+    const gateway = new RemoteDataGateway({ baseUrl: '/api/v1', fetch: fetchRequest })
+
+    expect(gateway.animalImportTemplateFormats).toEqual(['csv', 'xlsx'])
+    await gateway.downloadAnimalImportTemplate('csv', 'blank')
+    await gateway.downloadAnimalImportTemplate('csv')
+
+    expect(requests).toEqual([
+      '/api/v1/data/animal-import/template?format=csv&variant=blank',
+      '/api/v1/data/animal-import/template?format=csv&variant=example',
+    ])
+    expect(downloads.map(({ fileName }) => fileName)).toEqual([
+      'muriarc-animal-import-blank.csv',
+      'muriarc-animal-import.csv',
+    ])
+  })
+
   it('streams the original File body and reuses an in-memory cookie CSRF token', async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = []
     const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -331,6 +421,28 @@ describe('RemoteDataGateway', () => {
 })
 
 describe('DemoDataGateway', () => {
+  it('downloads a header-only blank CSV and a four-row synthetic example CSV', async () => {
+    const downloads = captureDownloads()
+    const gateway = new DemoDataGateway(domainGatewayWithAnimals([]))
+
+    expect(gateway.animalImportTemplateFormats).toEqual(['csv'])
+    await gateway.downloadAnimalImportTemplate('csv', 'blank')
+    await gateway.downloadAnimalImportTemplate('csv')
+
+    const blank = await readBlobText(downloads[0].blob)
+    const example = await readBlobText(downloads[1].blob)
+    expect(downloads.map(({ fileName }) => fileName)).toEqual([
+      'muriarc-animal-import-blank.csv',
+      'muriarc-animal-import.csv',
+    ])
+    expect(blank.trim().split('\n')).toHaveLength(1)
+    expect(example.trim().split('\n')).toHaveLength(5)
+    expect(example).toContain('"EXAMPLE-SIRE-001"')
+    expect(example).toContain('"EXAMPLE-PUP-002"')
+    await expect(gateway.downloadAnimalImportTemplate('xlsx', 'blank'))
+      .rejects.toThrow('浏览器演示模式仅提供 CSV 模板')
+  })
+
   it('previews conflicts, maps aliases, and blocks confirmation without writing', async () => {
     const gateway = new DemoDataGateway(domainGatewayWithAnimals([
       { id: 'animal-1', code: 'M-001', sex: 'male' },
@@ -478,7 +590,10 @@ describe('DemoDataGateway', () => {
     expect(exported).toMatchObject({ kind: 'export', fileName: 'animals.csv', mediaType: 'text/csv;charset=utf-8' })
     expect(exported.sizeBytes).toBe(exported.bytes?.length)
     expect(exported.sha256).toMatch(/^[0-9a-f]{64}$/)
-    expect(exportText).toBe('animal_uuid,display_id,sex\nanimal-1,M-001,male\nanimal-2,M-002,female')
+    expect(exportText).not.toContain('animal_uuid')
+    expect(exportText).not.toContain('animal-1')
+    expect(exportText).toContain('identifier_scope,project_name,display_id')
+    expect(exportText).toContain('"M-001"')
     expect(snapshot).toMatchObject({ kind: 'snapshot', fileName: 'muriarc-demo-snapshot.json' })
     expect(snapshotJson).toEqual({ product: 'MuriArc', demo: true, animals })
   })

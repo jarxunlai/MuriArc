@@ -607,7 +607,6 @@ async fn write_and_import_tools_are_never_executed() {
     for tool in [
         ToolName::ImportPreview,
         ToolName::ImportCommitDraft,
-        ToolName::ExportCreate,
         ToolName::ExperimentTemplateDraft,
         ToolName::MutationDraft,
     ] {
@@ -616,6 +615,13 @@ async fn write_and_import_tools_are_never_executed() {
             "unsupported_tool",
         );
     }
+    assert_rejected(
+        fixture
+            .executor
+            .execute(request(ToolName::ExportCreate, json!({})))
+            .await,
+        "autonomy_confirmation_required",
+    );
 }
 
 #[tokio::test]

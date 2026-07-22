@@ -5,6 +5,8 @@ import { activeProjectId } from './projectContext'
 
 export const MAX_IMPORT_FILE_BYTES = 32 * 1024 * 1024
 export type ImportKind = 'animal' | 'measurement'
+export type AnimalImportTemplateFormat = 'csv' | 'xlsx'
+export type AnimalImportTemplateVariant = 'blank' | 'example'
 
 export interface ImportSelection {
   importKind: ImportKind
@@ -34,6 +36,7 @@ export interface ImportPreview {
   previewHash: string
   totalRows: number
   acceptedRows: number
+  previewRows: Array<Record<string, string>>
   issues: ImportIssue[]
   canConfirm: boolean
 }
@@ -52,6 +55,23 @@ export interface ImportReceipt {
   }
 }
 
+export interface AnimalImportFieldSpec {
+  key: string
+  label: string
+  data_type: 'string' | 'enum' | 'date' | 'reference' | 'canonical_genotype'
+  required: boolean
+  legal_values: string[]
+  description: string
+  example: string
+}
+
+export interface AnimalImportSchema {
+  version: number
+  fields: AnimalImportFieldSpec[]
+  genotype_syntax: string
+  examples: Array<Record<string, string>>
+}
+
 export interface DataArtifact {
   jobId: string
   kind: 'export' | 'snapshot'
@@ -63,12 +83,125 @@ export interface DataArtifact {
   bytes?: number[]
 }
 
+export type AnimalExportField =
+  | 'identifier_scope'
+  | 'project_name'
+  | 'display_id'
+  | 'sex'
+  | 'birth_date'
+  | 'registered_at'
+  | 'strain'
+  | 'status'
+  | 'cage_location'
+  | 'cage_section'
+  | 'cage_display_id'
+  | 'current_genotype_summary'
+
+export interface AnimalExportOptions {
+  filter: {
+    sexes: Array<'male' | 'female' | 'unknown'>
+    cage_locations: string[]
+    cage_sections: string[]
+    cage_display_ids: string[]
+    strains: string[]
+    statuses: Array<'planned' | 'alive' | 'in_experiment' | 'sampled' | 'deceased' | 'euthanized' | 'lost' | 'archived'>
+    genotype_definitions: string[]
+    genotyping_states: Array<'unknown' | 'expected' | 'confirmed' | 'rejected'>
+    gene_loci: string[]
+    alleles: string[]
+    birth_date_from?: string
+    birth_date_to?: string
+    registered_at_from?: string
+    registered_at_to?: string
+    assessed_at_from?: string
+    assessed_at_to?: string
+  }
+  fields: AnimalExportField[]
+  include_genotype_details: boolean
+}
+
+export function defaultAnimalExportOptions(): AnimalExportOptions {
+  return {
+    filter: {
+      sexes: [],
+      cage_locations: [],
+      cage_sections: [],
+      cage_display_ids: [],
+      strains: [],
+      statuses: [],
+      genotype_definitions: [],
+      genotyping_states: [],
+      gene_loci: [],
+      alleles: [],
+    },
+    fields: [
+      'identifier_scope',
+      'project_name',
+      'display_id',
+      'sex',
+      'birth_date',
+      'registered_at',
+      'strain',
+      'status',
+      'cage_location',
+      'cage_section',
+      'cage_display_id',
+      'current_genotype_summary',
+    ],
+    include_genotype_details: true,
+  }
+}
+
+function demoAnimalImportSchema(): AnimalImportSchema {
+  const fields: AnimalImportFieldSpec[] = [
+    { key: 'display_id', label: '动物显示编号', data_type: 'string', required: true, legal_values: [], description: '在当前编号 scope 内唯一；不能为空。', example: 'M-26001' },
+    { key: 'sex', label: '性别', data_type: 'enum', required: false, legal_values: ['male', 'female', 'unknown'], description: '模板推荐使用标准英文值。', example: 'male' },
+    { key: 'birth_date', label: '出生日期', data_type: 'date', required: false, legal_values: ['YYYY-MM-DD'], description: '推荐 ISO 日期格式。', example: '2026-07-01' },
+    { key: 'strain', label: '品系', data_type: 'string', required: false, legal_values: [], description: '动物品系名称。', example: 'C57BL/6J' },
+    { key: 'cage', label: '笼位', data_type: 'reference', required: false, legal_values: ['display_id', 'section/display_id'], description: '笼位必须已存在。', example: 'A/A03' },
+    { key: 'genotype', label: '基因型', data_type: 'canonical_genotype', required: false, legal_values: ['{Locus}[allele_1]/[allele_2]&{AnotherLocus}[allele_1]/[allele_2]'], description: '位点、allele 和完全匹配的 Genetics v2 定义必须已存在。', example: '{Trp53}[+]/[flox]&{Cre}[Cre]/[+]' },
+    { key: 'father', label: '父本', data_type: 'reference', required: false, legal_values: [], description: '父本显示编号。', example: 'M-25010' },
+    { key: 'mother', label: '母本', data_type: 'reference', required: false, legal_values: [], description: '母本显示编号。', example: 'F-25011' },
+  ]
+  return {
+    version: 1,
+    fields,
+    genotype_syntax: '{Locus}[allele_1]/[allele_2]&{AnotherLocus}[allele_1]/[allele_2]',
+    examples: [
+      {
+        display_id: 'EXAMPLE-SIRE-001', sex: 'male', birth_date: '2025-10-01',
+        strain: 'C57BL/6J', cage: '', genotype: '', father: '', mother: '',
+      },
+      {
+        display_id: 'EXAMPLE-DAM-001', sex: 'female', birth_date: '2025-10-03',
+        strain: 'C57BL/6J', cage: '', genotype: '', father: '', mother: '',
+      },
+      {
+        display_id: 'EXAMPLE-PUP-001', sex: 'male', birth_date: '2026-01-05',
+        strain: 'C57BL/6J', cage: '', genotype: '',
+        father: 'EXAMPLE-SIRE-001', mother: 'EXAMPLE-DAM-001',
+      },
+      {
+        display_id: 'EXAMPLE-PUP-002', sex: 'female', birth_date: '2026-01-05',
+        strain: 'C57BL/6J', cage: '', genotype: '',
+        father: 'EXAMPLE-SIRE-001', mother: 'EXAMPLE-DAM-001',
+      },
+    ],
+  }
+}
+
 export interface MuriArcDataGateway {
+  readonly animalImportTemplateFormats: readonly AnimalImportTemplateFormat[]
+  getAnimalImportSchema(): Promise<AnimalImportSchema>
+  downloadAnimalImportTemplate(
+    format: AnimalImportTemplateFormat,
+    variant?: AnimalImportTemplateVariant,
+  ): Promise<void>
   previewImport(file: File, selection?: ImportSelection): Promise<ImportPreview>
   remapImport(previousJobId: string, mapping: ImportFieldMapping): Promise<ImportPreview>
   confirmImport(jobId: string, previewHash: string): Promise<ImportReceipt>
   cancelImport(jobId: string): Promise<void>
-  createExport(format?: 'csv' | 'xlsx', projectId?: string): Promise<DataArtifact>
+  createExport(format?: 'csv' | 'xlsx', projectId?: string, options?: AnimalExportOptions): Promise<DataArtifact>
   createSnapshot(): Promise<DataArtifact>
   downloadArtifact(artifact: DataArtifact): Promise<void>
 }
@@ -103,6 +236,7 @@ function gatewayError(error: unknown): Error {
 }
 
 export class LocalDataGateway implements MuriArcDataGateway {
+  readonly animalImportTemplateFormats = ['csv', 'xlsx'] as const
   private readonly remapIdempotency = new Map<string, string>()
 
   constructor(private readonly invokeCommand: Invoke = invoke) {}
@@ -113,6 +247,21 @@ export class LocalDataGateway implements MuriArcDataGateway {
     } catch (error) {
       throw gatewayError(error)
     }
+  }
+
+  getAnimalImportSchema() {
+    return this.call<AnimalImportSchema>('get_animal_import_schema')
+  }
+
+  async downloadAnimalImportTemplate(
+    format: AnimalImportTemplateFormat,
+    variant: AnimalImportTemplateVariant = 'example',
+  ) {
+    const template = await this.call<{ fileName: string; mediaType: string; bytes: number[] }>(
+      'get_animal_import_template',
+      { input: { format, variant } },
+    )
+    saveBlob(template.fileName, template.mediaType, new Uint8Array(template.bytes))
   }
 
   async previewImport(file: File, selection: ImportSelection = { importKind: 'animal' }): Promise<ImportPreview> {
@@ -148,9 +297,14 @@ export class LocalDataGateway implements MuriArcDataGateway {
     return this.call<void>('cancel_data_import', { input: { jobId } })
   }
 
-  createExport(format: 'csv' | 'xlsx' = 'xlsx', _projectId?: string) {
+  createExport(format: 'csv' | 'xlsx' = 'xlsx', projectId?: string, options?: AnimalExportOptions) {
     return this.call<DataArtifact>('create_data_export', {
-      input: { format, idempotencyKey: idempotencyKey('export') },
+      input: {
+        format,
+        idempotencyKey: idempotencyKey('export'),
+        projectId: activeProjectId(projectId),
+        options: options ?? defaultAnimalExportOptions(),
+      },
     })
   }
 
@@ -178,6 +332,7 @@ export interface RemoteDataGatewayOptions {
 }
 
 export class RemoteDataGateway implements MuriArcDataGateway {
+  readonly animalImportTemplateFormats = ['csv', 'xlsx'] as const
   private readonly baseUrl: string
   private readonly fetchRequest: typeof globalThis.fetch
   private csrfToken?: string
@@ -224,6 +379,29 @@ export class RemoteDataGateway implements MuriArcDataGateway {
     return (payload as ApiItem<T>).data
   }
 
+  getAnimalImportSchema() {
+    return this.json<AnimalImportSchema>('/data/animal-import/schema', {}, false)
+  }
+
+  async downloadAnimalImportTemplate(
+    format: AnimalImportTemplateFormat,
+    variant: AnimalImportTemplateVariant = 'example',
+  ) {
+    const query = new URLSearchParams({ format, variant })
+    const response = await this.fetchRequest(
+      `${this.baseUrl}/data/animal-import/template?${query}`,
+      { credentials: 'include' },
+    )
+    if (!response.ok) throw new Error(`无法下载动物导入模板（${response.status}）`)
+    saveBlob(
+      animalImportTemplateFileName(format, variant),
+      format === 'csv'
+        ? 'text/csv;charset=utf-8'
+        : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      await response.blob(),
+    )
+  }
+
   async previewImport(file: File, selection: ImportSelection = { importKind: 'animal' }): Promise<ImportPreview> {
     validateFile(file)
     validateImportSelection(selection)
@@ -261,13 +439,14 @@ export class RemoteDataGateway implements MuriArcDataGateway {
     return this.json<void>(`/data/imports/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
   }
 
-  createExport(format: 'csv' | 'xlsx' = 'xlsx', projectId?: string) {
+  createExport(format: 'csv' | 'xlsx' = 'xlsx', projectId?: string, options?: AnimalExportOptions) {
     return this.json<DataArtifact>('/data/exports', {
       method: 'POST',
       body: JSON.stringify({
         format,
         idempotency_key: idempotencyKey('export'),
         project_id: activeProjectId(projectId) ?? null,
+        options: options ?? defaultAnimalExportOptions(),
       }),
     })
   }
@@ -291,9 +470,32 @@ export class RemoteDataGateway implements MuriArcDataGateway {
 }
 
 export class DemoDataGateway implements MuriArcDataGateway {
+  readonly animalImportTemplateFormats = ['csv'] as const
   private pending = new Map<string, DemoPendingImport>()
 
   constructor(private readonly domainGateway: MuriArcGateway) {}
+
+  async getAnimalImportSchema() {
+    return demoAnimalImportSchema()
+  }
+
+  async downloadAnimalImportTemplate(
+    format: AnimalImportTemplateFormat,
+    variant: AnimalImportTemplateVariant = 'example',
+  ) {
+    if (format === 'xlsx') throw new Error('浏览器演示模式仅提供 CSV 模板')
+    const schema = demoAnimalImportSchema()
+    const headers = schema.fields.map((field) => field.key)
+    const rows = variant === 'example'
+      ? schema.examples.map((example) => headers.map((header) => example[header] ?? ''))
+      : []
+    const encode = (value: string) => `"${value.replaceAll('"', '""')}"`
+    const bytes = new TextEncoder().encode([
+      headers.join(','),
+      ...rows.map((row) => row.map(encode).join(',')),
+    ].join('\n'))
+    saveBlob(animalImportTemplateFileName(format, variant), 'text/csv;charset=utf-8', bytes)
+  }
 
   async previewImport(file: File, selection: ImportSelection = { importKind: 'animal' }): Promise<ImportPreview> {
     validateFile(file)
@@ -335,12 +537,35 @@ export class DemoDataGateway implements MuriArcDataGateway {
 
   async cancelImport(jobId: string) { this.pending.delete(jobId) }
 
-  async createExport(format: 'csv' | 'xlsx' = 'xlsx', projectId?: string): Promise<DataArtifact> {
+  async createExport(format: 'csv' | 'xlsx' = 'xlsx', projectId?: string, options?: AnimalExportOptions): Promise<DataArtifact> {
     const scopedProjectId = activeProjectId(projectId)
     const animals = await this.domainGateway.listAnimals(
       scopedProjectId ? { projectId: scopedProjectId } : undefined,
     )
-    const text = ['animal_uuid,display_id,sex', ...animals.map((animal) => `${animal.id},${animal.code},${animal.sex}`)].join('\n')
+    const selected = options ?? defaultAnimalExportOptions()
+    const filtered = animals.filter((animal) =>
+      (!selected.filter.sexes.length || selected.filter.sexes.includes(animal.sex))
+      && (!selected.filter.strains.length || selected.filter.strains.some((strain) =>
+        strain.localeCompare(animal.strain, undefined, { sensitivity: 'accent' }) === 0)))
+    const requestedFields = new Set<AnimalExportField>([
+      'identifier_scope', 'project_name', 'display_id', ...selected.fields,
+    ])
+    const orderedFields = defaultAnimalExportOptions().fields.filter((field) => requestedFields.has(field))
+    const value = (animal: (typeof animals)[number], field: AnimalExportField) => {
+      if (field === 'identifier_scope') return scopedProjectId ? 'project' : 'lab'
+      if (field === 'project_name') return animal.projectNames?.join('、') ?? ''
+      if (field === 'display_id') return animal.code
+      if (field === 'sex') return animal.sex
+      if (field === 'birth_date') return animal.birthDate ?? ''
+      if (field === 'strain') return animal.strain ?? ''
+      if (field === 'status') return animal.status ?? ''
+      if (field === 'cage_display_id') return animal.cageId ?? ''
+      if (field === 'current_genotype_summary') return animal.genotype ?? ''
+      return ''
+    }
+    const escape = (cell: string) => `"${cell.replaceAll('"', '""')}"`
+    const text = [orderedFields.join(','), ...filtered.map((animal) =>
+      orderedFields.map((field) => escape(value(animal, field) ?? '')).join(','))].join('\n')
     const bytes = Array.from(new TextEncoder().encode(text))
     return demoArtifact('export', format === 'csv' ? 'animals.csv' : 'animals-demo.csv', 'text/csv;charset=utf-8', bytes)
   }
@@ -397,6 +622,14 @@ export class DemoDataGateway implements MuriArcDataGateway {
       ].join('\n')),
       totalRows: table.rows.length,
       acceptedRows,
+      previewRows: selection.importKind === 'animal'
+        ? table.rows.slice(0, 20).map((row) => Object.fromEntries(
+            Object.entries(columns).map(([target, source]) => [
+              target,
+              row[table.headers.indexOf(source)] ?? '',
+            ]),
+          ))
+        : [],
       issues,
       canConfirm: !issues.some((issue) => issue.severity === 'error'),
     }
@@ -613,6 +846,13 @@ function validateImportSelection(selection: ImportSelection) {
   if (selection.importKind === 'animal' && selection.experimentId) {
     throw new Error('动物登记导入不能指定实验')
   }
+}
+
+function animalImportTemplateFileName(
+  format: AnimalImportTemplateFormat,
+  variant: AnimalImportTemplateVariant,
+) {
+  return `muriarc-animal-import${variant === 'blank' ? '-blank' : ''}.${format}`
 }
 
 function saveBlob(fileName: string, mediaType: string, content: BlobPart) {

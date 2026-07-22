@@ -1,5 +1,7 @@
 import { computed, ref } from 'vue'
 import type {
+  AiAutonomyMode,
+  AiAutonomyView,
   AiConversationDetail,
   AiConversationSummary,
   AiDraftDecisionInput,
@@ -24,6 +26,8 @@ const sending = ref(false)
 const loadingDrafts = ref(false)
 const loadingConversations = ref(false)
 const loadingConversation = ref(false)
+const autonomy = ref<AiAutonomyView>(defaultAutonomy())
+const autonomyBusy = ref(false)
 const reviewingDraftIds = ref(new Set<string>())
 let conversationScopeVersion = 0
 let conversationListRequest = 0
@@ -36,6 +40,17 @@ function welcomeMessage(): AiMessage {
     role: 'assistant',
     content: '你好，我可以基于你有权限访问的动物、实验和测量数据进行查询。选择科研项目后，涉及写入的请求只会生成可审阅草稿。',
     createdAt: new Date().toISOString(),
+  }
+}
+
+function defaultAutonomy(): AiAutonomyView {
+  return {
+    mode: 'ask',
+    effectiveMode: 'ask',
+    maxMode: 'full',
+    batchLimit: 1,
+    revision: 0,
+    requiresHumanApproval: [],
   }
 }
 
@@ -134,6 +149,7 @@ export function useAiAssistant() {
     conversationId.value = undefined
     messages.value = [welcomeMessage()]
     freshConversationRequested = explicit
+    autonomy.value = defaultAutonomy()
   }
 
   function newConversation() {
@@ -174,6 +190,14 @@ export function useAiAssistant() {
       const restored = restoredMessages(detail)
       messages.value = restored.length ? restored : [welcomeMessage()]
       mergePendingDrafts(detail.messages.flatMap((message) => message.response?.drafts ?? []))
+      if (gateway.getAiAutonomy) {
+        autonomy.value = await gateway.getAiAutonomy(detail.conversation.id)
+      } else {
+        autonomy.value = detail.messages
+          .map((message) => message.response?.autonomy)
+          .filter((value): value is AiAutonomyView => Boolean(value))
+          .at(-1) ?? defaultAutonomy()
+      }
       if (projectChanged) {
         void refreshConversations().catch(() => undefined)
         void refreshDrafts().catch(() => undefined)
@@ -226,6 +250,7 @@ export function useAiAssistant() {
         message: value,
       })
       conversationId.value = response.conversationId
+      autonomy.value = response.autonomy ?? defaultAutonomy()
       freshConversationRequested = false
       mergePendingDrafts(response.drafts)
       const index = messages.value.findIndex((message) => message.id === pendingId)
@@ -251,6 +276,27 @@ export function useAiAssistant() {
       }
     } finally {
       sending.value = false
+    }
+  }
+
+  async function updateAutonomy(
+    mode: AiAutonomyMode,
+    options: { currentPassword?: string; declared?: boolean } = {},
+  ): Promise<AiAutonomyView> {
+    if (!conversationId.value) throw new Error('请先发送一条消息，再设置当前会话的 AI 授权')
+    if (!gateway.setAiAutonomy) throw new Error('当前运行模式不支持会话授权设置')
+    autonomyBusy.value = true
+    try {
+      const updated = await gateway.setAiAutonomy(conversationId.value, {
+        mode,
+        expectedRevision: autonomy.value.revision,
+        currentPassword: options.currentPassword,
+        declared: options.declared,
+      })
+      autonomy.value = updated
+      return updated
+    } finally {
+      autonomyBusy.value = false
     }
   }
 
@@ -312,6 +358,8 @@ export function useAiAssistant() {
     loadingDrafts,
     loadingConversations,
     loadingConversation,
+    autonomy,
+    autonomyBusy,
     busy,
     reinforcedPasswordRequired,
     open,
@@ -324,6 +372,7 @@ export function useAiAssistant() {
     restoreLatestConversation,
     refreshDrafts,
     send,
+    updateAutonomy,
     decideDraft,
     draftBusy,
   }

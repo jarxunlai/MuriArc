@@ -8,9 +8,14 @@ use muriarc_core::{
 use muriarc_data::{
     AnimalImportPreviewResponse, ArtifactKind, ArtifactMetadata, AttachmentFileError,
     AttachmentFiles, DataError, DataFiles, ExportFormat, ImportKind, ImportRemapJobResult,
-    StoredAttachmentObject, artifact_metadata, build_lab_snapshot, export_animals,
+    StoredAttachmentObject, artifact_metadata, build_lab_snapshot,
+    export_animals_scoped_with_options,
 };
-use muriarc_importer::{AnimalExportFilter, FieldMapping, MeasurementFieldMapping};
+use muriarc_importer::{
+    AnimalExportOptions, AnimalImportSchema, AnimalImportTemplateVariant, FieldMapping,
+    MeasurementFieldMapping, animal_import_schema, animal_import_template_csv_with_variant,
+    animal_import_template_xlsx_with_variant,
+};
 use muriarc_store_sqlite::SqliteStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -103,6 +108,36 @@ pub(crate) struct DesktopDataState {
 }
 
 impl DesktopDataState {
+    pub(crate) fn animal_import_schema(&self) -> AnimalImportSchema {
+        animal_import_schema()
+    }
+
+    pub(crate) fn animal_import_template(
+        &self,
+        input: AnimalImportTemplateInput,
+    ) -> Result<AnimalImportTemplateView, DesktopDataError> {
+        let file_name = animal_import_template_file_name(input.format, input.variant).to_owned();
+        match input.format {
+            ExportFormat::Csv => {
+                let mut bytes = Vec::new();
+                animal_import_template_csv_with_variant(&mut bytes, input.variant)
+                    .map_err(DataError::from)?;
+                Ok(AnimalImportTemplateView {
+                    file_name,
+                    media_type: "text/csv;charset=utf-8".to_owned(),
+                    bytes,
+                })
+            }
+            ExportFormat::Xlsx => Ok(AnimalImportTemplateView {
+                file_name,
+                media_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .to_owned(),
+                bytes: animal_import_template_xlsx_with_variant(input.variant)
+                    .map_err(DataError::from)?,
+            }),
+        }
+    }
+
     pub(crate) async fn initialize(
         database_path: impl AsRef<Path>,
         app_data_dir: impl AsRef<Path>,
@@ -774,31 +809,47 @@ impl DesktopDataState {
     ) -> Result<DataArtifactView, DesktopDataError> {
         validate_idempotency_key(&input.idempotency_key)?;
         let format = input.format;
-        self.create_artifact_job(JobKind::Export, input.idempotency_key, move |job, state| {
-            Box::pin(async move {
-                let bytes = export_animals(
-                    &state.store,
-                    LOCAL_LAB_ID,
-                    format,
-                    &AnimalExportFilter::default(),
-                )
-                .await?;
-                let file_name = format!(
-                    "muriarc-animals-{}.{}",
-                    job.meta.created_at.format("%Y%m%d-%H%M%S"),
-                    format.extension()
-                );
-                let metadata = artifact_metadata(
-                    job.id,
-                    ArtifactKind::Export,
-                    file_name,
-                    format.media_type().to_owned(),
-                    &bytes,
-                    job.meta.created_at,
-                )?;
-                Ok((metadata, bytes))
-            })
-        })
+        let project_id = input
+            .project_id
+            .as_deref()
+            .map(|value| parse_id("project", value))
+            .transpose()?;
+        if let Some(project_id) = project_id {
+            let project = self.store.get_project(project_id).await?;
+            ensure_local_lab(project.lab_id)?;
+        }
+        let options = input.options;
+        self.create_artifact_job(
+            JobKind::Export,
+            input.idempotency_key,
+            project_id,
+            move |job, state| {
+                Box::pin(async move {
+                    let bytes = export_animals_scoped_with_options(
+                        &state.store,
+                        LOCAL_LAB_ID,
+                        project_id,
+                        format,
+                        &options,
+                    )
+                    .await?;
+                    let file_name = format!(
+                        "muriarc-animals-{}.{}",
+                        job.meta.created_at.format("%Y%m%d-%H%M%S"),
+                        format.extension()
+                    );
+                    let metadata = artifact_metadata(
+                        job.id,
+                        ArtifactKind::Export,
+                        file_name,
+                        format.media_type().to_owned(),
+                        &bytes,
+                        job.meta.created_at,
+                    )?;
+                    Ok((metadata, bytes))
+                })
+            },
+        )
         .await
     }
 
@@ -807,33 +858,38 @@ impl DesktopDataState {
         input: CreateDataSnapshotInput,
     ) -> Result<DataArtifactView, DesktopDataError> {
         validate_idempotency_key(&input.idempotency_key)?;
-        self.create_artifact_job(JobKind::Snapshot, input.idempotency_key, |job, state| {
-            Box::pin(async move {
-                let origin_instance_id = state.files.instance_id().await?;
-                let bytes = build_lab_snapshot(
-                    &state.store,
-                    state.attachments.root(),
-                    job.id,
-                    origin_instance_id,
-                    LOCAL_LAB_ID,
-                    Some(LOCAL_USER_ID),
-                    job.meta.created_at,
-                )
-                .await?;
-                let metadata = artifact_metadata(
-                    job.id,
-                    ArtifactKind::Snapshot,
-                    format!(
-                        "muriarc-snapshot-{}.muriarc.zip",
-                        job.meta.created_at.format("%Y%m%d-%H%M%S")
-                    ),
-                    "application/vnd.muriarc.snapshot+zip".to_owned(),
-                    &bytes,
-                    job.meta.created_at,
-                )?;
-                Ok((metadata, bytes))
-            })
-        })
+        self.create_artifact_job(
+            JobKind::Snapshot,
+            input.idempotency_key,
+            None,
+            |job, state| {
+                Box::pin(async move {
+                    let origin_instance_id = state.files.instance_id().await?;
+                    let bytes = build_lab_snapshot(
+                        &state.store,
+                        state.attachments.root(),
+                        job.id,
+                        origin_instance_id,
+                        LOCAL_LAB_ID,
+                        Some(LOCAL_USER_ID),
+                        job.meta.created_at,
+                    )
+                    .await?;
+                    let metadata = artifact_metadata(
+                        job.id,
+                        ArtifactKind::Snapshot,
+                        format!(
+                            "muriarc-snapshot-{}.muriarc.zip",
+                            job.meta.created_at.format("%Y%m%d-%H%M%S")
+                        ),
+                        "application/vnd.muriarc.snapshot+zip".to_owned(),
+                        &bytes,
+                        job.meta.created_at,
+                    )?;
+                    Ok((metadata, bytes))
+                })
+            },
+        )
         .await
     }
 
@@ -841,6 +897,7 @@ impl DesktopDataState {
         &self,
         kind: JobKind,
         idempotency_key: String,
+        project_id: Option<Uuid>,
         build: F,
     ) -> Result<DataArtifactView, DesktopDataError>
     where
@@ -861,6 +918,9 @@ impl DesktopDataState {
             .await?
         {
             ensure_job_scope(&existing, kind)?;
+            if existing.project_id != project_id {
+                return Err(DesktopDataError::ScopeMismatch);
+            }
             if existing.status != JobStatus::Completed {
                 return Err(DesktopDataError::InvalidJobState);
             }
@@ -871,7 +931,7 @@ impl DesktopDataState {
         let mut job = Job {
             id: Uuid::new_v4(),
             lab_id: LOCAL_LAB_ID,
-            project_id: None,
+            project_id,
             created_by: LOCAL_USER_ID,
             kind,
             status: JobStatus::Writing,
@@ -1236,6 +1296,41 @@ pub(crate) struct CancelDataImportInput {
 pub(crate) struct CreateDataExportInput {
     pub format: ExportFormat,
     pub idempotency_key: String,
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub options: AnimalExportOptions,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AnimalImportTemplateInput {
+    pub format: ExportFormat,
+    #[serde(default)]
+    pub variant: AnimalImportTemplateVariant,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AnimalImportTemplateView {
+    pub file_name: String,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+fn animal_import_template_file_name(
+    format: ExportFormat,
+    variant: AnimalImportTemplateVariant,
+) -> &'static str {
+    match (format, variant) {
+        (ExportFormat::Csv, AnimalImportTemplateVariant::Blank) => {
+            "muriarc-animal-import-blank.csv"
+        }
+        (ExportFormat::Xlsx, AnimalImportTemplateVariant::Blank) => {
+            "muriarc-animal-import-blank.xlsx"
+        }
+        (ExportFormat::Csv, AnimalImportTemplateVariant::Example) => "muriarc-animal-import.csv",
+        (ExportFormat::Xlsx, AnimalImportTemplateVariant::Example) => "muriarc-animal-import.xlsx",
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1322,11 +1417,58 @@ mod tests {
         Participation, Project, ProvenanceFilter, ProvenanceSource, RecordStatus, Sex,
         TemplateField, WriteSource,
     };
+    use muriarc_importer::read_xlsx;
     use muriarc_snapshot::verify_bundle;
     use tempfile::tempdir;
 
     use super::*;
     use crate::application::DesktopState;
+
+    #[tokio::test]
+    async fn local_animal_import_templates_support_variants_and_legacy_input_default() {
+        let legacy: AnimalImportTemplateInput = serde_json::from_value(serde_json::json!({
+            "format": "csv"
+        }))
+        .unwrap();
+        assert_eq!(legacy.variant, AnimalImportTemplateVariant::Example);
+        assert!(
+            serde_json::from_value::<AnimalImportTemplateInput>(serde_json::json!({
+                "format": "csv",
+                "unexpected": true
+            }))
+            .is_err()
+        );
+
+        let temp = tempdir().unwrap();
+        let database = temp.path().join("muriarc.sqlite3");
+        let _domain = DesktopState::initialize(&database).await.unwrap();
+        let state = DesktopDataState::initialize(&database, temp.path())
+            .await
+            .unwrap();
+
+        let blank = state
+            .animal_import_template(AnimalImportTemplateInput {
+                format: ExportFormat::Csv,
+                variant: AnimalImportTemplateVariant::Blank,
+            })
+            .unwrap();
+        assert_eq!(blank.file_name, "muriarc-animal-import-blank.csv");
+        assert_eq!(String::from_utf8(blank.bytes).unwrap().lines().count(), 1);
+
+        let example = state.animal_import_template(legacy).unwrap();
+        assert_eq!(example.file_name, "muriarc-animal-import.csv");
+        assert_eq!(String::from_utf8(example.bytes).unwrap().lines().count(), 5);
+
+        let blank_xlsx = state
+            .animal_import_template(AnimalImportTemplateInput {
+                format: ExportFormat::Xlsx,
+                variant: AnimalImportTemplateVariant::Blank,
+            })
+            .unwrap();
+        assert_eq!(blank_xlsx.file_name, "muriarc-animal-import-blank.xlsx");
+        let blank_xlsx_table = read_xlsx(Cursor::new(blank_xlsx.bytes)).unwrap();
+        assert!(blank_xlsx_table.rows.is_empty());
+    }
 
     #[tokio::test]
     async fn preview_confirm_export_and_snapshot_form_a_real_local_vertical_flow() {
@@ -1392,6 +1534,8 @@ mod tests {
             .create_export(CreateDataExportInput {
                 format: ExportFormat::Csv,
                 idempotency_key: "desktop-export-1".to_owned(),
+                project_id: None,
+                options: AnimalExportOptions::default(),
             })
             .await
             .unwrap();
@@ -1457,6 +1601,8 @@ mod tests {
             .create_export(CreateDataExportInput {
                 format: ExportFormat::Csv,
                 idempotency_key: "desktop-tampered-export".to_owned(),
+                project_id: None,
+                options: AnimalExportOptions::default(),
             })
             .await
             .unwrap();

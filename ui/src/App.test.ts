@@ -57,9 +57,9 @@ afterEach(() => {
   currentProjectId.value = undefined
 })
 
-describe('project-only navigation shell', () => {
+describe('project-scoped navigation shell', () => {
   for (const role of ['viewer', 'editor'] as const) {
-    it(`shows ${role} a project selector and no Lab Registry navigation`, async () => {
+    it(`shows ${role} the project animal, cage and experiment views`, async () => {
       const session = projectSession(role)
       gatewayState.currentAuthSession.value = session
       contextSession.value = session
@@ -75,9 +75,9 @@ describe('project-only navigation shell', () => {
       const wrapper = mount(App, { global: { plugins: [naive, router] } })
 
       expect(wrapper.find('[data-testid="project-switcher"]').exists()).toBe(true)
-      expect(wrapper.text()).toContain('小鼠档案')
+      expect(wrapper.text()).toContain('动物档案')
       expect(wrapper.text()).toContain('实验管理')
-      expect(wrapper.text()).not.toContain('笼位视图')
+      expect(wrapper.text()).toContain('笼位视图')
       expect(wrapper.text()).not.toContain('繁育管理')
     })
   }

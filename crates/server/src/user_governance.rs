@@ -149,6 +149,8 @@ pub enum UserGovernanceError {
     NotFound,
     #[error("the operation would remove the final active LabAdmin")]
     LastActiveLabAdmin,
+    #[error("the operation would remove the final active ProjectAdmin")]
+    LastActiveProjectAdmin,
     #[error("an administrator cannot remove their own active administrator access")]
     SelfLockout,
     #[error("the environment root account is managed by deployment configuration")]
@@ -191,11 +193,30 @@ impl PostgresUserGovernance {
         &self,
         actor: &AuthPrincipal,
         authentication: AuthenticationMethod,
+        project_id: Option<Uuid>,
     ) -> Result<Vec<ManagedUser>, UserGovernanceError> {
-        self.ensure_admin_claim(actor, authentication)?;
-        self.ensure_live_admin_session(actor, authentication)
-            .await?;
-        self.load_managed_users(None).await
+        if let Some(project_id) = project_id {
+            self.ensure_project_admin_claim(actor, authentication, project_id)?;
+            self.ensure_live_project_admin_session(actor, authentication, project_id)
+                .await?;
+            let mut users = self.load_managed_users(None).await?;
+            users.retain(|user| !user.is_environment_root);
+            for user in &mut users {
+                user.lab_membership_id = None;
+                user.lab_role = None;
+                user.lab_membership_revision = None;
+                user.credential_revision = 0;
+                user.must_change_password = false;
+                user.project_memberships
+                    .retain(|membership| membership.project_id == project_id);
+            }
+            Ok(users)
+        } else {
+            self.ensure_admin_claim(actor, authentication)?;
+            self.ensure_live_admin_session(actor, authentication)
+                .await?;
+            self.load_managed_users(None).await
+        }
     }
 
     pub async fn create_user(
@@ -635,11 +656,12 @@ impl PostgresUserGovernance {
         let verified = self.verify_step_up(context).await?;
         let now = Utc::now();
         let mut transaction = self.postgres.pool().begin().await.map_err(database)?;
-        self.lock_and_validate_actor(&mut transaction, context, &verified)
+        self.lock_and_validate_actor_for_project(&mut transaction, context, &verified, project_id)
             .await?;
         let user = load_user_for_update(&mut transaction, self.lab_id, user_id).await?;
-        self.ensure_target_governable(&mut transaction, context, user.id)
-            .await?;
+        if user.id == self.environment_root_user_id {
+            return Err(UserGovernanceError::EnvironmentRootManaged);
+        }
         ensure_revision(user.meta.revision, expected_user_revision, "user")?;
         validate_project(&mut transaction, self.lab_id, project_id).await?;
         let membership = Membership::project(self.lab_id, project_id, user_id, role, now);
@@ -669,14 +691,37 @@ impl PostgresUserGovernance {
         let verified = self.verify_step_up(context).await?;
         let now = Utc::now();
         let mut transaction = self.postgres.pool().begin().await.map_err(database)?;
-        self.lock_and_validate_actor(&mut transaction, context, &verified)
-            .await?;
         let mut membership =
             load_membership_for_update(&mut transaction, self.lab_id, membership_id).await?;
-        self.ensure_target_governable(&mut transaction, context, membership.user_id)
+        if let Some(project_id) = membership.project_id {
+            self.lock_and_validate_actor_for_project(
+                &mut transaction,
+                context,
+                &verified,
+                project_id,
+            )
             .await?;
+            if membership.user_id == self.environment_root_user_id {
+                return Err(UserGovernanceError::EnvironmentRootManaged);
+            }
+        } else {
+            self.lock_and_validate_actor(&mut transaction, context, &verified)
+                .await?;
+            self.ensure_target_governable(&mut transaction, context, membership.user_id)
+                .await?;
+        }
         ensure_revision(membership.meta.revision, expected_revision, "membership")?;
-        if membership.project_id.is_none() && membership.lab_role == Some(LabRole::LabAdmin) {
+        if let Some(project_id) = membership.project_id
+            && membership.project_role == Some(ProjectRole::ProjectAdmin)
+        {
+            self.ensure_project_admin_removal_safe(
+                &mut transaction,
+                project_id,
+                membership.user_id,
+            )
+            .await?;
+        } else if membership.project_id.is_none() && membership.lab_role == Some(LabRole::LabAdmin)
+        {
             self.ensure_admin_removal_safe(&mut transaction, membership.user_id)
                 .await?;
             if membership.user_id == context.actor.user_id {
@@ -726,12 +771,25 @@ impl PostgresUserGovernance {
         let verified = self.verify_step_up(context).await?;
         let now = Utc::now();
         let mut transaction = self.postgres.pool().begin().await.map_err(database)?;
-        self.lock_and_validate_actor(&mut transaction, context, &verified)
-            .await?;
         let mut membership =
             load_membership_for_update(&mut transaction, self.lab_id, membership_id).await?;
-        self.ensure_target_governable(&mut transaction, context, membership.user_id)
+        if let Some(project_id) = membership.project_id {
+            self.lock_and_validate_actor_for_project(
+                &mut transaction,
+                context,
+                &verified,
+                project_id,
+            )
             .await?;
+            if membership.user_id == self.environment_root_user_id {
+                return Err(UserGovernanceError::EnvironmentRootManaged);
+            }
+        } else {
+            self.lock_and_validate_actor(&mut transaction, context, &verified)
+                .await?;
+            self.ensure_target_governable(&mut transaction, context, membership.user_id)
+                .await?;
+        }
         ensure_revision(membership.meta.revision, expected_revision, "membership")?;
         let before = membership.clone();
         match (lab_role, project_role) {
@@ -770,6 +828,18 @@ impl PostgresUserGovernance {
                     return Err(UserGovernanceError::Conflict(
                         "membership already has the requested role".to_owned(),
                     ));
+                }
+                if membership.project_role == Some(ProjectRole::ProjectAdmin)
+                    && role != ProjectRole::ProjectAdmin
+                {
+                    self.ensure_project_admin_removal_safe(
+                        &mut transaction,
+                        membership
+                            .project_id
+                            .expect("project role has project scope"),
+                        membership.user_id,
+                    )
+                    .await?;
                 }
                 membership
                     .change_project_role(role, now)
@@ -815,7 +885,7 @@ impl PostgresUserGovernance {
         &self,
         context: &AdminMutationContext<'_>,
     ) -> Result<VerifiedCredential, UserGovernanceError> {
-        self.ensure_admin_claim(context.actor, context.authentication)?;
+        self.ensure_governance_claim(context.actor, context.authentication)?;
         let supplied = context.current_password.expose();
         if supplied.is_empty()
             || supplied.len() > MAX_PASSWORD_BYTES
@@ -862,6 +932,69 @@ impl PostgresUserGovernance {
             return Err(UserGovernanceError::Forbidden);
         }
         Ok(())
+    }
+
+    fn ensure_governance_claim(
+        &self,
+        actor: &AuthPrincipal,
+        authentication: AuthenticationMethod,
+    ) -> Result<(), UserGovernanceError> {
+        if !matches!(authentication, AuthenticationMethod::Session { .. }) {
+            return Err(UserGovernanceError::SessionRequired);
+        }
+        let project_admin = actor
+            .project_roles()
+            .any(|(_, role)| role == ProjectRole::ProjectAdmin);
+        if actor.lab_id != self.lab_id
+            || actor.is_external_ai()
+            || actor.must_change_password()
+            || (!actor.can(Permission::ManageUsers, None) && !project_admin)
+        {
+            return Err(UserGovernanceError::Forbidden);
+        }
+        Ok(())
+    }
+
+    fn ensure_project_admin_claim(
+        &self,
+        actor: &AuthPrincipal,
+        authentication: AuthenticationMethod,
+        project_id: Uuid,
+    ) -> Result<(), UserGovernanceError> {
+        self.ensure_governance_claim(actor, authentication)?;
+        if actor.can(Permission::ManageUsers, None)
+            || actor.can(Permission::ManageProject, Some(project_id))
+        {
+            Ok(())
+        } else {
+            Err(UserGovernanceError::Forbidden)
+        }
+    }
+
+    async fn ensure_live_project_admin_session(
+        &self,
+        actor: &AuthPrincipal,
+        authentication: AuthenticationMethod,
+        project_id: Uuid,
+    ) -> Result<(), UserGovernanceError> {
+        let AuthenticationMethod::Session { session_id } = authentication else {
+            return Err(UserGovernanceError::SessionRequired);
+        };
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM auth_sessions s JOIN users u ON u.id = s.user_id JOIN memberships m ON m.user_id = u.id AND m.lab_id = u.lab_id AND ((m.project_id IS NULL AND m.lab_role = 'lab_admin') OR (m.project_id = $4 AND m.project_role = 'project_admin')) AND m.deleted_at IS NULL WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND s.expires_at > now() AND u.lab_id = $3 AND u.status = 'active' AND u.deleted_at IS NULL)",
+        )
+        .bind(session_id)
+        .bind(actor.user_id)
+        .bind(self.lab_id)
+        .bind(project_id)
+        .fetch_one(self.postgres.pool())
+        .await
+        .map_err(database)?;
+        if valid {
+            Ok(())
+        } else {
+            Err(UserGovernanceError::Forbidden)
+        }
     }
 
     async fn ensure_live_admin_session(
@@ -939,6 +1072,59 @@ impl PostgresUserGovernance {
         Ok(())
     }
 
+    async fn lock_and_validate_actor_for_project(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        context: &AdminMutationContext<'_>,
+        verified: &VerifiedCredential,
+        project_id: Uuid,
+    ) -> Result<(), UserGovernanceError> {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(GOVERNANCE_LOCK_ID)
+            .execute(&mut **transaction)
+            .await
+            .map_err(database)?;
+        let AuthenticationMethod::Session { session_id } = context.authentication else {
+            return Err(UserGovernanceError::SessionRequired);
+        };
+        let session_exists = sqlx::query_scalar::<_, Uuid>(
+            "SELECT s.id FROM auth_sessions s WHERE s.id = $1 AND s.user_id = $2 AND s.revoked_at IS NULL AND s.expires_at > now() FOR UPDATE",
+        )
+        .bind(session_id)
+        .bind(context.actor.user_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database)?
+        .is_some();
+        if !session_exists {
+            return Err(UserGovernanceError::SessionRequired);
+        }
+        let current_hash: Option<String> = sqlx::query_scalar(
+            "SELECT c.password_hash FROM users u JOIN user_credentials c ON c.user_id = u.id WHERE u.id = $1 AND u.lab_id = $2 AND u.status = 'active' AND u.deleted_at IS NULL FOR UPDATE OF u, c",
+        )
+        .bind(context.actor.user_id)
+        .bind(self.lab_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database)?;
+        if current_hash.as_deref() != Some(verified.0.as_str()) {
+            return Err(UserGovernanceError::StepUpFailed);
+        }
+        let governing_membership = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM memberships WHERE lab_id = $1 AND user_id = $2 AND ((project_id IS NULL AND lab_role = 'lab_admin') OR (project_id = $3 AND project_role = 'project_admin')) AND deleted_at IS NULL ORDER BY project_id NULLS FIRST LIMIT 1 FOR UPDATE",
+        )
+        .bind(self.lab_id)
+        .bind(context.actor.user_id)
+        .bind(project_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database)?;
+        if governing_membership.is_none() {
+            return Err(UserGovernanceError::Forbidden);
+        }
+        Ok(())
+    }
+
     fn actor_is_environment_root(&self, actor: &AuthPrincipal) -> bool {
         actor.user_id == self.environment_root_user_id && actor.is_environment_root()
     }
@@ -984,6 +1170,27 @@ impl PostgresUserGovernance {
         .map_err(database)?;
         if active_admins.len() == 1 && active_admins[0] == user_id {
             Err(UserGovernanceError::LastActiveLabAdmin)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn ensure_project_admin_removal_safe(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        project_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), UserGovernanceError> {
+        let active_admins: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT m.user_id FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.lab_id = $1 AND m.project_id = $2 AND m.project_role = 'project_admin' AND m.deleted_at IS NULL AND u.status = 'active' AND u.deleted_at IS NULL ORDER BY m.user_id FOR UPDATE OF m, u",
+        )
+        .bind(self.lab_id)
+        .bind(project_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(database)?;
+        if active_admins.len() == 1 && active_admins[0] == user_id {
+            Err(UserGovernanceError::LastActiveProjectAdmin)
         } else {
             Ok(())
         }
@@ -1640,7 +1847,7 @@ mod tests {
             .await
             .unwrap();
         let credentialless_view = service
-            .list_users(&admin, admin_method)
+            .list_users(&admin, admin_method, None)
             .await
             .unwrap()
             .into_iter()
@@ -1774,7 +1981,7 @@ mod tests {
         );
         assert_eq!(
             service
-                .list_users(&managed_principal, managed_method)
+                .list_users(&managed_principal, managed_method, None)
                 .await
                 .unwrap_err(),
             UserGovernanceError::Forbidden
@@ -1802,7 +2009,7 @@ mod tests {
             .unwrap();
         assert!(!ready_principal.must_change_password());
         managed = service
-            .list_users(&admin, admin_method)
+            .list_users(&admin, admin_method, None)
             .await
             .unwrap()
             .into_iter()
@@ -1898,7 +2105,7 @@ mod tests {
             login_session(&other_auth, &other.user_email, &other_password).await;
         assert_eq!(
             service
-                .list_users(&other_admin, other_method)
+                .list_users(&other_admin, other_method, None)
                 .await
                 .unwrap_err(),
             UserGovernanceError::Forbidden
@@ -1912,7 +2119,7 @@ mod tests {
         );
 
         let admin_view = service
-            .list_users(&admin, admin_method)
+            .list_users(&admin, admin_method, None)
             .await
             .unwrap()
             .into_iter()
@@ -2116,7 +2323,7 @@ mod tests {
         assert!(!audit_payloads.contains("$argon2id$"));
 
         let second_admin_view = service
-            .list_users(&admin, admin_method)
+            .list_users(&admin, admin_method, None)
             .await
             .unwrap()
             .into_iter()

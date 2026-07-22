@@ -4,18 +4,18 @@ use chrono::{DateTime, Duration, Utc};
 
 use async_trait::async_trait;
 use muriarc_core::{
-    AnimalFilter, AnimalStatus, EntityType, ExperimentFilter, ExperimentStatus, Measurement,
-    MeasurementFilter, MeasurementValue, MuriArcStore, ParticipationFilter, Project, ProjectStatus,
-    SampleFilter, StoreError,
+    AiAutonomyMode, AnimalFilter, AnimalStatus, EntityType, ExperimentFilter, ExperimentStatus,
+    Measurement, MeasurementFilter, MeasurementValue, MuriArcStore, ParticipationFilter, Project,
+    ProjectStatus, SampleFilter, StoreError,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    AiDataAccessContext, AiDataToolBackend, Citation, DomainToolExecutor, DomainToolOutput,
-    DomainToolRequest, DraftKind, FieldChange, ProposalActor, ToolExecutionError, ToolName,
-    WriteDraft,
+    AiActionPolicy, AiDataAccessContext, AiDataToolBackend, Citation, DomainToolExecutor,
+    DomainToolOutput, DomainToolRequest, DraftKind, FieldChange, ProposalActor, ToolExecutionError,
+    ToolName, WriteDraft,
 };
 
 const DEFAULT_LIMIT: usize = 50;
@@ -108,6 +108,7 @@ pub struct StoreDomainToolExecutor {
     store: Arc<dyn MuriArcStore>,
     access: StoreToolAccessContext,
     data_tools: Option<(AiDataAccessContext, Arc<dyn AiDataToolBackend>)>,
+    autonomy_mode: AiAutonomyMode,
 }
 
 impl StoreDomainToolExecutor {
@@ -116,7 +117,13 @@ impl StoreDomainToolExecutor {
             store,
             access,
             data_tools: None,
+            autonomy_mode: AiAutonomyMode::Ask,
         }
+    }
+
+    pub const fn with_autonomy_mode(mut self, mode: AiAutonomyMode) -> Self {
+        self.autonomy_mode = mode;
+        self
     }
 
     pub fn with_data_tools(
@@ -543,9 +550,13 @@ impl StoreDomainToolExecutor {
 #[async_trait]
 impl DomainToolExecutor for StoreDomainToolExecutor {
     fn supported_tools(&self) -> Vec<ToolName> {
+        let policy = AiActionPolicy::new(self.autonomy_mode);
         let mut tools = STORE_READ_TOOLS
             .into_iter()
-            .filter(|tool| self.access.lab_registry_read || *tool != ToolName::CageList)
+            .filter(|tool| {
+                policy.allows_tool(*tool)
+                    && (self.access.lab_registry_read || *tool != ToolName::CageList)
+            })
             .collect::<Vec<_>>();
         if !self.access.writable_project_ids.is_empty() {
             tools.push(ToolName::MutationDraft);
@@ -555,7 +566,8 @@ impl DomainToolExecutor for StoreDomainToolExecutor {
                 if matches!(
                     tool,
                     ToolName::ImportPreview | ToolName::ImportCommitDraft | ToolName::ExportCreate
-                ) && !tools.contains(&tool)
+                ) && policy.allows_tool(tool)
+                    && !tools.contains(&tool)
                 {
                     tools.push(tool);
                 }
@@ -568,6 +580,9 @@ impl DomainToolExecutor for StoreDomainToolExecutor {
         &self,
         request: DomainToolRequest,
     ) -> Result<DomainToolOutput, ToolExecutionError> {
+        if !AiActionPolicy::new(self.autonomy_mode).allows_tool(request.tool) {
+            return Err(rejected("autonomy_confirmation_required"));
+        }
         match request.tool {
             ToolName::AnimalSearch => self.animal_search(request.arguments).await,
             ToolName::AnimalTimeline => self.animal_timeline(request.arguments).await,

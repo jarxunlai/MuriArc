@@ -7,13 +7,14 @@ use axum::{
     routing::{get, post, put},
 };
 use muriarc_ai::{
-    AccessGrant, AiExecutionContext, AiProvider, AiWorkflowError, AiWorkflowService,
-    ApprovalDecision, ApprovalError, ApprovalRequirement, AssistantConversationDetail,
-    AssistantConversationSummary, AssistantTurnRequest, AssistantTurnResponse, ChatMessage,
-    CompletionRequest, DraftDecisionRequest, DraftDecisionResponse, DraftStatus,
-    ProviderCredentials, ProviderError, ScopeSet, ToolScope, WriteDraftSummary,
+    AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiExecutionContext, AiProvider,
+    AiWorkflowError, AiWorkflowService, ApprovalDecision, ApprovalError, ApprovalRequirement,
+    AssistantConversationDetail, AssistantConversationSummary, AssistantTurnRequest,
+    AssistantTurnResponse, ChatMessage, CompletionRequest, DraftDecisionRequest,
+    DraftDecisionResponse, DraftStatus, ProviderCredentials, ProviderError, ScopeSet, ToolScope,
+    WriteDraftSummary,
 };
-use muriarc_core::{Permission, StoreError};
+use muriarc_core::{AiAutonomyMode, Permission, StoreError};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use uuid::Uuid;
@@ -51,6 +52,10 @@ pub(super) fn router() -> Router<AppState> {
         .route("/ai/turns", post(run_turn))
         .route("/ai/conversations", get(list_conversations))
         .route("/ai/conversations/{id}", get(get_conversation))
+        .route(
+            "/ai/conversations/{id}/autonomy",
+            get(get_autonomy).put(set_autonomy),
+        )
         .route("/ai/approvals", get(list_approvals))
         .route("/ai/approvals/{id}", get(get_approval))
         .route("/ai/approvals/{id}/decision", post(decide_approval))
@@ -290,11 +295,13 @@ fn provider_test_error_code(error: ProviderError) -> &'static str {
 async fn run_turn(
     State(state): State<AppState>,
     principal: AuthPrincipal,
+    authentication: AuthenticationMethod,
     metadata: RequestMetadata,
     ApiJson(payload): ApiJson<AssistantTurnRequest>,
 ) -> Result<Json<ItemResponse<AssistantTurnResponse>>, ApiError> {
     let workflow = workflow(&state, &metadata)?;
-    let context = execution_context(&state, &principal, &metadata).await?;
+    let context =
+        execution_context_with_autonomy(&state, &principal, authentication, &metadata).await?;
     let ResolvedAiProvider { provider, api_key } = state
         .ai_providers
         .resolve(principal.user_id)
@@ -356,6 +363,75 @@ async fn get_conversation(
         .await
         .map_err(|error| workflow_error(error, &metadata))?;
     Ok(item(conversation, &metadata))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AutonomyHttpRequest {
+    mode: AiAutonomyMode,
+    expected_revision: i64,
+    #[serde(default)]
+    current_password: Option<StepUpPassword>,
+}
+
+async fn get_autonomy(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    authentication: AuthenticationMethod,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Result<Json<ItemResponse<AiAutonomyView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let workflow = workflow(&state, &metadata)?;
+    let context =
+        execution_context_with_autonomy(&state, &principal, authentication, &metadata).await?;
+    let view = workflow
+        .get_autonomy(&context, id)
+        .await
+        .map_err(|error| workflow_error(error, &metadata))?;
+    Ok(item(view, &metadata))
+}
+
+async fn set_autonomy(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    authentication: AuthenticationMethod,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<AutonomyHttpRequest>,
+) -> Result<Json<ItemResponse<AiAutonomyView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let full = payload.mode == AiAutonomyMode::Full;
+    let step_up_verified = if full {
+        let AuthenticationMethod::Session { session_id } = authentication else {
+            return Err(step_up_session_required(&metadata));
+        };
+        let password = payload
+            .current_password
+            .as_ref()
+            .ok_or_else(|| step_up_required(&metadata))?;
+        verify_step_up_password(&state, &principal, session_id, password, &metadata).await?;
+        true
+    } else {
+        false
+    };
+    let workflow = workflow(&state, &metadata)?;
+    let context =
+        execution_context_with_autonomy(&state, &principal, authentication, &metadata).await?;
+    let view = workflow
+        .set_autonomy(
+            &context,
+            id,
+            AiAutonomyUpdateRequest {
+                mode: payload.mode,
+                expected_revision: payload.expected_revision,
+            },
+            step_up_verified,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| workflow_error(error, &metadata))?;
+    Ok(item(view, &metadata))
 }
 
 #[derive(Debug, Deserialize)]
@@ -528,6 +604,47 @@ fn step_up_required(metadata: &RequestMetadata) -> ApiError {
     .with_request_id(metadata.request_id.clone())
 }
 
+async fn verify_step_up_password(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    session_id: Uuid,
+    password: &StepUpPassword,
+    metadata: &RequestMetadata,
+) -> Result<(), ApiError> {
+    let attempt = state
+        .ai_step_up
+        .begin(principal.user_id, session_id, Instant::now())
+        .map_err(|limit| step_up_limit_error(limit, metadata))?;
+    match state
+        .sessions
+        .verify_current_password(principal.user_id, password.expose())
+        .await
+    {
+        Ok(()) => {
+            attempt.succeed();
+            Ok(())
+        }
+        Err(error) => {
+            if is_step_up_credential_failure(&error) {
+                let failure = attempt.fail(Instant::now());
+                tracing::warn!(
+                    target: "muriarc_server::security",
+                    security_event = "ai_autonomy_step_up_password_failed",
+                    user_id = %principal.user_id,
+                    session_id = %session_id,
+                    request_id = %metadata.request_id,
+                    failed_attempts = failure.failed_attempts,
+                    rate_limited = failure.blocked_for.is_some(),
+                    "AI autonomy password verification failed"
+                );
+            } else {
+                attempt.cancel(Instant::now());
+            }
+            Err(step_up_error(error, metadata))
+        }
+    }
+}
+
 fn step_up_session_required(metadata: &RequestMetadata) -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,
@@ -685,6 +802,31 @@ async fn execution_context(
         access_grant,
     )
     .with_data_access(importable_project_ids, exportable_project_ids, lab_import))
+}
+
+async fn execution_context_with_autonomy(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    authentication: AuthenticationMethod,
+    metadata: &RequestMetadata,
+) -> Result<AiExecutionContext, ApiError> {
+    let session_id = match authentication {
+        AuthenticationMethod::Session { session_id } => Some(session_id),
+        AuthenticationMethod::Bearer => None,
+    };
+    let max_mode = if principal.is_external_ai() {
+        AiAutonomyMode::Ask
+    } else {
+        state
+            .ai_providers
+            .get_lab_settings(principal.lab_id)
+            .await
+            .map_err(|error| provider_settings_error(error, metadata))?
+            .max_autonomy_mode
+    };
+    Ok(execution_context(state, principal, metadata)
+        .await?
+        .with_autonomy_context(session_id, max_mode))
 }
 
 fn ensure_human(principal: &AuthPrincipal, metadata: &RequestMetadata) -> Result<(), ApiError> {

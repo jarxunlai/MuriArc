@@ -25,4 +25,4 @@
 - managed_by: MuriArc runtime and backup/snapshot jobs
 - used_by: Desktop or Server instance
 - status: active
-- notes: Excluded from Git; database, attachment volume, secrets, and audit data must be backed up together.
+- notes: Excluded from Git; database, attachment volume, secrets, and audit data must be backed up together. Domain snapshots include explicit project-animal assignments, but exclude AI operation state, Server technical access logs, and the technical-log retention policy; use a full database backup when those records must be restored. Formal Audit and Provenance are never subject to technical-log cleanup.

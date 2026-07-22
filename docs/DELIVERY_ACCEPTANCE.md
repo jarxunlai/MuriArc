@@ -61,7 +61,7 @@ cargo fmt --all -- --check                                        PASS
 Non-Desktop workspace strict Clippy                               PASS
 Server tests: 85 passed                                           PASS
 PostgreSQL 17 Store runtime: 4 contracts + 1 research test        PASS
-PostgreSQL fresh/reapply and 0017 -> 0018 migration tests         PASS
+PostgreSQL fresh/reapply and 0017 -> 0023 migration tests         PASS
 Tauri Linux check image: strict Clippy + 28 tests                 PASS
 UI Vitest: 14 files / 91 tests                                    PASS
 TypeScript vue-tsc + remote Vite production build                 PASS
@@ -84,9 +84,11 @@ PostgreSQL contract 使用无挂载卷的临时 PostgreSQL 17 实例并设置真
 - `user_credential`、`auth_session`、`external_token` 与 `revoke` 安全生命周期 Audit 的兼容读取，
   未知 Audit 枚举值会返回带具体列名和原始枚举错误的诊断，而不是模糊的 JSON 行列错误。
 
-PostgreSQL migration 门禁从空库真实执行 `0001`–`0018`，再次执行验证幂等，并从 `0017` 状态增量应用
-`0018_auth_credential_lifecycle.sql`；既有 password hash 保留，`must_change_password=false`、
-`revision=1` 默认值符合升级契约。宿主 Linux 缺少 Tauri 的 GTK/WebKit 系统开发库，因此 Desktop
+PostgreSQL migration 门禁从空库真实执行 `0001`–`0023`，再次执行验证幂等，并从 `0017` 状态增量
+应用到当前版本；`0018_auth_credential_lifecycle.sql` 升级后既有 password hash 保留，
+`must_change_password=false`、`revision=1` 默认值符合升级契约。后续迁移依次覆盖 Provider endpoint、
+项目动物关系、AI 自主授权、Server 技术日志与 Genetics v2 检测记录生命周期；SQLite 对应业务链为
+`0018`–`0021`。宿主 Linux 缺少 Tauri 的 GTK/WebKit 系统开发库，因此 Desktop
 Clippy/test 使用隔离的 Tauri Linux 工具镜像执行；strict Clippy 与 28 个测试均通过，不是跳过或以
 非 Desktop 结果代替。
 

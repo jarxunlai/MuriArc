@@ -42,6 +42,11 @@ CSRF 可在有效会话内安全恢复但不持久化明文，外部 token 仅�
   官方 OpenAI v1 是唯一内置云端出口，Provider HTTP redirects 被禁用。
 - Lab-wide AI 会话只读；产生写入草稿前必须显式绑定 Project。客户端声明的
   step-up 状态不受信任，外部 token 不得修改 AI 设置或代替研究者审批。
+- AI 对话授权默认 Ask，可按对话提升为 Auto 或 Full；它不是可继承的用户角色。Server 的
+  Full 必须重新验证当前用户密码并绑定当前 session，30 分钟无使用即失效；Desktop 必须在
+  当前本地会话明确声明。实验室 AI 设置给出最大模式，外部 REST/MCP 永远封顶 Ask。
+- 无论 AI 模式如何，正式签署、动物转移/死亡、删除/批量导入、权限与账号治理、root 日志
+  清理以及繁育科学事实都是硬边界；模型只能准备草稿、解释或引导人工进入专用工作流。
 - 附件名称不得决定磁盘路径；使用 UUID/hash，阻止目录穿越。
 - 查询 DSL 使用资源、字段、操作符 allowlist，并限制分页和执行成本。
 - MCP 仅接受带 AI scopes 的外部身份，普通 Web session 不可隐式升级；浏览器 `Origin` 默认拒绝并只支持精确 allowlist。
@@ -51,6 +56,11 @@ CSRF 可在有效会话内安全恢复但不持久化明文，外部 token 仅�
 - 可选 bootstrap bearer 只供受控预览，正常运行应留空；它不创建持久管理员、不替代 Root、持久账号或可撤销 external token。
 - 高风险操作（删除、批量导入、权限、迁移）必须加强确认。
 - 科研测量由 AI 提取时先进入 draft，只有授权研究者可签署为正式记录。
+- 项目成员只能读取显式分配给项目的动物及相应实验；项目笼位视图必须过滤同笼的其他项目
+  动物。ProjectAdmin 的成员治理只作用于当前项目，不能查看凭据状态、实验室角色或其他项目
+  membership，并且不能移除最后一名有效 ProjectAdmin。
+- 技术访问日志不记录请求体、query、密码、token、AI key 或动物业务内容。只有 Environment
+  Root 可更改保留策略、预览并确认清理；清理本身必须写入不可删除的正式 Audit。
 
 ## Reporting
 

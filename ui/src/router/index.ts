@@ -6,6 +6,7 @@ import {
   availableProjects,
   hasLabRegistryAccess,
   initializeProjectContext,
+  isActiveProjectAdmin,
   isLabAdmin,
   setCurrentProject,
 } from '@/services/projectContext'
@@ -13,13 +14,15 @@ import {
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/cages' },
   { path: '/cages', name: 'cages', component: () => import('@/views/CagesView.vue'), meta: { title: '笼位视图', section: '动物管理' } },
-  { path: '/animals', name: 'animals', component: () => import('@/views/AnimalsView.vue'), meta: { title: '小鼠档案', section: '动物管理' } },
+  { path: '/animals', name: 'animals', component: () => import('@/views/AnimalsView.vue'), meta: { title: '动物档案', section: '动物管理' } },
+  { path: '/animal-data', name: 'animal-data', component: () => import('@/views/DataCenterView.vue'), meta: { title: '动物数据', section: '动物管理', animalData: true } },
+  { path: '/animal-data/import-guide', name: 'animal-import-guide', component: () => import('@/views/AnimalImportGuideView.vue'), meta: { title: '动物导入指南', section: '动物管理', animalData: true } },
   { path: '/breeding', name: 'breeding', component: () => import('@/views/BreedingView.vue'), meta: { title: '繁育管理', section: '动物管理' } },
   { path: '/experiments', name: 'experiments', component: () => import('@/views/ExperimentsView.vue'), meta: { title: '实验管理' } },
   { path: '/experiments/:experimentId/:section?', name: 'experiment-detail', component: () => import('@/views/ExperimentsView.vue'), meta: { title: '实验工作区', section: '实验管理' } },
   { path: '/data', name: 'data', component: () => import('@/views/DataCenterView.vue'), meta: { title: '数据中心' } },
   { path: '/library', name: 'library', component: () => import('@/views/LibraryView.vue'), meta: { title: '项目资料库' } },
-  { path: '/operations', name: 'operations', component: () => import('@/views/OperationsView.vue'), meta: { title: '操作与审计' } },
+  { path: '/operations', name: 'operations', component: () => import('@/views/OperationsView.vue'), meta: { title: '活动记录', section: '管理与工具' } },
   { path: '/ai', name: 'ai', component: () => import('@/views/AiWorkspaceView.vue'), meta: { title: 'AI 助手' } },
   { path: '/ai/images', name: 'ai-images', component: () => import('@/views/AiImagesView.vue'), meta: { title: '私人 AI 图片' } },
   { path: '/admin/ai', name: 'ai-admin', component: () => import('@/views/AiAdminView.vue'), meta: { title: 'AI 管理', section: '实验室管理' } },
@@ -38,7 +41,7 @@ export const router = createRouter({
 })
 
 function defaultAuthenticatedRoute(session: AuthSession): string {
-  return hasLabRegistryAccess(session) ? '/cages' : '/animals'
+  return '/cages'
 }
 
 function safeRedirect(value: unknown, fallback = '/cages'): string {
@@ -94,10 +97,13 @@ router.beforeEach(async (to) => {
       }
       setCurrentProject(requestedProjectId)
     }
-    if (!hasLabRegistryAccess(session) && (to.name === 'cages' || to.name === 'breeding')) {
+    if (!hasLabRegistryAccess(session) && (to.name === 'breeding' || to.meta.animalData === true)) {
       return { name: 'animals' }
     }
-    if ((to.name === 'members' || to.name === 'ai-admin') && !isLabAdmin(session)) {
+    if (to.name === 'members' && !isLabAdmin(session) && !isActiveProjectAdmin(session)) {
+      return fallback
+    }
+    if (to.name === 'ai-admin' && !isLabAdmin(session)) {
       return fallback
     }
     return to.name === 'login' ? safeRedirect(to.query.redirect, fallback) : true

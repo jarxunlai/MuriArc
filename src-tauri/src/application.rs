@@ -5,10 +5,10 @@ use muriarc_application::{
     ApplicationError, CreateAnimalCommand, CreateAnimalIdentifierScope, CreateCageCommand,
     CreateCohortCommand, CreateExperimentCommand, CreateParticipationCommand,
     CreateProcedureCommand, CreateProjectCommand, CreateTemplateVersionCommand,
-    PublishTemplateVersionCommand, TransferAnimalsCommand, TransitionExperimentCommand,
-    TransitionParticipationCommand, create_animal as create_animal_use_case,
-    create_cage as create_cage_use_case, create_cohort as create_cohort_use_case,
-    create_experiment as create_experiment_use_case,
+    InitialGenotypingRecordInput, PublishTemplateVersionCommand, TransferAnimalsCommand,
+    TransitionExperimentCommand, TransitionParticipationCommand,
+    create_animal as create_animal_use_case, create_cage as create_cage_use_case,
+    create_cohort as create_cohort_use_case, create_experiment as create_experiment_use_case,
     create_participation as create_participation_use_case,
     create_procedure as create_procedure_use_case, create_project as create_project_use_case,
     create_template_version as create_template_version_use_case,
@@ -20,10 +20,10 @@ use muriarc_application::{
 use muriarc_core::{
     Actor, Animal, AnimalEvent, AnimalEventKind, AnimalFilter, AnimalOverview, AnimalStatus,
     AuditContext, Cage, CageKind, Cohort, DomainError, Experiment, ExperimentFilter,
-    ExperimentStatus, ExperimentTemplateVersion, FieldValueType, JobFilter, JobKind, JobStatus,
-    LOCAL_LAB_ID, LOCAL_OPERATOR_NAME, LOCAL_USER_ID, MuriArcStore, Participation,
-    ParticipationFilter, ParticipationStatus, Procedure, ProcedureStatus, Sex, StoreError,
-    TemplateField, TemplateStatus, User, WriteSource,
+    ExperimentStatus, ExperimentTemplateVersion, FieldValueType, GenotypingState, JobFilter,
+    JobKind, JobStatus, LOCAL_LAB_ID, LOCAL_OPERATOR_NAME, LOCAL_USER_ID, MuriArcStore,
+    Participation, ParticipationFilter, ParticipationStatus, Procedure, ProcedureStatus, Sex,
+    StoreError, TemplateField, TemplateStatus, User, WriteSource,
 };
 use muriarc_store_sqlite::SqliteStore;
 use serde::{Deserialize, Serialize};
@@ -267,6 +267,17 @@ impl DesktopState {
                 birth_date,
                 legacy_id: None,
                 initial_cage_id: cage_id,
+                initial_genotyping_records: input
+                    .initial_genotyping_records
+                    .into_iter()
+                    .map(|record| InitialGenotypingRecordInput {
+                        genotype_definition_id: record.genotype_definition_id,
+                        state: record.state,
+                        assessed_at: record.assessed_at,
+                        method: record.method,
+                        notes: record.notes,
+                    })
+                    .collect(),
                 now,
             },
             &audit,
@@ -1300,6 +1311,18 @@ pub(crate) struct CreateAnimalInput {
     pub sex: Sex,
     pub strain: String,
     pub birth_date: Option<String>,
+    #[serde(default)]
+    pub initial_genotyping_records: Vec<InitialGenotypingRecordInputView>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct InitialGenotypingRecordInputView {
+    pub genotype_definition_id: Uuid,
+    pub state: GenotypingState,
+    pub assessed_at: Option<DateTime<Utc>>,
+    pub method: Option<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1735,6 +1758,7 @@ mod tests {
                 sex: Sex::Female,
                 strain: "C57BL/6J".to_owned(),
                 birth_date: Some("2026-06-01".to_owned()),
+                initial_genotyping_records: Vec::new(),
             })
             .await
             .unwrap();

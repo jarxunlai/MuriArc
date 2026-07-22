@@ -52,8 +52,12 @@ SQLite 与 PostgreSQL 按相同顺序应用以下共享业务迁移：
 
 Desktop/SQLite 不创建 Credential、Session、token 或认证迁移；无密码“进入本地空间”只使用
 `sessionStorage` 记录当前 WebView 会话已确认，不能被解释为数据加密或安全锁。迁移门禁同时
-验证全新 PostgreSQL 数据库一次/重复应用 0001–0018，以及带旧 Credential 记录的
-0017→0018 增量升级。
+验证全新 PostgreSQL 数据库一次/重复应用 0001–0023，以及带旧 Credential 记录的
+0017→当前版本增量升级。AI Provider endpoint 在 PostgreSQL 使用 0019、SQLite 使用 0018；
+项目动物关系与对话级 AI 自主授权在 PostgreSQL 使用 0020/0021、SQLite 使用 0019/0020。
+Server-only 技术日志保留表使用 PostgreSQL 0022；Genetics v2 检测记录生命周期在 PostgreSQL
+使用 0023、SQLite 使用 0021。平台专属迁移造成编号偏移，但共享业务迁移仍保持相同的相对
+顺序与语义。
 
 ## Ordinary import/export boundary
 

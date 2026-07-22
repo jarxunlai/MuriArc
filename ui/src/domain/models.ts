@@ -45,6 +45,16 @@ export interface ProjectSummary {
   name: string
 }
 
+export interface ProjectAnimalAssignment {
+  id: string
+  projectId: string
+  animalId: string
+  assignedBy?: string
+  reason?: string
+  assignedAt: string
+  revision: number
+}
+
 export type TemplateFieldValueType = 'number' | 'text' | 'boolean' | 'date' | 'category'
 
 export interface ExperimentTemplateSummary {
@@ -205,6 +215,7 @@ export interface GeneLocus {
   id: string
   symbol: string
   description?: string
+  archivedAt?: string
   revision: number
 }
 
@@ -214,6 +225,7 @@ export interface GeneAllele {
   symbol: string
   description?: string
   isWildType: boolean
+  archivedAt?: string
   revision: number
 }
 
@@ -254,6 +266,7 @@ export interface GenotypeDefinition {
   revision: number
   createdAt: string
   updatedAt: string
+  archivedAt?: string
 }
 
 export interface GenotypingRecord {
@@ -265,8 +278,12 @@ export interface GenotypingRecord {
   assessedAt?: string
   method?: string
   notes?: string
+  supersedesRecordId?: string
+  voidedAt?: string
+  voidReason?: string
   revision: number
   createdAt: string
+  updatedAt: string
 }
 
 export interface BreedingLine {
@@ -657,6 +674,26 @@ export interface AiTurnResponse {
   toolRuns: AiToolRun[]
   drafts: AiWriteDraft[]
   trace: AiAssistantTrace
+  autonomy?: AiAutonomyView
+}
+
+export type AiAutonomyMode = 'ask' | 'auto' | 'full'
+
+export interface AiAutonomyView {
+  mode: AiAutonomyMode
+  effectiveMode: AiAutonomyMode
+  maxMode: AiAutonomyMode
+  batchLimit: number
+  revision: number
+  expiresAt?: string
+  requiresHumanApproval: string[]
+}
+
+export interface AiAutonomyUpdateInput {
+  mode: AiAutonomyMode
+  expectedRevision: number
+  currentPassword?: string
+  declared?: boolean
 }
 
 export interface AiConversationSummary {

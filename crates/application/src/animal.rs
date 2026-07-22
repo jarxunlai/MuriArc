@@ -1,9 +1,14 @@
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, NaiveDate, Utc};
-use muriarc_core::{Animal, AuditContext, IdentifierScope, MuriArcStore, Sex};
+use muriarc_core::{
+    Animal, AuditContext, GenotypingRecord, GenotypingState, IdentifierScope, MuriArcStore, Sex,
+};
 use uuid::Uuid;
 
-use crate::ApplicationResult;
-use crate::validation::{normalized_optional, normalized_required};
+use crate::genetics::{MAX_GENOTYPING_METHOD_BYTES, MAX_GENOTYPING_NOTES_BYTES};
+use crate::validation::{normalized_optional, normalized_optional_bytes, normalized_required};
+use crate::{ApplicationError, ApplicationResult};
 
 pub const MAX_ANIMAL_DISPLAY_ID_CHARS: usize = 64;
 pub const MAX_ANIMAL_STRAIN_CHARS: usize = 128;
@@ -12,6 +17,15 @@ pub const MAX_ANIMAL_STRAIN_CHARS: usize = 128;
 pub enum CreateAnimalIdentifierScope {
     Lab,
     Project(Uuid),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialGenotypingRecordInput {
+    pub genotype_definition_id: Uuid,
+    pub state: GenotypingState,
+    pub assessed_at: Option<DateTime<Utc>>,
+    pub method: Option<String>,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +38,7 @@ pub struct CreateAnimalCommand {
     pub birth_date: Option<NaiveDate>,
     pub legacy_id: Option<String>,
     pub initial_cage_id: Option<Uuid>,
+    pub initial_genotyping_records: Vec<InitialGenotypingRecordInput>,
     pub now: DateTime<Utc>,
 }
 
@@ -32,9 +47,46 @@ pub async fn create_animal(
     command: CreateAnimalCommand,
     audit: &AuditContext,
 ) -> ApplicationResult<Animal> {
+    let project_id = match command.identifier_scope {
+        CreateAnimalIdentifierScope::Lab => None,
+        CreateAnimalIdentifierScope::Project(project_id) => Some(project_id),
+    };
+    let record_inputs = command.initial_genotyping_records.clone();
     let animal = prepare_animal(command)?;
-    store.create_animal(&animal, audit).await?;
-    Ok(animal)
+    let mut definition_ids = BTreeSet::new();
+    let mut records = Vec::with_capacity(record_inputs.len());
+    for input in record_inputs {
+        if !definition_ids.insert(input.genotype_definition_id) {
+            return Err(ApplicationError::Validation(
+                "initial genotyping records contain a duplicate genotype definition".to_owned(),
+            ));
+        }
+        let mut record = GenotypingRecord::new(
+            animal.lab_id,
+            animal.id,
+            input.genotype_definition_id,
+            input.state,
+            input.assessed_at,
+            animal.meta.created_at,
+        )?;
+        record.project_id = project_id;
+        record.method = normalized_optional_bytes(
+            "genotyping_record.method",
+            input.method,
+            MAX_GENOTYPING_METHOD_BYTES,
+        )?;
+        record.notes = normalized_optional_bytes(
+            "genotyping_record.notes",
+            input.notes,
+            MAX_GENOTYPING_NOTES_BYTES,
+        )?;
+        record.validate()?;
+        records.push(record);
+    }
+    store
+        .create_animal_with_genotyping_records(&animal, &records, audit)
+        .await?;
+    Ok(store.get_animal(animal.id).await?)
 }
 
 pub(crate) fn prepare_animal(command: CreateAnimalCommand) -> ApplicationResult<Animal> {
@@ -82,6 +134,7 @@ mod tests {
             birth_date: None,
             legacy_id: None,
             initial_cage_id: None,
+            initial_genotyping_records: Vec::new(),
             now: fixed_now(),
         }
     }

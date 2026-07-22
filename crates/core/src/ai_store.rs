@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    AiConversation, AiConversationMessage, Approval, AuditContext, Measurement, StoreResult,
-    ToolRun,
+    AiAutonomyGrant, AiConversation, AiConversationMessage, Approval, AuditContext, Measurement,
+    StoreResult, ToolRun,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +61,20 @@ pub trait AiOperationStore: Send + Sync {
         conversation_id: Uuid,
         limit: u32,
     ) -> StoreResult<Vec<AiConversationMessage>>;
+
+    async fn get_ai_autonomy_grant(
+        &self,
+        conversation_id: Uuid,
+    ) -> StoreResult<Option<AiAutonomyGrant>>;
+
+    /// Creates or replaces the conversation grant with optimistic revision
+    /// checking and a formal audit entry in the same transaction.
+    async fn save_ai_autonomy_grant(
+        &self,
+        grant: &AiAutonomyGrant,
+        expected_revision: Option<i64>,
+        audit: &AuditContext,
+    ) -> StoreResult<()>;
 
     async fn create_tool_run(&self, tool_run: &ToolRun, audit: &AuditContext) -> StoreResult<()>;
 

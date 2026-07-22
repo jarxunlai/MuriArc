@@ -6,8 +6,9 @@ use muriarc_data::DataFiles;
 use muriarc_server::{
     AiMasterKey, AppState, Authenticator, ChainedAuthenticator, EnvironmentRootConfig,
     LiveBootstrapAuthenticator, PostgresAiProviderStore, PostgresAuthBackend,
-    PostgresUserGovernance, SessionCookieConfig, StaticTokenAuthenticator, StoreJobRepository,
-    application_router, sync_postgres_environment_root,
+    PostgresTechnicalLogService, PostgresUserGovernance, SessionCookieConfig,
+    StaticTokenAuthenticator, StoreJobRepository, application_router,
+    sync_postgres_environment_root,
 };
 use muriarc_store_postgres::PostgresStore;
 use tracing_subscriber::EnvFilter;
@@ -77,7 +78,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         store.as_ref().clone(),
         server_lab_id,
         environment_root_user_id,
-    ));
+    ))
+    .with_technical_logs(Arc::new(PostgresTechnicalLogService::new(
+        store.as_ref().clone(),
+    )));
     let state = configure_ai(state, store.clone())?;
     let data_root = PathBuf::from(required_env("MURIARC_DATA_ROOT")?);
     let attachment_root = PathBuf::from(required_env("MURIARC_ATTACHMENT_ROOT")?);

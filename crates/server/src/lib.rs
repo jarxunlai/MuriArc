@@ -14,6 +14,7 @@ mod mcp;
 #[cfg(feature = "postgres")]
 mod persistent_auth;
 mod routes;
+mod technical_logs;
 #[cfg(feature = "postgres")]
 mod user_governance;
 
@@ -54,6 +55,12 @@ pub use jobs::{
 pub use persistent_auth::{LiveBootstrapAuthenticator, PostgresAuthBackend, hash_password};
 pub use routes::{api_router, application_router};
 #[cfg(feature = "postgres")]
+pub use technical_logs::PostgresTechnicalLogService;
+pub use technical_logs::{
+    DisabledTechnicalLogService, SaveTechnicalLogPolicyInput, TechnicalLogCleanupPreview,
+    TechnicalLogError, TechnicalLogEvent, TechnicalLogPolicyView, TechnicalLogService,
+};
+#[cfg(feature = "postgres")]
 pub use user_governance::{
     AdminMutationContext, CreateManagedUserCommand, InitialProjectRole, ManagedProjectMembership,
     ManagedUser, PostgresUserGovernance, SensitivePassword, UserGovernanceError,
@@ -77,6 +84,7 @@ pub struct AppState {
     pub data_files: Option<Arc<DataFiles>>,
     pub attachment_root: Option<Arc<PathBuf>>,
     pub(crate) admin_private_views: Arc<RwLock<HashSet<(uuid::Uuid, uuid::Uuid)>>>,
+    pub technical_logs: Arc<dyn TechnicalLogService>,
     #[cfg(feature = "postgres")]
     pub user_governance: Option<Arc<PostgresUserGovernance>>,
 }
@@ -99,6 +107,7 @@ impl AppState {
             data_files: None,
             attachment_root: None,
             admin_private_views: Arc::new(RwLock::new(HashSet::new())),
+            technical_logs: Arc::new(DisabledTechnicalLogService),
             #[cfg(feature = "postgres")]
             user_governance: None,
         }
@@ -143,6 +152,11 @@ impl AppState {
     #[cfg(feature = "postgres")]
     pub fn with_user_governance(mut self, governance: PostgresUserGovernance) -> Self {
         self.user_governance = Some(Arc::new(governance));
+        self
+    }
+
+    pub fn with_technical_logs(mut self, service: Arc<dyn TechnicalLogService>) -> Self {
+        self.technical_logs = service;
         self
     }
 }

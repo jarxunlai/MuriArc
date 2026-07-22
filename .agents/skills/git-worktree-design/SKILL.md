@@ -130,19 +130,10 @@ git worktree add -b <branch_name> <worktree_path>
 
 环境与缓存约定以仓库根目录 `AGENTS.md` 的「Git Worktree 与测试环境」为准。摘要：
 
-- **严禁**回到 main 工作树编译/测试该 worktree 的改动；**严禁**把 main 的 `./target` 或 `node_modules` 链进 worktree。
+- **严禁**回到 main 工作树编译/测试该 worktree 的改动；**严禁**把主仓或其它树的 `./target` / `node_modules` 链进 worktree。
 - **cwd 必须是该 worktree 绝对路径**；先 `source "$HOME/.cargo/env"`（若存在），再确认 `command -v cargo`。
-- **Cargo 缓存**指向仓库外：`CARGO_TARGET_DIR="$HOME/.cache/muriarc-cargo-target"`（并行时按分支分流）；不要指向 main 的 `./target`。
-- **前端**：在该 worktree 内执行一次：
-
-```bash
-cd <worktree_path>
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/muriarc-cargo-target}"
-corepack enable && corepack prepare pnpm@11.5.0 --activate
-pnpm --dir ui install
-```
-
+- **Cargo 产物**必须在仓库外，并按分支分流：有 `/mnt/e/Muriarc` 时默认 `/mnt/e/Muriarc/builds/cargo-target/<branch-slug>`，否则 `$HOME/.cache/muriarc-cargo-target/<branch-slug>`。完整引导脚本见 `AGENTS.md`。
+- **前端**：在该 worktree 内执行一次 `pnpm --dir ui install`（勿链回主仓）。
 - 不要把 `target/`、`node_modules` 移出 `.gitignore`；不要共用可写测试数据库/附件目录。
 
 ---

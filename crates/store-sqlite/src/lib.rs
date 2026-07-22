@@ -2267,9 +2267,13 @@ impl MuriArcStore for SqliteStore {
         let mut project_query = QueryBuilder::<Sqlite>::new(
             "SELECT paa.animal_id, p.id AS project_id, p.name AS project_name FROM project_animal_assignments paa JOIN projects p ON p.id = paa.project_id AND p.deleted_at IS NULL WHERE paa.deleted_at IS NULL AND p.lab_id = ",
         );
-        project_query
-            .push_bind(filter.lab_id.to_string())
-            .push(" AND paa.animal_id IN (");
+        project_query.push_bind(filter.lab_id.to_string());
+        if let Some(project_id) = filter.project_id {
+            project_query
+                .push(" AND paa.project_id = ")
+                .push_bind(project_id.to_string());
+        }
+        project_query.push(" AND paa.animal_id IN (");
         {
             let mut separated = project_query.separated(", ");
             for id in &ids {
@@ -2293,8 +2297,14 @@ impl MuriArcStore for SqliteStore {
         }
 
         let mut weight_query = QueryBuilder::<Sqlite>::new(
-            "SELECT animal_id, value_number, unit, measured_at FROM (SELECT m.animal_id, m.value_number, m.unit, m.measured_at, ROW_NUMBER() OVER (PARTITION BY m.animal_id ORDER BY m.measured_at DESC, m.id DESC) AS row_number FROM measurements m WHERE m.deleted_at IS NULL AND m.value_number IS NOT NULL AND lower(m.measurement_key) IN ('weight', 'body_weight') AND m.animal_id IN (",
+            "SELECT animal_id, value_number, unit, measured_at FROM (SELECT m.animal_id, m.value_number, m.unit, m.measured_at, ROW_NUMBER() OVER (PARTITION BY m.animal_id ORDER BY m.measured_at DESC, m.id DESC) AS row_number FROM measurements m WHERE m.deleted_at IS NULL AND m.value_number IS NOT NULL AND lower(m.measurement_key) IN ('weight', 'body_weight')",
         );
+        if let Some(project_id) = filter.project_id {
+            weight_query
+                .push(" AND m.project_id = ")
+                .push_bind(project_id.to_string());
+        }
+        weight_query.push(" AND m.animal_id IN (");
         {
             let mut separated = weight_query.separated(", ");
             for id in &ids {

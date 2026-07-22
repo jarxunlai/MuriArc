@@ -1250,6 +1250,7 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
     ));
 
     let correction_time = newer_time + Duration::milliseconds(3);
+    let correction_reason = "incorrect original call";
     let mut replacement_record = GenotypingRecord::new(
         lab.id,
         female.id,
@@ -1266,7 +1267,7 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         .correct_genotyping_record(
             genotyping_record.id,
             genotyping_record.meta.revision,
-            "incorrect original call",
+            correction_reason,
             correction_time,
             &replacement_record,
             &human_audit,
@@ -1284,6 +1285,54 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
             .await
             .unwrap(),
         vec![replacement_record.clone()]
+    );
+    let replacement_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_id: Some(replacement_record.id),
+        })
+        .await
+        .unwrap();
+    let replacement_create_audit = replacement_audits
+        .iter()
+        .find(|entry| {
+            entry.entity_type == EntityType::GenotypingRecord && entry.action == AuditAction::Create
+        })
+        .expect("corrected genotyping record creation must be audited");
+    assert_eq!(
+        replacement_create_audit.reason.as_deref(),
+        Some(correction_reason),
+        "replacement audit must retain the correction reason"
+    );
+    let correction_event = store
+        .list_animal_events(female.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|event| {
+            matches!(
+                event.kind,
+                AnimalEventKind::GenotypingRecorded { record_id, .. }
+                    if record_id == replacement_record.id
+            )
+        })
+        .expect("correction must append a genotyping animal event");
+    let correction_event_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_id: Some(correction_event.id),
+        })
+        .await
+        .unwrap();
+    assert!(
+        correction_event_audits.iter().any(|entry| {
+            entry.entity_type == EntityType::AnimalEvent
+                && entry.action == AuditAction::Create
+                && entry.reason.as_deref() == Some(correction_reason)
+        }),
+        "derived correction event audit must retain the correction reason"
     );
 
     let mut line = BreedingLine::new(lab.id, "Contract line", now).unwrap();
@@ -2841,6 +2890,157 @@ async fn run_relationship_contract(store: &dyn MuriArcStore, now: chrono::DateTi
     for animal_id in [animal_a.id, animal_a_peer.id] {
         assign_project_animal(store, lab_a.id, project_a.id, animal_id, &audit, now).await;
     }
+    assign_project_animal(
+        store,
+        lab_a.id,
+        project_a_other.id,
+        animal_a.id,
+        &audit,
+        now,
+    )
+    .await;
+
+    let mut project_a_weight = Measurement::draft(
+        lab_a.id,
+        project_a.id,
+        animal_a.id,
+        "body_weight",
+        "Project A body weight",
+        MeasurementValue::Number(21.5),
+        now,
+        now,
+    )
+    .unwrap();
+    project_a_weight.unit = Some("g".to_owned());
+    store
+        .create_measurement(&project_a_weight, &audit)
+        .await
+        .unwrap();
+    let mut project_a_other_weight = Measurement::draft(
+        lab_a.id,
+        project_a_other.id,
+        animal_a.id,
+        "body_weight",
+        "Other project body weight",
+        MeasurementValue::Number(27.5),
+        now + Duration::seconds(1),
+        now,
+    )
+    .unwrap();
+    project_a_other_weight.unit = Some("g".to_owned());
+    store
+        .create_measurement(&project_a_other_weight, &audit)
+        .await
+        .unwrap();
+
+    let project_a_overviews = store
+        .list_animal_overviews(
+            &AnimalFilter {
+                lab_id: lab_a.id,
+                project_id: Some(project_a.id),
+                ..AnimalFilter::default()
+            },
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(project_a_overviews.len(), 2);
+    let project_a_subject = project_a_overviews
+        .iter()
+        .find(|overview| overview.animal.id == animal_a.id)
+        .unwrap();
+    assert_eq!(
+        project_a_subject.projects,
+        vec![AnimalProjectRef {
+            id: project_a.id,
+            name: project_a.name.clone(),
+        }]
+    );
+    assert_eq!(
+        project_a_subject.latest_weight,
+        Some(LatestAnimalWeight {
+            value: 21.5,
+            unit: Some("g".to_owned()),
+            measured_at: now,
+        })
+    );
+    let project_a_peer = project_a_overviews
+        .iter()
+        .find(|overview| overview.animal.id == animal_a_peer.id)
+        .unwrap();
+    assert_eq!(
+        project_a_peer.projects,
+        vec![AnimalProjectRef {
+            id: project_a.id,
+            name: project_a.name.clone(),
+        }]
+    );
+    assert_eq!(project_a_peer.latest_weight, None);
+
+    let project_a_other_overviews = store
+        .list_animal_overviews(
+            &AnimalFilter {
+                lab_id: lab_a.id,
+                project_id: Some(project_a_other.id),
+                ..AnimalFilter::default()
+            },
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(project_a_other_overviews.len(), 1);
+    assert_eq!(project_a_other_overviews[0].animal.id, animal_a.id);
+    assert_eq!(
+        project_a_other_overviews[0].projects,
+        vec![AnimalProjectRef {
+            id: project_a_other.id,
+            name: project_a_other.name.clone(),
+        }]
+    );
+    assert_eq!(
+        project_a_other_overviews[0].latest_weight,
+        Some(LatestAnimalWeight {
+            value: 27.5,
+            unit: Some("g".to_owned()),
+            measured_at: now + Duration::seconds(1),
+        })
+    );
+
+    let lab_overviews = store
+        .list_animal_overviews(
+            &AnimalFilter {
+                lab_id: lab_a.id,
+                ..AnimalFilter::default()
+            },
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(lab_overviews.len(), 3);
+    let lab_subject = lab_overviews
+        .iter()
+        .find(|overview| overview.animal.id == animal_a.id)
+        .unwrap();
+    assert_eq!(
+        lab_subject
+            .projects
+            .iter()
+            .map(|project| project.id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([project_a.id, project_a_other.id])
+    );
+    assert_eq!(
+        lab_subject.latest_weight,
+        Some(LatestAnimalWeight {
+            value: 27.5,
+            unit: Some("g".to_owned()),
+            measured_at: now + Duration::seconds(1),
+        })
+    );
+
     for animal_id in [animal_a.id, animal_a_peer.id] {
         let participation = Participation::enroll(experiment_a.id, animal_id, now);
         store

@@ -115,6 +115,19 @@ struct AiConnectionTestView {
     error_code: Option<&'static str>,
 }
 
+const CONNECTION_TEST_MAX_OUTPUT_TOKENS: u32 = 256;
+
+fn connection_test_request() -> CompletionRequest {
+    let mut request = CompletionRequest::new(vec![ChatMessage::user(
+        "Connection check. Reply with the single word OK.",
+    )]);
+    // Reasoning-capable OpenAI-compatible models may consume a small token
+    // budget entirely in hidden reasoning and return no final content.
+    request.max_output_tokens = Some(CONNECTION_TEST_MAX_OUTPUT_TOKENS);
+    request.temperature = Some(0.0);
+    request
+}
+
 async fn test_settings(
     State(state): State<AppState>,
     principal: AuthPrincipal,
@@ -131,11 +144,7 @@ async fn test_settings(
             .map_err(|_| ApiError::internal().with_request_id(metadata.request_id.clone()))?,
         None => ProviderCredentials::none(),
     };
-    let mut request = CompletionRequest::new(vec![ChatMessage::user(
-        "Connection check. Reply with the single word OK.",
-    )]);
-    request.max_output_tokens = Some(8);
-    request.temperature = Some(0.0);
+    let request = connection_test_request();
     let started = Instant::now();
     let result = provider.complete(request, credentials).await;
     let view = AiConnectionTestView {
@@ -973,6 +982,18 @@ mod tests {
     const CSRF_TOKEN: &str = "mac_step_up_csrf_00000000000000000000000000000000";
     const BEARER_TOKEN: &str = "mat_step_up_bearer_000000000000000000000000000000";
     const CORRECT_PASSWORD: &str = "correct current password";
+
+    #[test]
+    fn connection_test_allows_reasoning_models_to_emit_final_content() {
+        let request = connection_test_request();
+
+        assert_eq!(
+            request.max_output_tokens,
+            Some(CONNECTION_TEST_MAX_OUTPUT_TOKENS)
+        );
+        assert!(CONNECTION_TEST_MAX_OUTPUT_TOKENS > 8);
+        assert_eq!(request.temperature, Some(0.0));
+    }
 
     #[derive(Clone)]
     struct TestSessions {

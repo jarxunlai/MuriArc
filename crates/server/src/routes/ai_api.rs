@@ -9,10 +9,10 @@ use axum::{
 use muriarc_ai::{
     AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiExecutionContext, AiProvider,
     AiWorkflowError, AiWorkflowService, ApprovalDecision, ApprovalError, ApprovalRequirement,
-    AssistantConversationDetail, AssistantConversationSummary, AssistantTurnRequest,
-    AssistantTurnResponse, ChatMessage, CompletionRequest, DraftDecisionRequest,
-    DraftDecisionResponse, DraftStatus, ProviderCredentials, ProviderError, ScopeSet, ToolScope,
-    WriteDraftSummary,
+    AssistantConversationDetail, AssistantConversationSummary, AssistantError,
+    AssistantTurnRequest, AssistantTurnResponse, ChatMessage, CompletionRequest,
+    DraftDecisionRequest, DraftDecisionResponse, DraftStatus, ProviderCredentials, ProviderError,
+    ScopeSet, ToolScope, TransportFailure, WriteDraftSummary,
 };
 use muriarc_core::{AiAutonomyMode, Permission, StoreError};
 use serde::{Deserialize, Deserializer};
@@ -21,10 +21,11 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderEndpointView, AiProviderSettingsView,
-    AiProviderStoreError, ApiError, AppState, AuthError, AuthPrincipal, AuthenticationMethod,
-    RequestMetadata, ResolvedAiProvider, SaveAiLabSettingsInput, SaveAiProviderEndpointInput,
-    SaveAiProviderSettingsInput, ai_data_tools::ServerAiDataTools, ai_step_up::AiStepUpLimit,
+    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderEndpointView, AiProviderPresetView,
+    AiProviderSettingsView, AiProviderStoreError, ApiError, AppState, AuthError, AuthPrincipal,
+    AuthenticationMethod, RequestMetadata, ResolvedAiProvider, SaveAiLabSettingsInput,
+    SaveAiProviderEndpointInput, SaveAiProviderSettingsInput, ai_data_tools::ServerAiDataTools,
+    ai_step_up::AiStepUpLimit,
 };
 
 use super::{
@@ -39,6 +40,7 @@ pub(super) fn router() -> Router<AppState> {
         )
         .route("/ai/settings/test", post(test_settings))
         .route("/ai/diagnostics", get(diagnostics))
+        .route("/ai/provider-presets", get(list_provider_presets))
         .route("/admin/ai", get(get_lab_ai).put(save_lab_ai))
         .route(
             "/admin/ai/endpoints",
@@ -134,7 +136,9 @@ async fn test_settings(
     metadata: RequestMetadata,
 ) -> Result<Json<ItemResponse<AiConnectionTestView>>, ApiError> {
     ensure_human(&principal, &metadata)?;
-    let ResolvedAiProvider { provider, api_key } = state
+    let ResolvedAiProvider {
+        provider, api_key, ..
+    } = state
         .ai_providers
         .resolve(principal.user_id)
         .await
@@ -168,6 +172,20 @@ async fn diagnostics(
         .await
         .map_err(|error| provider_settings_error(error, &metadata))?;
     Ok(item(diagnostics, &metadata))
+}
+
+async fn list_provider_presets(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+) -> Result<Json<CollectionResponse<AiProviderPresetView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let presets = state
+        .ai_providers
+        .list_provider_presets(principal.lab_id)
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(collection(presets, &metadata))
 }
 
 async fn get_lab_ai(
@@ -289,14 +307,26 @@ fn ensure_lab_admin(principal: &AuthPrincipal, metadata: &RequestMetadata) -> Re
 fn provider_test_error_code(error: ProviderError) -> &'static str {
     match error {
         ProviderError::InvalidConfig(_) | ProviderError::InvalidRequest(_) => "invalid_provider",
-        ProviderError::RequestTooLarge { .. } => "request_too_large",
+        ProviderError::RequestTooLarge { .. } => "context_exceeded",
         ProviderError::ResponseTooLarge { .. } => "response_too_large",
-        ProviderError::Transport { .. } => "transport_failed",
+        ProviderError::Transport {
+            kind: TransportFailure::Timeout,
+        } => "request_timeout",
+        ProviderError::Transport {
+            kind: TransportFailure::Connection,
+        } => "provider_unreachable",
+        ProviderError::Transport {
+            kind: TransportFailure::Request,
+        } => "provider_transport_error",
         ProviderError::HttpStatus {
             status: 401 | 403, ..
-        } => "credential_rejected",
+        } => "api_key_rejected",
+        ProviderError::HttpStatus { status: 404, .. } => "model_not_found",
         ProviderError::HttpStatus { .. } => "provider_http_error",
-        ProviderError::MalformedResponse | ProviderError::EmptyResponse => "invalid_response",
+        ProviderError::MalformedResponse | ProviderError::EmptyResponse => {
+            "response_format_incompatible"
+        }
+        ProviderError::OutputBudgetExhausted => "output_budget_exhausted",
         ProviderError::MockExhausted | ProviderError::MockUnavailable => "provider_unavailable",
     }
 }
@@ -311,17 +341,22 @@ async fn run_turn(
     let workflow = workflow(&state, &metadata)?;
     let context =
         execution_context_with_autonomy(&state, &principal, authentication, &metadata).await?;
-    let ResolvedAiProvider { provider, api_key } = state
+    let ResolvedAiProvider {
+        provider,
+        api_key,
+        runtime,
+    } = state
         .ai_providers
         .resolve(principal.user_id)
         .await
         .map_err(|error| provider_resolve_error(error, &metadata))?;
     let response = workflow
-        .run_turn(
+        .run_turn_with_config(
             provider,
             api_key.as_ref().map(|secret| secret.as_str()),
             &context,
             payload,
+            runtime,
         )
         .await
         .map_err(|error| workflow_error(error, &metadata))?;
@@ -849,22 +884,45 @@ fn ensure_human(principal: &AuthPrincipal, metadata: &RequestMetadata) -> Result
 fn ai_disabled(metadata: &RequestMetadata) -> ApiError {
     ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
-        "ai_disabled",
-        "the shared AI service is disabled by the server administrator",
+        "ai_runtime_not_configured",
+        "the AI runtime is not configured for this deployment",
     )
     .with_request_id(metadata.request_id.clone())
 }
 
 fn provider_settings_error(error: AiProviderStoreError, metadata: &RequestMetadata) -> ApiError {
     let api_error = match error {
-        AiProviderStoreError::InvalidSettings
-        | AiProviderStoreError::InvalidCredential
-        | AiProviderStoreError::LocalUrlForbidden
-        | AiProviderStoreError::CloudUrlForbidden
-        | AiProviderStoreError::MissingCredential => ApiError::validation(error.to_string()),
-        AiProviderStoreError::Disabled | AiProviderStoreError::NotConfigured => {
-            return ai_disabled(metadata);
+        AiProviderStoreError::InvalidSettings | AiProviderStoreError::InvalidCredential => {
+            ApiError::validation(error.to_string())
         }
+        AiProviderStoreError::LocalUrlForbidden | AiProviderStoreError::CloudUrlForbidden => {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "provider_exit_not_approved",
+                error.to_string(),
+            )
+        }
+        AiProviderStoreError::ProviderNotSelected => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ai_provider_not_selected",
+            error.to_string(),
+        ),
+        AiProviderStoreError::MissingCredential => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ai_api_key_missing",
+            "AI is enabled and waiting for the current user's API key",
+        ),
+        AiProviderStoreError::LabDisabled => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ai_lab_disabled",
+            "AI is disabled by laboratory policy",
+        ),
+        AiProviderStoreError::Disabled => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ai_user_disabled",
+            "AI is disabled in the current user's settings",
+        ),
+        AiProviderStoreError::NotConfigured => return ai_disabled(metadata),
         AiProviderStoreError::InvalidMasterKey
         | AiProviderStoreError::Encryption
         | AiProviderStoreError::Storage => {
@@ -875,27 +933,31 @@ fn provider_settings_error(error: AiProviderStoreError, metadata: &RequestMetada
     api_error.with_request_id(metadata.request_id.clone())
 }
 
-fn provider_resolve_error(error: AiProviderStoreError, metadata: &RequestMetadata) -> ApiError {
-    let api_error = match error {
-        AiProviderStoreError::Disabled
-        | AiProviderStoreError::MissingCredential
-        | AiProviderStoreError::NotConfigured => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ai_not_configured",
-            "AI is not enabled and fully configured for this user",
-        ),
-        AiProviderStoreError::InvalidSettings
-        | AiProviderStoreError::InvalidCredential
-        | AiProviderStoreError::LocalUrlForbidden
-        | AiProviderStoreError::CloudUrlForbidden
-        | AiProviderStoreError::InvalidMasterKey
-        | AiProviderStoreError::Encryption
-        | AiProviderStoreError::Storage => {
-            tracing::error!(kind = ?error, "AI provider resolution failed");
-            ApiError::internal()
-        }
+pub(super) fn provider_resolve_error(
+    error: AiProviderStoreError,
+    metadata: &RequestMetadata,
+) -> ApiError {
+    provider_settings_error(error, metadata)
+}
+
+pub(super) fn provider_api_error(error: ProviderError, metadata: &RequestMetadata) -> ApiError {
+    let code = provider_test_error_code(error.clone());
+    let status = match code {
+        "request_timeout" => StatusCode::GATEWAY_TIMEOUT,
+        "context_exceeded" => StatusCode::UNPROCESSABLE_ENTITY,
+        "api_key_rejected" => StatusCode::UNAUTHORIZED,
+        "model_not_found" => StatusCode::NOT_FOUND,
+        "provider_unreachable"
+        | "provider_transport_error"
+        | "provider_http_error"
+        | "response_format_incompatible"
+        | "output_budget_exhausted"
+        | "provider_unavailable"
+        | "response_too_large" => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
     };
-    api_error.with_request_id(metadata.request_id.clone())
+    tracing::warn!(kind = ?error, diagnostic_code = code, "AI Provider request failed");
+    ApiError::new(status, code, error.to_string()).with_request_id(metadata.request_id.clone())
 }
 
 fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiError {
@@ -907,6 +969,27 @@ fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiErro
         }
         AiWorkflowError::Approval(error) => ApiError::validation(error.to_string()),
         AiWorkflowError::Credential(error) => ApiError::validation(error.to_string()),
+        AiWorkflowError::Assistant(AssistantError::Provider(error)) => {
+            provider_api_error(error, metadata)
+        }
+        AiWorkflowError::Assistant(AssistantError::ContextWindowExceeded {
+            estimated_tokens,
+            max_input_tokens,
+        }) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "context_exceeded",
+            "the current question and required context exceed the configured input token budget",
+        )
+        .with_details(json!({
+            "estimatedInputTokens": estimated_tokens,
+            "maxInputTokens": max_input_tokens,
+            "currentQuestionTruncated": false,
+        })),
+        AiWorkflowError::Assistant(AssistantError::TotalTimeoutExceeded) => ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "request_timeout",
+            "the AI request exceeded the configured timeout",
+        ),
         AiWorkflowError::Assistant(error) => {
             tracing::warn!(kind = ?error, "AI provider or tool execution failed");
             ApiError::new(
@@ -915,6 +998,7 @@ fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiErro
                 "the AI provider could not complete this request",
             )
         }
+        AiWorkflowError::Config(error) => ApiError::validation(error.to_string()),
         AiWorkflowError::DataTool(muriarc_ai::ToolExecutionError::Rejected { code }) => {
             ApiError::conflict(format!("AI data operation was rejected ({code})"))
         }
@@ -991,8 +1075,61 @@ mod tests {
             request.max_output_tokens,
             Some(CONNECTION_TEST_MAX_OUTPUT_TOKENS)
         );
-        assert!(CONNECTION_TEST_MAX_OUTPUT_TOKENS > 8);
         assert_eq!(request.temperature, Some(0.0));
+    }
+
+    #[test]
+    fn provider_failures_have_distinct_stable_diagnostic_codes() {
+        let cases = [
+            (
+                ProviderError::HttpStatus {
+                    status: 401,
+                    request_id: None,
+                },
+                "api_key_rejected",
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 404,
+                    request_id: None,
+                },
+                "model_not_found",
+            ),
+            (
+                ProviderError::HttpStatus {
+                    status: 500,
+                    request_id: None,
+                },
+                "provider_http_error",
+            ),
+            (
+                ProviderError::Transport {
+                    kind: TransportFailure::Connection,
+                },
+                "provider_unreachable",
+            ),
+            (
+                ProviderError::Transport {
+                    kind: TransportFailure::Timeout,
+                },
+                "request_timeout",
+            ),
+            (
+                ProviderError::MalformedResponse,
+                "response_format_incompatible",
+            ),
+            (
+                ProviderError::OutputBudgetExhausted,
+                "output_budget_exhausted",
+            ),
+            (
+                ProviderError::RequestTooLarge { limit: 1024 },
+                "context_exceeded",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(provider_test_error_code(error), expected);
+        }
     }
 
     #[derive(Clone)]

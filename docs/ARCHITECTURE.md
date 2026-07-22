@@ -60,6 +60,18 @@ Desktop 与 Server 共享核心领域模型、主要业务用例和同一套响�
   默认；Auto 只放行受控读取、产物和可逆草稿；Full 需要 step-up，30 分钟空闲后失效。
   所有 AI 写入仍必须经过结构化 draft/preview/approval，不得把 Full 解释为最终签署权限。
 
+## AI configuration and runtime boundaries
+
+AI 配置按两个层级持久化，预设目录不等于共享账号：
+
+- 实验室级仅保存 AI 总开关、最大自主模式、自定义 URL 审批策略，以及不含密钥的 Provider 出口/预设目录。Environment Root 与 LabAdmin 只能治理这一层，不能查看、替用户修改或调用用户凭据。
+- 用户级按认证 `user_id` 独立保存 `enabled`、Provider kind/preset、Base URL、文本/视觉模型、Token 预算、Temperature、超时与 revision。Server API 只返回 `hasKey`；Desktop 把 Key 放入 OS keyring，Server 使用部署 Master Key 以 AES-256-GCM 加密，并把 user ID 与 key version 绑定到 AAD。Provider 身份或出口切换会清除旧凭据绑定，模型和预算等非身份参数更新会保留同一 Provider 的 Key。
+- 新环境的 Server AI runtime、实验室开关和用户默认开关均为启用，默认个人预设为 DeepSeek；无个人 Key 的稳定状态是 `waiting_for_personal_api_key`，任何请求在网络调用前失败。Docker 只启动 MuriArc Server 与 PostgreSQL，不启动 Ollama、不下载模型。
+
+每次文本调用从用户设置构造 `AssistantRuntimeConfig`。`maxInputTokens + maxOutputTokens` 必须不超过 `contextWindowTokens`；`maxOutputTokens` 作为 OpenAI-compatible `max_tokens` 发给 Provider。调用前的输入 Token 是明确标注的保守估算，覆盖系统提示、历史、工具定义/结果与当前用户消息；超限时只从最旧的完整 user/assistant 历史轮次开始裁剪，当前 tool call/result 组保持配对，当前问题绝不静默截断。响应 Trace 分开记录估算输入、裁剪原因与 Provider 返回的真实 usage。
+
+内置 Provider 预设为 DeepSeek、智谱 GLM、Moonshot/Kimi、OpenAI 和自定义 OpenAI-compatible。它们只提供显示名称、官方推荐出口、可选模型与文档链接；每位用户仍必须保存自己的 Key、模型和参数。Provider HTTP redirects 被禁用，自定义 OpenAI-compatible 云出口要求 HTTPS；实验室启用 URL 审批时还必须精确匹配官方出口或管理员登记的出口。
+
 ## Operational records
 
 - 面向成员的“操作动态”只投影动物分配/移除、转移、实验入组、测量/样本等关键业务事件，

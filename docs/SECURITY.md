@@ -29,17 +29,13 @@ CSRF 可在有效会话内安全恢复但不持久化明文，外部 token 仅�
 - 页面刷新后只可通过有效 HttpOnly session 调用安全的 `GET /api/v1/auth/csrf` 恢复 CSRF；该端点拒绝 bearer 身份并返回 `Cache-Control: no-store`。
 - 登录失败统一返回安全错误，不区分未知 email、错误密码、停用或删除账号。
 - 持久外部 token 具有 scopes、到期时间和撤销时间；有效权限始终为用户实时角色与 scopes 的交集，数据库不保存明文 token。
-- AI key：Desktop 存 OS keyring；Server 使用环境注入的 32-byte master key，
-  以 AES-256-GCM、随机 nonce 和绑定 user/key-version 的 AAD 对每位用户的 key
-  独立加密。数据库不保存 master key。
-- `MURIARC_AI_MASTER_KEY` 是部署级密钥材料；生成一次后保持稳定。只有在完成所有既有用户
-  AI 凭据重新加密后才递增 `MURIARC_AI_MASTER_KEY_VERSION`。
-- AI key 不进入项目数据库、日志、审计、快照或错误响应。
-- Server 未配置有效 master key 时所有 AI settings、turn 和 approval 路由 fail closed，
-  不允许回退到明文存储。
-- Provider 出口由 LabAdmin 在产品内管理，并以实验室级数据库记录保存。非官方
-  OpenAI-compatible Provider URL 和 LocalHttp Provider URL 都必须精确匹配已启用出口；
-  官方 OpenAI v1 是唯一内置云端出口，Provider HTTP redirects 被禁用。
+- AI key：Desktop 存 OS keyring；Server 优先使用环境注入的 32-byte Master Key，未注入时在数据卷的 `secrets/ai-master-key` 首次生成并跨重启复用。Server 以 AES-256-GCM、随机 nonce 和绑定 user/key-version 的 AAD 对每位用户的 Key 独立加密；PostgreSQL 不保存 Master Key。
+- `MURIARC_AI_MASTER_KEY` 或生成的 key 文件是部署级密钥材料；生成一次后保持稳定并纳入受控备份。文件无效或不可写时启动失败。只有在完成所有既有用户 AI 凭据重新加密后才递增 `MURIARC_AI_MASTER_KEY_VERSION`。
+- API 只返回 `hasKey`。Root/LabAdmin 只能管理实验室总开关、自主度上限、自定义 URL 审批策略与非敏感预设/出口，不能读取、解密、替换或调用其他用户的 Key、模型、Base URL 覆盖和 Token 参数。设置写入要求 actor user ID 与目标 user ID 相同。
+- AI Key 不进入项目数据库、前端状态、日志、审计、快照或错误响应。更新同一 Provider 的模型/Token 参数保留 Key；Provider kind/preset/Base URL 变化且未提供新 Key 时清除旧绑定；清除只影响当前用户。
+- 新环境默认启用 AI runtime、实验室开关与用户开关；无个人 Key 时返回 `waiting_for_personal_api_key` 并在任何外部网络请求前失败，因此不会自动产生费用。Docker 不启动 Ollama、不下载本地模型。
+- 内置非敏感出口包括 DeepSeek、智谱 GLM、Moonshot/Kimi 与 OpenAI。自定义 URL 审批开启时，非官方 OpenAI-compatible 和 LocalHttp 必须精确匹配已启用出口；显式关闭审批时仍执行协议安全校验。OpenAI-compatible 云出口必须 HTTPS，Provider HTTP redirects 被禁用。
+- AI Token 预算强制满足 `maxInputTokens + maxOutputTokens <= contextWindowTokens`。输入估算明确标记为 estimate；超限只裁剪最旧完整历史轮次并保持 tool call/result 配对，不截断当前问题。Provider 返回的真实 usage 与估算值分开记录。
 - Lab-wide AI 会话只读；产生写入草稿前必须显式绑定 Project。客户端声明的
   step-up 状态不受信任，外部 token 不得修改 AI 设置或代替研究者审批。
 - AI 对话授权默认 Ask，可按对话提升为 Auto 或 Full；它不是可继承的用户角色。Server 的

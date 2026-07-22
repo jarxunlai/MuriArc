@@ -23,6 +23,7 @@ vi.mock('@/services/gateway', () => ({
 // and can leave it pending past Vitest's timeout under parallel/UNC runs.
 vi.mock('@/views/CagesView.vue', () => ({ default: { template: '<div />' } }))
 vi.mock('@/views/AnimalsView.vue', () => ({ default: { template: '<div />' } }))
+vi.mock('@/views/AnimalImportGuideView.vue', () => ({ default: { template: '<div />' } }))
 vi.mock('@/views/LoginView.vue', () => ({ default: { template: '<div />' } }))
 vi.mock('@/views/ChangePasswordView.vue', () => ({ default: { template: '<div />' } }))
 vi.mock('@/views/LocalWelcomeView.vue', () => ({ default: { template: '<div />' } }))
@@ -91,6 +92,37 @@ describe('remote route authentication guard', () => {
 
     expect(router.currentRoute.value.name).toBe('cages')
     expect(currentProjectId.value).toBe('project-1')
+  })
+
+  it('guards every animal-data route through the shared route metadata', async () => {
+    auth.gateway.restoreSession.mockResolvedValue({
+      user: {
+        id: 'viewer-1', labId: 'lab-1', displayName: 'Viewer', labRoles: [],
+        projectRoles: [{ projectId: 'project-1', role: 'viewer' }],
+        authentication: 'session', mustChangePassword: false, isEnvironmentRoot: false,
+      },
+      csrfAvailable: true,
+    })
+
+    await router.push('/animal-data/import-guide')
+
+    expect(router.currentRoute.value.name).toBe('animals')
+  })
+
+  it('allows an AnimalManager to open the animal import guide directly', async () => {
+    auth.gateway.restoreSession.mockResolvedValue({
+      user: {
+        id: 'manager-1', labId: 'lab-1', displayName: 'Manager',
+        labRoles: ['animal_manager'], projectRoles: [],
+        authentication: 'session', mustChangePassword: false, isEnvironmentRoot: false,
+      },
+      csrfAvailable: true,
+    })
+
+    await router.push('/animal-data/import-guide')
+
+    expect(router.currentRoute.value.name).toBe('animal-import-guide')
+    expect(router.currentRoute.value.meta.animalData).toBe(true)
   })
 
   it('keeps Lab operators on the Registry while accepting an allowed project deep link', async () => {

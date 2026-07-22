@@ -45,7 +45,7 @@ test('可以通过真实 Gateway 入口登记新动物', async ({ page }, testIn
   await expect(desktopTable).toBeVisible({ visible: !compact })
   await expect(mobileCards).toBeVisible({ visible: compact })
   const createdAnimal = compact
-    ? mobileCards.getByRole('button', { name: '查看小鼠 M-999', exact: true })
+    ? mobileCards.getByRole('button', { name: '查看动物 M-999', exact: true })
     : desktopTable.getByText('M-999', { exact: true })
   await expect(createdAnimal).toBeVisible()
 })
@@ -158,13 +158,81 @@ test('测量 CSV 绑定明确实验后以草稿测量计数写入', async ({ pag
   await expect(page.locator('.created')).toContainText('动物 0 · 事件 0 · 测量 1')
 })
 
+test('动物导入与独立指南在目标视口无步骤重叠和页面横向滚动', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', '由单一浏览器覆盖四个明确验收宽度')
+
+  for (const width of [375, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 960 })
+    await page.goto('/#/animal-data')
+
+    await expect(page.getByRole('heading', { name: '动物数据' })).toBeVisible()
+    await expect(page.locator('.import-resources')).toBeVisible()
+    await expect(page.locator('.schema-guide')).toHaveCount(0)
+    await expect(page.locator('.import-selection')).toHaveCount(0)
+
+    const stepLayoutIsSafe = await page.locator('.steps').evaluate((steps) => {
+      const items = Array.from(steps.querySelectorAll('li'))
+      const visibleLabels = items
+        .map((item) => ({
+          item: item.getBoundingClientRect(),
+          marker: item.querySelector('i')?.getBoundingClientRect(),
+          label: item.querySelector('span')?.getBoundingClientRect(),
+        }))
+        .filter((entry) => entry.label && entry.label.width > 0 && entry.label.height > 0)
+      return visibleLabels.every((entry, index) => {
+        if (!entry.marker || !entry.label) return false
+        const contained = entry.label.left >= entry.item.left - 1
+          && entry.label.right <= entry.item.right + 1
+        const belowMarker = entry.label.top >= entry.marker.bottom - 1
+        const next = visibleLabels[index + 1]?.label
+        const separateFromNext = !next || entry.label.right <= next.left + 1
+        return contained && belowMarker && separateFromNext
+      })
+    })
+    expect(stepLayoutIsSafe).toBe(true)
+
+    const importPanel = await page.locator('.import-panel').boundingBox()
+    const principles = await page.locator('.principles').boundingBox()
+    expect(importPanel).not.toBeNull()
+    expect(principles).not.toBeNull()
+    if (width <= 1180) {
+      expect(principles!.y).toBeGreaterThanOrEqual(importPanel!.y + importPanel!.height - 1)
+    } else {
+      expect(principles!.x).toBeGreaterThan(importPanel!.x)
+      expect(Math.abs(principles!.y - importPanel!.y)).toBeLessThanOrEqual(1)
+    }
+
+    expect(await page.evaluate(() =>
+      document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+    )).toBe(true)
+
+    await page.goto('/#/animal-data/import-guide')
+    await expect(page.getByRole('heading', { name: '动物导入指南' })).toBeVisible()
+    await expect(page.locator('.example-table-scroll tbody tr')).toHaveCount(4)
+    await expect(page.getByTestId('download-xlsx-example')).toBeDisabled()
+    await expect(page.getByText(/当前运行环境仅提供 CSV 模板/)).toBeVisible()
+    expect(await page.evaluate(() =>
+      document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+    )).toBe(true)
+
+    if (width === 1440) {
+      await expect(page.locator('.nav-item.active')).toContainText('动物数据')
+    }
+  }
+})
+
 test('动物 Registry 导出和完整业务归档快照都会触发浏览器下载', async ({ page }) => {
   await page.goto('/#/data')
 
-  const exportDownload = page.waitForEvent('download')
-  await page.getByRole('button', { name: '导出动物 Registry' }).click()
-  expect((await exportDownload).suggestedFilename()).toBe('animals-demo.csv')
-  await expect(page.getByText(/动物 Registry 导出已生成/)).toBeVisible()
+  await page.getByRole('button', { name: '配置动物导出' }).click()
+  const exportDialog = page.getByRole('dialog')
+  await expect(exportDialog).toContainText('配置动物业务导出')
+  const [exportDownload] = await Promise.all([
+    page.waitForEvent('download'),
+    exportDialog.getByRole('button', { name: '生成并下载' }).click(),
+  ])
+  expect(exportDownload.suggestedFilename()).toBe('animals-demo.csv')
+  await expect(page.getByText(/动物业务导出已生成/)).toBeVisible()
 
   const snapshotButton = page.getByRole('button', { name: '创建完整归档快照' })
   await expect(snapshotButton).toBeEnabled()

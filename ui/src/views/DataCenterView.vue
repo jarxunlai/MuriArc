@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useMessage } from 'naive-ui'
-import { useRoute } from 'vue-router'
-import { Archive, CheckCircle2, Download, FileSpreadsheet, Plus, RefreshCw, UploadCloud, XCircle } from '@lucide/vue'
+import { useRoute, useRouter } from 'vue-router'
+import { Archive, BookOpen, CheckCircle2, Download, FileSpreadsheet, Plus, RefreshCw, UploadCloud, XCircle } from '@lucide/vue'
 import type { DataJob, Experiment } from '@/domain/models'
 import { gateway } from '@/services/gateway'
 import {
@@ -33,6 +33,7 @@ import PageHeader from '@/components/PageHeader.vue'
 
 const message = useMessage()
 const route = useRoute()
+const router = useRouter()
 const dataGateway = createDataGateway(gateway)
 const jobs = ref<DataJob[]>([])
 const experiments = ref<Experiment[]>([])
@@ -61,6 +62,7 @@ const snapshotAllowed = computed(() => gateway.mode === 'local' || canCreateSnap
 const importKind = ref<ImportKind>(animalImportAllowed.value ? 'animal' : 'measurement')
 const selectedExperimentId = ref<string>()
 const stepLabels = ['选择文件', '识别字段', '检查与预览', '事务写入']
+const supportsXlsxTemplates = computed(() => dataGateway.animalImportTemplateFormats.includes('xlsx'))
 const pageTitle = computed(() => animalDataMode.value ? '动物数据' : '数据中心')
 const pageDescription = computed(() => animalDataMode.value
   ? '批量登记动物、查看生产 schema 与模板，并按条件生成不含 UUID 的业务导出。'
@@ -259,10 +261,14 @@ function isoDate(value: number) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
-async function downloadAnimalTemplate(format: 'csv' | 'xlsx') {
+async function downloadAnimalTemplate(
+  format: 'csv' | 'xlsx',
+  variant: 'blank' | 'example' = 'example',
+) {
+  if (format === 'xlsx' && !supportsXlsxTemplates.value) return
   busy.value = true
   try {
-    await dataGateway.downloadAnimalImportTemplate(format)
+    await dataGateway.downloadAnimalImportTemplate(format, variant)
   } catch (error) {
     message.error(error instanceof Error ? error.message : '模板下载失败')
   } finally {
@@ -355,14 +361,21 @@ onMounted(async () => {
           <div><UploadCloud :size="19" /><div><strong>{{ importTitle }}</strong><span>CSV / XLSX · 最大 32 MiB</span></div></div>
           <button v-if="step > 1" type="button" :disabled="busy" @click="resetImport()">取消并重新选择</button>
         </header>
-        <ol class="steps">
-          <li v-for="(label, index) in stepLabels" :key="label" :class="{ active: step === index + 1, done: step > index + 1 }">
-            <i>{{ step > index + 1 ? '✓' : index + 1 }}</i><span>{{ label }}</span>
+        <ol class="steps" aria-label="导入进度">
+          <li
+            v-for="(label, index) in stepLabels"
+            :key="label"
+            :class="{ active: step === index + 1, done: step > index + 1 }"
+            :aria-current="step === index + 1 ? 'step' : undefined"
+            :aria-label="`第 ${index + 1} 步：${label}`"
+          >
+            <i aria-hidden="true">{{ step > index + 1 ? '✓' : index + 1 }}</i><span>{{ label }}</span>
           </li>
         </ol>
+        <div class="mobile-step-label" aria-live="polite">第 {{ step }}/{{ stepLabels.length }} 步 · {{ stepLabels[step - 1] }}</div>
 
-        <div v-if="step === 1" class="import-selection">
-          <div v-if="!animalDataMode">
+        <div v-if="step === 1 && !animalDataMode" class="import-selection">
+          <div>
             <span>导入类型</span>
             <n-radio-group v-model:value="importKind" size="small">
               <n-radio-button v-if="animalImportAllowed" value="animal">动物登记</n-radio-button>
@@ -375,27 +388,27 @@ onMounted(async () => {
             <small v-if="!experimentOptions.length">尚无可选实验，请先在实验管理中创建实验并关联已发布模板。</small>
           </div>
         </div>
-        <n-collapse v-if="step === 1 && importKind === 'animal' && animalImportSchema" class="schema-guide">
-          <n-collapse-item title="动物导入字段、合法值与完整示例" name="animal-schema">
-            <div class="schema-actions">
-              <span>schema v{{ animalImportSchema.version }} · 页面说明和模板来自生产 parser 的同一契约。</span>
-              <n-space size="small">
-                <n-button size="small" secondary :loading="busy" @click="downloadAnimalTemplate('csv')">CSV 模板</n-button>
-                <n-button size="small" secondary :loading="busy" @click="downloadAnimalTemplate('xlsx')">XLSX 模板</n-button>
-              </n-space>
-            </div>
-            <div class="schema-table">
-              <div class="schema-head"><span>字段</span><span>类型/必填</span><span>合法值与说明</span><span>示例</span></div>
-              <div v-for="field in animalImportSchema.fields" :key="field.key">
-                <code>{{ field.key }}</code>
-                <span>{{ field.data_type }} · {{ field.required ? '必填' : '可选' }}</span>
-                <span>{{ field.legal_values.join(' / ') || '自由文本' }}<small>{{ field.description }}</small></span>
-                <code>{{ field.example }}</code>
-              </div>
-            </div>
-            <n-alert type="info" :show-icon="false">基因型 canonical 语法：<code>{{ animalImportSchema.genotype_syntax }}</code>。未知或歧义的笼位、父母、位点、allele 和定义会在本页预览阶段阻断。</n-alert>
-          </n-collapse-item>
-        </n-collapse>
+        <section v-if="step === 1 && importKind === 'animal'" class="import-resources" aria-labelledby="import-resources-title">
+          <div>
+            <BookOpen :size="18" />
+            <span>
+              <strong id="import-resources-title">导入指南与合成示例</strong>
+              <small>查看字段、合法值和风险提示，或下载 4 行示例后调整。</small>
+            </span>
+          </div>
+          <div class="resource-actions">
+            <n-button size="small" secondary @click="router.push({ name: 'animal-import-guide' })">查看指南</n-button>
+            <n-button size="small" secondary :loading="busy" @click="downloadAnimalTemplate('csv', 'example')">CSV 示例</n-button>
+            <n-button
+              size="small"
+              secondary
+              :loading="busy"
+              :disabled="!supportsXlsxTemplates"
+              @click="downloadAnimalTemplate('xlsx', 'example')"
+            >XLSX 示例</n-button>
+          </div>
+          <small v-if="!supportsXlsxTemplates" class="resource-note">当前运行环境仅提供 CSV；指南页会说明 XLSX 降级范围。</small>
+        </section>
         <div v-if="step === 1" class="drop-zone" :class="{ disabled: !canChooseFile }" @click="canChooseFile && input?.click()">
           <input ref="input" type="file" accept=".xlsx,.csv" hidden @change="selectFile" />
           <FileSpreadsheet :size="31" /><strong>选择一个表格文件</strong>
@@ -526,19 +539,29 @@ onMounted(async () => {
 .data-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; align-items: start; gap: 13px; }
 .data-layout.compact { grid-template-columns: minmax(0, 560px); }
 .import-panel { overflow: hidden; }.import-panel > header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--muri-border); }.import-panel > header > div { display: flex; align-items: center; gap: 10px; }.import-panel > header svg { color: var(--muri-primary); }.import-panel > header div div { display: flex; flex-direction: column; }.import-panel > header span { color: var(--muri-text-tertiary); font-size: 11px; }.import-panel > header button { border: 0; color: var(--muri-primary); background: transparent; cursor: pointer; font-size: 12px; }.import-panel > header button:disabled { opacity: .5; }
-.steps { display: grid; grid-template-columns: repeat(4, 1fr); margin: 0; padding: 15px 18px; list-style: none; border-bottom: 1px solid var(--muri-border); background: var(--muri-surface-muted); }.steps li { position: relative; display: flex; align-items: center; gap: 7px; color: var(--muri-text-tertiary); font-size: 11px; }.steps li:not(:last-child)::after { position: absolute; z-index: 0; right: 8px; left: 30px; height: 1px; background: var(--muri-border-strong); content: ''; }.steps i { z-index: 1; display: grid; width: 22px; height: 22px; place-items: center; border: 1px solid var(--muri-border-strong); border-radius: 50%; background: white; font-style: normal; }.steps .active { color: var(--muri-primary); font-weight: 600; }.steps .active i,.steps .done i { border-color: var(--muri-primary); color: white; background: var(--muri-primary); }
+.steps { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0; padding: 13px 18px 11px; list-style: none; border-bottom: 1px solid var(--muri-border); background: var(--muri-surface-muted); }
+.steps li { position: relative; display: grid; min-width: 0; justify-items: center; gap: 5px; color: var(--muri-text-tertiary); font-size: 11px; line-height: 1.25; text-align: center; }
+.steps li:not(:last-child)::after { position: absolute; z-index: 0; top: 11px; right: calc(-50% + 16px); left: calc(50% + 16px); height: 1px; background: var(--muri-border-strong); content: ''; }
+.steps i { z-index: 1; display: grid; width: 22px; height: 22px; place-items: center; border: 1px solid var(--muri-border-strong); border-radius: 50%; background: white; font-style: normal; }
+.steps span { z-index: 1; display: block; max-width: 100%; overflow-wrap: anywhere; }
+.steps .active { color: var(--muri-primary); font-weight: 600; }
+.steps .active i,.steps .done i { border-color: var(--muri-primary); color: white; background: var(--muri-primary); }
+.mobile-step-label { display: none; padding: 9px 18px; border-bottom: 1px solid var(--muri-border); color: var(--muri-primary); background: var(--muri-surface-muted); font-size: 12px; font-weight: 600; text-align: center; }
 .import-selection { display: grid; grid-template-columns: minmax(220px, .7fr) minmax(280px, 1.3fr); gap: 13px; padding: 15px 18px 0; }.import-selection > div { display: flex; min-width: 0; flex-direction: column; gap: 6px; }.import-selection span { color: var(--muri-text-secondary); font-size: 11px; font-weight: 600; }.import-selection small { color: var(--muri-warning); line-height: 1.45; }
-.schema-guide { margin: 13px 18px 0; border: 1px solid var(--muri-border); border-radius: 8px; }
-.schema-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; color: var(--muri-text-secondary); font-size: 11px; }
-.schema-table { overflow: auto; margin-bottom: 10px; border: 1px solid var(--muri-border); border-radius: 7px; }
-.schema-table > div { display: grid; grid-template-columns: 115px 110px minmax(300px, 1fr) minmax(180px, .7fr); gap: 10px; min-width: 760px; padding: 8px 10px; border-bottom: 1px solid var(--muri-border); font-size: 11px; }
-.schema-table > div:last-child { border-bottom: 0; }.schema-head { color: var(--muri-text-tertiary); background: var(--muri-surface-muted); font-weight: 600; }.schema-table span { display: flex; flex-direction: column; }.schema-table small { margin-top: 3px; color: var(--muri-text-tertiary); line-height: 1.4; }.schema-table code { color: var(--muri-primary); white-space: normal; overflow-wrap: anywhere; }
+.import-resources { display: flex; min-width: 0; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; margin: 13px 18px 0; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: 8px; background: var(--muri-surface-muted); }
+.import-resources > div:first-child { display: flex; min-width: 0; flex: 1; align-items: flex-start; gap: 8px; }
+.import-resources > div:first-child svg { flex: none; margin-top: 1px; color: var(--muri-primary); }
+.import-resources > div:first-child span { display: flex; min-width: 0; flex-direction: column; }
+.import-resources > div:first-child small { margin-top: 2px; color: var(--muri-text-tertiary); font-size: 11px; line-height: 1.4; }
+.resource-actions { display: flex; flex: none; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
+.resource-note { flex-basis: 100%; color: var(--muri-text-tertiary); font-size: 10px; text-align: right; }
 .drop-zone { display: flex; min-height: 250px; align-items: center; justify-content: center; flex-direction: column; gap: 8px; margin: 15px 18px 18px; border: 1px dashed #aab8c5; border-radius: 9px; color: var(--muri-text-secondary); background: #fbfcfd; cursor: pointer; }.drop-zone.disabled { opacity: .62; cursor: not-allowed; }.drop-zone svg { color: var(--muri-primary); }.drop-zone span { margin-bottom: 7px; color: var(--muri-text-tertiary); font-size: 12px; }.processing,.created { display: flex; min-height: 310px; align-items: center; justify-content: center; flex-direction: column; gap: 8px; }.processing span,.created span { color: var(--muri-text-secondary); }.created svg { color: var(--muri-success); }.created button { margin-top: 5px; }
 .mapping-preview { padding: 18px; }.file-summary { display: flex; align-items: center; gap: 9px; margin-bottom: 13px; }.file-summary svg { color: var(--muri-primary); }.file-summary div { display: flex; flex-direction: column; }.file-summary span { color: var(--muri-text-tertiary); font-size: 11px; }.mapping-table { border: 1px solid var(--muri-border); border-radius: 7px; overflow: hidden; }.mapping-table > div { display: grid; grid-template-columns: 1fr 1fr 90px; align-items: center; min-height: 38px; padding: 0 11px; border-bottom: 1px solid var(--muri-border); }.mapping-table > div:last-child { border-bottom: 0; }.mapping-head { color: var(--muri-text-tertiary); background: var(--muri-surface-muted); font-size: 11px; }.mapping-table code { min-width: 0; overflow: hidden; color: var(--muri-primary); text-overflow: ellipsis; white-space: nowrap; }.mapping-changed { border-color: var(--muri-warning); }.validation-note,.validation-ok { display: flex; padding: 10px 12px; gap: 2px; margin-top: 12px; border-left: 3px solid var(--muri-warning); background: #fff9ee; flex-direction: column; }.validation-note.blocking { border-color: var(--muri-danger, #d95656); background: #fff6f6; }.validation-note strong { color: #7b531b; font-size: 12px; }.validation-note.blocking strong { color: #9b3333; }.validation-note span { color: #8a6a3e; font-size: 11px; }.validation-ok { align-items: center; border-color: var(--muri-success); color: var(--muri-success); background: #f2fbf7; flex-direction: row; font-size: 12px; }.import-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 13px; }
 .row-preview { margin-top: 13px; }.row-preview > strong { display: block; margin-bottom: 7px; font-size: 12px; }.row-preview-scroll { overflow: auto; border: 1px solid var(--muri-border); border-radius: 7px; }.row-preview table { width: 100%; min-width: 800px; border-collapse: collapse; font-size: 11px; }.row-preview th, .row-preview td { max-width: 240px; padding: 7px 9px; overflow: hidden; border-right: 1px solid var(--muri-border); border-bottom: 1px solid var(--muri-border); text-align: left; text-overflow: ellipsis; white-space: nowrap; }.row-preview th { color: var(--muri-text-tertiary); background: var(--muri-surface-muted); }.row-preview tr:last-child td { border-bottom: 0; }
 .principles { padding: 16px; }.principles h3 { margin: 0 0 12px; font-size: 14px; }.principles ul { display: flex; padding: 0; flex-direction: column; gap: 10px; margin: 0 0 18px; list-style: none; color: var(--muri-text-secondary); font-size: 12px; }.principles li { display: flex; align-items: center; gap: 7px; }.principles li svg { color: var(--muri-success); }.principles li:nth-child(3) svg { color: var(--muri-danger, #d95656); }
 .jobs-section { margin-top: 22px; }.jobs-section > header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }.jobs-section header div { display: flex; align-items: baseline; gap: 8px; }.jobs-section h2 { margin: 0; font-size: 17px; }.jobs-section header span { color: var(--muri-text-tertiary); font-size: 11px; }.job-list article { display: grid; grid-template-columns: 32px 1fr auto; align-items: center; gap: 10px; min-height: 58px; padding: 8px 12px; border-bottom: 1px solid var(--muri-border); }.job-list article:last-child { border-bottom: 0; }.job-icon { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 7px; color: var(--muri-primary); background: var(--muri-primary-soft); }.job-list article > div:nth-child(2) { display: flex; min-width: 0; flex-direction: column; }.job-list article span { color: var(--muri-text-tertiary); font-size: 11px; }.empty-jobs { padding: 28px; color: var(--muri-text-tertiary); text-align: center; font-size: 12px; }
 .export-dialog { width: min(820px, calc(100vw - 28px)); }.export-dialog .n-alert { margin-bottom: 14px; }.export-grid, .tag-filter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }.field-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }.export-actions { display: flex; justify-content: flex-end; gap: 8px; }
-@media (max-width: 900px) { .data-layout { grid-template-columns: 1fr; } }
-@media (max-width: 600px) { .steps span { display: none; }.steps li:not(:last-child)::after { right: 4px; left: 28px; }.import-selection { grid-template-columns: 1fr; }.schema-actions { align-items: flex-start; flex-direction: column; }.drop-zone { min-height: 220px; text-align: center; }.mapping-table > div { grid-template-columns: 1fr 1fr 70px; padding: 0 7px; }.job-list article { grid-template-columns: 32px 1fr auto; }.export-grid, .tag-filter-grid, .field-grid { grid-template-columns: 1fr; } }
+@media (max-width: 1180px) { .data-layout,.data-layout.compact { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .import-resources { align-items: stretch; flex-direction: column; }.resource-actions { justify-content: flex-start; }.resource-note { text-align: left; } }
+@media (max-width: 600px) { .steps { padding-bottom: 13px; }.steps span { display: none; }.steps li:not(:last-child)::after { right: calc(-50% + 16px); left: calc(50% + 16px); }.mobile-step-label { display: block; }.import-selection { grid-template-columns: 1fr; }.resource-actions { display: grid; grid-template-columns: 1fr 1fr; }.resource-actions > :first-child { grid-column: 1 / -1; }.drop-zone { min-height: 220px; text-align: center; }.mapping-table > div { grid-template-columns: 1fr 1fr 70px; padding: 0 7px; }.job-list article { grid-template-columns: 32px 1fr auto; }.export-grid, .tag-filter-grid, .field-grid { grid-template-columns: 1fr; } }
 </style>

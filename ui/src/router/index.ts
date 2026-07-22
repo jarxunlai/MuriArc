@@ -16,6 +16,7 @@ const routes: RouteRecordRaw[] = [
   { path: '/cages', name: 'cages', component: () => import('@/views/CagesView.vue'), meta: { title: '笼位视图', section: '动物管理' } },
   { path: '/animals', name: 'animals', component: () => import('@/views/AnimalsView.vue'), meta: { title: '动物档案', section: '动物管理' } },
   { path: '/animal-data', name: 'animal-data', component: () => import('@/views/DataCenterView.vue'), meta: { title: '动物数据', section: '动物管理', animalData: true } },
+  { path: '/animal-data/import-guide', name: 'animal-import-guide', component: () => import('@/views/AnimalImportGuideView.vue'), meta: { title: '动物导入指南', section: '动物管理', animalData: true } },
   { path: '/breeding', name: 'breeding', component: () => import('@/views/BreedingView.vue'), meta: { title: '繁育管理', section: '动物管理' } },
   { path: '/experiments', name: 'experiments', component: () => import('@/views/ExperimentsView.vue'), meta: { title: '实验管理' } },
   { path: '/experiments/:experimentId/:section?', name: 'experiment-detail', component: () => import('@/views/ExperimentsView.vue'), meta: { title: '实验工作区', section: '实验管理' } },
@@ -96,7 +97,7 @@ router.beforeEach(async (to) => {
       }
       setCurrentProject(requestedProjectId)
     }
-    if (!hasLabRegistryAccess(session) && (to.name === 'breeding' || to.name === 'animal-data')) {
+    if (!hasLabRegistryAccess(session) && (to.name === 'breeding' || to.meta.animalData === true)) {
       return { name: 'animals' }
     }
     if (to.name === 'members' && !isLabAdmin(session) && !isActiveProjectAdmin(session)) {

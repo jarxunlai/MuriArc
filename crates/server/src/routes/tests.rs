@@ -707,7 +707,7 @@ async fn response_json(response: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
-async fn disabled_ai_routes_fail_closed_without_echoing_credentials() {
+async fn unconfigured_ai_runtime_fails_closed_without_echoing_credentials() {
     let fixture = Fixture::new(None).await;
     let secret = "server-user-api-key-must-never-be-returned";
     let response = fixture
@@ -729,7 +729,7 @@ async fn disabled_ai_routes_fail_closed_without_echoing_credentials() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = response_json(response).await;
-    assert_eq!(body["error"]["code"], json!("ai_disabled"));
+    assert_eq!(body["error"]["code"], json!("ai_runtime_not_configured"));
     assert!(!body.to_string().contains(secret));
 }
 

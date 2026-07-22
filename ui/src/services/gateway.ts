@@ -10,6 +10,7 @@ import type {
   AiDraftStatus,
   AiEntityType,
   AiProviderKind,
+  AiProviderPreset,
   AiSettings,
   AiTurnInput,
   AiTurnResponse,
@@ -66,6 +67,7 @@ import type {
   WorkspaceSettings,
 } from '@/domain/models'
 import { seedAnimals, seedCages, seedDataJobs, seedExperiments } from './mock-data'
+import { builtinAiProviderPresets } from './aiProviderPresets'
 import {
   activeProjectId,
   clearProjectContext,
@@ -446,6 +448,10 @@ export interface AiExtractionRecord {
 }
 export interface AiDiagnostics {
   runtimeConfigured: boolean
+  labEnabled: boolean
+  userEnabled: boolean
+  providerPresetsAvailable: boolean
+  status: string
   providerConfigured: boolean
   providerEnabled: boolean
   credentialConfigured: boolean
@@ -648,6 +654,7 @@ export interface MuriArcGateway {
   clearAiApiKey?(): Promise<AiSettings>
   testAiSettings?(): Promise<{ ok: boolean; latencyMs: number; errorCode?: string }>
   getAiDiagnostics?(): Promise<AiDiagnostics>
+  listAiProviderPresets?(): Promise<AiProviderPreset[]>
   getAiLabSettings?(): Promise<AiLabSettings>
   saveAiLabSettings?(input: { enabled: boolean; customUrlApprovalRequired: boolean; maxAutonomyMode: AiAutonomyMode }): Promise<AiLabSettings>
   listAiProviderEndpoints?(): Promise<AiProviderEndpoint[]>
@@ -1007,6 +1014,7 @@ export class LocalTauriGateway implements MuriArcGateway {
     return this.call<AiSettings>('save_ai_settings', { input })
   }
   clearAiApiKey() { return this.call<AiSettings>('clear_ai_api_key') }
+  async listAiProviderPresets() { return structuredClone(builtinAiProviderPresets) }
   async aiTurn(input: AiTurnInput) {
     return mapAiTurn(await this.call<RawAiTurnResponse>('ai_turn', { input }))
   }
@@ -1557,6 +1565,13 @@ interface RawAiTurnResponse {
       input_tokens: number
       output_tokens: number
       total_tokens: number
+    }
+    context?: {
+      estimatedInputTokens: number
+      inputTokenCountIsEstimate: boolean
+      contextTrimmed: boolean
+      trimmedHistoryTurns: number
+      trimReasons?: string[]
     }
   }
   autonomy?: AiAutonomyView
@@ -2963,6 +2978,9 @@ export class RemoteHttpGateway implements MuriArcGateway {
   async getAiDiagnostics(): Promise<AiDiagnostics> {
     return (await this.request<ApiItem<AiDiagnostics>>('/ai/diagnostics')).data
   }
+  async listAiProviderPresets(): Promise<AiProviderPreset[]> {
+    return (await this.request<ApiCollection<AiProviderPreset>>('/ai/provider-presets')).data
+  }
   async getAiLabSettings(): Promise<AiLabSettings> {
     return (await this.request<ApiItem<AiLabSettings>>('/admin/ai')).data
   }
@@ -3143,6 +3161,13 @@ function mapAiTurn(raw: RawAiTurnResponse): AiTurnResponse {
         inputTokens: raw.trace.usage.input_tokens,
         outputTokens: raw.trace.usage.output_tokens,
         totalTokens: raw.trace.usage.total_tokens,
+      },
+      context: {
+        estimatedInputTokens: raw.trace.context?.estimatedInputTokens ?? 0,
+        inputTokenCountIsEstimate: raw.trace.context?.inputTokenCountIsEstimate ?? false,
+        contextTrimmed: raw.trace.context?.contextTrimmed ?? false,
+        trimmedHistoryTurns: raw.trace.context?.trimmedHistoryTurns ?? 0,
+        trimReasons: raw.trace.context?.trimReasons ?? [],
       },
     },
     autonomy: raw.autonomy ?? defaultAiAutonomy(),
@@ -3819,24 +3844,33 @@ class DemoDomainStore {
     operatorName: '本地操作者',
   }
   aiSettings: AiSettings = {
-    enabled: false,
+    enabled: true,
     providerKind: 'open_ai_compatible',
-    model: 'gpt-4.1-mini',
-    baseUrl: 'https://api.openai.com/v1',
+    providerPresetId: 'deepseek',
+    model: 'deepseek-chat',
+    baseUrl: 'https://api.deepseek.com',
     hasKey: false,
     supportsVision: false,
+    contextWindowTokens: 131072,
+    maxInputTokens: 65536,
+    maxOutputTokens: 4096,
+    historyTokenBudget: 32768,
+    historyTurns: 20,
+    temperature: 0,
+    timeoutMs: 120000,
+    revision: 0,
   }
-  aiProviderEndpoints: AiProviderEndpoint[] = [
-    {
-      id: '00000000-0000-0000-0000-000000000001',
-      providerKind: 'open_ai_compatible',
-      label: 'OpenAI API',
-      baseUrl: 'https://api.openai.com/v1',
+  aiProviderEndpoints: AiProviderEndpoint[] = builtinAiProviderPresets
+    .filter((preset) => preset.recommendedBaseUrl)
+    .map((preset, index) => ({
+      id: `00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`,
+      providerKind: preset.providerKind,
+      label: `${preset.displayName} API`,
+      baseUrl: preset.recommendedBaseUrl,
       enabled: true,
       builtin: true,
       revision: 1,
-    },
-  ]
+    }))
 
   createCage(input: CreateCageInput) {
     if (this.cages.some((cage) => cage.room === input.room && cage.code.toLowerCase() === input.code.toLowerCase())) {
@@ -4795,14 +4829,28 @@ export class DemoGateway implements MuriArcGateway {
   async getAiSettings() { await pause(20); return clone(this.store.aiSettings) }
   async saveAiSettings(input: SaveAiSettingsInput) {
     await pause(20)
+    const sameCredentialBinding = this.store.aiSettings.providerKind === input.providerKind
+      && this.store.aiSettings.providerPresetId === input.providerPresetId
+      && this.store.aiSettings.baseUrl.replace(/\/$/, '') === input.baseUrl.replace(/\/$/, '')
     this.store.aiSettings = {
       enabled: input.enabled,
       providerKind: input.providerKind,
+      providerPresetId: input.providerPresetId,
       model: input.model,
       baseUrl: input.baseUrl,
       supportsVision: input.supportsVision ?? false,
       visionModel: input.visionModel,
-      hasKey: input.apiKey === undefined ? this.store.aiSettings.hasKey : input.apiKey.length > 0,
+      contextWindowTokens: input.contextWindowTokens,
+      maxInputTokens: input.maxInputTokens,
+      maxOutputTokens: input.maxOutputTokens,
+      historyTokenBudget: input.historyTokenBudget,
+      historyTurns: input.historyTurns,
+      temperature: input.temperature,
+      timeoutMs: input.timeoutMs,
+      revision: this.store.aiSettings.revision + 1,
+      hasKey: input.apiKey === undefined
+        ? (sameCredentialBinding && this.store.aiSettings.hasKey)
+        : input.apiKey.length > 0,
     }
     return clone(this.store.aiSettings)
   }
@@ -4810,6 +4858,10 @@ export class DemoGateway implements MuriArcGateway {
     await pause(20)
     this.store.aiSettings.hasKey = false
     return clone(this.store.aiSettings)
+  }
+  async listAiProviderPresets() {
+    await pause(20)
+    return clone(builtinAiProviderPresets)
   }
   async listAiProviderEndpoints() {
     await pause(20)
@@ -4866,6 +4918,13 @@ export class DemoGateway implements MuriArcGateway {
       trace: {
         providerId: 'demo', model: 'deterministic-demo',
         usage: { providerCalls: 0, toolCalls: 1, inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        context: {
+          estimatedInputTokens: 0,
+          inputTokenCountIsEstimate: true,
+          contextTrimmed: false,
+          trimmedHistoryTurns: 0,
+          trimReasons: [],
+        },
       },
     }
     let detail = this.aiConversations.get(conversationId)

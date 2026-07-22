@@ -173,10 +173,12 @@ external token 明文。验收停止时只执行 `docker compose down`，未使�
 
 ### G. AI and audit
 
-1. 让 AI 建议繁育方案；确认只返回分析/预测/建议，没有创建交配事件按钮或自动结果。
-2. 尝试要求 AI 直接创建 `MatingEvent` 或更新 Animal，应因固定工具面而无法执行。
-3. 在审计/来源页面抽查 Definition、检测、配对、窝次、Draft 注册、Observation 初值/修订，确认
-   actor、source、entity ID 与 revision 可追溯。
+1. 在全新 Server 数据卷启动普通 Compose 部署；确认 diagnostics 为 `runtimeConfigured=true`、`labEnabled=true`、`userEnabled=true`、`providerPresetsAvailable=true`，无个人 Key 时状态为 `waiting_for_personal_api_key`。确认只存在 Server/PostgreSQL 容器，没有 Ollama 容器、模型下载或外部 AI 请求。
+2. 分别以 Root、Editor、Viewer 保存 DeepSeek/智谱 GLM/Moonshot-Kimi、不同模型和不同测试 Key；确认读取接口只返回 `hasKey`，Root 配置不出现在其他用户页面。Fake upstream 必须分别捕获预期 Authorization、model、`max_tokens` 与 Temperature。未配置 Key 的用户不能触发 upstream。
+3. 修改 Root 模型与 Token 参数，刷新设置页后再次调用；确认参数保持并实际进入 Provider 请求，Editor/Viewer 不变。切换 Provider 或 Base URL 且不输入新 Key 时，旧 Key 必须清除而不是复用。
+4. 验证 `maxInputTokens + maxOutputTokens <= contextWindowTokens`；超限 UI 禁止保存。构造历史与工具结果压力，确认只裁剪最旧完整历史、tool call/result 不拆分、当前问题不截断，Trace 区分估算输入、裁剪原因与 Provider 真实 usage。
+5. 让 AI 建议繁育方案；确认只返回分析/预测/建议，没有创建交配事件按钮或自动结果。尝试要求 AI 直接创建 `MatingEvent` 或更新 Animal，应因固定工具面而无法执行。
+6. 在审计/来源页面抽查 AI 设置修改及 Definition、检测、配对、窝次、Draft 注册、Observation 初值/修订，确认 actor、source、entity ID 与 revision 可追溯；任何日志、Audit、错误与前端状态都不得包含 API Key。
 
 ### H. Desktop Windows 本地交付
 

@@ -477,23 +477,61 @@ export interface WorkspaceSettings {
 
 export type AiProviderKind = 'open_ai_compatible' | 'local_http'
 
+export interface AiProviderModelPreset {
+  id: string
+  displayName: string
+  contextWindowTokens: number
+  maxOutputTokens: number
+  supportsVision: boolean
+}
+
+export interface AiProviderPreset {
+  id: string
+  displayName: string
+  providerKind: AiProviderKind
+  recommendedBaseUrl: string
+  models: AiProviderModelPreset[]
+  supportsVision: boolean
+  documentationUrl: string
+  builtin: boolean
+  enabled: boolean
+  defaultPreset: boolean
+}
+
 export interface AiSettings {
   enabled: boolean
   providerKind: AiProviderKind
+  providerPresetId: string
   model: string
   baseUrl: string
   hasKey: boolean
   supportsVision: boolean
   visionModel?: string
+  contextWindowTokens: number
+  maxInputTokens: number
+  maxOutputTokens: number
+  historyTokenBudget: number
+  historyTurns: number
+  temperature: number
+  timeoutMs: number
+  revision: number
 }
 
 export interface SaveAiSettingsInput {
   enabled: boolean
   providerKind: AiProviderKind
+  providerPresetId: string
   model: string
   baseUrl: string
   supportsVision?: boolean
   visionModel?: string
+  contextWindowTokens: number
+  maxInputTokens: number
+  maxOutputTokens: number
+  historyTokenBudget: number
+  historyTurns: number
+  temperature: number
+  timeoutMs: number
   /** Omit to keep the existing protected secret. Never populated from a read response. */
   apiKey?: string
 }
@@ -658,6 +696,13 @@ export interface AiAssistantTrace {
     inputTokens: number
     outputTokens: number
     totalTokens: number
+  }
+  context: {
+    estimatedInputTokens: number
+    inputTokenCountIsEstimate: boolean
+    contextTrimmed: boolean
+    trimmedHistoryTurns: number
+    trimReasons: string[]
   }
 }
 

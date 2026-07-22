@@ -44,36 +44,62 @@ If the database password contains URL-reserved characters, URL-encode it before 
 
 `MURIARC_ROOT_PASSWORD` deliberately remains plaintext in the host environment under the approved deployment model. Mode `600` does **not** protect it from the host administrator, Docker daemon or `docker inspect`, process-environment collection, or anyone who can read an unencrypted `.env` backup. Encrypt and access-control configuration backups, restrict Docker membership, and never attach Compose configuration or container-inspection output to tickets.
 
-### Encrypted per-user AI credentials
+### Default AI runtime and encrypted per-user credentials
 
-The shared AI transport is opt-in. Generate one stable 32-byte Base64 master
-key and protect `.env` and its backup with the same care as the database backup:
+The shared AI runtime is enabled by default, but it does not install Ollama,
+download a model, or call an external Provider until a user has saved their own
+API key. A new user sees the enabled DeepSeek preset and the stable
+`waiting_for_personal_api_key` state rather than a runtime failure.
+
+On first start, when `MURIARC_AI_MASTER_KEY` is blank or absent, Server creates a
+stable random 32-byte Base64 key at
+`MURIARC_AI_MASTER_KEY_FILE` (default:
+`MURIARC_DATA_ROOT/secrets/ai-master-key`). The Compose deployment pins that file
+to `/var/lib/muriarc/secrets/ai-master-key` inside the persistent `server_data`
+volume. Back up this file together with deployment secrets. Subsequent starts
+reuse it; an invalid file or an unwritable secrets directory fails startup
+instead of falling back to plaintext or silently replacing the key.
+
+Operators may instead inject a stable key explicitly:
 
 ```bash
 openssl rand -base64 32
+# Set the output as MURIARC_AI_MASTER_KEY
 ```
 
-Set the output as `MURIARC_AI_MASTER_KEY` and keep
-`MURIARC_AI_MASTER_KEY_VERSION=1`. The key is never stored in PostgreSQL. It is
-used only to encrypt each user's Provider credential with AES-256-GCM and
-user/version-bound additional authenticated data. Losing or changing this key
-makes existing credentials unreadable; do not increment the version until a
-documented re-encryption workflow is available.
+Keep `MURIARC_AI_MASTER_KEY_VERSION=1` unless all existing credentials are
+re-encrypted through a documented rotation procedure. The master key is never
+stored in PostgreSQL. Each user's Provider key is encrypted independently with
+AES-256-GCM, a random nonce, and AAD bound to that user ID and key version.
+Losing or changing the master key makes existing credentials unreadable. Read
+APIs return only `hasKey`; Root and LabAdmin cannot read or reuse another user's
+key, model, endpoint, or Token parameters.
 
-If the key is empty, invalid, or absent, the Server never falls back to
-plaintext: `/api/v1/ai/settings`, `/api/v1/ai/turns`, and
-`/api/v1/ai/approvals` remain disabled.
+Built-in non-sensitive presets cover DeepSeek
+(`https://api.deepseek.com`), 智谱 GLM
+(`https://open.bigmodel.cn/api/paas/v4`), Moonshot/Kimi
+(`https://api.moonshot.cn/v1`), OpenAI
+(`https://api.openai.com/v1`), and custom OpenAI-compatible services. Presets
+are convenience metadata only. Each user independently chooses a Provider,
+model, Base URL, API key, context/input/output/history budgets, Temperature,
+timeout, and optional vision model. Changing only model or Token parameters
+preserves the same Provider credential; changing Provider identity or Base URL
+without supplying a new key clears the old binding.
 
-Provider exits are managed inside MuriArc by LabAdmin. The official
-`https://api.openai.com/v1` endpoint is built in. Every other
-OpenAI-compatible URL and every `LocalHttp` URL must be added as an exact
-Provider endpoint in the AI management page before users can save it in their
-personal AI settings. OpenAI-compatible custom endpoints must use HTTPS.
-Provider HTTP clients reject redirects, so approving one URL cannot silently
-redirect requests elsewhere. Use an HTTPS reverse proxy and network policy for
-any non-loopback Provider. Never put a user's Provider API key in environment
-variables; users save their own key through the authenticated settings endpoint,
-which never echoes it back.
+When the laboratory's custom-URL approval policy is enabled (the default),
+non-official OpenAI-compatible and every `LocalHttp` URL must exactly match an
+enabled endpoint registered by LabAdmin. When the policy is explicitly disabled,
+users may save URLs that still pass protocol validation. OpenAI-compatible cloud
+URLs require HTTPS. Provider HTTP clients reject redirects, so approving one URL
+cannot silently redirect requests elsewhere. Use an HTTPS reverse proxy and
+network policy for non-loopback services. Never place a user's Provider API key
+in environment variables or deployment logs.
+
+Database migration keeps each existing `ai_provider_settings` row owned by the
+same user, infers only a non-sensitive preset label from that user's existing
+URL, and adds safe runtime defaults. Existing Root settings remain Root-owned;
+Editor and Viewer accounts do not inherit them. Back up PostgreSQL and the
+master-key file before upgrade and verify a disposable restore before production.
 
 MuriArc reconciles the Environment Root on **every** Server start under one PostgreSQL transaction and advisory lock. It creates or verifies the Lab, Root User, LabAdmin membership, and Argon2id credential. A changed Root email/name is synchronized. If the environment password no longer verifies against the database hash, the hash, password-change timestamp, and credential revision are updated. Root identity or credential changes revoke all Root browser Sessions. Every write has a stable, sanitized Audit operation; plaintext passwords and hashes are never recorded.
 

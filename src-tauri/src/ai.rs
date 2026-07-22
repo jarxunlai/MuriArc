@@ -52,11 +52,12 @@ impl DesktopAiState {
         let resolved = self.settings.resolve_provider()?;
         let context = self.context().await?;
         self.workflow
-            .run_turn(
+            .run_turn_with_config(
                 resolved.provider,
                 resolved.api_key.as_ref().map(|secret| secret.as_str()),
                 &context,
                 request,
+                resolved.runtime,
             )
             .await
             .map_err(Into::into)
@@ -286,6 +287,7 @@ impl DesktopAiError {
             Self::Store(StoreError::NotFound { .. }) => "not_found",
             Self::Store(StoreError::Conflict(_)) => "conflict",
             Self::Store(StoreError::Validation(_))
+            | Self::Workflow(AiWorkflowError::Config(_))
             | Self::Workflow(AiWorkflowError::Approval(_))
             | Self::Workflow(AiWorkflowError::InvalidStoredDraft)
             | Self::Workflow(AiWorkflowError::UnsupportedDraftOperation)

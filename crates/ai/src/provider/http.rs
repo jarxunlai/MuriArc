@@ -320,6 +320,7 @@ fn parse_response(bytes: &[u8]) -> Result<CompletionResponse, ProviderError> {
         .into_iter()
         .next()
         .ok_or(ProviderError::MalformedResponse)?;
+    let finish_reason = choice.finish_reason;
     let content = choice
         .message
         .content
@@ -342,7 +343,11 @@ fn parse_response(bytes: &[u8]) -> Result<CompletionResponse, ProviderError> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     if content.is_none() && tool_calls.is_empty() {
-        return Err(ProviderError::EmptyResponse);
+        return if finish_reason.as_deref() == Some("length") {
+            Err(ProviderError::OutputBudgetExhausted)
+        } else {
+            Err(ProviderError::EmptyResponse)
+        };
     }
     let usage = wire.usage.map(|usage| TokenUsage {
         input_tokens: usage.prompt_tokens,
@@ -354,7 +359,7 @@ fn parse_response(bytes: &[u8]) -> Result<CompletionResponse, ProviderError> {
         model: wire.model,
         content,
         tool_calls,
-        finish_reason: choice.finish_reason,
+        finish_reason,
         usage,
     })
 }

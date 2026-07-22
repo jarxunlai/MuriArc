@@ -1,5 +1,14 @@
-use std::{env, error::Error, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    error::Error,
+    fs::{self, OpenOptions},
+    io::{ErrorKind, Read, Write},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
+use base64::{Engine as _, engine::general_purpose};
 use chrono::Duration;
 use muriarc_core::{AiOperationStore, AiScope, LabRole, MuriArcStore, WriteSource};
 use muriarc_data::DataFiles;
@@ -11,6 +20,7 @@ use muriarc_server::{
     sync_postgres_environment_root,
 };
 use muriarc_store_postgres::PostgresStore;
+use rand::{RngCore, rngs::OsRng};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -82,11 +92,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .with_technical_logs(Arc::new(PostgresTechnicalLogService::new(
         store.as_ref().clone(),
     )));
-    let state = configure_ai(state, store.clone())?;
     let data_root = PathBuf::from(required_env("MURIARC_DATA_ROOT")?);
     let attachment_root = PathBuf::from(required_env("MURIARC_ATTACHMENT_ROOT")?);
     tokio::fs::create_dir_all(&data_root).await?;
     tokio::fs::create_dir_all(&attachment_root).await?;
+    let state = configure_ai(state, store.clone(), &data_root)?;
     let state = state.with_data_storage(DataFiles::new(data_root), attachment_root);
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
     let ui_dir = env::var_os("MURIARC_UI_DIR").map(PathBuf::from);
@@ -99,14 +109,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn configure_ai(state: AppState, store: Arc<PostgresStore>) -> Result<AppState, Box<dyn Error>> {
-    let Some(encoded_key) = optional_secret_env("MURIARC_AI_MASTER_KEY")? else {
-        tracing::warn!(
-            "MURIARC_AI_MASTER_KEY is not set; shared AI settings, turns and approvals are disabled"
-        );
-        return Ok(state);
+fn configure_ai(
+    state: AppState,
+    store: Arc<PostgresStore>,
+    data_root: &Path,
+) -> Result<AppState, Box<dyn Error>> {
+    let encoded_key = match optional_secret_env("MURIARC_AI_MASTER_KEY")? {
+        Some(value) => Zeroizing::new(value),
+        None => {
+            let path = env::var_os("MURIARC_AI_MASTER_KEY_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| data_root.join("secrets/ai-master-key"));
+            Zeroizing::new(load_or_create_ai_master_key_file(&path)?)
+        }
     };
-    let encoded_key = Zeroizing::new(encoded_key);
     let key_version = optional_positive_i32_env("MURIARC_AI_MASTER_KEY_VERSION", 1)?;
     let master_key = AiMasterKey::from_base64(encoded_key.as_str(), key_version)?;
     let providers = Arc::new(PostgresAiProviderStore::new(
@@ -116,9 +132,58 @@ fn configure_ai(state: AppState, store: Arc<PostgresStore>) -> Result<AppState, 
     let operations: Arc<dyn AiOperationStore> = store;
     tracing::info!(
         key_version,
-        "shared AI transport is enabled with encrypted per-user credentials"
+        "shared AI runtime is enabled with encrypted per-user credentials"
     );
     Ok(state.with_ai(operations, providers))
+}
+
+fn load_or_create_ai_master_key_file(path: &Path) -> Result<String, Box<dyn Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::read_to_string(path) {
+        Ok(value) => return validated_master_key_file(value),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let encoded = general_purpose::STANDARD.encode(bytes);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(encoded.as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            tracing::warn!(
+                path = %path.display(),
+                "generated the stable deployment AI master key file; protect and back it up"
+            );
+            Ok(encoded)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let mut value = String::new();
+            OpenOptions::new()
+                .read(true)
+                .open(path)?
+                .read_to_string(&mut value)?;
+            validated_master_key_file(value)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validated_master_key_file(value: String) -> Result<String, Box<dyn Error>> {
+    let value = value.trim().to_owned();
+    AiMasterKey::from_base64(&value, 1)?;
+    Ok(value)
 }
 
 fn bootstrap_authenticator(
@@ -238,4 +303,28 @@ fn optional_secret_env(name: &'static str) -> Result<Option<String>, Box<dyn Err
 
 fn required_env(name: &'static str) -> Result<String, Box<dyn Error>> {
     env::var(name).map_err(|_| format!("required environment variable {name} is not set").into())
+}
+
+#[cfg(test)]
+mod ai_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn generated_master_key_is_stable_across_restarts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("secrets/ai-master-key");
+        let first = load_or_create_ai_master_key_file(&path).unwrap();
+        let second = load_or_create_ai_master_key_file(&path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(general_purpose::STANDARD.decode(first).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn compose_starts_only_server_and_postgres_without_local_models() {
+        let compose = include_str!("../../../docker-compose.yml").to_ascii_lowercase();
+        assert!(compose.contains("  db:"));
+        assert!(compose.contains("  server:"));
+        assert!(!compose.contains("ollama"));
+        assert!(!compose.contains("model pull"));
+    }
 }

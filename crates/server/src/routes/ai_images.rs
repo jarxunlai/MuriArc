@@ -1,5 +1,6 @@
 use super::{
     ApiJson, ApiPath, ApiQuery, CollectionResponse, ItemResponse,
+    ai_api::{provider_api_error, provider_resolve_error},
     attachment_files::{open_verified, remove_installed_object, write_object},
     collection, item, scope, store,
 };
@@ -18,6 +19,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
 use muriarc_ai::{
     AiProvider, ChatMessage, CompletionRequest, ProviderCredentials, VisionImageInput,
+    estimate_completion_input_tokens,
 };
 use muriarc_core::{
     AiExtractionDraft, AiExtractionItem, AiExtractionStatus, AppliedAiExtraction, Attachment,
@@ -571,18 +573,15 @@ async fn create_extraction(
             .map_err(|_| ApiError::internal().with_request_id(m.request_id.clone()))?,
         q.experiment_id
     );
-    let ResolvedAiProvider { provider, api_key } = state
+    let ResolvedAiProvider {
+        provider,
+        api_key,
+        runtime,
+    } = state
         .ai_providers
         .resolve_vision(p.user_id)
         .await
-        .map_err(|e| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "vision_provider_unavailable",
-                e.to_string(),
-            )
-            .with_request_id(m.request_id.clone())
-        })?;
+        .map_err(|error| provider_resolve_error(error, &m))?;
     let provider_id = provider.provider_id().to_owned();
     let model = provider.model().to_owned();
     let credentials = match api_key.as_ref() {
@@ -597,16 +596,27 @@ async fn create_extraction(
             data_base64: STANDARD.encode(bytes),
         }],
     )]);
-    request.temperature = Some(0.0);
-    request.max_output_tokens = Some(4096);
-    let response = provider.complete(request, credentials).await.map_err(|e| {
-        ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "vision_provider_failed",
-            e.to_string(),
+    request.temperature = Some(runtime.temperature);
+    request.max_output_tokens = Some(runtime.max_output_tokens);
+    let estimated_input_tokens = estimate_completion_input_tokens(&request);
+    if estimated_input_tokens > u64::from(runtime.max_input_tokens) {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "context_exceeded",
+            "the image and extraction prompt exceed the configured input token budget",
         )
-        .with_request_id(m.request_id.clone())
-    })?;
+        .with_details(serde_json::json!({
+            "estimatedInputTokens": estimated_input_tokens,
+            "inputTokenCountIsEstimate": true,
+            "maxInputTokens": runtime.max_input_tokens,
+            "currentInputTruncated": false,
+        }))
+        .with_request_id(m.request_id));
+    }
+    let response = provider
+        .complete(request, credentials)
+        .await
+        .map_err(|error| provider_api_error(error, &m))?;
     let raw = response
         .content
         .ok_or_else(|| invalid_vision("provider returned no structured result", &m))?;

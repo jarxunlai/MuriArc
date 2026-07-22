@@ -1,7 +1,7 @@
 use std::fmt;
 
 use async_trait::async_trait;
-use muriarc_ai::{BuiltinProvider, ProviderKind};
+use muriarc_ai::{AssistantRuntimeConfig, BuiltinProvider, ProviderKind};
 #[cfg(feature = "postgres")]
 use muriarc_ai::{ProviderConfig, ProviderCredentials};
 use muriarc_core::{AiAutonomyMode, AuditContext};
@@ -13,30 +13,47 @@ use zeroize::Zeroizing;
 #[cfg(feature = "postgres")]
 const SERVER_PROVIDER_ID: &str = "server-user-provider";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiProviderSettingsView {
     pub enabled: bool,
     pub provider_kind: ProviderKind,
+    pub provider_preset_id: String,
     pub model: String,
     pub base_url: String,
     pub has_key: bool,
     pub supports_vision: bool,
     pub vision_model: Option<String>,
+    pub context_window_tokens: u32,
+    pub max_input_tokens: u32,
+    pub max_output_tokens: u32,
+    pub history_token_budget: u32,
+    pub history_turns: u32,
+    pub temperature: f32,
+    pub timeout_ms: u64,
     pub revision: i64,
 }
 
 impl AiProviderSettingsView {
     #[cfg(feature = "postgres")]
     fn unconfigured() -> Self {
+        let runtime = AssistantRuntimeConfig::default();
         Self {
-            enabled: false,
+            enabled: true,
             provider_kind: ProviderKind::OpenAiCompatible,
-            model: "gpt-4.1-mini".to_owned(),
-            base_url: "https://api.openai.com/v1".to_owned(),
+            provider_preset_id: "deepseek".to_owned(),
+            model: "deepseek-chat".to_owned(),
+            base_url: "https://api.deepseek.com".to_owned(),
             has_key: false,
             supports_vision: false,
             vision_model: None,
+            context_window_tokens: runtime.context_window_tokens,
+            max_input_tokens: runtime.max_input_tokens,
+            max_output_tokens: runtime.max_output_tokens,
+            history_token_budget: runtime.history_token_budget,
+            history_turns: runtime.history_turns,
+            temperature: runtime.temperature,
+            timeout_ms: runtime.timeout_ms,
             revision: 0,
         }
     }
@@ -47,14 +64,71 @@ impl AiProviderSettingsView {
 pub struct SaveAiProviderSettingsInput {
     pub enabled: bool,
     pub provider_kind: ProviderKind,
+    #[serde(default = "default_provider_preset_id")]
+    pub provider_preset_id: String,
     pub model: String,
     pub base_url: String,
     #[serde(default)]
     pub supports_vision: bool,
     #[serde(default)]
     pub vision_model: Option<String>,
+    #[serde(default = "default_context_window_tokens")]
+    pub context_window_tokens: u32,
+    #[serde(default = "default_max_input_tokens")]
+    pub max_input_tokens: u32,
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
+    #[serde(default = "default_history_token_budget")]
+    pub history_token_budget: u32,
+    #[serde(default = "default_history_turns")]
+    pub history_turns: u32,
+    #[serde(default = "default_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u64,
     #[serde(default)]
     pub api_key: Option<String>,
+}
+
+fn default_provider_preset_id() -> String {
+    "deepseek".to_owned()
+}
+const fn default_context_window_tokens() -> u32 {
+    131_072
+}
+const fn default_max_input_tokens() -> u32 {
+    65_536
+}
+const fn default_max_output_tokens() -> u32 {
+    4_096
+}
+const fn default_history_token_budget() -> u32 {
+    32_768
+}
+const fn default_history_turns() -> u32 {
+    20
+}
+const fn default_temperature() -> f32 {
+    0.0
+}
+const fn default_timeout_ms() -> u64 {
+    120_000
+}
+
+impl SaveAiProviderSettingsInput {
+    fn runtime(&self) -> Result<AssistantRuntimeConfig, AiProviderStoreError> {
+        AssistantRuntimeConfig {
+            context_window_tokens: self.context_window_tokens,
+            max_input_tokens: self.max_input_tokens,
+            max_output_tokens: self.max_output_tokens,
+            history_token_budget: self.history_token_budget,
+            history_turns: self.history_turns,
+            temperature: self.temperature,
+            timeout_ms: self.timeout_ms,
+        }
+        .validate()
+        .map_err(|_| AiProviderStoreError::InvalidSettings)
+    }
 }
 
 impl fmt::Debug for SaveAiProviderSettingsInput {
@@ -63,9 +137,17 @@ impl fmt::Debug for SaveAiProviderSettingsInput {
             .debug_struct("SaveAiProviderSettingsInput")
             .field("enabled", &self.enabled)
             .field("provider_kind", &self.provider_kind)
+            .field("provider_preset_id", &self.provider_preset_id)
             .field("model", &"[REDACTED]")
             .field("base_url", &"[REDACTED]")
             .field("supports_vision", &self.supports_vision)
+            .field("context_window_tokens", &self.context_window_tokens)
+            .field("max_input_tokens", &self.max_input_tokens)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("history_token_budget", &self.history_token_budget)
+            .field("history_turns", &self.history_turns)
+            .field("temperature", &self.temperature)
+            .field("timeout_ms", &self.timeout_ms)
             .field(
                 "vision_model",
                 &self.vision_model.as_ref().map(|_| "[REDACTED]"),
@@ -97,12 +179,17 @@ impl fmt::Debug for SensitiveSecret {
 pub struct ResolvedAiProvider {
     pub provider: BuiltinProvider,
     pub api_key: Option<SensitiveSecret>,
+    pub runtime: AssistantRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiProviderDiagnosticsView {
     pub runtime_configured: bool,
+    pub lab_enabled: bool,
+    pub user_enabled: bool,
+    pub provider_presets_available: bool,
+    pub status: String,
     pub provider_configured: bool,
     pub provider_enabled: bool,
     pub credential_configured: bool,
@@ -111,6 +198,31 @@ pub struct AiProviderDiagnosticsView {
     pub vision_model_configured: bool,
     pub local_endpoint_count: usize,
     pub cloud_endpoint_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProviderModelPresetView {
+    pub id: String,
+    pub display_name: String,
+    pub context_window_tokens: u32,
+    pub max_output_tokens: u32,
+    pub supports_vision: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProviderPresetView {
+    pub id: String,
+    pub display_name: String,
+    pub provider_kind: ProviderKind,
+    pub recommended_base_url: String,
+    pub models: Vec<AiProviderModelPresetView>,
+    pub supports_vision: bool,
+    pub documentation_url: String,
+    pub builtin: bool,
+    pub enabled: bool,
+    pub default_preset: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -186,8 +298,12 @@ pub enum AiProviderStoreError {
     LocalUrlForbidden,
     #[error("OpenAI-compatible provider URL is not enabled as a laboratory Provider endpoint")]
     CloudUrlForbidden,
-    #[error("AI provider is disabled")]
+    #[error("laboratory AI is disabled")]
+    LabDisabled,
+    #[error("AI is disabled for the current user")]
     Disabled,
+    #[error("the current user has not selected an AI Provider")]
+    ProviderNotSelected,
     #[error("AI provider credential is missing")]
     MissingCredential,
     #[error("AI secret master key configuration is invalid")]
@@ -234,6 +350,10 @@ pub trait UserAiProviderStore: Send + Sync {
         input: SaveAiLabSettingsInput,
         audit: &AuditContext,
     ) -> Result<AiLabSettingsView, AiProviderStoreError>;
+    async fn list_provider_presets(
+        &self,
+        lab_id: Uuid,
+    ) -> Result<Vec<AiProviderPresetView>, AiProviderStoreError>;
     async fn list_provider_endpoints(
         &self,
         lab_id: Uuid,
@@ -292,6 +412,10 @@ impl UserAiProviderStore for DisabledAiProviderStore {
     ) -> Result<AiProviderDiagnosticsView, AiProviderStoreError> {
         Ok(AiProviderDiagnosticsView {
             runtime_configured: false,
+            lab_enabled: true,
+            user_enabled: true,
+            provider_presets_available: false,
+            status: "runtime_not_configured".to_owned(),
             provider_configured: false,
             provider_enabled: false,
             credential_configured: false,
@@ -314,6 +438,12 @@ impl UserAiProviderStore for DisabledAiProviderStore {
         _input: SaveAiLabSettingsInput,
         _audit: &AuditContext,
     ) -> Result<AiLabSettingsView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+    async fn list_provider_presets(
+        &self,
+        _lab_id: Uuid,
+    ) -> Result<Vec<AiProviderPresetView>, AiProviderStoreError> {
         Err(AiProviderStoreError::NotConfigured)
     }
     async fn list_provider_endpoints(
@@ -350,10 +480,18 @@ mod shared_tests {
         let input = SaveAiProviderSettingsInput {
             enabled: true,
             provider_kind: ProviderKind::OpenAiCompatible,
+            provider_preset_id: "custom-openai-compatible".to_owned(),
             model: "private-model".to_owned(),
             base_url: "https://private-provider.example.test/v1".to_owned(),
             supports_vision: true,
             vision_model: Some("private-vision-model".to_owned()),
+            context_window_tokens: default_context_window_tokens(),
+            max_input_tokens: default_max_input_tokens(),
+            max_output_tokens: default_max_output_tokens(),
+            history_token_budget: default_history_token_budget(),
+            history_turns: default_history_turns(),
+            temperature: default_temperature(),
+            timeout_ms: default_timeout_ms(),
             api_key: Some("private-api-key".to_owned()),
         };
         let debug = format!("{input:?}");
@@ -380,8 +518,10 @@ mod postgres {
 
     const NONCE_BYTES: usize = 12;
     const KEY_BYTES: usize = 32;
+    const OFFICIAL_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
+    const OFFICIAL_GLM_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+    const OFFICIAL_KIMI_BASE_URL: &str = "https://api.moonshot.cn/v1";
     const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-    const OFFICIAL_OPENAI_LABEL: &str = "OpenAI API";
 
     pub struct AiMasterKey {
         bytes: Zeroizing<Vec<u8>>,
@@ -460,6 +600,10 @@ mod postgres {
                     input.base_url.clone(),
                 ),
             };
+            let mut config = config;
+            config.timeout_ms = input.timeout_ms;
+            input.runtime()?;
+            validate_preset_id(&input.provider_preset_id)?;
             BuiltinProvider::from_config(config.clone())
                 .map_err(|_| AiProviderStoreError::InvalidSettings)?;
             Ok(config)
@@ -508,20 +652,103 @@ mod postgres {
             }
         }
 
-        fn builtin_openai_endpoint_id() -> Uuid {
-            Uuid::from_u128(1)
+        fn builtin_endpoint_id(index: u128) -> Uuid {
+            Uuid::from_u128(index)
         }
 
-        fn builtin_openai_endpoint() -> AiProviderEndpointView {
-            AiProviderEndpointView {
-                id: Self::builtin_openai_endpoint_id(),
+        fn builtin_endpoints() -> Vec<AiProviderEndpointView> {
+            [
+                (1, "DeepSeek API", OFFICIAL_DEEPSEEK_BASE_URL),
+                (2, "智谱 GLM API", OFFICIAL_GLM_BASE_URL),
+                (3, "Moonshot / Kimi API", OFFICIAL_KIMI_BASE_URL),
+                (4, "OpenAI API", OFFICIAL_OPENAI_BASE_URL),
+            ]
+            .into_iter()
+            .map(|(id, label, base_url)| AiProviderEndpointView {
+                id: Self::builtin_endpoint_id(id),
                 provider_kind: ProviderKind::OpenAiCompatible,
-                label: OFFICIAL_OPENAI_LABEL.to_owned(),
-                base_url: OFFICIAL_OPENAI_BASE_URL.to_owned(),
+                label: label.to_owned(),
+                base_url: base_url.to_owned(),
                 enabled: true,
                 builtin: true,
                 revision: 1,
-            }
+            })
+            .collect()
+        }
+
+        fn builtin_provider_presets() -> Vec<AiProviderPresetView> {
+            vec![
+                preset(
+                    "deepseek",
+                    "DeepSeek",
+                    OFFICIAL_DEEPSEEK_BASE_URL,
+                    "https://api-docs.deepseek.com/",
+                    true,
+                    false,
+                    &[
+                        ("deepseek-chat", "DeepSeek Chat", 131_072, 8_192, false),
+                        (
+                            "deepseek-reasoner",
+                            "DeepSeek Reasoner",
+                            131_072,
+                            65_536,
+                            false,
+                        ),
+                    ],
+                ),
+                preset(
+                    "zhipu-glm",
+                    "智谱 GLM",
+                    OFFICIAL_GLM_BASE_URL,
+                    "https://docs.bigmodel.cn/cn/guide/develop/http/introduction",
+                    false,
+                    true,
+                    &[
+                        ("glm-5.2", "GLM-5.2", 131_072, 65_536, false),
+                        ("glm-5v-turbo", "GLM-5V-Turbo", 131_072, 16_384, true),
+                    ],
+                ),
+                preset(
+                    "moonshot-kimi",
+                    "Moonshot / Kimi",
+                    OFFICIAL_KIMI_BASE_URL,
+                    "https://platform.kimi.com/docs/api/chat",
+                    false,
+                    true,
+                    &[
+                        ("kimi-k3", "Kimi K3", 262_144, 65_536, true),
+                        ("kimi-k2.6", "Kimi K2.6", 262_144, 65_536, true),
+                    ],
+                ),
+                preset(
+                    "openai",
+                    "OpenAI",
+                    OFFICIAL_OPENAI_BASE_URL,
+                    "https://developers.openai.com/api/docs/guides/latest-model",
+                    false,
+                    true,
+                    &[
+                        ("gpt-5.6", "GPT-5.6", 400_000, 128_000, true),
+                        ("gpt-5.6-terra", "GPT-5.6 Terra", 400_000, 128_000, true),
+                        ("gpt-5.6-luna", "GPT-5.6 Luna", 400_000, 128_000, true),
+                    ],
+                ),
+                preset(
+                    "custom-openai-compatible",
+                    "自定义 OpenAI-compatible",
+                    "",
+                    "",
+                    false,
+                    false,
+                    &[],
+                ),
+            ]
+        }
+
+        fn builtin_endpoint(endpoint_id: Uuid) -> bool {
+            Self::builtin_endpoints()
+                .iter()
+                .any(|endpoint| endpoint.id == endpoint_id)
         }
 
         fn endpoint_view(
@@ -578,6 +805,15 @@ mod postgres {
             .ok_or(AiProviderStoreError::Storage)
         }
 
+        async fn lab_enabled(&self, lab_id: Uuid) -> Result<bool, AiProviderStoreError> {
+            sqlx::query_scalar("SELECT enabled FROM ai_lab_settings WHERE lab_id = $1")
+                .bind(lab_id)
+                .fetch_optional(self.postgres.pool())
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)
+                .map(|value| value.unwrap_or(true))
+        }
+
         async fn validate_endpoint_for_lab(
             &self,
             lab_id: Uuid,
@@ -585,8 +821,26 @@ mod postgres {
         ) -> Result<(), AiProviderStoreError> {
             let normalized = normalized_url(&config.base_url);
             if config.kind == ProviderKind::OpenAiCompatible
-                && normalized == normalized_url(OFFICIAL_OPENAI_BASE_URL)
+                && [
+                    OFFICIAL_DEEPSEEK_BASE_URL,
+                    OFFICIAL_GLM_BASE_URL,
+                    OFFICIAL_KIMI_BASE_URL,
+                    OFFICIAL_OPENAI_BASE_URL,
+                ]
+                .into_iter()
+                .any(|value| normalized == normalized_url(value))
             {
+                return Ok(());
+            }
+            let approval_required: bool = sqlx::query_scalar(
+                "SELECT custom_url_approval_required FROM ai_lab_settings WHERE lab_id = $1",
+            )
+            .bind(lab_id)
+            .fetch_optional(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .unwrap_or(true);
+            if !approval_required {
                 return Ok(());
             }
             let allowed: bool = sqlx::query_scalar(
@@ -618,7 +872,7 @@ mod postgres {
             .fetch_one(self.postgres.pool())
             .await
             .map_err(|_| AiProviderStoreError::Storage)?;
-            Ok((counts.0 as usize, counts.1 as usize + 1))
+            Ok((counts.0 as usize, counts.1 as usize + 4))
         }
 
         fn encrypt(
@@ -677,7 +931,7 @@ mod postgres {
             &self,
             user_id: Uuid,
         ) -> Result<Option<sqlx::postgres::PgRow>, AiProviderStoreError> {
-            sqlx::query("SELECT enabled, provider_config, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, revision FROM ai_provider_settings WHERE user_id = $1")
+            sqlx::query("SELECT enabled, provider_config, provider_preset_id, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, context_window_tokens, max_input_tokens, max_output_tokens, history_token_budget, history_turns, temperature, timeout_ms, revision FROM ai_provider_settings WHERE user_id = $1")
                 .bind(user_id)
                 .fetch_optional(self.postgres.pool())
                 .await
@@ -688,7 +942,7 @@ mod postgres {
             transaction: &mut Transaction<'_, Postgres>,
             user_id: Uuid,
         ) -> Result<Option<sqlx::postgres::PgRow>, AiProviderStoreError> {
-            sqlx::query("SELECT enabled, provider_config, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, revision FROM ai_provider_settings WHERE user_id = $1 FOR UPDATE")
+            sqlx::query("SELECT enabled, provider_config, provider_preset_id, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, context_window_tokens, max_input_tokens, max_output_tokens, history_token_budget, history_turns, temperature, timeout_ms, revision FROM ai_provider_settings WHERE user_id = $1 FOR UPDATE")
                 .bind(user_id)
                 .fetch_optional(&mut **transaction)
                 .await
@@ -718,6 +972,9 @@ mod postgres {
                     .try_get("enabled")
                     .map_err(|_| AiProviderStoreError::Storage)?,
                 provider_kind: config.kind,
+                provider_preset_id: row
+                    .try_get("provider_preset_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
                 model: config.model,
                 base_url: config.base_url,
                 has_key: row
@@ -730,6 +987,16 @@ mod postgres {
                 vision_model: row
                     .try_get("vision_model")
                     .map_err(|_| AiProviderStoreError::Storage)?,
+                context_window_tokens: numeric_u32(row, "context_window_tokens")?,
+                max_input_tokens: numeric_u32(row, "max_input_tokens")?,
+                max_output_tokens: numeric_u32(row, "max_output_tokens")?,
+                history_token_budget: numeric_u32(row, "history_token_budget")?,
+                history_turns: numeric_u32(row, "history_turns")?,
+                temperature: row
+                    .try_get::<f64, _>("temperature")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    as f32,
+                timeout_ms: numeric_u64(row, "timeout_ms")?,
                 revision: row
                     .try_get("revision")
                     .map_err(|_| AiProviderStoreError::Storage)?,
@@ -743,12 +1010,19 @@ mod postgres {
             row: &sqlx::postgres::PgRow,
             vision: bool,
         ) -> Result<ResolvedAiProvider, AiProviderStoreError> {
+            if !self.lab_enabled(lab_id).await? {
+                return Err(AiProviderStoreError::LabDisabled);
+            }
             let enabled: bool = row
                 .try_get("enabled")
                 .map_err(|_| AiProviderStoreError::Storage)?;
             if !enabled {
                 return Err(AiProviderStoreError::Disabled);
             }
+            let preset_id: String = row
+                .try_get("provider_preset_id")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            validate_preset_id(&preset_id)?;
             let mut config = decode_config(row)?;
             if vision {
                 let supports_vision: bool = row
@@ -784,7 +1058,11 @@ mod postgres {
             if config.kind == ProviderKind::OpenAiCompatible && api_key.is_none() {
                 return Err(AiProviderStoreError::MissingCredential);
             }
-            Ok(ResolvedAiProvider { provider, api_key })
+            Ok(ResolvedAiProvider {
+                provider,
+                api_key,
+                runtime: runtime_from_row(row)?,
+            })
         }
     }
     #[async_trait]
@@ -804,6 +1082,9 @@ mod postgres {
         ) -> Result<AiProviderSettingsView, AiProviderStoreError> {
             validate_settings_audit(user_id, audit)?;
             let config = Self::config(&input)?;
+            let runtime = input.runtime()?;
+            let provider_preset_id = input.provider_preset_id.trim().to_owned();
+            validate_preset_id(&provider_preset_id)?;
             let vision_model = input
                 .vision_model
                 .as_deref()
@@ -821,11 +1102,6 @@ mod postgres {
             }
             let config_json =
                 serde_json::to_value(&config).map_err(|_| AiProviderStoreError::Storage)?;
-            let credential_action = if input.api_key.is_some() {
-                "replace"
-            } else {
-                "preserve"
-            };
             let mut transaction = self
                 .postgres
                 .pool()
@@ -836,6 +1112,16 @@ mod postgres {
             self.validate_endpoint_for_lab(lab_id, &config).await?;
             let current = Self::locked_row(&mut transaction, user_id).await?;
             let before = settings_audit_state(current.as_ref())?;
+            let identity_matches = current
+                .as_ref()
+                .map(|row| credential_identity_matches(row, &config, &provider_preset_id))
+                .transpose()?
+                .unwrap_or(false);
+            let credential_action = match (input.api_key.is_some(), identity_matches) {
+                (true, _) => "replace",
+                (false, true) => "preserve",
+                (false, false) => "clear_provider_change",
+            };
             let (key_version, nonce, ciphertext) = match input.api_key.as_deref() {
                 Some(secret) => {
                     let (nonce, ciphertext) = self.encrypt(user_id, secret)?;
@@ -845,7 +1131,7 @@ mod postgres {
                         Some(ciphertext),
                     )
                 }
-                None => match current.as_ref() {
+                None if identity_matches => match current.as_ref() {
                     Some(row) => (
                         row.try_get("secret_key_version")
                             .map_err(|_| AiProviderStoreError::Storage)?,
@@ -856,16 +1142,28 @@ mod postgres {
                     ),
                     None => (None, None, None),
                 },
+                None => (None, None, None),
             };
-            if input.enabled
-                && config.kind == ProviderKind::OpenAiCompatible
-                && ciphertext.is_none()
-            {
-                return Err(AiProviderStoreError::MissingCredential);
-            }
-            let row = sqlx::query("INSERT INTO ai_provider_settings (user_id, enabled, provider_config, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now(),now(),1) ON CONFLICT (user_id) DO UPDATE SET enabled = EXCLUDED.enabled, provider_config = EXCLUDED.provider_config, secret_key_version = EXCLUDED.secret_key_version, secret_nonce = EXCLUDED.secret_nonce, secret_ciphertext = EXCLUDED.secret_ciphertext, supports_vision = EXCLUDED.supports_vision, vision_model = EXCLUDED.vision_model, updated_at = now(), revision = ai_provider_settings.revision + 1 RETURNING enabled, provider_config, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, revision")
-                .bind(user_id).bind(input.enabled).bind(config_json).bind(key_version).bind(nonce).bind(ciphertext).bind(input.supports_vision).bind(vision_model)
-                .fetch_one(&mut *transaction).await.map_err(|_| AiProviderStoreError::Storage)?;
+            let row = sqlx::query("INSERT INTO ai_provider_settings (user_id, enabled, provider_config, provider_preset_id, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, context_window_tokens, max_input_tokens, max_output_tokens, history_token_budget, history_turns, temperature, timeout_ms, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now(),now(),1) ON CONFLICT (user_id) DO UPDATE SET enabled = EXCLUDED.enabled, provider_config = EXCLUDED.provider_config, provider_preset_id = EXCLUDED.provider_preset_id, secret_key_version = EXCLUDED.secret_key_version, secret_nonce = EXCLUDED.secret_nonce, secret_ciphertext = EXCLUDED.secret_ciphertext, supports_vision = EXCLUDED.supports_vision, vision_model = EXCLUDED.vision_model, context_window_tokens = EXCLUDED.context_window_tokens, max_input_tokens = EXCLUDED.max_input_tokens, max_output_tokens = EXCLUDED.max_output_tokens, history_token_budget = EXCLUDED.history_token_budget, history_turns = EXCLUDED.history_turns, temperature = EXCLUDED.temperature, timeout_ms = EXCLUDED.timeout_ms, updated_at = now(), revision = ai_provider_settings.revision + 1 RETURNING enabled, provider_config, provider_preset_id, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, context_window_tokens, max_input_tokens, max_output_tokens, history_token_budget, history_turns, temperature, timeout_ms, revision")
+                .bind(user_id)
+                .bind(input.enabled)
+                .bind(config_json)
+                .bind(provider_preset_id)
+                .bind(key_version)
+                .bind(nonce)
+                .bind(ciphertext)
+                .bind(input.supports_vision)
+                .bind(vision_model)
+                .bind(i64::from(runtime.context_window_tokens))
+                .bind(i64::from(runtime.max_input_tokens))
+                .bind(i64::from(runtime.max_output_tokens))
+                .bind(i64::from(runtime.history_token_budget))
+                .bind(i32::try_from(runtime.history_turns).map_err(|_| AiProviderStoreError::InvalidSettings)?)
+                .bind(f64::from(runtime.temperature))
+                .bind(i64::try_from(runtime.timeout_ms).map_err(|_| AiProviderStoreError::InvalidSettings)?)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
             let view = Self::view(&row)?;
             let after = tagged_settings_audit_state(
                 settings_audit_state(Some(&row))?,
@@ -910,7 +1208,7 @@ mod postgres {
             let current = Self::locked_row(&mut transaction, user_id).await?;
             let before = settings_audit_state(current.as_ref())?;
             let (view, after) = if current.is_some() {
-                let row = sqlx::query("UPDATE ai_provider_settings SET enabled = FALSE, secret_key_version = NULL, secret_nonce = NULL, secret_ciphertext = NULL, updated_at = now(), revision = revision + 1 WHERE user_id = $1 RETURNING enabled, provider_config, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, revision")
+                let row = sqlx::query("UPDATE ai_provider_settings SET secret_key_version = NULL, secret_nonce = NULL, secret_ciphertext = NULL, updated_at = now(), revision = revision + 1 WHERE user_id = $1 RETURNING enabled, provider_config, provider_preset_id, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, context_window_tokens, max_input_tokens, max_output_tokens, history_token_budget, history_turns, temperature, timeout_ms, revision")
                     .bind(user_id)
                     .fetch_one(&mut *transaction)
                     .await
@@ -945,7 +1243,7 @@ mod postgres {
             let row = self
                 .row(user_id)
                 .await?
-                .ok_or(AiProviderStoreError::NotConfigured)?;
+                .ok_or(AiProviderStoreError::MissingCredential)?;
             self.resolve_row(user_id, lab_id, &row, false).await
         }
 
@@ -957,7 +1255,7 @@ mod postgres {
             let row = self
                 .row(user_id)
                 .await?
-                .ok_or(AiProviderStoreError::NotConfigured)?;
+                .ok_or(AiProviderStoreError::MissingCredential)?;
             self.resolve_row(user_id, lab_id, &row, true).await
         }
 
@@ -977,28 +1275,44 @@ mod postgres {
                 return Err(AiProviderStoreError::Storage);
             }
             let row = self.row(user_id).await?;
+            let lab_enabled = self.lab_enabled(lab_id).await?;
+            let user_enabled = row
+                .as_ref()
+                .and_then(|value| value.try_get("enabled").ok())
+                .unwrap_or(true);
+            let credential_configured = row
+                .as_ref()
+                .and_then(|value| {
+                    value
+                        .try_get::<Option<Vec<u8>>, _>("secret_ciphertext")
+                        .ok()
+                })
+                .flatten()
+                .is_some();
+            let status = if !lab_enabled {
+                "lab_disabled"
+            } else if !user_enabled {
+                "user_disabled"
+            } else if !credential_configured {
+                "waiting_for_personal_api_key"
+            } else {
+                "ready"
+            };
             let (local_endpoint_count, cloud_endpoint_count) = self.endpoint_counts(lab_id).await?;
             Ok(AiProviderDiagnosticsView {
                 runtime_configured: true,
+                lab_enabled,
+                user_enabled,
+                provider_presets_available: true,
+                status: status.to_owned(),
                 provider_configured: row.is_some(),
-                provider_enabled: row
-                    .as_ref()
-                    .and_then(|value| value.try_get("enabled").ok())
-                    .unwrap_or(false),
-                credential_configured: row
-                    .as_ref()
-                    .and_then(|value| {
-                        value
-                            .try_get::<Option<Vec<u8>>, _>("secret_ciphertext")
-                            .ok()
-                    })
-                    .flatten()
-                    .is_some(),
+                provider_enabled: user_enabled,
+                credential_configured,
                 supports_vision: row
                     .as_ref()
                     .and_then(|value| value.try_get("supports_vision").ok())
                     .unwrap_or(false),
-                text_model_configured: row.is_some(),
+                text_model_configured: true,
                 vision_model_configured: row
                     .as_ref()
                     .and_then(|value| value.try_get::<Option<String>, _>("vision_model").ok())
@@ -1113,6 +1427,36 @@ mod postgres {
             self.get_lab_settings(lab_id).await
         }
 
+        async fn list_provider_presets(
+            &self,
+            lab_id: Uuid,
+        ) -> Result<Vec<AiProviderPresetView>, AiProviderStoreError> {
+            let rows = sqlx::query(
+                "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE lab_id = $1 ORDER BY enabled DESC, provider_kind, label, base_url",
+            )
+            .bind(lab_id)
+            .fetch_all(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            let mut presets = Self::builtin_provider_presets();
+            for row in &rows {
+                let endpoint = Self::endpoint_view(row)?;
+                presets.push(AiProviderPresetView {
+                    id: format!("endpoint:{}", endpoint.id),
+                    display_name: endpoint.label,
+                    provider_kind: endpoint.provider_kind,
+                    recommended_base_url: endpoint.base_url,
+                    models: Vec::new(),
+                    supports_vision: false,
+                    documentation_url: String::new(),
+                    builtin: false,
+                    enabled: endpoint.enabled,
+                    default_preset: false,
+                });
+            }
+            Ok(presets)
+        }
+
         async fn list_provider_endpoints(
             &self,
             lab_id: Uuid,
@@ -1124,7 +1468,7 @@ mod postgres {
             .fetch_all(self.postgres.pool())
             .await
             .map_err(|_| AiProviderStoreError::Storage)?;
-            let mut endpoints = vec![Self::builtin_openai_endpoint()];
+            let mut endpoints = Self::builtin_endpoints();
             endpoints.extend(
                 rows.iter()
                     .map(Self::endpoint_view)
@@ -1144,14 +1488,21 @@ mod postgres {
             if audit.actor.actor_type != ActorType::Human {
                 return Err(AiProviderStoreError::Storage);
             }
-            if endpoint_id == Some(Self::builtin_openai_endpoint_id()) {
+            if endpoint_id.is_some_and(Self::builtin_endpoint) {
                 return Err(AiProviderStoreError::InvalidSettings);
             }
             let label = Self::validated_endpoint_label(&input.label)?;
             let config = Self::endpoint_config(&input)?;
             let normalized = normalized_url(&config.base_url);
             if config.kind == ProviderKind::OpenAiCompatible
-                && normalized == normalized_url(OFFICIAL_OPENAI_BASE_URL)
+                && [
+                    OFFICIAL_DEEPSEEK_BASE_URL,
+                    OFFICIAL_GLM_BASE_URL,
+                    OFFICIAL_KIMI_BASE_URL,
+                    OFFICIAL_OPENAI_BASE_URL,
+                ]
+                .into_iter()
+                .any(|value| normalized == normalized_url(value))
             {
                 return Err(AiProviderStoreError::InvalidSettings);
             }
@@ -1259,9 +1610,7 @@ mod postgres {
             audit: &AuditContext,
         ) -> Result<AiProviderEndpointView, AiProviderStoreError> {
             let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
-            if audit.actor.actor_type != ActorType::Human
-                || endpoint_id == Self::builtin_openai_endpoint_id()
-            {
+            if audit.actor.actor_type != ActorType::Human || Self::builtin_endpoint(endpoint_id) {
                 return Err(AiProviderStoreError::Storage);
             }
             let mut transaction = self
@@ -1312,6 +1661,99 @@ mod postgres {
                 .map_err(|_| AiProviderStoreError::Storage)?;
             Ok(view)
         }
+    }
+
+    fn preset(
+        id: &str,
+        display_name: &str,
+        recommended_base_url: &str,
+        documentation_url: &str,
+        default_preset: bool,
+        supports_vision: bool,
+        models: &[(&str, &str, u32, u32, bool)],
+    ) -> AiProviderPresetView {
+        AiProviderPresetView {
+            id: id.to_owned(),
+            display_name: display_name.to_owned(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            recommended_base_url: recommended_base_url.to_owned(),
+            models: models
+                .iter()
+                .map(
+                    |(id, display_name, context, output, vision)| AiProviderModelPresetView {
+                        id: (*id).to_owned(),
+                        display_name: (*display_name).to_owned(),
+                        context_window_tokens: *context,
+                        max_output_tokens: *output,
+                        supports_vision: *vision,
+                    },
+                )
+                .collect(),
+            supports_vision,
+            documentation_url: documentation_url.to_owned(),
+            builtin: true,
+            enabled: true,
+            default_preset,
+        }
+    }
+
+    fn validate_preset_id(value: &str) -> Result<(), AiProviderStoreError> {
+        if value.is_empty()
+            || value.len() > 160
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.')
+            })
+        {
+            Err(AiProviderStoreError::ProviderNotSelected)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn numeric_i64(row: &sqlx::postgres::PgRow, column: &str) -> Result<i64, AiProviderStoreError> {
+        row.try_get::<i64, _>(column)
+            .or_else(|_| row.try_get::<i32, _>(column).map(i64::from))
+            .map_err(|_| AiProviderStoreError::Storage)
+    }
+
+    fn numeric_u32(row: &sqlx::postgres::PgRow, column: &str) -> Result<u32, AiProviderStoreError> {
+        u32::try_from(numeric_i64(row, column)?).map_err(|_| AiProviderStoreError::Storage)
+    }
+
+    fn numeric_u64(row: &sqlx::postgres::PgRow, column: &str) -> Result<u64, AiProviderStoreError> {
+        u64::try_from(numeric_i64(row, column)?).map_err(|_| AiProviderStoreError::Storage)
+    }
+
+    fn runtime_from_row(
+        row: &sqlx::postgres::PgRow,
+    ) -> Result<AssistantRuntimeConfig, AiProviderStoreError> {
+        AssistantRuntimeConfig {
+            context_window_tokens: numeric_u32(row, "context_window_tokens")?,
+            max_input_tokens: numeric_u32(row, "max_input_tokens")?,
+            max_output_tokens: numeric_u32(row, "max_output_tokens")?,
+            history_token_budget: numeric_u32(row, "history_token_budget")?,
+            history_turns: numeric_u32(row, "history_turns")?,
+            temperature: row
+                .try_get::<f64, _>("temperature")
+                .map_err(|_| AiProviderStoreError::Storage)? as f32,
+            timeout_ms: numeric_u64(row, "timeout_ms")?,
+        }
+        .validate()
+        .map_err(|_| AiProviderStoreError::InvalidSettings)
+    }
+
+    fn credential_identity_matches(
+        row: &sqlx::postgres::PgRow,
+        config: &ProviderConfig,
+        provider_preset_id: &str,
+    ) -> Result<bool, AiProviderStoreError> {
+        let current = decode_config(row)?;
+        let current_preset: String = row
+            .try_get("provider_preset_id")
+            .map_err(|_| AiProviderStoreError::Storage)?;
+        Ok(current.kind == config.kind
+            && normalized_url(&current.base_url) == normalized_url(&config.base_url)
+            && current_preset == provider_preset_id)
     }
 
     fn aad(user_id: Uuid, version: i32) -> String {
@@ -1480,6 +1922,226 @@ mod postgres {
             );
         }
 
+        fn settings_input(
+            preset_id: &str,
+            model: &str,
+            base_url: &str,
+            api_key: Option<&str>,
+        ) -> SaveAiProviderSettingsInput {
+            SaveAiProviderSettingsInput {
+                enabled: true,
+                provider_kind: ProviderKind::OpenAiCompatible,
+                provider_preset_id: preset_id.to_owned(),
+                model: model.to_owned(),
+                base_url: base_url.to_owned(),
+                supports_vision: false,
+                vision_model: None,
+                context_window_tokens: default_context_window_tokens(),
+                max_input_tokens: default_max_input_tokens(),
+                max_output_tokens: default_max_output_tokens(),
+                history_token_budget: default_history_token_budget(),
+                history_turns: default_history_turns(),
+                temperature: default_temperature(),
+                timeout_ms: default_timeout_ms(),
+                api_key: api_key.map(str::to_owned),
+            }
+        }
+
+        fn user_audit(user: &User, request_id: &str) -> AuditContext {
+            AuditContext {
+                actor: Actor::human(user.id, user.display_name.clone()),
+                source: WriteSource::Web,
+                request_id: Some(request_id.to_owned()),
+                reason: Some("test personal AI settings isolation".to_owned()),
+            }
+        }
+
+        #[tokio::test]
+        async fn root_editor_and_viewer_provider_settings_are_strictly_isolated() {
+            use muriarc_ai::AiProvider;
+
+            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+                return;
+            };
+            assert!(
+                database_url.contains("muriarc_test"),
+                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
+            );
+            let postgres = PostgresStore::connect(&database_url).await.unwrap();
+            postgres.migrate().await.unwrap();
+            let now = Utc::now();
+            let bootstrap = AuditContext::system(WriteSource::Migration);
+            let lab = Lab::new(format!("AI isolation lab {}", Uuid::new_v4()), now).unwrap();
+            postgres.create_lab(&lab, &bootstrap).await.unwrap();
+            let root = User::new(
+                lab.id,
+                format!("root-ai-{}@example.test", Uuid::new_v4()),
+                "Root AI owner",
+                now,
+            )
+            .unwrap();
+            let editor = User::new(
+                lab.id,
+                format!("editor-ai-{}@example.test", Uuid::new_v4()),
+                "Editor AI owner",
+                now,
+            )
+            .unwrap();
+            let viewer = User::new(
+                lab.id,
+                format!("viewer-ai-{}@example.test", Uuid::new_v4()),
+                "Viewer AI owner",
+                now,
+            )
+            .unwrap();
+            let newcomer = User::new(
+                lab.id,
+                format!("new-ai-{}@example.test", Uuid::new_v4()),
+                "New AI user",
+                now,
+            )
+            .unwrap();
+            for user in [&root, &editor, &viewer, &newcomer] {
+                postgres.create_user(user, &bootstrap).await.unwrap();
+            }
+
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
+            let cases = [
+                (
+                    &root,
+                    "deepseek",
+                    "deepseek-chat",
+                    OFFICIAL_DEEPSEEK_BASE_URL,
+                    "root-deepseek-key-a",
+                ),
+                (
+                    &editor,
+                    "zhipu-glm",
+                    "glm-5.2",
+                    OFFICIAL_GLM_BASE_URL,
+                    "editor-glm-key-b",
+                ),
+                (
+                    &viewer,
+                    "moonshot-kimi",
+                    "kimi-k3",
+                    OFFICIAL_KIMI_BASE_URL,
+                    "viewer-kimi-key-c",
+                ),
+            ];
+            for (user, preset, model, base_url, api_key) in cases {
+                let saved = store
+                    .save(
+                        user.id,
+                        settings_input(preset, model, base_url, Some(api_key)),
+                        &user_audit(user, &format!("save-{preset}")),
+                    )
+                    .await
+                    .unwrap();
+                assert!(saved.has_key);
+                assert_eq!(saved.provider_preset_id, preset);
+                assert_eq!(saved.model, model);
+                let serialized = serde_json::to_value(saved).unwrap();
+                assert!(serialized.get("apiKey").is_none());
+                assert!(serialized.get("secretCiphertext").is_none());
+
+                let resolved = store.resolve(user.id).await.unwrap();
+                assert_eq!(resolved.provider.model(), model);
+                assert_eq!(resolved.api_key.as_ref().unwrap().as_str(), api_key);
+            }
+
+            let root_updated = store
+                .save(
+                    root.id,
+                    settings_input(
+                        "deepseek",
+                        "deepseek-reasoner",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        None,
+                    ),
+                    &user_audit(&root, "root-model-update"),
+                )
+                .await
+                .unwrap();
+            assert!(root_updated.has_key);
+            assert_eq!(root_updated.model, "deepseek-reasoner");
+            assert_eq!(
+                store
+                    .resolve(root.id)
+                    .await
+                    .unwrap()
+                    .api_key
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                "root-deepseek-key-a"
+            );
+            assert_eq!(store.get(editor.id).await.unwrap().model, "glm-5.2");
+            assert_eq!(store.get(viewer.id).await.unwrap().model, "kimi-k3");
+
+            let editor_switched = store
+                .save(
+                    editor.id,
+                    settings_input("moonshot-kimi", "kimi-k3", OFFICIAL_KIMI_BASE_URL, None),
+                    &user_audit(&editor, "editor-provider-switch"),
+                )
+                .await
+                .unwrap();
+            assert!(!editor_switched.has_key);
+            assert!(matches!(
+                store.resolve(editor.id).await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+            assert_eq!(
+                store
+                    .resolve(viewer.id)
+                    .await
+                    .unwrap()
+                    .api_key
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                "viewer-kimi-key-c"
+            );
+
+            let cross_user_write = store
+                .save(
+                    editor.id,
+                    settings_input(
+                        "zhipu-glm",
+                        "glm-5.2",
+                        OFFICIAL_GLM_BASE_URL,
+                        Some("must-not-be-written"),
+                    ),
+                    &user_audit(&root, "root-cannot-write-editor-secret"),
+                )
+                .await;
+            assert!(matches!(
+                cross_user_write,
+                Err(AiProviderStoreError::Storage)
+            ));
+
+            let defaults = store.get(newcomer.id).await.unwrap();
+            assert!(defaults.enabled);
+            assert_eq!(defaults.provider_preset_id, "deepseek");
+            assert!(!defaults.has_key);
+            let diagnostics = store.diagnostics(newcomer.id, lab.id).await.unwrap();
+            assert!(diagnostics.runtime_configured);
+            assert!(diagnostics.lab_enabled);
+            assert!(diagnostics.user_enabled);
+            assert!(diagnostics.provider_presets_available);
+            assert_eq!(diagnostics.status, "waiting_for_personal_api_key");
+
+            drop(store);
+            let restarted_store = PostgresAiProviderStore::new(postgres, master());
+            let after_restart = restarted_store.resolve(root.id).await.unwrap();
+            assert_eq!(after_restart.provider.model(), "deepseek-reasoner");
+            assert_eq!(
+                after_restart.api_key.as_ref().unwrap().as_str(),
+                "root-deepseek-key-a"
+            );
+        }
+
         #[test]
         fn master_key_requires_exactly_32_base64_bytes() {
             let encoded = general_purpose::STANDARD.encode([9_u8; KEY_BYTES]);
@@ -1542,10 +2204,18 @@ mod postgres {
                     SaveAiProviderSettingsInput {
                         enabled: true,
                         provider_kind: ProviderKind::OpenAiCompatible,
+                        provider_preset_id: endpoint.id.to_string(),
                         model: sensitive_model.to_owned(),
                         base_url: sensitive_url.to_owned(),
                         supports_vision: false,
                         vision_model: None,
+                        context_window_tokens: default_context_window_tokens(),
+                        max_input_tokens: default_max_input_tokens(),
+                        max_output_tokens: default_max_output_tokens(),
+                        history_token_budget: default_history_token_budget(),
+                        history_turns: default_history_turns(),
+                        temperature: default_temperature(),
+                        timeout_ms: default_timeout_ms(),
                         api_key: Some(sensitive_key.to_owned()),
                     },
                     &audit,
@@ -1567,7 +2237,7 @@ mod postgres {
             assert_eq!(saved_audit["credential_present"], true);
 
             let cleared = store.clear_key(user.id, &audit).await.unwrap();
-            assert!(!cleared.enabled);
+            assert!(cleared.enabled);
             assert!(!cleared.has_key);
             let audit_payloads: Vec<String> = sqlx::query_scalar(
                 "SELECT coalesce(reason, '') || coalesce(before_json::text, '') || coalesce(after_json::text, '') FROM audit_entries WHERE entity_type = 'ai_provider_settings' AND entity_id = $1 ORDER BY occurred_at, id",
@@ -1606,10 +2276,18 @@ mod postgres {
                     SaveAiProviderSettingsInput {
                         enabled: true,
                         provider_kind: ProviderKind::OpenAiCompatible,
+                        provider_preset_id: "custom-openai-compatible".to_owned(),
                         model: "rejected-model".to_owned(),
                         base_url: "https://not-allowlisted.example.test/v1".to_owned(),
                         supports_vision: false,
                         vision_model: None,
+                        context_window_tokens: default_context_window_tokens(),
+                        max_input_tokens: default_max_input_tokens(),
+                        max_output_tokens: default_max_output_tokens(),
+                        history_token_budget: default_history_token_budget(),
+                        history_turns: default_history_turns(),
+                        temperature: default_temperature(),
+                        timeout_ms: default_timeout_ms(),
                         api_key: Some("another-key-that-must-not-be-recorded".to_owned()),
                     },
                     &audit,

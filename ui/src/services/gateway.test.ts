@@ -203,6 +203,14 @@ describe('MuriArc gateway selection', () => {
       providerKind: 'open_ai_compatible',
       model: 'gpt-4.1-mini',
       baseUrl: 'https://api.openai.com/v1',
+      providerPresetId: 'openai',
+      contextWindowTokens: 400000,
+      maxInputTokens: 65536,
+      maxOutputTokens: 4096,
+      historyTokenBudget: 32768,
+      historyTurns: 20,
+      temperature: 0,
+      timeoutMs: 120000,
       apiKey: 'write-only-secret',
     })
     const loaded = await gateway.getAiSettings()
@@ -608,8 +616,10 @@ describe('MuriArc gateway selection', () => {
     await remote.login({ email: 'r@example.org', password: 'not-retained' })
 
     const settings = await remote.saveAiSettings({
-      enabled: true, providerKind: 'open_ai_compatible', model: 'gpt-test',
-      baseUrl: 'https://api.example/v1', apiKey: 'write-only-key',
+      enabled: true, providerKind: 'open_ai_compatible', providerPresetId: 'custom-openai-compatible', model: 'gpt-test',
+      baseUrl: 'https://api.example/v1', contextWindowTokens: 131072, maxInputTokens: 65536,
+      maxOutputTokens: 4096, historyTokenBudget: 32768, historyTurns: 20,
+      temperature: 0, timeoutMs: 120000, apiKey: 'write-only-key',
     })
     const turn = await remote.aiTurn({ projectId: 'project-1', message: '总结进度' })
     await remote.listAiDrafts('project-1', 'pending_approval')
@@ -1125,13 +1135,30 @@ describe('browser demo gateway', () => {
     const saved = await gateway.saveAiSettings({
       enabled: true,
       providerKind: 'local_http',
+      providerPresetId: 'custom-openai-compatible',
       model: 'qwen-local',
       baseUrl: 'http://127.0.0.1:11434/v1',
+      contextWindowTokens: 65536,
+      maxInputTokens: 32768,
+      maxOutputTokens: 3072,
+      historyTokenBudget: 12000,
+      historyTurns: 8,
+      temperature: 0.4,
+      timeoutMs: 180000,
       apiKey: 'do-not-retain-this',
     })
     const loaded = await gateway.getAiSettings()
 
     expect(saved.hasKey).toBe(true)
+    expect(loaded).toEqual(expect.objectContaining({
+      contextWindowTokens: 65536,
+      maxInputTokens: 32768,
+      maxOutputTokens: 3072,
+      historyTokenBudget: 12000,
+      historyTurns: 8,
+      temperature: 0.4,
+      timeoutMs: 180000,
+    }))
     expect(JSON.stringify(loaded)).not.toContain('do-not-retain-this')
     expect((await gateway.clearAiApiKey()).hasKey).toBe(false)
   })

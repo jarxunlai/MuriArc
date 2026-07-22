@@ -182,6 +182,61 @@ async fn local_http_provider_uses_openai_wire_format_and_call_credentials() {
 }
 
 #[tokio::test]
+async fn deepseek_glm_and_kimi_compatible_requests_keep_credentials_and_models_isolated() {
+    for (provider_id, model, api_key) in [
+        ("deepseek", "deepseek-chat", "deepseek-key-a"),
+        ("zhipu-glm", "glm-5.2", "glm-key-b"),
+        ("moonshot-kimi", "kimi-k3", "kimi-key-c"),
+    ] {
+        let body = serde_json::json!({
+            "id": format!("response-{provider_id}"),
+            "model": model,
+            "choices": [{
+                "message": {"content": "OK", "tool_calls": []},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 1, "total_tokens": 12}
+        })
+        .to_string();
+        let (base_url, captured, handle) = spawn_http_server("200 OK", body, Duration::ZERO);
+        let provider =
+            LocalHttpProvider::new(ProviderConfig::local_http(provider_id, model, base_url))
+                .unwrap();
+        let mut request = CompletionRequest::new(vec![ChatMessage::user("ping")]);
+        request.max_output_tokens = Some(777);
+        request.temperature = Some(0.4);
+
+        let response = provider
+            .complete(request, ProviderCredentials::bearer(api_key).unwrap())
+            .await
+            .unwrap();
+        let captured = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(response.model.as_deref(), Some(model));
+        let authorization = captured
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then_some(value.trim())
+            })
+            .unwrap();
+        assert_eq!(authorization, format!("Bearer {api_key}"));
+        let payload: serde_json::Value = serde_json::from_str(
+            captured
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["model"], model);
+        assert_eq!(payload["max_tokens"], 777);
+        assert_eq!(payload["temperature"], 0.4);
+    }
+}
+
+#[tokio::test]
 async fn local_http_provider_serializes_assistant_tool_call_history() {
     let body = serde_json::json!({
         "id": "response-2",

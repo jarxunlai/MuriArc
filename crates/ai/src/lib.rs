@@ -23,8 +23,9 @@ pub use approval::{
 };
 pub use assistant::{
     AssistantConfigError, AssistantError, AssistantLimits, AssistantRequest, AssistantResponse,
-    AssistantService, AssistantUsage, Citation, DomainToolExecutor, DomainToolOutput,
-    DomainToolRequest, ToolExecutionError, ToolRunOutcome, ToolRunTrace, fixed_tool_definitions,
+    AssistantRuntimeConfig, AssistantService, AssistantUsage, Citation, ContextManagementTrace,
+    DomainToolExecutor, DomainToolOutput, DomainToolRequest, ToolExecutionError, ToolRunOutcome,
+    ToolRunTrace, estimate_completion_input_tokens, fixed_tool_definitions,
 };
 pub use autonomy::AiActionPolicy;
 pub use data_tools::{

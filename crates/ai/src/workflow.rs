@@ -13,15 +13,15 @@ use uuid::Uuid;
 
 use crate::{
     AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiDataAccessContext, AiDataToolBackend,
-    AiProvider, ApprovalDecision, ApprovalError, AssistantConversationDetail,
+    AiProvider, ApprovalDecision, ApprovalError, AssistantConfigError, AssistantConversationDetail,
     AssistantConversationMessage, AssistantConversationSummary, AssistantError, AssistantRequest,
-    AssistantService, AssistantTurnRequest, AssistantTurnResponse, ChatMessage,
-    DraftDecisionRequest, DraftKind, DraftStatus, HumanApprover, ProposalActor,
+    AssistantRuntimeConfig, AssistantService, AssistantTurnRequest, AssistantTurnResponse,
+    ChatMessage, DraftDecisionRequest, DraftKind, DraftStatus, HumanApprover, ProposalActor,
     ProviderCredentials, StoreDomainToolExecutor, StoreToolAccessContext, ToolExecutionError,
     ToolName, WriteDraft, WriteDraftSummary,
 };
 
-const PROVIDER_HISTORY_LIMIT: u32 = 40;
+const PROVIDER_HISTORY_LIMIT: u32 = 200;
 const CONVERSATION_LIST_LIMIT: u32 = 100;
 const CONVERSATION_DETAIL_LIMIT: u32 = 200;
 
@@ -203,6 +203,24 @@ impl AiWorkflowService {
         context: &AiExecutionContext,
         request: AssistantTurnRequest,
     ) -> Result<AssistantTurnResponse, AiWorkflowError> {
+        self.run_turn_with_config(
+            provider,
+            api_key,
+            context,
+            request,
+            AssistantRuntimeConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn run_turn_with_config<P: AiProvider>(
+        &self,
+        provider: P,
+        api_key: Option<&str>,
+        context: &AiExecutionContext,
+        request: AssistantTurnRequest,
+        runtime: AssistantRuntimeConfig,
+    ) -> Result<AssistantTurnResponse, AiWorkflowError> {
         let resolved = self.resolve_conversation(context, &request).await?;
         let conversation_id = resolved.conversation_id;
         let project_id = resolved.project_id;
@@ -239,7 +257,7 @@ impl AiWorkflowService {
             Some(api_key) => ProviderCredentials::bearer(api_key)?,
             None => ProviderCredentials::none(),
         };
-        let assistant = AssistantService::new(provider, executor);
+        let assistant = AssistantService::new(provider, executor).with_runtime_config(runtime)?;
         let response = assistant
             .run(
                 AssistantRequest::new(context.user_id, request.message.clone())
@@ -1031,6 +1049,8 @@ fn ai_audit(context: &AiExecutionContext, reason: &'static str) -> AuditContext 
 pub enum AiWorkflowError {
     #[error(transparent)]
     Assistant(#[from] AssistantError),
+    #[error(transparent)]
+    Config(#[from] AssistantConfigError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]

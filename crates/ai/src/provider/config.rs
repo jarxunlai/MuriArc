@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 pub const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 pub const MIN_TIMEOUT_MS: u64 = 50;
-pub const MAX_TIMEOUT_MS: u64 = 300_000;
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub const MIN_MAX_RESPONSE_BYTES: usize = 1024;
 pub const MAX_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -233,6 +233,8 @@ pub enum ProviderError {
     MalformedResponse,
     #[error("provider returned neither content nor a tool call")]
     EmptyResponse,
+    #[error("provider exhausted the output token budget before returning final content")]
+    OutputBudgetExhausted,
     #[error("mock provider has no queued response")]
     MockExhausted,
     #[error("mock provider state is unavailable")]

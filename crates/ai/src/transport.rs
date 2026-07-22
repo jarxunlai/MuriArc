@@ -5,8 +5,8 @@ use uuid::Uuid;
 use muriarc_core::{AiAutonomyMode, AiConversation, AiConversationMessageRole};
 
 use crate::{
-    ApprovalRequirement, AssistantResponse, AssistantUsage, Citation, DraftKind, DraftStatus,
-    FieldChange, ToolRunTrace, WriteDraft,
+    ApprovalRequirement, AssistantResponse, AssistantUsage, Citation, ContextManagementTrace,
+    DraftKind, DraftStatus, FieldChange, ToolRunTrace, WriteDraft,
 };
 
 /// Stable request contract shared by Tauri commands and `/api/v1/ai/turns`.
@@ -132,6 +132,7 @@ pub struct AssistantTrace {
     pub provider_id: String,
     pub model: String,
     pub usage: AssistantUsage,
+    pub context: ContextManagementTrace,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -184,6 +185,7 @@ impl AssistantTurnResponse {
                 provider_id: response.provider_id,
                 model: response.model,
                 usage: response.usage,
+                context: response.context,
             },
             autonomy,
         }

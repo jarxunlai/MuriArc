@@ -109,7 +109,200 @@ async fn bounded_user_assistant_history_is_sent_before_the_new_turn() {
 }
 
 #[tokio::test]
-async fn malformed_or_oversized_history_is_rejected_before_provider_access() {
+async fn runtime_token_and_sampling_settings_reach_the_provider_request() {
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [Ok(completion(Some("configured"), vec![]))],
+    );
+    let probe = provider.clone();
+    let runtime = AssistantRuntimeConfig {
+        context_window_tokens: 32_768,
+        max_input_tokens: 20_000,
+        max_output_tokens: 777,
+        history_token_budget: 10_000,
+        history_turns: 3,
+        temperature: 0.7,
+        timeout_ms: 2_000,
+    };
+    let service = AssistantService::new(provider, empty_read_executor())
+        .with_runtime_config(runtime)
+        .unwrap();
+
+    let response = service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), "use my saved parameters"),
+            &read_access(),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+
+    let requests = probe.requests().unwrap();
+    assert_eq!(requests[0].max_output_tokens, Some(777));
+    assert_eq!(requests[0].temperature, Some(0.7));
+    assert!(response.context.input_token_count_is_estimate);
+    assert!(response.context.estimated_input_tokens > 0);
+}
+
+#[tokio::test]
+async fn history_turn_limit_trims_only_the_oldest_complete_turns() {
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [Ok(completion(Some("third answer"), vec![]))],
+    );
+    let probe = provider.clone();
+    let runtime = AssistantRuntimeConfig {
+        history_turns: 1,
+        ..AssistantRuntimeConfig::default()
+    };
+    let service = AssistantService::new(provider, empty_read_executor())
+        .with_runtime_config(runtime)
+        .unwrap();
+    let request = AssistantRequest::new(Uuid::new_v4(), "third question").with_history(vec![
+        ChatMessage::user("first question"),
+        ChatMessage::assistant("first answer"),
+        ChatMessage::user("second question"),
+        ChatMessage::assistant("second answer"),
+    ]);
+
+    let response = service
+        .run(request, &read_access(), ProviderCredentials::none())
+        .await
+        .unwrap();
+
+    let requests = probe.requests().unwrap();
+    let messages = &requests[0].messages;
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[1].content, "second question");
+    assert_eq!(messages[2].content, "second answer");
+    assert_eq!(messages[3].content, "third question");
+    assert!(response.context.context_trimmed);
+    assert_eq!(response.context.trimmed_history_turns, 1);
+    assert_eq!(response.context.trim_reasons, vec!["history_turn_limit"]);
+}
+
+#[tokio::test]
+async fn oversized_current_question_is_rejected_without_provider_access_or_truncation() {
+    let provider = MockProvider::new("mock", "model", []);
+    let probe = provider.clone();
+    let runtime = AssistantRuntimeConfig {
+        context_window_tokens: 4_096,
+        max_input_tokens: 1_024,
+        max_output_tokens: 1_024,
+        history_token_budget: 0,
+        history_turns: 0,
+        temperature: 0.0,
+        timeout_ms: 2_000,
+    };
+    let service = AssistantService::new(provider, empty_read_executor())
+        .with_runtime_config(runtime)
+        .unwrap();
+    let question = format!("CURRENT-QUESTION:{}", "x".repeat(24_000));
+
+    let error = service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), question),
+            &read_access(),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AssistantError::ContextWindowExceeded {
+            max_input_tokens: 1_024,
+            ..
+        }
+    ));
+    assert!(probe.requests().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tool_result_pressure_trims_old_history_without_splitting_the_current_tool_pair() {
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [
+            Ok(completion(
+                None,
+                vec![call(
+                    "call-1",
+                    ToolName::AnimalSearch.as_str(),
+                    json!({"query": "M001"}),
+                )],
+            )),
+            Ok(completion(Some("done"), vec![])),
+        ],
+    );
+    let probe = provider.clone();
+    let executor = TestExecutor::new(|_| {
+        Ok(DomainToolOutput::read(
+            json!({"payload": "x".repeat(12_000)}),
+            vec![],
+        ))
+    });
+    let access = read_access();
+    let service = AssistantService::new(provider, executor);
+    let tools = service.visible_tools(&access);
+    let history = vec![
+        ChatMessage::user(format!("old-user:{}", "u".repeat(20_000))),
+        ChatMessage::assistant(format!("old-assistant:{}", "a".repeat(20_000))),
+    ];
+    let initial_messages = vec![
+        ChatMessage::system(SYSTEM_PROMPT),
+        history[0].clone(),
+        history[1].clone(),
+        ChatMessage::user("current question"),
+    ];
+    let initial_estimate =
+        u32::try_from(estimate_request_tokens(&initial_messages, &tools)).unwrap();
+    let history_budget = u32::try_from(estimate_messages_tokens(&history)).unwrap();
+    let runtime = AssistantRuntimeConfig {
+        context_window_tokens: initial_estimate + 4_096,
+        max_input_tokens: initial_estimate + 64,
+        max_output_tokens: 1_024,
+        history_token_budget: history_budget,
+        history_turns: 20,
+        temperature: 0.0,
+        timeout_ms: 2_000,
+    };
+    let service = service.with_runtime_config(runtime).unwrap();
+
+    let response = service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), "current question").with_history(history),
+            &access,
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+
+    assert!(response.context.context_trimmed);
+    assert_eq!(response.context.trimmed_history_turns, 1);
+    assert!(
+        response
+            .context
+            .trim_reasons
+            .iter()
+            .any(|reason| reason == "max_input_tokens")
+    );
+    let requests = probe.requests().unwrap();
+    assert_eq!(requests.len(), 2);
+    let second = &requests[1].messages;
+    assert_eq!(second[0].role, ChatRole::System);
+    assert_eq!(second[1].role, ChatRole::User);
+    assert_eq!(second[1].content, "current question");
+    assert_eq!(second[2].role, ChatRole::Assistant);
+    assert_eq!(second[2].tool_calls[0].id, "call-1");
+    assert_eq!(second[3].role, ChatRole::Tool);
+    assert_eq!(second[3].tool_call_id.as_deref(), Some("call-1"));
+}
+
+#[tokio::test]
+async fn malformed_history_is_rejected_before_provider_access() {
     let provider = MockProvider::new("mock", "model", []);
     let probe = provider.clone();
     let service = AssistantService::new(provider, empty_read_executor());

@@ -29,6 +29,63 @@ const ALL_TOOL_NAMES: [ToolName; 12] = [
     ToolName::MutationDraft,
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AssistantRuntimeConfig {
+    pub context_window_tokens: u32,
+    pub max_input_tokens: u32,
+    pub max_output_tokens: u32,
+    pub history_token_budget: u32,
+    pub history_turns: u32,
+    pub temperature: f32,
+    pub timeout_ms: u64,
+}
+
+impl Default for AssistantRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            context_window_tokens: 131_072,
+            max_input_tokens: 65_536,
+            max_output_tokens: 4_096,
+            history_token_budget: 32_768,
+            history_turns: 20,
+            temperature: 0.0,
+            timeout_ms: 120_000,
+        }
+    }
+}
+
+impl AssistantRuntimeConfig {
+    pub fn validate(self) -> Result<Self, AssistantConfigError> {
+        let valid = (4_096..=2_000_000).contains(&self.context_window_tokens)
+            && (1_024..=1_900_000).contains(&self.max_input_tokens)
+            && (1..=131_072).contains(&self.max_output_tokens)
+            && self.max_input_tokens.saturating_add(self.max_output_tokens)
+                <= self.context_window_tokens
+            && (0..=1_000_000).contains(&self.history_token_budget)
+            && self.history_token_budget <= self.max_input_tokens
+            && self.history_turns <= 100
+            && self.temperature.is_finite()
+            && (0.0..=2.0).contains(&self.temperature)
+            && (100..=600_000).contains(&self.timeout_ms);
+        if valid {
+            Ok(self)
+        } else {
+            Err(AssistantConfigError::InvalidRuntimeConfig)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextManagementTrace {
+    pub estimated_input_tokens: u64,
+    pub input_token_count_is_estimate: bool,
+    pub context_trimmed: bool,
+    pub trimmed_history_turns: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trim_reasons: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AssistantLimits {
     pub max_iterations: usize,
@@ -91,6 +148,8 @@ impl AssistantLimits {
 pub enum AssistantConfigError {
     #[error("assistant safety limits are invalid")]
     InvalidLimits,
+    #[error("assistant token and timeout settings are invalid")]
+    InvalidRuntimeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +305,7 @@ pub struct AssistantResponse {
     pub provider_id: String,
     pub model: String,
     pub usage: AssistantUsage,
+    pub context: ContextManagementTrace,
 }
 
 #[derive(Debug, Error)]
@@ -300,12 +360,20 @@ pub enum AssistantError {
     MissingFinalContent,
     #[error("assistant exceeded its total execution deadline")]
     TotalTimeoutExceeded,
+    #[error(
+        "assistant input context estimate {estimated_tokens} exceeds the configured {max_input_tokens} token limit"
+    )]
+    ContextWindowExceeded {
+        estimated_tokens: u64,
+        max_input_tokens: u32,
+    },
 }
 
 pub struct AssistantService<P, E> {
     provider: P,
     executor: E,
     limits: AssistantLimits,
+    runtime: AssistantRuntimeConfig,
 }
 
 impl<P, E> AssistantService<P, E>
@@ -318,6 +386,7 @@ where
             provider,
             executor,
             limits: AssistantLimits::default(),
+            runtime: AssistantRuntimeConfig::default(),
         }
     }
 
@@ -326,11 +395,32 @@ where
         executor: E,
         limits: AssistantLimits,
     ) -> Result<Self, AssistantConfigError> {
+        let limits = limits.validate()?;
+        let defaults = AssistantRuntimeConfig::default();
+        let estimated_history_budget =
+            u32::try_from(limits.max_history_bytes / 3).unwrap_or(u32::MAX);
+        let runtime = AssistantRuntimeConfig {
+            max_output_tokens: limits.max_output_tokens,
+            history_token_budget: estimated_history_budget.min(defaults.max_input_tokens),
+            history_turns: u32::try_from(limits.max_history_messages / 2).unwrap_or(u32::MAX),
+            timeout_ms: limits.total_timeout_ms,
+            ..defaults
+        }
+        .validate()?;
         Ok(Self {
             provider,
             executor,
-            limits: limits.validate()?,
+            limits,
+            runtime,
         })
+    }
+
+    pub fn with_runtime_config(
+        mut self,
+        runtime: AssistantRuntimeConfig,
+    ) -> Result<Self, AssistantConfigError> {
+        self.runtime = runtime.validate()?;
+        Ok(self)
     }
 
     pub const fn limits(&self) -> AssistantLimits {
@@ -356,7 +446,7 @@ where
         credentials: ProviderCredentials<'_>,
     ) -> Result<AssistantResponse, AssistantError> {
         tokio::time::timeout(
-            Duration::from_millis(self.limits.total_timeout_ms),
+            Duration::from_millis(self.runtime.timeout_ms),
             self.run_bounded(request, access, credentials),
         )
         .await
@@ -374,7 +464,7 @@ where
         {
             return Err(AssistantError::InvalidUserMessage);
         }
-        validate_history(&request.history, self.limits)?;
+        validate_history_structure(&request.history)?;
 
         let supported_tools = self.executor.supported_tools();
         let tools = fixed_tool_definitions()
@@ -385,10 +475,8 @@ where
                 })
             })
             .collect::<Vec<_>>();
-        let mut messages = Vec::with_capacity(request.history.len() + 2);
-        messages.push(ChatMessage::system(SYSTEM_PROMPT));
-        messages.extend(request.history);
-        messages.push(ChatMessage::user(request.message));
+        let (mut messages, mut current_user_index, mut context) =
+            prepare_bounded_messages(request.history, request.message, &tools, self.runtime)?;
         let mut seen_call_ids = BTreeSet::new();
         let mut cumulative_bytes = 0_usize;
         let mut usage = AssistantUsage::default();
@@ -397,14 +485,23 @@ where
         let mut drafts = Vec::new();
 
         for iteration in 0..self.limits.max_iterations {
+            let estimate = enforce_input_budget(
+                &mut messages,
+                &mut current_user_index,
+                &tools,
+                self.runtime,
+                &mut context,
+            )?;
+            context.estimated_input_tokens = estimate;
+            context.input_token_count_is_estimate = true;
             let response = self
                 .provider
                 .complete(
                     CompletionRequest {
                         messages: messages.clone(),
                         tools: tools.clone(),
-                        temperature: Some(0.0),
-                        max_output_tokens: Some(self.limits.max_output_tokens),
+                        temperature: Some(self.runtime.temperature),
+                        max_output_tokens: Some(self.runtime.max_output_tokens),
                     },
                     credentials,
                 )
@@ -425,6 +522,7 @@ where
                     provider_id: self.provider.provider_id().to_owned(),
                     model: self.provider.model().to_owned(),
                     usage,
+                    context,
                 });
             }
 
@@ -508,14 +606,10 @@ where
     }
 }
 
-fn validate_history(
-    history: &[ChatMessage],
-    limits: AssistantLimits,
-) -> Result<(), AssistantError> {
-    if history.len() > limits.max_history_messages || !history.len().is_multiple_of(2) {
+fn validate_history_structure(history: &[ChatMessage]) -> Result<(), AssistantError> {
+    if !history.len().is_multiple_of(2) {
         return Err(AssistantError::InvalidConversationHistory);
     }
-    let mut bytes = 0_usize;
     for (index, message) in history.iter().enumerate() {
         let expected_role = if index.is_multiple_of(2) {
             ChatRole::User
@@ -529,14 +623,126 @@ fn validate_history(
         {
             return Err(AssistantError::InvalidConversationHistory);
         }
-        bytes = bytes
-            .checked_add(message.content.len())
-            .ok_or(AssistantError::InvalidConversationHistory)?;
-        if bytes > limits.max_history_bytes {
-            return Err(AssistantError::InvalidConversationHistory);
-        }
     }
     Ok(())
+}
+
+fn prepare_bounded_messages(
+    mut history: Vec<ChatMessage>,
+    user_message: String,
+    tools: &[ToolDefinition],
+    runtime: AssistantRuntimeConfig,
+) -> Result<(Vec<ChatMessage>, usize, ContextManagementTrace), AssistantError> {
+    let mut context = ContextManagementTrace {
+        input_token_count_is_estimate: true,
+        ..ContextManagementTrace::default()
+    };
+    let allowed_messages = (runtime.history_turns as usize).saturating_mul(2);
+    while history.len() > allowed_messages {
+        history.drain(..2);
+        record_trim(&mut context, "history_turn_limit");
+    }
+    while estimate_messages_tokens(&history) > u64::from(runtime.history_token_budget)
+        && !history.is_empty()
+    {
+        history.drain(..2);
+        record_trim(&mut context, "history_token_budget");
+    }
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    messages.push(ChatMessage::system(SYSTEM_PROMPT));
+    messages.extend(history);
+    let current_user_index = messages.len();
+    messages.push(ChatMessage::user(user_message));
+    let mut current_user_index = current_user_index;
+    let estimate = enforce_input_budget(
+        &mut messages,
+        &mut current_user_index,
+        tools,
+        runtime,
+        &mut context,
+    )?;
+    context.estimated_input_tokens = estimate;
+    Ok((messages, current_user_index, context))
+}
+
+fn enforce_input_budget(
+    messages: &mut Vec<ChatMessage>,
+    current_user_index: &mut usize,
+    tools: &[ToolDefinition],
+    runtime: AssistantRuntimeConfig,
+    context: &mut ContextManagementTrace,
+) -> Result<u64, AssistantError> {
+    let mut estimate = estimate_request_tokens(messages, tools);
+    while estimate > u64::from(runtime.max_input_tokens) && *current_user_index > 1 {
+        messages.drain(1..3);
+        *current_user_index -= 2;
+        record_trim(context, "max_input_tokens");
+        estimate = estimate_request_tokens(messages, tools);
+    }
+    if estimate > u64::from(runtime.max_input_tokens) {
+        return Err(AssistantError::ContextWindowExceeded {
+            estimated_tokens: estimate,
+            max_input_tokens: runtime.max_input_tokens,
+        });
+    }
+    Ok(estimate)
+}
+
+fn record_trim(context: &mut ContextManagementTrace, reason: &str) {
+    context.context_trimmed = true;
+    context.trimmed_history_turns = context.trimmed_history_turns.saturating_add(1);
+    if !context.trim_reasons.iter().any(|item| item == reason) {
+        context.trim_reasons.push(reason.to_owned());
+    }
+}
+
+/// Estimates the Provider input size without claiming tokenizer-precise usage.
+/// Provider-reported usage remains the only authoritative token count.
+pub fn estimate_completion_input_tokens(request: &CompletionRequest) -> u64 {
+    estimate_request_tokens(&request.messages, &request.tools)
+}
+
+fn estimate_request_tokens(messages: &[ChatMessage], tools: &[ToolDefinition]) -> u64 {
+    estimate_messages_tokens(messages).saturating_add(
+        tools
+            .iter()
+            .map(|tool| {
+                8_u64
+                    .saturating_add(estimate_text_tokens(&tool.name))
+                    .saturating_add(estimate_text_tokens(&tool.description))
+                    .saturating_add(estimate_text_tokens(&tool.parameters.to_string()))
+            })
+            .sum::<u64>(),
+    )
+}
+
+fn estimate_messages_tokens(messages: &[ChatMessage]) -> u64 {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+fn estimate_message_tokens(message: &ChatMessage) -> u64 {
+    let mut tokens = 4_u64.saturating_add(estimate_text_tokens(&message.content));
+    if let Some(tool_call_id) = &message.tool_call_id {
+        tokens = tokens.saturating_add(estimate_text_tokens(tool_call_id));
+    }
+    for call in &message.tool_calls {
+        tokens = tokens
+            .saturating_add(8)
+            .saturating_add(estimate_text_tokens(&call.id))
+            .saturating_add(estimate_text_tokens(&call.name))
+            .saturating_add(estimate_text_tokens(&call.arguments.to_string()));
+    }
+    for image in &message.images {
+        // Explicit estimate only: approximate image payload at one token per KiB.
+        tokens = tokens.saturating_add((image.data_base64.len() as u64).div_ceil(1_024));
+    }
+    tokens
+}
+
+fn estimate_text_tokens(value: &str) -> u64 {
+    // Provider tokenizers differ. A conservative UTF-8 byte estimate is exposed as
+    // an estimate in the trace and is never mixed with Provider-reported usage.
+    (value.len() as u64).div_ceil(3).saturating_add(1)
 }
 
 struct PreparedCall {

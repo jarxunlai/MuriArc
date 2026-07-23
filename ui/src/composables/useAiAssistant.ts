@@ -644,6 +644,8 @@ export function useAiAssistant() {
     const enteredValue = prompt.trim()
     const stagedSnapshot = [...stagedImages.value]
     if ((!enteredValue && !stagedSnapshot.length) || busy.value) return
+    const disabledReason = composerDisabledReason.value
+    if (disabledReason) throw new Error(disabledReason)
     const value = enteredValue || '请分析这些图片。'
     if (!conversationId.value) await startConversation(startOptions)
 

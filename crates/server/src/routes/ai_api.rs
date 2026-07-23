@@ -2792,6 +2792,51 @@ mod tests {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
     }
 
+    #[tokio::test]
+    async fn stale_defaults_fail_closed_and_secret_storage_errors_stay_generic() {
+        let metadata = RequestMetadata {
+            request_id: "phase-five-default-safety".to_owned(),
+            reason: None,
+        };
+
+        for error in [
+            AiProviderStoreError::ModelProfileNotFound,
+            AiProviderStoreError::ProviderNotSelected,
+        ] {
+            let error = default_model_error(error, &metadata);
+            assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = response_json(error.into_response()).await;
+            assert_eq!(body["error"]["code"], "model_selection_required");
+            assert_eq!(body["error"]["request_id"], metadata.request_id);
+        }
+        for error in [
+            AiProviderStoreError::ModelProfileNotFound,
+            AiProviderStoreError::ProviderNotSelected,
+        ] {
+            let error = default_vision_model_error(error, &metadata);
+            assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = response_json(error.into_response()).await;
+            assert_eq!(body["error"]["code"], "vision_model_selection_required");
+            assert_eq!(body["error"]["request_id"], metadata.request_id);
+        }
+
+        for error in [
+            AiProviderStoreError::InvalidMasterKey,
+            AiProviderStoreError::Encryption,
+            AiProviderStoreError::Storage,
+        ] {
+            let error = provider_settings_error(error, &metadata);
+            assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = response_json(error.into_response()).await;
+            assert_eq!(body["error"]["code"], "internal_error");
+            assert_eq!(
+                body["error"]["message"],
+                "an internal server error occurred"
+            );
+            assert_eq!(body["error"]["request_id"], metadata.request_id);
+        }
+    }
+
     async fn upload_test_image(fixture: &ConversationFixture) -> Uuid {
         let response = fixture
             .app
@@ -3245,6 +3290,27 @@ mod tests {
         assert_eq!(
             history["data"]["conversation"]["readOnlyReason"],
             "model_archived"
+        );
+
+        let replacement = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/conversations",
+                Some(conversation_start_request(AiAutonomyMode::Ask, None, None)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replacement.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(replacement).await["error"]["code"],
+            "model_selection_required"
+        );
+        assert_eq!(
+            fixture.providers.resolve_calls.load(Ordering::SeqCst),
+            1,
+            "an archived default must not be resolved or replaced by a list fallback"
         );
 
         let turn = fixture

@@ -5410,6 +5410,13 @@ mod postgres {
             }
         }
 
+        fn master_with(byte: u8, version: i32) -> AiMasterKey {
+            AiMasterKey {
+                bytes: Zeroizing::new(vec![byte; KEY_BYTES]),
+                version,
+            }
+        }
+
         #[tokio::test]
         async fn legacy_ciphertext_is_user_bound_and_secret_is_redacted() {
             let store = PostgresAiProviderStore::new(
@@ -5539,6 +5546,102 @@ mod postgres {
                 store
                     .decrypt(user_id, key_version, &nonce, &ciphertext)
                     .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn master_key_rotation_fails_closed_until_secrets_are_explicitly_reencrypted() {
+            let old_store = PostgresAiProviderStore::new(
+                PostgresStore::from_pool(
+                    sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap(),
+                ),
+                master_with(7, 1),
+            );
+            let rotated_store = PostgresAiProviderStore::new(
+                PostgresStore::from_pool(
+                    sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap(),
+                ),
+                master_with(9, 2),
+            );
+            let wrong_old_store = PostgresAiProviderStore::new(
+                PostgresStore::from_pool(
+                    sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap(),
+                ),
+                master_with(8, 1),
+            );
+            let user_id = Uuid::new_v4();
+            let profile_id = Uuid::new_v4();
+            let profile_version = 3;
+            let secret = "master-key-rotation-secret";
+            let (old_key_version, old_nonce, old_ciphertext) = old_store
+                .encrypt_profile_secret(user_id, profile_id, profile_version, secret)
+                .unwrap();
+
+            let rotation_error = rotated_store
+                .decrypt_profile_secret(
+                    user_id,
+                    profile_id,
+                    profile_version,
+                    old_key_version,
+                    &old_nonce,
+                    &old_ciphertext,
+                )
+                .unwrap_err();
+            assert!(matches!(rotation_error, AiProviderStoreError::Encryption));
+            assert!(!format!("{rotation_error:?}").contains(secret));
+
+            let wrong_key_error = wrong_old_store
+                .decrypt_profile_secret(
+                    user_id,
+                    profile_id,
+                    profile_version,
+                    old_key_version,
+                    &old_nonce,
+                    &old_ciphertext,
+                )
+                .unwrap_err();
+            assert!(matches!(wrong_key_error, AiProviderStoreError::Encryption));
+            assert!(!format!("{wrong_key_error:?}").contains(secret));
+
+            let plaintext = old_store
+                .decrypt_profile_secret(
+                    user_id,
+                    profile_id,
+                    profile_version,
+                    old_key_version,
+                    &old_nonce,
+                    &old_ciphertext,
+                )
+                .unwrap();
+            let (new_key_version, new_nonce, new_ciphertext) = rotated_store
+                .encrypt_profile_secret(user_id, profile_id, profile_version, plaintext.as_str())
+                .unwrap();
+            assert_eq!(new_key_version, 2);
+            assert!(
+                old_store
+                    .decrypt_profile_secret(
+                        user_id,
+                        profile_id,
+                        profile_version,
+                        new_key_version,
+                        &new_nonce,
+                        &new_ciphertext,
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                rotated_store
+                    .decrypt_profile_secret(
+                        user_id,
+                        profile_id,
+                        profile_version,
+                        new_key_version,
+                        &new_nonce,
+                        &new_ciphertext,
+                    )
+                    .unwrap()
+                    .as_str(),
+                secret
             );
         }
 

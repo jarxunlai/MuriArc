@@ -5,6 +5,8 @@ use sqlx::{SqlitePool, migrate::Migrator, sqlite::SqlitePoolOptions};
 
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations/sqlite");
 
+type LegacyProviderSecretBundle = (Option<i64>, Option<Vec<u8>>, Option<Vec<u8>>, i64);
+
 async fn memory_pool() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
@@ -558,17 +560,20 @@ async fn sqlite_model_profile_migration_projects_legacy_settings_and_schema_cons
     sqlx::query(
         "INSERT INTO ai_provider_settings (
             user_id, enabled, provider_config, provider_preset_id,
+            secret_key_version, secret_nonce, secret_ciphertext,
             supports_vision, vision_model, context_window_tokens,
             max_input_tokens, max_output_tokens, history_token_budget,
             history_turns, temperature, timeout_ms, created_at, updated_at,
             revision
-         ) VALUES (?, 1, ?, 'custom-openai-compatible', 1, 'legacy-vision',
+         ) VALUES (?, 1, ?, 'custom-openai-compatible', 7, ?, ?, 1, 'legacy-vision',
             131072, 65536, 4096, 32768, 20, 0.25, 90000, ?, ?, 4)",
     )
     .bind(vision_user_id)
     .bind(
         r#"{"provider_id":"legacy-vision-provider","kind":"open_ai_compatible","model":"legacy-chat","base_url":"https://provider.example.test/v1/","timeout_ms":90000,"max_response_bytes":2097152}"#,
     )
+    .bind(vec![7_u8; 12])
+    .bind(vec![8_u8; 32])
     .bind(now)
     .bind(now)
     .execute(&pool)
@@ -794,6 +799,19 @@ async fn sqlite_model_profile_migration_projects_legacy_settings_and_schema_cons
             Some(vision_profile_id.clone()),
             1,
         )
+    );
+    let legacy_secret_bundle: LegacyProviderSecretBundle = sqlx::query_as(
+        "SELECT secret_key_version, secret_nonce, secret_ciphertext, revision
+             FROM ai_provider_settings WHERE user_id = ?",
+    )
+    .bind(vision_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy encrypted provider settings must remain readable");
+    assert_eq!(
+        legacy_secret_bundle,
+        (Some(7), Some(vec![7_u8; 12]), Some(vec![8_u8; 32]), 4,),
+        "forward migration must preserve the legacy credential bundle and key version"
     );
 
     let text_only: (i64, Option<String>) = sqlx::query_as(
@@ -1025,6 +1043,352 @@ async fn sqlite_model_profile_migration_projects_legacy_settings_and_schema_cons
             .await
             .expect("0023 migration ledger entry must be readable");
     assert_eq!(migration_0023_count, 1);
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_compatibility_finalize_repairs_only_invalid_defaults() {
+    let pool = memory_pool().await;
+    let through_0024 = Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= 24)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    };
+    through_0024
+        .run(&pool)
+        .await
+        .expect("migration prefix through 0024 must succeed");
+
+    let lab_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let invalid_user_id = "11111111-1111-4111-8111-111111111111";
+    let valid_user_id = "22222222-2222-4222-8222-222222222222";
+    let cross_owner_user_id = "33333333-3333-4333-8333-333333333333";
+    let archived_profile_id = "44444444-4444-4444-8444-444444444444";
+    let non_vision_profile_id = "55555555-5555-4555-8555-555555555555";
+    let valid_vision_profile_id = "66666666-6666-4666-8666-666666666666";
+    let bound_conversation_id = "77777777-7777-4777-8777-777777777777";
+    let legacy_conversation_id = "88888888-8888-4888-8888-888888888888";
+    let now = "2026-07-23T00:00:00Z";
+
+    sqlx::query(
+        "INSERT INTO labs (id, name, created_at, updated_at, deleted_at, revision)
+         VALUES (?, 'Compatibility repair lab', ?, ?, NULL, 1)",
+    )
+    .bind(lab_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("compatibility lab fixture must be inserted");
+    for (user_id, email) in [
+        (invalid_user_id, "invalid-default@example.test"),
+        (valid_user_id, "valid-default@example.test"),
+        (cross_owner_user_id, "cross-owner-default@example.test"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (
+                id, lab_id, email, display_name, status, created_at, updated_at,
+                deleted_at, revision
+             ) VALUES (?, ?, ?, 'Compatibility user', 'active', ?, ?, NULL, 1)",
+        )
+        .bind(user_id)
+        .bind(lab_id)
+        .bind(email)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("compatibility user fixture must be inserted");
+    }
+
+    for (profile_id, user_id, name, supports_vision, archived_at) in [
+        (
+            archived_profile_id,
+            invalid_user_id,
+            "Archived conversation default",
+            0_i64,
+            Some(now),
+        ),
+        (
+            non_vision_profile_id,
+            invalid_user_id,
+            "Non-vision default",
+            0_i64,
+            None,
+        ),
+        (
+            valid_vision_profile_id,
+            valid_user_id,
+            "Valid vision default",
+            1_i64,
+            None,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO ai_model_profiles (
+                id, lab_id, user_id, name, current_version, created_at,
+                updated_at, archived_at, deleted_at, revision
+             ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, 1)",
+        )
+        .bind(profile_id)
+        .bind(lab_id)
+        .bind(user_id)
+        .bind(name)
+        .bind(now)
+        .bind(now)
+        .bind(archived_at)
+        .execute(&pool)
+        .await
+        .expect("compatibility profile fixture must be inserted");
+        sqlx::query(
+            "INSERT INTO ai_model_profile_versions (
+                profile_id, version, protocol, transport, base_url,
+                normalized_base_url, model_id, supports_vision,
+                context_window_tokens, max_input_tokens, max_output_tokens,
+                history_token_budget, history_turns, temperature, timeout_ms,
+                created_at
+             ) VALUES (
+                ?, 1, 'openai_chat_completions', 'open_ai_compatible',
+                'https://provider.example.test/v1',
+                'https://provider.example.test/v1', ?, ?,
+                16384, 8192, 2048, 4096, 20, 0, 30000, ?
+             )",
+        )
+        .bind(profile_id)
+        .bind(format!("model-{profile_id}"))
+        .bind(supports_vision)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("compatibility profile version fixture must be inserted");
+    }
+
+    for (user_id, conversation_profile, vision_profile, revision) in [
+        (
+            invalid_user_id,
+            archived_profile_id,
+            non_vision_profile_id,
+            4_i64,
+        ),
+        (
+            valid_user_id,
+            valid_vision_profile_id,
+            valid_vision_profile_id,
+            5_i64,
+        ),
+        (
+            cross_owner_user_id,
+            valid_vision_profile_id,
+            valid_vision_profile_id,
+            6_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO ai_user_model_defaults (
+                user_id, default_conversation_profile_id,
+                default_vision_profile_id, created_at, updated_at, deleted_at,
+                revision
+             ) VALUES (?, ?, ?, ?, ?, NULL, ?)",
+        )
+        .bind(user_id)
+        .bind(conversation_profile)
+        .bind(vision_profile)
+        .bind(now)
+        .bind(now)
+        .bind(revision)
+        .execute(&pool)
+        .await
+        .expect("compatibility default fixture must be inserted");
+    }
+
+    sqlx::query(
+        "INSERT INTO ai_provider_settings (
+            user_id, enabled, provider_config, provider_preset_id,
+            secret_key_version, secret_nonce, secret_ciphertext,
+            supports_vision, vision_model, context_window_tokens,
+            max_input_tokens, max_output_tokens, history_token_budget,
+            history_turns, temperature, timeout_ms, created_at, updated_at,
+            revision
+         ) VALUES (
+            ?, 1, ?, 'custom-openai-compatible', 11, ?, ?, 0, NULL,
+            16384, 8192, 2048, 4096, 20, 0, 30000, ?, ?, 9
+         )",
+    )
+    .bind(invalid_user_id)
+    .bind(
+        r#"{"kind":"open_ai_compatible","model":"legacy-model","base_url":"https://provider.example.test/v1"}"#,
+    )
+    .bind(vec![11_u8; 12])
+    .bind(vec![12_u8; 32])
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("legacy credential fixture must be inserted");
+    sqlx::query(
+        "INSERT INTO ai_model_profile_secret_refs (
+            profile_id, profile_version, keyring_account, credential_state,
+            created_at, updated_at, revision
+         ) VALUES (?, 1, 'compatibility-profile-v1', 'present', ?, ?, 3)",
+    )
+    .bind(archived_profile_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("profile-version keyring reference fixture must be inserted");
+    sqlx::query(
+        "INSERT INTO ai_conversations (
+            id, lab_id, project_id, user_id, title, model_profile_id,
+            model_profile_version, legacy_read_only, created_at, updated_at,
+            deleted_at, revision
+         ) VALUES (?, ?, NULL, ?, 'Archived model history', ?, 1, 0, ?, ?, NULL, 1)",
+    )
+    .bind(bound_conversation_id)
+    .bind(lab_id)
+    .bind(invalid_user_id)
+    .bind(archived_profile_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("bound historical conversation fixture must be inserted");
+    sqlx::query(
+        "INSERT INTO ai_conversations (
+            id, lab_id, project_id, user_id, title, model_profile_id,
+            model_profile_version, legacy_read_only, created_at, updated_at,
+            deleted_at, revision
+         ) VALUES (?, ?, NULL, ?, 'Legacy read-only history', NULL, NULL, 1, ?, ?, NULL, 1)",
+    )
+    .bind(legacy_conversation_id)
+    .bind(lab_id)
+    .bind(invalid_user_id)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("legacy read-only conversation fixture must be inserted");
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("compatibility finalization migration must succeed");
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("compatibility finalization ledger replay must be idempotent");
+
+    let invalid_defaults: (Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT default_conversation_profile_id, default_vision_profile_id,
+            revision
+         FROM ai_user_model_defaults WHERE user_id = ?",
+    )
+    .bind(invalid_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("repaired invalid defaults must be readable");
+    assert_eq!(invalid_defaults, (None, None, 5));
+    let valid_defaults: (Option<String>, Option<String>, i64, String) = sqlx::query_as(
+        "SELECT default_conversation_profile_id, default_vision_profile_id,
+            revision, updated_at
+         FROM ai_user_model_defaults WHERE user_id = ?",
+    )
+    .bind(valid_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("valid defaults must be readable");
+    assert_eq!(
+        valid_defaults,
+        (
+            Some(valid_vision_profile_id.to_owned()),
+            Some(valid_vision_profile_id.to_owned()),
+            5,
+            now.to_owned(),
+        ),
+        "valid defaults must remain byte-for-byte unchanged"
+    );
+    let cross_owner_defaults: (Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT default_conversation_profile_id, default_vision_profile_id,
+            revision
+         FROM ai_user_model_defaults WHERE user_id = ?",
+    )
+    .bind(cross_owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("cross-owner defaults must be readable");
+    assert_eq!(
+        cross_owner_defaults,
+        (None, None, 7),
+        "both invalid references must be repaired with one revision advance"
+    );
+
+    let retained_legacy_secret: LegacyProviderSecretBundle = sqlx::query_as(
+        "SELECT secret_key_version, secret_nonce, secret_ciphertext, revision
+             FROM ai_provider_settings WHERE user_id = ?",
+    )
+    .bind(invalid_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("legacy credential row must remain readable");
+    assert_eq!(
+        retained_legacy_secret,
+        (Some(11), Some(vec![11_u8; 12]), Some(vec![12_u8; 32]), 9,)
+    );
+    let retained_secret_ref: (i64, String, String, i64) = sqlx::query_as(
+        "SELECT profile_version, keyring_account, credential_state, revision
+         FROM ai_model_profile_secret_refs WHERE profile_id = ?",
+    )
+    .bind(archived_profile_id)
+    .fetch_one(&pool)
+    .await
+    .expect("profile-version keyring reference must remain readable");
+    assert_eq!(
+        retained_secret_ref,
+        (
+            1,
+            "compatibility-profile-v1".to_owned(),
+            "present".to_owned(),
+            3,
+        )
+    );
+    let retained_bindings: Vec<(String, Option<String>, Option<i64>, i64)> = sqlx::query_as(
+        "SELECT id, model_profile_id, model_profile_version, legacy_read_only
+         FROM ai_conversations
+         WHERE id IN (?, ?)
+         ORDER BY id",
+    )
+    .bind(bound_conversation_id)
+    .bind(legacy_conversation_id)
+    .fetch_all(&pool)
+    .await
+    .expect("historical conversation bindings must remain readable");
+    assert_eq!(
+        retained_bindings,
+        vec![
+            (
+                bound_conversation_id.to_owned(),
+                Some(archived_profile_id.to_owned()),
+                Some(1),
+                0,
+            ),
+            (legacy_conversation_id.to_owned(), None, None, 1,),
+        ]
+    );
+    let retained_profiles: (i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM ai_model_profiles),
+            (SELECT count(*) FROM ai_model_profile_versions)",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("profile compatibility rows must remain readable");
+    assert_eq!(retained_profiles, (3, 3));
 
     pool.close().await;
 }

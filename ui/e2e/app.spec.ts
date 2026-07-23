@@ -17,7 +17,7 @@ async function selectNaiveOption(page: Page, selector: string, option: string | 
 async function expectDataEntryDialogFits(page: Page) {
   for (const width of [375, 768, 1024, 1440]) {
     await page.setViewportSize({ width, height: 960 })
-    const layout = await page.locator('.data-entry-dialog').evaluate((card) => {
+    await expect.poll(() => page.locator('.data-entry-dialog').evaluate((card) => {
       const cardRect = card.getBoundingClientRect()
       const content = card.querySelector<HTMLElement>('.n-card__content')
       const footer = card.querySelector<HTMLElement>('.n-card__footer')
@@ -29,8 +29,7 @@ async function expectDataEntryDialogFits(page: Page) {
         documentHasNoOverflow:
           document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
       }
-    })
-    expect(layout).toEqual({
+    })).toEqual({
       cardContained: true,
       cardHasNoOverflow: true,
       contentHasNoOverflow: true,

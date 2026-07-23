@@ -405,6 +405,31 @@ describe('useAiAssistant', () => {
     expect(mocks.aiTurn).not.toHaveBeenCalled()
   })
 
+  it('does not fall back to the first active profile when the saved default no longer exists', async () => {
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { isDefaultConversation: false }),
+      modelProfile('profile-2', { isDefaultConversation: false }),
+    ])
+    mocks.getAiModelDefaults.mockResolvedValue({
+      defaultConversationProfileId: 'missing-profile',
+      revision: 7,
+    })
+
+    await ai.loadModels(true)
+    ai.newConversation()
+
+    expect(ai.selectedModelProfileId.value).toBeUndefined()
+    expect(ai.modelOptions.value.map((option) => option.value)).toEqual([
+      'profile-1',
+      'profile-2',
+    ])
+    await expect(ai.send('不能回退到列表第一项', {
+      fullConfirmed: true,
+    })).rejects.toThrow('明确选择')
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
+  })
+
   it('restores persisted content without injecting project-level drafts into the conversation', async () => {
     const draft = measurementDraft()
     const unrelatedProjectDraft = { ...measurementDraft(), id: 'project-draft' }
@@ -528,7 +553,34 @@ describe('useAiAssistant', () => {
     expect(ai.messages.value).toHaveLength(2)
     expect(ai.conversationReadOnlyReason.value).toContain('已归档')
     expect(ai.composerDisabledReason.value).toContain('已归档')
+    await expect(ai.send('不能继续归档会话')).rejects.toThrow('已归档')
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
   })
+
+  it.each([
+    ['legacy_model_unknown', undefined, '旧会话没有可识别的模型绑定'],
+    ['model_unavailable', 'missing-profile', '模型版本当前不可用'],
+  ] as const)(
+    'keeps %s history readable and blocks direct send calls',
+    async (readOnlyReason, modelProfileId, expectedReason) => {
+      const detail = conversationDetail()
+      detail.conversation = {
+        ...conversationSummary(),
+        modelProfileId,
+        readOnly: true,
+        readOnlyReason,
+      }
+      mocks.getAiConversation.mockResolvedValue(detail)
+
+      await ai.openConversation('conversation-1')
+
+      expect(ai.messages.value).toHaveLength(2)
+      expect(ai.conversationReadOnlyReason.value).toContain(expectedReason)
+      expect(ai.composerDisabledReason.value).toContain(expectedReason)
+      await expect(ai.send('不能继续只读历史')).rejects.toThrow(expectedReason)
+      expect(mocks.aiTurn).not.toHaveBeenCalled()
+    },
+  )
 
   it('shares the unsent composer draft between Drawer and Workspace consumers', () => {
     const drawer = useAiAssistant()

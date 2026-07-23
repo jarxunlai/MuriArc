@@ -64,6 +64,7 @@ const conversationSummary = (projectId = 'project-1'): AiConversationSummary => 
   id: 'conversation-1',
   projectId,
   title: '总结实验进度',
+  readOnly: false,
   createdAt: '2026-07-18T01:00:00Z',
   updatedAt: '2026-07-18T02:00:00Z',
   revision: 2,

@@ -26,7 +26,7 @@ use muriarc_core::{
     AttachmentDerivative, AuditAction, DerivativeKind, DerivativeStatus, EntityType, Observation,
     ObservationDefinition, ObservationSubjectType, ObservationValueData, ObservationValueRecord,
     Permission, PrivateAiImage, PrivateImageFilter, PrivateImageStats, PrivateImageStatus,
-    RecordMeta,
+    RecordMeta, StoreError,
 };
 use muriarc_data::{
     AttachmentContentKind, AttachmentFiles, AttachmentInspectionError, MAX_ATTACHMENT_BYTES,
@@ -118,6 +118,7 @@ async fn upload(
         .with_request_id(m.request_id));
     }
     let file_name = valid_file_name(q.file_name, &m)?;
+    preflight_upload_conversation(&state, &p, &m, q.conversation_id).await?;
     let declared = q.media_type.or_else(|| {
         headers
             .get(header::CONTENT_TYPE)
@@ -201,6 +202,45 @@ async fn upload(
     let view = image_view(&state, &m, image).await?;
     Ok((StatusCode::CREATED, item(view, &m)))
 }
+
+async fn preflight_upload_conversation(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    metadata: &RequestMetadata,
+    conversation_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let Some(conversation_id) = conversation_id else {
+        return Ok(());
+    };
+    let operations = state.ai_operations.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ai_runtime_not_configured",
+            "the AI runtime is not configured for this deployment",
+        )
+        .with_request_id(metadata.request_id.clone())
+    })?;
+    let conversation = match operations.get_ai_conversation(conversation_id).await {
+        Ok(conversation) => conversation,
+        Err(StoreError::NotFound { .. }) => {
+            return Err(ApiError::not_found("AI conversation was not found")
+                .with_request_id(metadata.request_id.clone()));
+        }
+        Err(error) => {
+            return Err(ApiError::from_store(error).with_request_id(metadata.request_id.clone()));
+        }
+    };
+    if conversation.lab_id != principal.lab_id || conversation.user_id != principal.user_id {
+        return Err(ApiError::not_found("AI conversation was not found")
+            .with_request_id(metadata.request_id.clone()));
+    }
+    if conversation.legacy_read_only {
+        return Err(ApiError::conflict("legacy AI conversation is read-only")
+            .with_request_id(metadata.request_id.clone()));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImageListQuery {
@@ -577,6 +617,7 @@ async fn create_extraction(
         provider,
         api_key,
         runtime,
+        ..
     } = state
         .ai_providers
         .resolve_vision(p.user_id)

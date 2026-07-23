@@ -49,13 +49,32 @@ impl DesktopAiState {
         &self,
         request: AssistantTurnRequest,
     ) -> Result<AssistantTurnResponse, DesktopAiError> {
-        let resolved = self.settings.resolve_provider()?;
         let context = self.context().await?;
+        let model_profile = match request.conversation_id {
+            Some(conversation_id) => {
+                self.workflow
+                    .conversation_model_profile(&context, conversation_id)
+                    .await?
+            }
+            None => {
+                self.settings
+                    .materialize_model_profiles(
+                        self.store.as_ref(),
+                        &AuditContext::system(WriteSource::Migration),
+                    )
+                    .await?
+            }
+        };
+        let resolved = self
+            .settings
+            .resolve_provider_for_profile(self.store.as_ref(), model_profile)
+            .await?;
         self.workflow
             .run_turn_with_config(
                 resolved.provider,
                 resolved.api_key.as_ref().map(|secret| secret.as_str()),
                 &context,
+                model_profile,
                 request,
                 resolved.runtime,
             )
@@ -279,6 +298,9 @@ impl DesktopAiError {
             Self::Settings(SettingsError::Disabled | SettingsError::MissingCredential) => {
                 "ai_not_configured"
             }
+            Self::Settings(SettingsError::UnsupportedProtocol) => {
+                "unsupported_ai_provider_protocol"
+            }
             Self::Settings(error) if error.is_validation() => "validation",
             Self::Workflow(AiWorkflowError::Assistant(_))
             | Self::Workflow(AiWorkflowError::DataTool(
@@ -292,6 +314,8 @@ impl DesktopAiError {
             | Self::Workflow(AiWorkflowError::InvalidStoredDraft)
             | Self::Workflow(AiWorkflowError::UnsupportedDraftOperation)
             | Self::Workflow(AiWorkflowError::InvalidConversationRequest)
+            | Self::Workflow(AiWorkflowError::LegacyConversationReadOnly)
+            | Self::Workflow(AiWorkflowError::ConversationModelProfileMismatch)
             | Self::Workflow(AiWorkflowError::DataTool(
                 muriarc_ai::ToolExecutionError::Rejected { .. },
             ))
@@ -347,6 +371,10 @@ mod tests {
         assert_eq!(
             DesktopAiError::Workflow(AiWorkflowError::InvalidStoredConversation).code(),
             "storage_error"
+        );
+        assert_eq!(
+            DesktopAiError::Settings(SettingsError::UnsupportedProtocol).code(),
+            "unsupported_ai_provider_protocol"
         );
     }
 

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{DomainError, RecordMeta, WriteSource};
+use crate::{AiModelProfileBinding, DomainError, RecordMeta, WriteSource};
 
 pub const MAX_AI_CONVERSATION_MESSAGE_BYTES: usize = 256 * 1024;
 pub const MAX_AI_CONVERSATION_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
@@ -15,6 +15,15 @@ pub struct AiConversation {
     pub project_id: Option<Uuid>,
     pub user_id: Uuid,
     pub title: String,
+    /// `None` is reserved for conversations created before versioned model
+    /// profiles existed. Such conversations remain readable but cannot accept
+    /// another turn.
+    #[serde(default)]
+    pub model_profile: Option<AiModelProfileBinding>,
+    /// Set only by the compatibility migration for conversations whose
+    /// historical provider/version cannot be proven.
+    #[serde(default)]
+    pub legacy_read_only: bool,
     pub meta: RecordMeta,
 }
 

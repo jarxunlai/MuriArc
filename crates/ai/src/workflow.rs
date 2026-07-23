@@ -4,8 +4,9 @@ use chrono::{Duration, Utc};
 use muriarc_core::{
     Actor, ActorType, AiActionCategory, AiApprovalFilter, AiAutonomyGrant, AiAutonomyMode,
     AiConversation, AiConversationFilter, AiConversationMessage, AiConversationMessageRole,
-    AiOperationStore, Approval, ApprovalDecision as StoredApprovalDecision, AuditContext,
-    Measurement, MuriArcStore, RecordMeta, StoreError, ToolRun, ToolRunStatus, WriteSource,
+    AiModelProfileBinding, AiOperationStore, Approval, ApprovalDecision as StoredApprovalDecision,
+    AuditContext, Measurement, MuriArcStore, RecordMeta, StoreError, ToolRun, ToolRunStatus,
+    WriteSource,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -201,12 +202,14 @@ impl AiWorkflowService {
         provider: P,
         api_key: Option<&str>,
         context: &AiExecutionContext,
+        model_profile: AiModelProfileBinding,
         request: AssistantTurnRequest,
     ) -> Result<AssistantTurnResponse, AiWorkflowError> {
         self.run_turn_with_config(
             provider,
             api_key,
             context,
+            model_profile,
             request,
             AssistantRuntimeConfig::default(),
         )
@@ -218,10 +221,13 @@ impl AiWorkflowService {
         provider: P,
         api_key: Option<&str>,
         context: &AiExecutionContext,
+        model_profile: AiModelProfileBinding,
         request: AssistantTurnRequest,
         runtime: AssistantRuntimeConfig,
     ) -> Result<AssistantTurnResponse, AiWorkflowError> {
-        let resolved = self.resolve_conversation(context, &request).await?;
+        let resolved = self
+            .resolve_conversation(context, model_profile, &request)
+            .await?;
         let conversation_id = resolved.conversation_id;
         let project_id = resolved.project_id;
         let ai_audit = ai_audit(context, "assistant_turn");
@@ -310,6 +316,9 @@ impl AiWorkflowService {
     ) -> Result<AiAutonomyView, AiWorkflowError> {
         let conversation = self.operations.get_ai_conversation(conversation_id).await?;
         authorize_conversation(context, &conversation)?;
+        if conversation.legacy_read_only {
+            return Err(AiWorkflowError::LegacyConversationReadOnly);
+        }
         if audit.actor.actor_type != ActorType::Human
             || audit.actor.user_id != Some(context.user_id)
             || request.expected_revision < 0
@@ -487,6 +496,27 @@ impl AiWorkflowService {
         })
     }
 
+    /// Resolves the immutable model binding for an existing conversation after
+    /// enforcing its authenticated lab, user and project boundary.
+    ///
+    /// Provider adapters must call this before loading credentials or issuing
+    /// a request for an existing conversation. New conversations instead use
+    /// the caller's explicitly resolved current default binding.
+    pub async fn conversation_model_profile(
+        &self,
+        context: &AiExecutionContext,
+        conversation_id: Uuid,
+    ) -> Result<AiModelProfileBinding, AiWorkflowError> {
+        let conversation = self.operations.get_ai_conversation(conversation_id).await?;
+        authorize_conversation(context, &conversation)?;
+        if conversation.legacy_read_only {
+            return Err(AiWorkflowError::LegacyConversationReadOnly);
+        }
+        conversation
+            .model_profile
+            .ok_or(AiWorkflowError::InvalidStoredConversation)
+    }
+
     pub async fn list_drafts(
         &self,
         context: &AiExecutionContext,
@@ -550,6 +580,8 @@ impl AiWorkflowService {
         let mut approval = self.operations.get_approval(draft_id).await?;
         let mut tool_run = self.operations.get_tool_run(approval.tool_run_id).await?;
         let mut draft = self.authorized_stored_draft(context, &approval, &tool_run)?;
+        self.authorize_writable_draft_conversation(context, &tool_run)
+            .await?;
         let now = Utc::now();
         draft.decide(
             request.expected_revision,
@@ -697,6 +729,7 @@ impl AiWorkflowService {
     async fn resolve_conversation(
         &self,
         context: &AiExecutionContext,
+        model_profile: AiModelProfileBinding,
         request: &AssistantTurnRequest,
     ) -> Result<ResolvedConversation, AiWorkflowError> {
         if request
@@ -708,6 +741,12 @@ impl AiWorkflowService {
         if let Some(conversation_id) = request.conversation_id {
             let conversation = self.operations.get_ai_conversation(conversation_id).await?;
             authorize_conversation(context, &conversation)?;
+            if conversation.legacy_read_only {
+                return Err(AiWorkflowError::LegacyConversationReadOnly);
+            }
+            if conversation.model_profile != Some(model_profile) {
+                return Err(AiWorkflowError::ConversationModelProfileMismatch);
+            }
             if request
                 .project_id
                 .is_some_and(|id| Some(id) != conversation.project_id)
@@ -735,6 +774,8 @@ impl AiWorkflowService {
                 project_id: request.project_id,
                 user_id: context.user_id,
                 title: conversation_title(&request.message),
+                model_profile: Some(model_profile),
+                legacy_read_only: false,
                 meta: RecordMeta::new(now),
             };
             Ok(ResolvedConversation {
@@ -890,6 +931,28 @@ impl AiWorkflowService {
             return Err(AiWorkflowError::InvalidStoredDraft);
         }
         Ok(draft)
+    }
+
+    async fn authorize_writable_draft_conversation(
+        &self,
+        context: &AiExecutionContext,
+        tool_run: &ToolRun,
+    ) -> Result<(), AiWorkflowError> {
+        let Some(conversation_id) = tool_run.conversation_id else {
+            return Ok(());
+        };
+        let conversation = self.operations.get_ai_conversation(conversation_id).await?;
+        authorize_conversation(context, &conversation)?;
+        if conversation.legacy_read_only {
+            return Err(AiWorkflowError::LegacyConversationReadOnly);
+        }
+        if conversation.lab_id != tool_run.lab_id
+            || conversation.project_id != tool_run.project_id
+            || conversation.user_id != tool_run.user_id
+        {
+            return Err(AiWorkflowError::InvalidStoredDraft);
+        }
+        Ok(())
     }
 }
 
@@ -1069,23 +1132,35 @@ pub enum AiWorkflowError {
     InvalidConversationRequest,
     #[error("stored AI conversation is invalid")]
     InvalidStoredConversation,
+    #[error(
+        "this legacy AI conversation is read-only because its historical model version is unknown"
+    )]
+    LegacyConversationReadOnly,
+    #[error("the resolved model profile does not match the conversation's immutable binding")]
+    ConversationModelProfileMismatch,
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::{
         AiDataApplyResult, CompletionResponse, DomainToolOutput, DomainToolRequest, FieldChange,
         MockProvider, ProviderToolCall, ScopeSet, ToolScope,
     };
     use async_trait::async_trait;
-    use muriarc_core::{Lab, Project, User};
+    use muriarc_core::{
+        AiModelProfile, AiModelProfileStore, AiModelProfileVersion, AiProviderProtocol,
+        AiProviderTransport, Lab, Project, User,
+    };
     use muriarc_store_sqlite::SqliteStore;
 
     struct FakeImportBackend {
         job_id: Uuid,
         project_id: Uuid,
         fail_apply: bool,
+        apply_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -1136,6 +1211,7 @@ mod tests {
             draft: &WriteDraft,
             _audit: &AuditContext,
         ) -> Result<AiDataApplyResult, ToolExecutionError> {
+            self.apply_calls.fetch_add(1, Ordering::SeqCst);
             assert_eq!(draft.status(), DraftStatus::Approved);
             if self.fail_apply {
                 Err(ToolExecutionError::Rejected {
@@ -1150,6 +1226,160 @@ mod tests {
         }
     }
 
+    struct LegacyConversationOperations {
+        inner: Arc<SqliteStore>,
+        conversation_id: Uuid,
+    }
+
+    #[async_trait]
+    impl AiOperationStore for LegacyConversationOperations {
+        async fn create_ai_conversation(
+            &self,
+            conversation: &AiConversation,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner.create_ai_conversation(conversation, audit).await
+        }
+
+        async fn get_ai_conversation(&self, id: Uuid) -> muriarc_core::StoreResult<AiConversation> {
+            let mut conversation = self.inner.get_ai_conversation(id).await?;
+            if id == self.conversation_id {
+                conversation.model_profile = None;
+                conversation.legacy_read_only = true;
+            }
+            Ok(conversation)
+        }
+
+        async fn list_ai_conversations(
+            &self,
+            filter: &AiConversationFilter,
+            offset: u32,
+            limit: u32,
+        ) -> muriarc_core::StoreResult<Vec<AiConversation>> {
+            self.inner
+                .list_ai_conversations(filter, offset, limit)
+                .await
+        }
+
+        async fn append_ai_turn_messages(
+            &self,
+            user_message: &AiConversationMessage,
+            assistant_message: &AiConversationMessage,
+            expected_last_sequence: i64,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<AiConversation> {
+            self.inner
+                .append_ai_turn_messages(
+                    user_message,
+                    assistant_message,
+                    expected_last_sequence,
+                    audit,
+                )
+                .await
+        }
+
+        async fn list_ai_conversation_messages(
+            &self,
+            conversation_id: Uuid,
+            limit: u32,
+        ) -> muriarc_core::StoreResult<Vec<AiConversationMessage>> {
+            self.inner
+                .list_ai_conversation_messages(conversation_id, limit)
+                .await
+        }
+
+        async fn get_ai_autonomy_grant(
+            &self,
+            conversation_id: Uuid,
+        ) -> muriarc_core::StoreResult<Option<AiAutonomyGrant>> {
+            self.inner.get_ai_autonomy_grant(conversation_id).await
+        }
+
+        async fn save_ai_autonomy_grant(
+            &self,
+            grant: &AiAutonomyGrant,
+            expected_revision: Option<i64>,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner
+                .save_ai_autonomy_grant(grant, expected_revision, audit)
+                .await
+        }
+
+        async fn create_tool_run(
+            &self,
+            tool_run: &ToolRun,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner.create_tool_run(tool_run, audit).await
+        }
+
+        async fn get_tool_run(&self, id: Uuid) -> muriarc_core::StoreResult<ToolRun> {
+            self.inner.get_tool_run(id).await
+        }
+
+        async fn create_approval(
+            &self,
+            approval: &Approval,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner.create_approval(approval, audit).await
+        }
+
+        async fn get_approval(&self, id: Uuid) -> muriarc_core::StoreResult<Approval> {
+            self.inner.get_approval(id).await
+        }
+
+        async fn list_approvals(
+            &self,
+            filter: &AiApprovalFilter,
+        ) -> muriarc_core::StoreResult<Vec<Approval>> {
+            self.inner.list_approvals(filter).await
+        }
+
+        async fn finalize_ai_draft(
+            &self,
+            tool_run: &ToolRun,
+            expected_tool_run_revision: i64,
+            approval: &Approval,
+            expected_approval_revision: i64,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner
+                .finalize_ai_draft(
+                    tool_run,
+                    expected_tool_run_revision,
+                    approval,
+                    expected_approval_revision,
+                    audit,
+                )
+                .await
+        }
+
+        async fn apply_ai_measurement_draft(
+            &self,
+            measurement: &Measurement,
+            expected_animal_revision: i64,
+            tool_run: &ToolRun,
+            expected_tool_run_revision: i64,
+            approval: &Approval,
+            expected_approval_revision: i64,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner
+                .apply_ai_measurement_draft(
+                    measurement,
+                    expected_animal_revision,
+                    tool_run,
+                    expected_tool_run_revision,
+                    approval,
+                    expected_approval_revision,
+                    audit,
+                )
+                .await
+        }
+    }
+
     fn context(projects: [Uuid; 2]) -> AiExecutionContext {
         AiExecutionContext::new(
             Uuid::new_v4(),
@@ -1161,6 +1391,53 @@ mod tests {
             true,
             AccessGrant::local_user(ScopeSet::new([ToolScope::Read, ToolScope::WriteDraft])),
         )
+    }
+
+    async fn create_model_profile(
+        store: &SqliteStore,
+        lab_id: Uuid,
+        user_id: Uuid,
+        now: chrono::DateTime<Utc>,
+    ) -> AiModelProfileBinding {
+        let profile = AiModelProfile {
+            id: Uuid::new_v4(),
+            lab_id,
+            user_id,
+            name: format!("Workflow test model {}", Uuid::new_v4()),
+            current_version: 1,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        let version = AiModelProfileVersion {
+            profile_id: profile.id,
+            version: 1,
+            protocol: AiProviderProtocol::OpenaiChatCompletions,
+            transport: AiProviderTransport::OpenAiCompatible,
+            base_url: "https://provider.example.test/v1".to_owned(),
+            normalized_base_url: "https://provider.example.test/v1".to_owned(),
+            model_id: "workflow-test-model".to_owned(),
+            supports_vision: false,
+            context_window_tokens: 16_384,
+            max_input_tokens: 8_192,
+            max_output_tokens: 2_048,
+            history_token_budget: 4_096,
+            history_turns: 20,
+            temperature: 0.0,
+            timeout_ms: 30_000,
+            created_at: now,
+        };
+        store
+            .create_ai_model_profile(
+                &profile,
+                &version,
+                &AuditContext::system(WriteSource::Migration),
+            )
+            .await
+            .unwrap();
+        AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: 1,
+        }
     }
 
     #[test]
@@ -1197,6 +1474,7 @@ mod tests {
         store.create_user(&user, &bootstrap).await.unwrap();
         let project = Project::new(lab.id, "History project", now).unwrap();
         store.create_project(&project, &bootstrap).await.unwrap();
+        let model_profile = create_model_profile(&store, lab.id, user.id, now).await;
         let domain: Arc<dyn MuriArcStore> = store.clone();
         let operations: Arc<dyn AiOperationStore> = store.clone();
         let workflow = AiWorkflowService::new(domain, operations);
@@ -1224,6 +1502,7 @@ mod tests {
                 MockProvider::new("history", "history-model", [Ok(completion("First answer"))]),
                 None,
                 &context,
+                model_profile,
                 AssistantTurnRequest {
                     conversation_id: None,
                     project_id: Some(project.id),
@@ -1232,6 +1511,43 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(
+            workflow
+                .conversation_model_profile(&context, first.conversation_id)
+                .await
+                .unwrap(),
+            model_profile
+        );
+        let mismatched_provider = MockProvider::new(
+            "history",
+            "history-model",
+            [Ok(completion("Must not be called"))],
+        );
+        let mismatch_probe = mismatched_provider.clone();
+        let mismatch = workflow
+            .run_turn(
+                mismatched_provider,
+                None,
+                &context,
+                AiModelProfileBinding {
+                    profile_id: Uuid::new_v4(),
+                    profile_version: 1,
+                },
+                AssistantTurnRequest {
+                    conversation_id: Some(first.conversation_id),
+                    project_id: Some(project.id),
+                    message: "Attempt to rebind".to_owned(),
+                },
+            )
+            .await;
+        assert!(matches!(
+            mismatch,
+            Err(AiWorkflowError::ConversationModelProfileMismatch)
+        ));
+        assert!(
+            mismatch_probe.requests().unwrap().is_empty(),
+            "a mismatched immutable model binding must fail before the Provider is called"
+        );
         let second_provider = MockProvider::new(
             "history",
             "history-model",
@@ -1243,6 +1559,7 @@ mod tests {
                 second_provider,
                 None,
                 &context,
+                model_profile,
                 AssistantTurnRequest {
                     conversation_id: Some(first.conversation_id),
                     project_id: Some(project.id),
@@ -1285,6 +1602,7 @@ mod tests {
                 MockProvider::new("history", "history-model", []),
                 None,
                 &context,
+                model_profile,
                 AssistantTurnRequest {
                     conversation_id: None,
                     project_id: Some(project.id),
@@ -1312,6 +1630,7 @@ mod tests {
         AiExecutionContext,
         Uuid,
         Uuid,
+        Arc<FakeImportBackend>,
     ) {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
         store.migrate().await.unwrap();
@@ -1323,15 +1642,17 @@ mod tests {
         store.create_user(&user, &bootstrap).await.unwrap();
         let project = Project::new(lab.id, "Import project", now).unwrap();
         store.create_project(&project, &bootstrap).await.unwrap();
+        let model_profile = create_model_profile(&store, lab.id, user.id, now).await;
         let job_id = Uuid::new_v4();
         let backend = Arc::new(FakeImportBackend {
             job_id,
             project_id: project.id,
             fail_apply,
+            apply_calls: AtomicUsize::new(0),
         });
         let domain: Arc<dyn MuriArcStore> = store.clone();
         let operations: Arc<dyn AiOperationStore> = store.clone();
-        let workflow = AiWorkflowService::new(domain, operations).with_data_tools(backend);
+        let workflow = AiWorkflowService::new(domain, operations).with_data_tools(backend.clone());
         let context = AiExecutionContext::new(
             lab.id,
             user.id,
@@ -1382,6 +1703,7 @@ mod tests {
                 provider,
                 None,
                 &context,
+                model_profile,
                 AssistantTurnRequest {
                     conversation_id: None,
                     project_id: Some(project.id),
@@ -1391,12 +1713,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(turn.drafts.len(), 1);
-        (store, workflow, context, turn.drafts[0].id, job_id)
+        (store, workflow, context, turn.drafts[0].id, job_id, backend)
     }
 
     #[tokio::test]
     async fn bulk_import_is_applied_only_after_reinforced_approval_and_failures_stay_auditable() {
-        let (store, workflow, context, draft_id, job_id) = import_draft_fixture(false).await;
+        let (store, workflow, context, draft_id, job_id, _) = import_draft_fixture(false).await;
         let audit = AuditContext {
             actor: Actor::human(context.user_id, "Importer"),
             source: WriteSource::Web,
@@ -1424,7 +1746,7 @@ mod tests {
         assert_eq!(approval.decision, StoredApprovalDecision::Approved);
         assert_eq!(tool_run.status, ToolRunStatus::Completed);
 
-        let (store, workflow, context, draft_id, _) = import_draft_fixture(true).await;
+        let (store, workflow, context, draft_id, _, _) = import_draft_fixture(true).await;
         let audit = AuditContext {
             actor: Actor::human(context.user_id, "Importer"),
             source: WriteSource::Web,
@@ -1452,5 +1774,71 @@ mod tests {
         assert_eq!(tool_run.status, ToolRunStatus::Failed);
         assert_eq!(tool_run.error.as_deref(), Some("stale_import_fixture"));
         assert_eq!(stored.status, DraftStatus::Approved);
+    }
+
+    #[tokio::test]
+    async fn legacy_bulk_import_is_rejected_before_backend_or_draft_state_changes() {
+        let (store, original_workflow, context, draft_id, _, backend) =
+            import_draft_fixture(false).await;
+        let approval_before = store.get_approval(draft_id).await.unwrap();
+        let tool_run_before = store
+            .get_tool_run(approval_before.tool_run_id)
+            .await
+            .unwrap();
+        let draft_before = original_workflow
+            .get_draft(&context, draft_id)
+            .await
+            .unwrap();
+        let conversation_id = tool_run_before
+            .conversation_id
+            .expect("AI write drafts must be associated with their conversation");
+        let domain: Arc<dyn MuriArcStore> = store.clone();
+        let operations: Arc<dyn AiOperationStore> = Arc::new(LegacyConversationOperations {
+            inner: store.clone(),
+            conversation_id,
+        });
+        let workflow = AiWorkflowService::new(domain, operations).with_data_tools(backend.clone());
+        let audit = AuditContext {
+            actor: Actor::human(context.user_id, "Importer"),
+            source: WriteSource::Web,
+            request_id: Some("reject-legacy-import".to_owned()),
+            reason: Some("legacy conversation must remain read-only".to_owned()),
+        };
+
+        let result = workflow
+            .decide_draft(
+                &context,
+                draft_id,
+                DraftDecisionRequest {
+                    expected_revision: draft_before.revision,
+                    decision: ApprovalDecision::Approve,
+                    statement: Some("This must not be applied".to_owned()),
+                    step_up_verified: true,
+                },
+                &audit,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AiWorkflowError::LegacyConversationReadOnly)
+        ));
+        assert_eq!(
+            backend.apply_calls.load(Ordering::SeqCst),
+            0,
+            "legacy drafts must fail before the import backend is called"
+        );
+        assert_eq!(store.get_approval(draft_id).await.unwrap(), approval_before);
+        assert_eq!(
+            store
+                .get_tool_run(approval_before.tool_run_id)
+                .await
+                .unwrap(),
+            tool_run_before
+        );
+        assert_eq!(
+            workflow.get_draft(&context, draft_id).await.unwrap(),
+            draft_before
+        );
     }
 }

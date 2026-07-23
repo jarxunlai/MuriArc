@@ -1,3 +1,4 @@
+mod ai_models;
 mod ai_operations;
 mod workspace;
 

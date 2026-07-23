@@ -2430,6 +2430,7 @@ dependencies = [
  "muriarc-store-sqlite",
  "serde",
  "serde_json",
+ "sqlx",
  "tauri",
  "tauri-build",
  "tempfile",

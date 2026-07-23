@@ -32,6 +32,7 @@ const editingId = ref<string>()
 const draft = reactive<SaveAiProviderEndpointInput>({
   enabled: true,
   providerKind: 'open_ai_compatible',
+  protocol: 'openai_chat_completions',
   label: '',
   baseUrl: '',
 })
@@ -55,6 +56,7 @@ function resetDraft() {
   Object.assign(draft, {
     enabled: true,
     providerKind: 'open_ai_compatible',
+    protocol: 'openai_chat_completions',
     label: '',
     baseUrl: '',
   })
@@ -103,6 +105,7 @@ function editEndpoint(endpoint: AiProviderEndpoint) {
   Object.assign(draft, {
     enabled: endpoint.enabled,
     providerKind: endpoint.providerKind,
+    protocol: endpoint.protocol,
     label: endpoint.label,
     baseUrl: endpoint.baseUrl,
   })
@@ -113,6 +116,7 @@ async function saveEndpoint() {
   const input = {
     enabled: draft.enabled,
     providerKind: draft.providerKind,
+    protocol: draft.protocol,
     label: draft.label.trim(),
     baseUrl: draft.baseUrl.trim(),
   }

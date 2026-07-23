@@ -45,6 +45,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(ui_dir: Option<PathBuf>) -> Self {
+        Self::new_with_ai_operations(ui_dir, false).await
+    }
+
+    async fn new_with_ai_operations(ui_dir: Option<PathBuf>, enable_ai_operations: bool) -> Self {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
         store.migrate().await.unwrap();
         let now = chrono::Utc::now();
@@ -124,7 +128,7 @@ impl Fixture {
         let data_dir = tempfile::tempdir().unwrap();
         let attachment_root = data_dir.path().join("attachments");
         fs::create_dir_all(&attachment_root).unwrap();
-        let state = AppState::new(
+        let mut state = AppState::new(
             store.clone(),
             Arc::new(authenticator),
             Arc::new(StoreJobRepository::new(store.clone())),
@@ -133,6 +137,9 @@ impl Fixture {
             DataFiles::new(data_dir.path().join("data")),
             attachment_root.clone(),
         );
+        if enable_ai_operations {
+            state.ai_operations = Some(store.clone());
+        }
         Self {
             app: application_router(state, ui_dir),
             store,
@@ -153,6 +160,59 @@ impl Fixture {
             .body(Body::from(value.to_string()))
             .unwrap()
     }
+}
+
+#[tokio::test]
+async fn legacy_conversation_image_upload_is_rejected_before_polling_the_body() {
+    let fixture = Fixture::new_with_ai_operations(None, true).await;
+    let conversation_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO ai_conversations (
+            id, lab_id, project_id, user_id, title, model_profile_id,
+            model_profile_version, legacy_read_only, created_at, updated_at,
+            deleted_at, revision
+         ) VALUES (?, ?, NULL, ?, 'Legacy image conversation',
+            NULL, NULL, 1, ?, ?, NULL, 1)",
+    )
+    .bind(conversation_id.to_string())
+    .bind(fixture.lab_id.to_string())
+    .bind(fixture.user_id.to_string())
+    .bind(now)
+    .bind(now)
+    .execute(fixture.store.pool())
+    .await
+    .unwrap();
+
+    let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let body_probe = body_polled.clone();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        body_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"\x89PNG\r\n\x1a\n"))
+    }));
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/ai/images/upload?file_name=legacy.png&media_type=image%2Fpng&conversation_id={conversation_id}"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        !body_polled.load(std::sync::atomic::Ordering::SeqCst),
+        "legacy conversation rejection must happen before the upload body reaches object storage"
+    );
+    assert_eq!(fs::read_dir(&fixture.attachment_root).unwrap().count(), 0);
 }
 
 #[tokio::test]

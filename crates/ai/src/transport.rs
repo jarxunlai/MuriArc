@@ -89,6 +89,11 @@ pub struct AssistantConversationSummary {
     pub id: Uuid,
     pub project_id: Option<Uuid>,
     pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile_version: Option<i64>,
+    pub read_only: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub revision: i64,
@@ -100,6 +105,9 @@ impl From<AiConversation> for AssistantConversationSummary {
             id: value.id,
             project_id: value.project_id,
             title: value.title,
+            model_profile_id: value.model_profile.map(|binding| binding.profile_id),
+            model_profile_version: value.model_profile.map(|binding| binding.profile_version),
+            read_only: value.legacy_read_only,
             created_at: value.meta.created_at,
             updated_at: value.meta.updated_at,
             revision: value.meta.revision,

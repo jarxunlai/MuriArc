@@ -1988,11 +1988,276 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
     }
 }
 
+/// Runs the versioned AI model profile behavior contract shared by SQLite and
+/// PostgreSQL adapters.
+pub async fn run_ai_model_profile_contract<S>(store: &S)
+where
+    S: MuriArcStore + AiModelProfileStore + ?Sized,
+{
+    store.migrate().await.expect("migration succeeds");
+    let now = contract_now();
+    let audit = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new(
+        format!("AI model profile contract {}", uuid::Uuid::new_v4()),
+        now,
+    )
+    .unwrap();
+    store.create_lab(&lab, &audit).await.unwrap();
+    let user = User::new(
+        lab.id,
+        format!("{}@example.test", uuid::Uuid::new_v4()),
+        "AI model profile owner",
+        now,
+    )
+    .unwrap();
+    let other_user = User::new(
+        lab.id,
+        format!("{}@example.test", uuid::Uuid::new_v4()),
+        "Other model profile owner",
+        now,
+    )
+    .unwrap();
+    let mut deleted_user = User::new(
+        lab.id,
+        format!("{}@example.test", uuid::Uuid::new_v4()),
+        "Deleted model profile owner",
+        now,
+    )
+    .unwrap();
+    deleted_user
+        .meta
+        .soft_delete(now + Duration::milliseconds(1));
+    store.create_user(&user, &audit).await.unwrap();
+    store.create_user(&other_user, &audit).await.unwrap();
+    store.create_user(&deleted_user, &audit).await.unwrap();
+
+    let mut profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "Primary conversation model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let first = AiModelProfileVersion {
+        profile_id: profile.id,
+        version: 1,
+        protocol: AiProviderProtocol::OpenaiChatCompletions,
+        transport: AiProviderTransport::OpenAiCompatible,
+        base_url: "https://provider.example.test/v1/".to_owned(),
+        normalized_base_url: "https://provider.example.test/v1".to_owned(),
+        model_id: "model-v1".to_owned(),
+        supports_vision: false,
+        context_window_tokens: 131_072,
+        max_input_tokens: 65_536,
+        max_output_tokens: 4_096,
+        history_token_budget: 32_768,
+        history_turns: 20,
+        temperature: 0.0,
+        timeout_ms: 120_000,
+        created_at: now,
+    };
+    let deleted_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: deleted_user.id,
+        name: "Deleted owner's model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let deleted_version = AiModelProfileVersion {
+        profile_id: deleted_profile.id,
+        ..first.clone()
+    };
+    assert!(matches!(
+        store
+            .create_ai_model_profile(&deleted_profile, &deleted_version, &audit)
+            .await,
+        Err(StoreError::NotFound { entity: "user", id }) if id == deleted_user.id
+    ));
+    store
+        .create_ai_model_profile(&profile, &first, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_ai_model_profile(profile.id).await.unwrap(),
+        profile
+    );
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(profile.id, 1)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        store
+            .list_ai_model_profiles(&AiModelProfileFilter {
+                lab_id: lab.id,
+                user_id: other_user.id,
+                include_archived: true,
+            })
+            .await
+            .unwrap(),
+        Vec::<AiModelProfile>::new()
+    );
+
+    let unicode_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: other_user.id,
+        name: "Unicode model identifier".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let unicode_version = AiModelProfileVersion {
+        profile_id: unicode_profile.id,
+        model_id: "模".repeat(256),
+        ..first.clone()
+    };
+    store
+        .create_ai_model_profile(&unicode_profile, &unicode_version, &audit)
+        .await
+        .expect("model identifier length is measured in characters");
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(unicode_profile.id, 1)
+            .await
+            .unwrap(),
+        unicode_version
+    );
+
+    profile.current_version = 2;
+    profile.meta.touch(now + Duration::milliseconds(1));
+    let second = AiModelProfileVersion {
+        profile_id: profile.id,
+        version: 2,
+        protocol: AiProviderProtocol::AnthropicMessages,
+        transport: AiProviderTransport::LocalHttp,
+        base_url: "https://provider.example.test".to_owned(),
+        normalized_base_url: "https://provider.example.test".to_owned(),
+        model_id: "model-v2".to_owned(),
+        supports_vision: true,
+        created_at: now + Duration::milliseconds(1),
+        ..first.clone()
+    };
+    store
+        .append_ai_model_profile_version(&profile, &second, 1, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(profile.id, 1)
+            .await
+            .unwrap(),
+        first,
+        "appending a version must not mutate version 1"
+    );
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(profile.id, 2)
+            .await
+            .unwrap(),
+        second
+    );
+    assert!(matches!(
+        store
+            .append_ai_model_profile_version(&profile, &second, 1, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let defaults = AiUserModelDefaults {
+        user_id: user.id,
+        default_conversation_profile_id: Some(profile.id),
+        default_vision_profile_id: Some(profile.id),
+        meta: RecordMeta::new(now),
+    };
+    store
+        .save_ai_user_model_defaults(&defaults, None, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_ai_user_model_defaults(user.id).await.unwrap(),
+        Some(defaults)
+    );
+
+    profile.archived_at = Some(now + Duration::milliseconds(2));
+    profile.meta.touch(now + Duration::milliseconds(2));
+    store
+        .archive_ai_model_profile(&profile, 2, &audit)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .list_ai_model_profiles(&AiModelProfileFilter {
+                lab_id: lab.id,
+                user_id: user.id,
+                include_archived: false,
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(profile.id, 1)
+            .await
+            .unwrap(),
+        first,
+        "archiving a profile must preserve historical versions"
+    );
+
+    let third = AiModelProfileVersion {
+        version: 3,
+        model_id: "model-v3".to_owned(),
+        created_at: now + Duration::milliseconds(3),
+        ..second.clone()
+    };
+    let mut append_to_archived = profile.clone();
+    append_to_archived.current_version = 3;
+    append_to_archived
+        .meta
+        .touch(now + Duration::milliseconds(3));
+    assert!(matches!(
+        store
+            .append_ai_model_profile_version(&append_to_archived, &third, 3, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let mut revive_through_append = append_to_archived;
+    revive_through_append.archived_at = None;
+    assert!(matches!(
+        store
+            .append_ai_model_profile_version(&revive_through_append, &third, 3, &audit)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert_eq!(
+        store.get_ai_model_profile(profile.id).await.unwrap(),
+        profile,
+        "failed append and revive attempts must preserve the archived profile"
+    );
+    assert!(matches!(
+        store
+            .get_ai_model_profile_version(profile.id, 3)
+            .await,
+        Err(StoreError::NotFound {
+            entity: "ai_model_profile",
+            id
+        }) if id == profile.id
+    ));
+}
+
 /// Runs the AI conversation/message behavior contract shared by SQLite and
 /// PostgreSQL adapters. The store may contain unrelated fixtures.
 pub async fn run_ai_conversation_contract<S>(store: &S)
 where
-    S: MuriArcStore + AiOperationStore + ?Sized,
+    S: MuriArcStore + AiModelProfileStore + AiOperationStore + ?Sized,
 {
     store.migrate().await.expect("migration succeeds");
     let now = contract_now();
@@ -2017,6 +2282,62 @@ where
     store.create_user(&other_user, &bootstrap).await.unwrap();
     let project = Project::new(lab.id, "AI Contract Project", now).unwrap();
     store.create_project(&project, &bootstrap).await.unwrap();
+    let profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "AI conversation contract model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let profile_version = AiModelProfileVersion {
+        profile_id: profile.id,
+        version: 1,
+        protocol: AiProviderProtocol::OpenaiChatCompletions,
+        transport: AiProviderTransport::OpenAiCompatible,
+        base_url: "https://provider.example.test/v1".to_owned(),
+        normalized_base_url: "https://provider.example.test/v1".to_owned(),
+        model_id: "contract-model".to_owned(),
+        supports_vision: false,
+        context_window_tokens: 16_384,
+        max_input_tokens: 8_192,
+        max_output_tokens: 2_048,
+        history_token_budget: 4_096,
+        history_turns: 20,
+        temperature: 0.0,
+        timeout_ms: 30_000,
+        created_at: now,
+    };
+    store
+        .create_ai_model_profile(&profile, &profile_version, &bootstrap)
+        .await
+        .unwrap();
+    let other_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: other_user.id,
+        name: "Other AI conversation contract model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let other_profile_version = AiModelProfileVersion {
+        profile_id: other_profile.id,
+        ..profile_version.clone()
+    };
+    store
+        .create_ai_model_profile(&other_profile, &other_profile_version, &bootstrap)
+        .await
+        .unwrap();
+    let model_profile = AiModelProfileBinding {
+        profile_id: profile.id,
+        profile_version: 1,
+    };
+    let other_model_profile = AiModelProfileBinding {
+        profile_id: other_profile.id,
+        profile_version: 1,
+    };
     let audit = AuditContext {
         actor: Actor {
             actor_type: ActorType::Ai,
@@ -2034,6 +2355,8 @@ where
         project_id: Some(project.id),
         user_id: user.id,
         title: "Project conversation".to_owned(),
+        model_profile: Some(model_profile),
+        legacy_read_only: false,
         meta: RecordMeta::new(now),
     };
     let lab_conversation = AiConversation {
@@ -2042,6 +2365,8 @@ where
         project_id: None,
         user_id: user.id,
         title: "Lab conversation".to_owned(),
+        model_profile: Some(model_profile),
+        legacy_read_only: false,
         meta: RecordMeta::new(now - Duration::seconds(1)),
     };
     let hidden_conversation = AiConversation {
@@ -2050,8 +2375,20 @@ where
         project_id: Some(project.id),
         user_id: other_user.id,
         title: "Other user's conversation".to_owned(),
+        model_profile: Some(other_model_profile),
+        legacy_read_only: false,
         meta: RecordMeta::new(now),
     };
+    let unbound = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        title: "Unbound writable conversation".to_owned(),
+        model_profile: None,
+        ..conversation.clone()
+    };
+    assert!(matches!(
+        store.create_ai_conversation(&unbound, &audit).await,
+        Err(StoreError::Validation(_))
+    ));
     for value in [&conversation, &lab_conversation, &hidden_conversation] {
         store.create_ai_conversation(value, &audit).await.unwrap();
     }

@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    AiAutonomyGrant, AiConversation, AiConversationMessage, Approval, AuditContext, Measurement,
-    StoreResult, ToolRun,
+    AiAutonomyGrant, AiConversation, AiConversationMessage, AiModelProfile,
+    AiModelProfileSecretRef, AiModelProfileVersion, AiUserModelDefaults, Approval, AuditContext,
+    Measurement, StoreResult, ToolRun,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +21,93 @@ pub struct AiApprovalFilter {
     pub user_id: Uuid,
     pub project_id: Option<Uuid>,
     pub decision: Option<crate::ApprovalDecision>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiModelProfileFilter {
+    pub lab_id: Uuid,
+    pub user_id: Uuid,
+    pub include_archived: bool,
+}
+
+#[async_trait]
+pub trait AiModelProfileStore: Send + Sync {
+    /// Creates the editable profile identity and immutable version 1 in one
+    /// transaction, together with a redacted audit entry.
+    async fn create_ai_model_profile(
+        &self,
+        profile: &AiModelProfile,
+        version: &AiModelProfileVersion,
+        audit: &AuditContext,
+    ) -> StoreResult<()>;
+
+    async fn get_ai_model_profile(&self, id: Uuid) -> StoreResult<AiModelProfile>;
+
+    async fn list_ai_model_profiles(
+        &self,
+        filter: &AiModelProfileFilter,
+    ) -> StoreResult<Vec<AiModelProfile>>;
+
+    async fn get_ai_model_profile_version(
+        &self,
+        profile_id: Uuid,
+        version: i64,
+    ) -> StoreResult<AiModelProfileVersion>;
+
+    /// Appends one immutable version and advances the profile projection using
+    /// optimistic revision checking.
+    async fn append_ai_model_profile_version(
+        &self,
+        profile: &AiModelProfile,
+        version: &AiModelProfileVersion,
+        expected_revision: i64,
+        audit: &AuditContext,
+    ) -> StoreResult<()>;
+
+    async fn archive_ai_model_profile(
+        &self,
+        profile: &AiModelProfile,
+        expected_revision: i64,
+        audit: &AuditContext,
+    ) -> StoreResult<()>;
+
+    async fn save_ai_user_model_defaults(
+        &self,
+        defaults: &AiUserModelDefaults,
+        expected_revision: Option<i64>,
+        audit: &AuditContext,
+    ) -> StoreResult<()>;
+
+    async fn get_ai_user_model_defaults(
+        &self,
+        user_id: Uuid,
+    ) -> StoreResult<Option<AiUserModelDefaults>>;
+}
+
+/// Desktop-only metadata boundary for exact immutable profile-version Keyring
+/// bindings. Implementations persist only redacted state; secret bytes remain
+/// exclusively in the operating-system credential store.
+#[async_trait]
+pub trait AiModelProfileSecretRefStore: Send + Sync {
+    async fn get_ai_model_profile_secret_ref(
+        &self,
+        profile_id: Uuid,
+        profile_version: i64,
+    ) -> StoreResult<Option<AiModelProfileSecretRef>>;
+
+    async fn list_ai_model_profile_secret_refs(
+        &self,
+        profile_id: Uuid,
+    ) -> StoreResult<Vec<AiModelProfileSecretRef>>;
+
+    /// Creates or updates one exact-version binding with optimistic revision
+    /// checking and writes its redacted audit entry in the same transaction.
+    async fn save_ai_model_profile_secret_ref(
+        &self,
+        value: &AiModelProfileSecretRef,
+        expected_revision: Option<i64>,
+        audit: &AuditContext,
+    ) -> StoreResult<()>;
 }
 
 /// Persistence boundary for AI orchestration records.

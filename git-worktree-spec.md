@@ -129,7 +129,8 @@ PDF 与图片形成可复核的科研候选，最终仍由当前用户通过正�
 - [ ] 配置 `MURIARC_TEST_DATABASE_URL` 后运行 PostgreSQL 新增 contract tests
 - [x] `pnpm --dir ui run test`（21 个文件、153 项测试）
 - [x] `pnpm --dir ui run build`
-- [ ] 相关 Playwright 场景（当前 Chromium 在启动前缺少 `libnspr4.so`，42 个场景均未执行）
+- [x] 相关 Playwright 场景（GitHub Linux CI 的 42 个响应式场景通过；当前 WSL 本地 Chromium
+      仍因缺少 `libnspr4.so` 无法启动）
 - [ ] 精确提交的 Windows Tauri 验收
 - [x] 最终源码状态执行 `git diff --check`
 
@@ -145,5 +146,6 @@ force-push 或删除分支。
   不虚报为运行通过。
 - 完整 Rust workspace/Clippy 在进入 Desktop 产品代码前，被当前 WSL 缺少 `pkg-config`
   及 dbus/GTK/WebKit 系统开发库阻断。
-- Playwright 已完成前置 UI 构建，但 Chromium 因缺少 `libnspr4.so` 无法启动，42 个场景未
-  执行。Windows Tauri 仍必须对最终精确提交验收，不能由 WSL 构建或旧产物代替。
+- GitHub Linux CI 已通过 42 个 Playwright 响应式场景；当前 WSL 本地 Chromium 仍因缺少
+  `libnspr4.so` 无法启动。Windows Tauri 仍必须对最终精确提交验收，不能由 WSL 构建或旧
+  产物代替。

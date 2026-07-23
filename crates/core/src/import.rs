@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::{
     Animal, AnimalEvent, AnimalEventKind, Approval, ApprovalDecision, GenotypingRecord, Job,
     JobKind, Measurement, Pedigree, RecordStatus, ToolRun, ToolRunStatus, WriteSource,
+    has_portable_storage_precision,
 };
 
 pub const MAX_IMPORT_ENTITIES: usize = 50_000;
@@ -339,6 +340,16 @@ impl AiImportResolution {
                         .and_then(|value| Uuid::parse_str(value).ok())
                         == Some(self.approval.id)
             });
+        let replay_timestamps_are_portable = self
+            .tool_run
+            .completed_at
+            .is_some_and(has_portable_storage_precision)
+            && has_portable_storage_precision(self.tool_run.meta.updated_at)
+            && self
+                .approval
+                .decided_at
+                .is_some_and(has_portable_storage_precision)
+            && has_portable_storage_precision(self.approval.meta.updated_at);
         if self.expected_job_revision < 1
             || self.tool_run.id.is_nil()
             || self.approval.id.is_nil()
@@ -357,6 +368,7 @@ impl AiImportResolution {
             || self.approval.decided_by.is_none()
             || self.approval.decided_at.is_none()
             || !applied_draft_matches
+            || !replay_timestamps_are_portable
         {
             Err(ImportPlanError::InvalidAiResolution)
         } else {
@@ -558,7 +570,7 @@ mod tests {
     use chrono::Duration;
 
     use super::*;
-    use crate::{AnimalEvent, MeasurementValue, Sex};
+    use crate::{AnimalEvent, MeasurementValue, RecordMeta, Sex, portable_storage_timestamp};
 
     fn simple_animal_plan() -> (ImportPlan, Animal, DateTime<Utc>) {
         let now = Utc::now();
@@ -592,6 +604,69 @@ mod tests {
             Some(legacy_hash.as_str())
         );
         assert_eq!(import_job_preview_hash(Some(&serde_json::json!({}))), None);
+    }
+
+    #[test]
+    fn ai_import_resolution_requires_portable_replay_timestamps() {
+        let now = portable_storage_timestamp(Utc::now());
+        let decided_at = now + Duration::seconds(1);
+        let lab_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let tool_run_id = Uuid::new_v4();
+        let approval_id = Uuid::new_v4();
+        let draft = serde_json::json!({
+            "id": approval_id,
+            "kind": "bulk_import",
+            "status": "applied",
+            "tool": "import_commit_draft",
+        });
+        let mut tool_meta = RecordMeta::new(now);
+        tool_meta.touch(decided_at);
+        let mut approval_meta = RecordMeta::new(now);
+        approval_meta.touch(decided_at);
+        let mut resolution = AiImportResolution {
+            expected_job_revision: 1,
+            tool_run: ToolRun {
+                id: tool_run_id,
+                conversation_id: Some(Uuid::new_v4()),
+                lab_id,
+                project_id: Some(project_id),
+                user_id,
+                tool_name: "import_commit_draft".to_owned(),
+                input: serde_json::json!({}),
+                output: Some(serde_json::json!({"draft": draft.clone()})),
+                status: ToolRunStatus::Completed,
+                source: WriteSource::Ai,
+                started_at: Some(now),
+                completed_at: Some(decided_at),
+                error: None,
+                meta: tool_meta,
+            },
+            expected_tool_run_revision: 1,
+            approval: Approval {
+                id: approval_id,
+                tool_run_id,
+                requested_diff: serde_json::json!({"draft": draft}),
+                decision: ApprovalDecision::Approved,
+                decided_by: Some(user_id),
+                decided_at: Some(decided_at),
+                reason: Some("reviewed".to_owned()),
+                meta: approval_meta,
+            },
+            expected_approval_revision: 1,
+        };
+        assert_eq!(resolution.validate(), Ok(()));
+
+        let non_portable = decided_at + Duration::nanoseconds(123);
+        resolution.tool_run.completed_at = Some(non_portable);
+        resolution.tool_run.meta.updated_at = non_portable;
+        resolution.approval.decided_at = Some(non_portable);
+        resolution.approval.meta.updated_at = non_portable;
+        assert_eq!(
+            resolution.validate(),
+            Err(ImportPlanError::InvalidAiResolution)
+        );
     }
 
     #[test]

@@ -3,6 +3,20 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Normalizes a timestamp to the precision shared by SQLite and PostgreSQL.
+///
+/// PostgreSQL `TIMESTAMPTZ` and SQLx round-trip at microsecond precision.
+/// Values that participate in exact replay checks must be normalized before
+/// they are embedded in both JSON receipts and timestamp columns.
+pub fn portable_storage_timestamp(value: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(value.timestamp_micros())
+        .expect("a valid UTC timestamp remains representable at microsecond precision")
+}
+
+pub fn has_portable_storage_precision(value: DateTime<Utc>) -> bool {
+    value.timestamp_subsec_nanos() % 1_000 == 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordMeta {
     pub created_at: DateTime<Utc>,
@@ -243,5 +257,21 @@ pub(crate) fn require_non_empty(field: &'static str, value: &str) -> Result<(), 
         Err(DomainError::EmptyField { field })
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_storage_timestamp_matches_postgres_microsecond_precision() {
+        let value = DateTime::from_timestamp(1_753_286_400, 123_456_789).unwrap();
+        let portable = portable_storage_timestamp(value);
+
+        assert_eq!(portable.timestamp_micros(), value.timestamp_micros());
+        assert_eq!(portable.timestamp_subsec_nanos(), 123_456_000);
+        assert!(has_portable_storage_precision(portable));
+        assert!(!has_portable_storage_precision(value));
     }
 }

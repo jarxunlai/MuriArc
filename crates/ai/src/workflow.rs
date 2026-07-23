@@ -8,7 +8,7 @@ use muriarc_core::{
     AiConversationMessage, AiConversationMessageRole, AiConversationSourceRef,
     AiConversationUpdate, AiExperimentGroupingApplication, AiImportResolution, AiOperationStore,
     Approval, ApprovalDecision as StoredApprovalDecision, AuditContext, Measurement, MuriArcStore,
-    RecordMeta, StoreError, ToolRun, ToolRunStatus, WriteSource,
+    RecordMeta, StoreError, ToolRun, ToolRunStatus, WriteSource, portable_storage_timestamp,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -712,7 +712,7 @@ impl AiWorkflowService {
         } else {
             None
         };
-        let now = Utc::now();
+        let now = portable_storage_timestamp(Utc::now());
         draft.decide(
             request.expected_revision,
             request.decision,
@@ -1671,6 +1671,24 @@ mod tests {
             assert_eq!(draft.status(), DraftStatus::Approved);
             assert_eq!(resolution.approval.id, draft.id());
             assert_eq!(resolution.expected_job_revision, 2);
+            assert!(
+                resolution
+                    .tool_run
+                    .completed_at
+                    .is_some_and(muriarc_core::has_portable_storage_precision)
+            );
+            assert!(muriarc_core::has_portable_storage_precision(
+                resolution.tool_run.meta.updated_at
+            ));
+            assert!(
+                resolution
+                    .approval
+                    .decided_at
+                    .is_some_and(muriarc_core::has_portable_storage_precision)
+            );
+            assert!(muriarc_core::has_portable_storage_precision(
+                resolution.approval.meta.updated_at
+            ));
             if self.fail_apply {
                 Err(ToolExecutionError::Rejected {
                     code: "stale_import_fixture".to_owned(),

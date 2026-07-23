@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc};
 use muriarc_ai::{
     AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiExecutionContext, AiWorkflowError,
     AiWorkflowService, ApprovalDecision, ApprovalRequirement, AssistantConversationDetail,
-    AssistantConversationSummary, AssistantError, AssistantTurnRequest, AssistantTurnResponse,
+    AssistantConversationSummary, AssistantTurnRequest, AssistantTurnResponse,
     DraftDecisionRequest, DraftDecisionResponse, DraftStatus, ScopeSet, ToolScope,
     WriteDraftSummary,
 };
@@ -428,6 +428,7 @@ pub(crate) fn parse_uuid(value: &str) -> Result<Uuid, DesktopAiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muriarc_ai::AssistantError;
 
     #[test]
     fn provider_failures_do_not_echo_secrets() {

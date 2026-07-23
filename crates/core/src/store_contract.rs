@@ -4028,6 +4028,14 @@ where
         completed_job.meta.revision,
         successful.job.meta.revision + 1
     );
+    let durable_receipt =
+        serde_json::from_value::<ImportCommitResult>(completed_job.result.clone().unwrap())
+            .unwrap();
+    assert_eq!(
+        durable_receipt,
+        canonical_import_receipt(&receipt),
+        "the Job must persist the database-canonical receipt used for replay"
+    );
     assert_eq!(
         completed_job
             .result
@@ -4047,6 +4055,20 @@ where
     );
     let completed_tool = store.get_tool_run(successful.tool_run.id).await.unwrap();
     assert_eq!(completed_tool.status, ToolRunStatus::Completed);
+    let tool_receipt = serde_json::from_value::<ImportCommitResult>(
+        completed_tool
+            .output
+            .as_ref()
+            .and_then(|value| value.get("result"))
+            .cloned()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        tool_receipt,
+        canonical_import_receipt(&receipt),
+        "the ToolRun must persist the same database-canonical receipt"
+    );
     assert_eq!(
         completed_tool
             .output
@@ -4078,6 +4100,11 @@ where
         .await
         .unwrap();
     assert!(replay.replayed, "the compound receipt must be durable");
+    assert_eq!(
+        canonical_import_receipt(&replay),
+        canonical_import_receipt(&receipt),
+        "replay must return the exact durable original receipt"
+    );
 
     let rejected = create_ai_import_atomicity_fixture(
         store,

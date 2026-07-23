@@ -5,7 +5,9 @@ use muriarc_ai::{
     AssistantSourceBundle, AssistantSourceError, AssistantSourceResolutionRequest,
     AssistantSourceResolver, ResolvedAssistantSource, VisionImageInput,
 };
-use muriarc_core::{AiConversationSource, AiConversationSourceStatus, Attachment, MuriArcStore};
+use muriarc_core::{
+    AiConversationSource, AiConversationSourceStatus, Attachment, MuriArcStore, WorkspaceStore,
+};
 use muriarc_data::{AiSourceMaterial, extract_ai_source_material, extract_ai_source_vision_assets};
 
 use crate::data::DesktopDataState;

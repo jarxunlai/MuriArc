@@ -9,11 +9,11 @@ use muriarc_ai::{
     ToolExecutionError, ToolName, WriteDraft, valid_sha256,
 };
 use muriarc_core::{
-    Actor, ActorType, AiConversationSourceStatus, AiImportResolution,
+    Actor, ActorType, AiConversationSourceStatus, AiImportResolution, AiOperationStore,
     ApprovalDecision as StoredApprovalDecision, AuditContext, EntityType, ImportCommitResult,
     ImportSourceArchive, Job, JobKind, JobStatus, LOCAL_LAB_ID, LOCAL_USER_ID, MuriArcStore,
-    ProvenanceFilter, RecordMeta, StoreError, ToolRunStatus, WriteSource, canonical_import_receipt,
-    completed_ai_import_tool_run,
+    ProvenanceFilter, RecordMeta, StoreError, ToolRunStatus, WorkspaceStore, WriteSource,
+    canonical_import_receipt, completed_ai_import_tool_run,
 };
 use muriarc_data::{
     AiSourceImportValidationError, AnimalImportPreviewResponse, ArtifactKind, ArtifactMetadata,
@@ -1182,9 +1182,7 @@ fn map_data_error(error: DataError) -> ToolExecutionError {
 mod tests {
     use super::*;
     use muriarc_ai::DomainToolOutput;
-    use muriarc_core::{
-        AiConversation, AiConversationSourceStatus, AiOperationStore, Project, StoreError,
-    };
+    use muriarc_core::{AiConversation, AiConversationSourceStatus, Project, StoreError};
     use serde_json::json;
     use tempfile::TempDir;
 

@@ -8130,7 +8130,7 @@ impl MuriArcStore for PostgresStore {
             StoreError::Validation("measurement import count is too large".to_owned())
         })?;
         let preview_hash = plan.preview_hash.to_ascii_lowercase();
-        let committed_at = Utc::now();
+        let proposed_committed_at = Utc::now();
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         validate_ai_source_import_resolution(&mut tx, &options).await?;
@@ -8138,8 +8138,8 @@ impl MuriArcStore for PostgresStore {
         // Claim the idempotency key before doing any entity work. PostgreSQL's
         // unique-index wait makes concurrent confirmations serialize here. A
         // losing transaction can then return the durable original receipt.
-        let claim = sqlx::query(
-            "INSERT INTO import_commits (commit_id, lab_id, idempotency_key, preview_hash, animal_count, animal_event_count, genotype_count, pedigree_count, measurement_count, committed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (lab_id, idempotency_key) DO NOTHING",
+        let claimed_committed_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "INSERT INTO import_commits (commit_id, lab_id, idempotency_key, preview_hash, animal_count, animal_event_count, genotype_count, pedigree_count, measurement_count, committed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT (lab_id, idempotency_key) DO NOTHING RETURNING committed_at",
         )
         .bind(plan.commit_id)
         .bind(plan.lab_id)
@@ -8150,12 +8150,12 @@ impl MuriArcStore for PostgresStore {
         .bind(genotype_count)
         .bind(pedigree_count)
         .bind(measurement_count)
-        .bind(committed_at)
-        .execute(&mut *tx)
+        .bind(proposed_committed_at)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx)?;
 
-        if claim.rows_affected() == 0 {
+        let Some(committed_at) = claimed_committed_at else {
             let row = sqlx::query(
                 "SELECT commit_id, preview_hash, animal_count, animal_event_count, genotype_count, pedigree_count, measurement_count, committed_at FROM import_commits WHERE lab_id = $1 AND idempotency_key = $2 FOR UPDATE",
             )
@@ -8208,7 +8208,7 @@ impl MuriArcStore for PostgresStore {
             validate_ai_import_replay(&mut tx, plan, &options, &result, audit).await?;
             tx.commit().await.map_err(map_sqlx)?;
             return Ok(result);
-        }
+        };
 
         validate_import_cages(&mut tx, plan).await?;
         archive_import_source(&mut tx, plan, &options, audit, committed_at).await?;

@@ -578,6 +578,30 @@ mod tests {
         assert!(second.absolute_path.exists());
     }
 
+    #[tokio::test]
+    async fn installed_object_removal_is_idempotent_and_preserves_shared_shards() {
+        let root = tempfile::tempdir().unwrap();
+        let files = AttachmentFiles::with_limit(root.path(), 32);
+        let first = files
+            .write_bytes(Uuid::new_v4(), b"shared content")
+            .await
+            .unwrap();
+        let second = files
+            .write_bytes(Uuid::new_v4(), b"shared content")
+            .await
+            .unwrap();
+        assert_eq!(first.absolute_path.parent(), second.absolute_path.parent());
+
+        files.remove_installed_object(&first).await.unwrap();
+        assert!(!first.absolute_path.exists());
+        assert!(second.absolute_path.exists());
+        files.remove_installed_object(&first).await.unwrap();
+        assert!(second.absolute_path.exists());
+
+        files.remove_installed_object(&second).await.unwrap();
+        assert!(!second.absolute_path.exists());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn verified_removal_rejects_symbolic_links() {

@@ -533,6 +533,17 @@ mod tests {
     use muriarc_core::{AiConversation, Project, ProvenanceFilter};
     use tempfile::tempdir;
 
+    fn directory_contains_object(path: &Path) -> bool {
+        std::fs::read_dir(path).unwrap().any(|entry| {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                directory_contains_object(&entry.path())
+            } else {
+                true
+            }
+        })
+    }
+
     #[test]
     fn native_source_transport_requires_a_conversation_for_upload_and_list() {
         assert!(
@@ -996,7 +1007,13 @@ mod tests {
             before
         );
         let object_root = state.attachments_ref().root().join("objects");
-        let mut entries = tokio::fs::read_dir(object_root).await.unwrap();
-        assert!(entries.next_entry().await.unwrap().is_none());
+        assert!(
+            !directory_contains_object(&object_root),
+            "rejected source cleanup may retain empty hash shards, but no object"
+        );
+        assert!(
+            !directory_contains_object(&state.attachments_ref().root().join(".tmp")),
+            "rejected source cleanup must not retain staging files"
+        );
     }
 }

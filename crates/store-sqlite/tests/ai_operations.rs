@@ -46,6 +46,8 @@ async fn approved_ai_measurement_is_applied_atomically_as_unsigned_draft() {
         project_id: Some(project.id),
         user_id: user.id,
         title: "Record weight".to_owned(),
+        pinned_at: None,
+        archived_at: None,
         meta: RecordMeta::new(now),
     };
     store

@@ -3,13 +3,14 @@ use std::path::Path;
 use chrono::Utc;
 use muriarc_core::{
     Actor, AnimalFilter, Attachment, AuditContext, Job, JobKind, JobStatus, LOCAL_LAB_ID,
-    LOCAL_USER_ID, MuriArcStore, RecordMeta, StoreError, WriteSource,
+    LOCAL_USER_ID, MAX_AI_CONVERSATION_SOURCE_CLEANUP_BATCH, MuriArcStore, RecordMeta, StoreError,
+    WriteSource, is_ai_source_import_job,
 };
 use muriarc_data::{
     AnimalImportPreviewResponse, ArtifactKind, ArtifactMetadata, AttachmentFileError,
-    AttachmentFiles, DataError, DataFiles, ExportFormat, ImportKind, ImportRemapJobResult,
-    StoredAttachmentObject, artifact_metadata, build_lab_snapshot,
-    export_animals_scoped_with_options,
+    AttachmentFiles, AttachmentInspectionError, DataError, DataFiles, ExportFormat, ImportKind,
+    ImportRemapJobResult, StoredAttachmentObject, artifact_metadata, build_lab_snapshot,
+    cleanup_expired_ai_conversation_sources, export_animals_scoped_with_options,
 };
 use muriarc_importer::{
     AnimalExportOptions, AnimalImportSchema, AnimalImportTemplateVariant, FieldMapping,
@@ -34,6 +35,8 @@ pub(crate) enum DesktopDataError {
     Data(#[from] DataError),
     #[error(transparent)]
     Attachment(#[from] AttachmentFileError),
+    #[error(transparent)]
+    AttachmentInspection(#[from] AttachmentInspectionError),
     #[error("invalid {0} identifier")]
     InvalidId(&'static str),
     #[error("job does not belong to the local operator")]
@@ -65,6 +68,11 @@ impl DesktopDataError {
                 | DataError::Directory(_),
             )
             | Self::Attachment(AttachmentFileError::TooLarge)
+            | Self::AttachmentInspection(
+                AttachmentInspectionError::ExecutableContent
+                | AttachmentInspectionError::SignatureMismatch
+                | AttachmentInspectionError::ResourceLimit,
+            )
             | Self::Store(StoreError::Validation(_))
             | Self::InvalidId(_)
             | Self::ScopeMismatch
@@ -86,6 +94,7 @@ impl DesktopDataError {
                 | AttachmentFileError::Integrity
                 | AttachmentFileError::Io(_),
             )
+            | Self::AttachmentInspection(AttachmentInspectionError::Io)
             | Self::Store(StoreError::Database(_) | StoreError::Serialization(_)) => {
                 "storage_error"
             }
@@ -146,11 +155,50 @@ impl DesktopDataState {
         store.migrate().await?;
         let attachments = AttachmentFiles::new(app_data_dir.as_ref().join("attachments"));
         attachments.initialize().await?;
-        Ok(Self {
+        let state = Self {
             store,
             files: DataFiles::new(app_data_dir.as_ref().join("data")),
             attachments,
-        })
+        };
+        state
+            .cleanup_expired_ai_sources_best_effort("desktop_startup")
+            .await;
+        Ok(state)
+    }
+
+    pub(crate) async fn cleanup_expired_ai_sources_best_effort(&self, trigger: &'static str) {
+        match cleanup_expired_ai_conversation_sources(
+            &self.store,
+            &self.attachments,
+            LOCAL_LAB_ID,
+            Utc::now(),
+            MAX_AI_CONVERSATION_SOURCE_CLEANUP_BATCH,
+            WriteSource::Desktop,
+        )
+        .await
+        {
+            Ok(report)
+                if report.discarded != 0
+                    || report.cleaned != 0
+                    || report.conflicts != 0
+                    || report.store_failures != 0
+                    || report.object_failures != 0 =>
+            {
+                eprintln!(
+                    "MuriArc AI source cleanup ({trigger}): inspected={}, discarded={}, cleaned={}, conflicts={}, store_failures={}, object_failures={}",
+                    report.inspected,
+                    report.discarded,
+                    report.cleaned,
+                    report.conflicts,
+                    report.store_failures,
+                    report.object_failures
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("MuriArc AI source cleanup ({trigger}) will retry later: {error}");
+            }
+        }
     }
 
     async fn audit(&self, reason: &'static str) -> Result<AuditContext, DesktopDataError> {
@@ -504,6 +552,9 @@ impl DesktopDataState {
         let previous_id = parse_id("job", &input.job_id)?;
         let mut previous = self.store.get_job(previous_id).await?;
         ensure_job_scope(&previous, JobKind::Import)?;
+        if is_ai_source_import_job(&previous) {
+            return Err(DesktopDataError::InvalidJobState);
+        }
 
         if let Some(existing) = self
             .store
@@ -718,6 +769,9 @@ impl DesktopDataState {
         let job_id = parse_id("job", &input.job_id)?;
         let mut job = self.store.get_job(job_id).await?;
         ensure_job_scope(&job, JobKind::Import)?;
+        if is_ai_source_import_job(&job) {
+            return Err(DesktopDataError::InvalidJobState);
+        }
         if job.status == JobStatus::Completed {
             let value = job
                 .result
@@ -1010,6 +1064,10 @@ impl DesktopDataState {
 
     pub(crate) fn files_ref(&self) -> &DataFiles {
         &self.files
+    }
+
+    pub(crate) fn attachments_ref(&self) -> &AttachmentFiles {
+        &self.attachments
     }
 }
 

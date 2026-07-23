@@ -6,12 +6,16 @@ use axum::{
     http::{Method, Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
+use muriarc_ai::SOURCE_IMPORT_JOB_BINDING_KEY;
 use muriarc_core::{
-    Actor, AiScope, Animal, AnimalEvent, AnimalEventKind, Attachment, AuditContext, Cage,
-    EntityType, Experiment, ExperimentTemplateVersion, FieldValueType, Lab, LabRole, Measurement,
-    MeasurementFilter, MeasurementValue, MuriArcStore, ParentType, Participation, Pedigree,
-    Project, ProjectAnimalAssignment, ProjectRole, ProvenanceFilter, ProvenanceSource, RecordMeta,
-    RecordStatus, Sample, Sex, TemplateField, User, WriteSource,
+    Actor, ActorType, AiConversation, AiConversationMessage, AiConversationMessageRole,
+    AiOperationStore, AiScope, Animal, AnimalEvent, AnimalEventKind, Approval, ApprovalDecision,
+    Attachment, AuditContext, Cage, EntityType, Experiment, ExperimentTemplateVersion,
+    FieldValueType, Job, JobKind, JobStatus, Lab, LabRole, Measurement, MeasurementFilter,
+    MeasurementValue, MuriArcStore, ParentType, Participation, Pedigree, Project,
+    ProjectAnimalAssignment, ProjectRole, ProvenanceFilter, ProvenanceSource, RecordMeta,
+    RecordStatus, Sample, Sex, TemplateField, ToolRun, ToolRunStatus, User, WorkspaceStore,
+    WriteSource,
 };
 use muriarc_data::DataFiles;
 use muriarc_importer::read_xlsx;
@@ -22,7 +26,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::{
-    AppState, AuthPrincipal, StaticTokenAuthenticator, StoreJobRepository, application_router,
+    AppState, AuthPrincipal, DisabledAiProviderStore, StaticTokenAuthenticator, StoreJobRepository,
+    application_router,
 };
 
 const HUMAN_TOKEN: &str = "human-token-000000000000000000000000";
@@ -45,6 +50,14 @@ struct Fixture {
 
 impl Fixture {
     async fn new(ui_dir: Option<PathBuf>) -> Self {
+        Self::new_inner(ui_dir, false).await
+    }
+
+    async fn new_with_ai(ui_dir: Option<PathBuf>) -> Self {
+        Self::new_inner(ui_dir, true).await
+    }
+
+    async fn new_inner(ui_dir: Option<PathBuf>, enable_ai: bool) -> Self {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
         store.migrate().await.unwrap();
         let now = chrono::Utc::now();
@@ -133,6 +146,11 @@ impl Fixture {
             DataFiles::new(data_dir.path().join("data")),
             attachment_root.clone(),
         );
+        let state = if enable_ai {
+            state.with_ai(store.clone(), Arc::new(DisabledAiProviderStore))
+        } else {
+            state
+        };
         Self {
             app: application_router(state, ui_dir),
             store,
@@ -704,6 +722,207 @@ async fn project_viewer_animal_detail_is_isolated_and_audit_summaries_are_redact
 async fn response_json(response: axum::response::Response) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn job_routes_project_safe_views_and_keep_source_imports_owner_only() {
+    let fixture = Fixture::new(None).await;
+    let now = chrono::Utc::now();
+    let audit = AuditContext::system(WriteSource::Migration);
+    let private_attachment_id = Uuid::new_v4();
+    let private_animal = "PRIVATE-ANIMAL-DO-NOT-LEAK";
+    let source_project_id = Uuid::new_v4();
+    let source_lab_id = Uuid::new_v4();
+    let ordinary_project_id = Uuid::new_v4();
+    let ordinary_lab_id = Uuid::new_v4();
+    let source_result = || {
+        Some(json!({
+            (SOURCE_IMPORT_JOB_BINDING_KEY): {
+                "schema_version": 1,
+                "source_id": Uuid::new_v4(),
+                "source_revision": 1,
+                "source_project_id": fixture.project_id,
+                "attachment_id": private_attachment_id,
+                "attachment_revision": 1,
+                "conversation_id": Uuid::new_v4(),
+            },
+            "preview_rows": [{"display_id": private_animal}],
+        }))
+    };
+    let jobs = [
+        Job {
+            id: source_project_id,
+            lab_id: fixture.lab_id,
+            project_id: Some(fixture.project_id),
+            created_by: fixture.user_id,
+            kind: JobKind::Import,
+            status: JobStatus::AwaitingConfirmation,
+            idempotency_key: "ai-source-import:private-project".to_owned(),
+            progress_current: 2,
+            progress_total: Some(3),
+            result: source_result(),
+            error_report: None,
+            cancellation_requested: false,
+            meta: RecordMeta::new(now),
+        },
+        Job {
+            id: source_lab_id,
+            lab_id: fixture.lab_id,
+            project_id: None,
+            created_by: fixture.user_id,
+            kind: JobKind::Import,
+            status: JobStatus::AwaitingConfirmation,
+            idempotency_key: "ai-source-import:private-lab".to_owned(),
+            progress_current: 2,
+            progress_total: Some(3),
+            result: source_result(),
+            error_report: None,
+            cancellation_requested: false,
+            meta: RecordMeta::new(now),
+        },
+        Job {
+            id: ordinary_project_id,
+            lab_id: fixture.lab_id,
+            project_id: Some(fixture.project_id),
+            created_by: fixture.user_id,
+            kind: JobKind::Export,
+            status: JobStatus::Completed,
+            idempotency_key: "ordinary-project-secret-key".to_owned(),
+            progress_current: 1,
+            progress_total: Some(1),
+            result: Some(json!({"private_result": "PROJECT-RESULT-DO-NOT-LEAK"})),
+            error_report: None,
+            cancellation_requested: false,
+            meta: RecordMeta::new(now),
+        },
+        Job {
+            id: ordinary_lab_id,
+            lab_id: fixture.lab_id,
+            project_id: None,
+            created_by: fixture.user_id,
+            kind: JobKind::Snapshot,
+            status: JobStatus::Failed,
+            idempotency_key: "ordinary-lab-secret-key".to_owned(),
+            progress_current: 0,
+            progress_total: Some(1),
+            result: None,
+            error_report: Some(json!({"private_error": "LAB-ERROR-DO-NOT-LEAK"})),
+            cancellation_requested: false,
+            meta: RecordMeta::new(now),
+        },
+    ];
+    for job in &jobs {
+        fixture.store.create_job(job, &audit).await.unwrap();
+    }
+
+    let owner_list = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(Method::GET, "/api/v1/jobs", HUMAN_TOKEN, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(owner_list.status(), StatusCode::OK);
+    let owner_body = response_json(owner_list).await;
+    assert_eq!(owner_body["count"], json!(4));
+    for job in owner_body["data"].as_array().unwrap() {
+        let object = job.as_object().unwrap();
+        for forbidden in [
+            "idempotency_key",
+            "result",
+            "error_report",
+            "created_by",
+            "lab_id",
+            "meta",
+        ] {
+            assert!(
+                !object.contains_key(forbidden),
+                "public Job view leaked {forbidden}"
+            );
+        }
+    }
+    let serialized_owner = owner_body.to_string();
+    for forbidden in [
+        SOURCE_IMPORT_JOB_BINDING_KEY,
+        "preview_rows",
+        private_animal,
+        "PROJECT-RESULT-DO-NOT-LEAK",
+        "LAB-ERROR-DO-NOT-LEAK",
+    ] {
+        assert!(
+            !serialized_owner.contains(forbidden),
+            "public Job view leaked {forbidden}"
+        );
+    }
+    assert!(!serialized_owner.contains(&private_attachment_id.to_string()));
+
+    let viewer_list = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(Method::GET, "/api/v1/jobs", PROJECT_TOKEN, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(viewer_list.status(), StatusCode::OK);
+    let viewer_body = response_json(viewer_list).await;
+    assert_eq!(viewer_body["count"], json!(1));
+    assert_eq!(
+        viewer_body["data"][0]["id"],
+        json!(ordinary_project_id.to_string())
+    );
+
+    let manager_list = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(Method::GET, "/api/v1/jobs", ANIMAL_MANAGER_TOKEN, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(manager_list.status(), StatusCode::OK);
+    let manager_body = response_json(manager_list).await;
+    let manager_ids = manager_body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["id"].as_str().unwrap().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        manager_ids,
+        std::collections::BTreeSet::from([
+            ordinary_project_id.to_string(),
+            ordinary_lab_id.to_string(),
+        ])
+    );
+
+    for (token, id) in [
+        (PROJECT_TOKEN, source_project_id),
+        (ANIMAL_MANAGER_TOKEN, source_lab_id),
+    ] {
+        let hidden = fixture
+            .app
+            .clone()
+            .oneshot(fixture.request(Method::GET, &format!("/api/v1/jobs/{id}"), token, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+    }
+
+    let owner_get = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::GET,
+            &format!("/api/v1/jobs/{source_project_id}"),
+            HUMAN_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner_get.status(), StatusCode::OK);
+    let owner_get = response_json(owner_get).await;
+    assert_eq!(owner_get["data"]["result_available"], true);
+    assert!(
+        !owner_get
+            .to_string()
+            .contains(SOURCE_IMPORT_JOB_BINDING_KEY)
+    );
 }
 
 #[tokio::test]
@@ -2629,4 +2848,730 @@ async fn private_ai_images_are_owner_scoped_and_admin_bearer_requires_a_view_ses
         .unwrap();
     assert_eq!(stats.status(), StatusCode::OK);
     assert_eq!(response_json(stats).await["count"], 1);
+}
+
+#[tokio::test]
+async fn ai_sources_are_validated_owner_scoped_archived_and_soft_discarded() {
+    let fixture = Fixture::new_with_ai(None).await;
+    let now = chrono::Utc::now();
+    let lab_conversation = AiConversation {
+        id: Uuid::new_v4(),
+        lab_id: fixture.lab_id,
+        project_id: None,
+        user_id: fixture.user_id,
+        title: "Lab conversation".to_owned(),
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    fixture
+        .store
+        .create_ai_conversation(
+            &lab_conversation,
+            &AuditContext {
+                actor: Actor::human(fixture.user_id, "Animal manager"),
+                source: WriteSource::Web,
+                request_id: Some(Uuid::new_v4().to_string()),
+                reason: Some("AI source scope fixture".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let project_conversation = AiConversation {
+        id: Uuid::new_v4(),
+        project_id: Some(fixture.project_id),
+        title: "Project conversation".to_owned(),
+        ..lab_conversation.clone()
+    };
+    let other_project_conversation = AiConversation {
+        id: Uuid::new_v4(),
+        title: "Other project conversation".to_owned(),
+        ..project_conversation.clone()
+    };
+    fixture
+        .store
+        .create_ai_conversation(
+            &project_conversation,
+            &AuditContext {
+                actor: Actor::human(fixture.user_id, "Animal manager"),
+                source: WriteSource::Web,
+                request_id: Some(Uuid::new_v4().to_string()),
+                reason: Some("AI project source fixture".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    fixture
+        .store
+        .create_ai_conversation(
+            &other_project_conversation,
+            &AuditContext {
+                actor: Actor::human(fixture.user_id, "Animal manager"),
+                source: WriteSource::Web,
+                request_id: Some(Uuid::new_v4().to_string()),
+                reason: Some("AI other conversation fixture".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let archived_conversation = AiConversation {
+        id: Uuid::new_v4(),
+        title: "Archived project conversation".to_owned(),
+        archived_at: Some(now),
+        ..project_conversation.clone()
+    };
+    fixture
+        .store
+        .create_ai_conversation(
+            &archived_conversation,
+            &AuditContext {
+                actor: Actor::human(fixture.user_id, "Animal manager"),
+                source: WriteSource::Web,
+                request_id: Some(Uuid::new_v4().to_string()),
+                reason: Some("AI archived conversation fixture".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let archived_upload = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/ai/sources/upload?file_name=archived.md&media_type=text%2Fmarkdown&conversation_id={}",
+                    archived_conversation.id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .body(Body::from("must unarchive first"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_upload.status(), StatusCode::CONFLICT);
+
+    let missing_conversation = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/ai/sources/upload?file_name=unbound.md&media_type=text%2Fmarkdown")
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .body(Body::from("must be conversation bound"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_conversation.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let widened_conversation = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/ai/sources/upload?file_name=widened.md&media_type=text%2Fmarkdown&conversation_id={}&project_id={}",
+                    lab_conversation.id, fixture.project_id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .body(Body::from("must not widen a lab conversation"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(widened_conversation.status(), StatusCode::NOT_FOUND);
+
+    let upload = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/ai/sources/upload?file_name=notes.md&media_type=text%2Fmarkdown&conversation_id={}&project_id={}",
+                    project_conversation.id, fixture.project_id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .body(Body::from("# Project notes"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::CREATED);
+    let uploaded = response_json(upload).await["data"].clone();
+    let source_id = uploaded["id"].as_str().unwrap();
+    assert_eq!(uploaded["status"], "ready");
+    assert_eq!(uploaded["kind"], "text");
+    assert_eq!(uploaded["projectId"], json!(fixture.project_id));
+
+    let unbound_list = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(Method::GET, "/api/v1/ai/sources", HUMAN_TOKEN, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(unbound_list.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let owner_list = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::GET,
+            &format!(
+                "/api/v1/ai/sources?conversation_id={}&project_id={}",
+                project_conversation.id, fixture.project_id
+            ),
+            HUMAN_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner_list.status(), StatusCode::OK);
+    assert_eq!(response_json(owner_list).await["count"], 1);
+
+    let other_conversation_list = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::GET,
+            &format!(
+                "/api/v1/ai/sources?conversation_id={}&project_id={}",
+                other_project_conversation.id, fixture.project_id
+            ),
+            HUMAN_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_conversation_list.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(other_conversation_list).await["count"],
+        0,
+        "sources from another conversation must not be enumerable"
+    );
+
+    let other_owner_list = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::GET,
+            &format!(
+                "/api/v1/ai/sources?conversation_id={}&project_id={}",
+                project_conversation.id, fixture.project_id
+            ),
+            PROJECT_EDITOR_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other_owner_list.status(), StatusCode::NOT_FOUND);
+
+    let archived = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::POST,
+            &format!("/api/v1/ai/sources/{source_id}/archive"),
+            HUMAN_TOKEN,
+            json!({
+                "project_id": fixture.project_id,
+                "expected_revision": uploaded["revision"],
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(archived.status(), StatusCode::OK);
+    assert_eq!(response_json(archived).await["data"]["status"], "archived");
+
+    let archived_delete = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::DELETE,
+            &format!("/api/v1/ai/sources/{source_id}"),
+            HUMAN_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(archived_delete.status(), StatusCode::CONFLICT);
+
+    let second = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/ai/sources/upload?file_name=animals.csv&media_type=text%2Fcsv&conversation_id={}",
+                    lab_conversation.id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "text/csv")
+                .body(Body::from("animal,value\nM-1,12\n"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::CREATED);
+    let second = response_json(second).await;
+    let second_id = second["data"]["id"].as_str().unwrap();
+    let second_source = fixture
+        .store
+        .get_ai_conversation_source(Uuid::parse_str(second_id).unwrap())
+        .await
+        .unwrap();
+    let second_attachment = fixture
+        .store
+        .get_attachment(second_source.attachment_id)
+        .await
+        .unwrap();
+    let second_object_path = fixture
+        .attachment_root
+        .join(&second_attachment.relative_path);
+    assert!(second_object_path.exists());
+    let invalid_archive = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::POST,
+            &format!("/api/v1/ai/sources/{second_id}/archive"),
+            HUMAN_TOKEN,
+            json!({
+                "project_id": fixture.project_id,
+                "expected_revision": second["data"]["revision"],
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_archive.status(), StatusCode::NOT_FOUND);
+    let discarded = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::DELETE,
+            &format!("/api/v1/ai/sources/{second_id}"),
+            HUMAN_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(discarded.status(), StatusCode::NO_CONTENT);
+    assert!(
+        !second_object_path.exists(),
+        "manual source discard must also remove the verified immutable object"
+    );
+    assert!(
+        fixture
+            .store
+            .list_pending_ai_conversation_source_object_deletions(fixture.lab_id, 100)
+            .await
+            .unwrap()
+            .is_empty(),
+        "successful manual object removal must complete its durable cleanup item"
+    );
+
+    let attachment_count = fixture
+        .store
+        .list_lab_attachments(fixture.lab_id)
+        .await
+        .unwrap()
+        .len();
+    let rejected = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/ai/sources/upload?file_name=source.docx&conversation_id={}",
+                    lab_conversation.id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from("not an accepted source"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        fixture
+            .store
+            .list_lab_attachments(fixture.lab_id)
+            .await
+            .unwrap()
+            .len(),
+        attachment_count
+    );
+
+    let external_upload = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/ai/sources/upload?file_name=notes.txt&conversation_id={}",
+                    lab_conversation.id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {AI_TOKEN}"))
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("must be rejected"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(external_upload.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn public_audit_routes_hide_ai_source_storage_identity_and_legacy_sensitive_keys() {
+    const CHAT_SENTINEL: &str = "OWNER-PRIVATE-CHAT-DO-NOT-LEAK";
+    const TOOL_SENTINEL: &str = "OWNER-PRIVATE-TOOL-OUTPUT-DO-NOT-LEAK";
+    const APPROVAL_SENTINEL: &str = "OWNER-PRIVATE-APPROVAL-STATEMENT-DO-NOT-LEAK";
+
+    fn assert_no_sensitive_keys(value: &Value) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    assert_no_sensitive_keys(value);
+                }
+            }
+            Value::Object(object) => {
+                for (key, value) in object {
+                    let normalized = key
+                        .chars()
+                        .filter(char::is_ascii_alphanumeric)
+                        .flat_map(char::to_lowercase)
+                        .collect::<String>();
+                    assert!(
+                        !matches!(
+                            normalized.as_str(),
+                            "attachmentid"
+                                | "relativepath"
+                                | "sha256"
+                                | "idempotencykey"
+                                | "result"
+                                | "errorreport"
+                        ),
+                        "public audit response leaked sensitive key {key}"
+                    );
+                    assert_no_sensitive_keys(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let fixture = Fixture::new_with_ai(None).await;
+    let now = chrono::Utc::now();
+    let conversation = AiConversation {
+        id: Uuid::new_v4(),
+        lab_id: fixture.lab_id,
+        project_id: None,
+        user_id: fixture.user_id,
+        title: "Audit-safe source".to_owned(),
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    fixture
+        .store
+        .create_ai_conversation(
+            &conversation,
+            &AuditContext {
+                actor: Actor::human(fixture.user_id, "Animal manager"),
+                source: WriteSource::Web,
+                request_id: Some(Uuid::new_v4().to_string()),
+                reason: Some("AI source audit safety fixture".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+    let ai_audit = AuditContext {
+        actor: Actor {
+            actor_type: ActorType::Ai,
+            user_id: Some(fixture.user_id),
+            display_name: "MuriArc AI".to_owned(),
+        },
+        source: WriteSource::Ai,
+        request_id: Some(Uuid::new_v4().to_string()),
+        reason: None,
+    };
+    let user_message = AiConversationMessage::new(
+        conversation.id,
+        fixture.lab_id,
+        None,
+        fixture.user_id,
+        1,
+        AiConversationMessageRole::User,
+        CHAT_SENTINEL,
+        None,
+        now + chrono::Duration::milliseconds(1),
+    )
+    .unwrap();
+    let assistant_message = AiConversationMessage::new(
+        conversation.id,
+        fixture.lab_id,
+        None,
+        fixture.user_id,
+        2,
+        AiConversationMessageRole::Assistant,
+        "Private audit sentinel response",
+        Some(json!({"content": "Private audit sentinel response"})),
+        now + chrono::Duration::milliseconds(2),
+    )
+    .unwrap();
+    let tool_run = ToolRun {
+        id: Uuid::new_v4(),
+        conversation_id: Some(conversation.id),
+        lab_id: fixture.lab_id,
+        project_id: None,
+        user_id: fixture.user_id,
+        tool_name: "audit_private_probe".to_owned(),
+        input: json!({"operation": "read"}),
+        output: Some(json!({"private": TOOL_SENTINEL})),
+        status: ToolRunStatus::AwaitingApproval,
+        source: WriteSource::Ai,
+        started_at: Some(now + chrono::Duration::milliseconds(1)),
+        completed_at: None,
+        error: None,
+        meta: RecordMeta::new(now + chrono::Duration::milliseconds(1)),
+    };
+    let approval = Approval {
+        id: Uuid::new_v4(),
+        tool_run_id: tool_run.id,
+        requested_diff: json!({"statement": APPROVAL_SENTINEL}),
+        decision: ApprovalDecision::Pending,
+        decided_by: None,
+        decided_at: None,
+        reason: None,
+        meta: RecordMeta::new(now + chrono::Duration::milliseconds(1)),
+    };
+    fixture
+        .store
+        .append_ai_turn_records(
+            &user_message,
+            &assistant_message,
+            std::slice::from_ref(&tool_run),
+            std::slice::from_ref(&approval),
+            0,
+            &ai_audit,
+        )
+        .await
+        .unwrap();
+
+    let upload = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/ai/sources/upload?file_name=audit.md&media_type=text%2Fmarkdown&conversation_id={}",
+                    conversation.id
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "text/markdown")
+                .body(Body::from("# Private audit source"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::CREATED);
+    let source_id =
+        Uuid::parse_str(response_json(upload).await["data"]["id"].as_str().unwrap()).unwrap();
+    let source = fixture
+        .store
+        .get_ai_conversation_source(source_id)
+        .await
+        .unwrap();
+    let attachment = fixture
+        .store
+        .get_attachment(source.attachment_id)
+        .await
+        .unwrap();
+    let private_source_id = Uuid::new_v4();
+    let private_conversation_id = Uuid::new_v4();
+    let private_draft_id = Uuid::new_v4();
+    let private_preview_hash = "PREVIEW-HASH-DO-NOT-LEAK";
+    let private_job = Job {
+        id: Uuid::new_v4(),
+        lab_id: fixture.lab_id,
+        project_id: Some(fixture.project_id),
+        created_by: fixture.user_id,
+        kind: JobKind::Import,
+        status: JobStatus::AwaitingConfirmation,
+        idempotency_key: format!("ai-source-import:{private_preview_hash}"),
+        progress_current: 2,
+        progress_total: Some(3),
+        result: Some(json!({
+            (SOURCE_IMPORT_JOB_BINDING_KEY): {
+                "source_id": private_source_id,
+                "conversation_id": private_conversation_id,
+                "attachment_id": attachment.id,
+                "preview_sha256": private_preview_hash,
+            },
+            "_ai_draft_id": private_draft_id,
+            "_ai_expected_revision": 1,
+        })),
+        error_report: None,
+        cancellation_requested: false,
+        meta: RecordMeta::new(now),
+    };
+    fixture
+        .store
+        .create_job(
+            &private_job,
+            &AuditContext {
+                actor: Actor::human(fixture.user_id, "Animal manager"),
+                source: WriteSource::Ai,
+                request_id: Some(Uuid::new_v4().to_string()),
+                reason: Some("Private AI source Job audit fixture".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Ordinary Jobs remain visible as activity, but their public audit
+    // projection must not expose internal transport payloads.
+    let ordinary_job = Job {
+        id: Uuid::new_v4(),
+        lab_id: fixture.lab_id,
+        project_id: Some(fixture.project_id),
+        created_by: fixture.user_id,
+        kind: JobKind::Export,
+        status: JobStatus::Failed,
+        idempotency_key: "ORDINARY-IDEMPOTENCY-DO-NOT-LEAK".to_owned(),
+        progress_current: 1,
+        progress_total: Some(2),
+        result: Some(json!({"private_result": "ORDINARY-RESULT-DO-NOT-LEAK"})),
+        error_report: Some(json!({"private_error": "ORDINARY-ERROR-DO-NOT-LEAK"})),
+        cancellation_requested: false,
+        meta: RecordMeta::new(now),
+    };
+    fixture
+        .store
+        .create_job(
+            &ordinary_job,
+            &AuditContext {
+                actor: Actor::human(fixture.user_id, "Animal manager"),
+                source: WriteSource::Web,
+                request_id: Some(Uuid::new_v4().to_string()),
+                reason: Some("Ordinary Job audit fixture".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Simulate a legacy source audit row written before safe snapshots. Both
+    // public audit surfaces must recursively redact it at read time.
+    let legacy_after = json!({
+        "id": source.id,
+        "entity_type": "ai_conversation_source",
+        "attachmentId": attachment.id,
+        "nested": {
+            "relative_path": attachment.relative_path,
+            "sha256": attachment.sha256,
+        },
+    });
+    let legacy_params = json!({
+        "sourceRefs": [{
+            "sourceId": source.id,
+            "attachment_id": attachment.id,
+        }],
+    });
+    let updated = sqlx::query(
+        "UPDATE audit_entries
+         SET after_json = ?, operation_params_json = ?
+         WHERE entity_type = 'ai_conversation_source'
+           AND entity_id = ? AND action = 'create'",
+    )
+    .bind(legacy_after.to_string())
+    .bind(legacy_params.to_string())
+    .bind(source.id.to_string())
+    .execute(fixture.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+
+    for (uri, token) in [
+        ("/api/v1/audit?limit=500".to_owned(), OTHER_ADMIN_TOKEN),
+        (
+            "/api/v1/operations?include_technical=true&limit=500".to_owned(),
+            OTHER_ADMIN_TOKEN,
+        ),
+        (
+            format!(
+                "/api/v1/operations?project_id={}&limit=500",
+                fixture.project_id
+            ),
+            PROJECT_TOKEN,
+        ),
+    ] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.request(Method::GET, &uri, token, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_no_sensitive_keys(&body);
+        let text = body.to_string();
+        assert!(
+            text.contains(&ordinary_job.id.to_string()),
+            "ordinary Job activity should remain visible at {uri}"
+        );
+        assert!(
+            !text.contains(&private_job.id.to_string()),
+            "private AI source Job audit leaked at {uri}"
+        );
+        for private_id in [
+            conversation.id,
+            user_message.id,
+            assistant_message.id,
+            tool_run.id,
+            approval.id,
+        ] {
+            assert!(
+                !text.contains(&private_id.to_string()),
+                "owner-private AI operational entity {private_id} leaked at {uri}"
+            );
+        }
+        assert!(!text.contains(&attachment.id.to_string()));
+        assert!(!text.contains(&attachment.relative_path));
+        assert!(!text.contains(&attachment.sha256));
+        for secret in [
+            private_source_id.to_string(),
+            private_conversation_id.to_string(),
+            private_draft_id.to_string(),
+            private_preview_hash.to_owned(),
+            SOURCE_IMPORT_JOB_BINDING_KEY.to_owned(),
+            "_ai_draft_id".to_owned(),
+            "_ai_expected_revision".to_owned(),
+            "ORDINARY-IDEMPOTENCY-DO-NOT-LEAK".to_owned(),
+            "ORDINARY-RESULT-DO-NOT-LEAK".to_owned(),
+            "ORDINARY-ERROR-DO-NOT-LEAK".to_owned(),
+            CHAT_SENTINEL.to_owned(),
+            TOOL_SENTINEL.to_owned(),
+            APPROVAL_SENTINEL.to_owned(),
+        ] {
+            assert!(
+                !text.contains(&secret),
+                "public audit response leaked {secret} at {uri}"
+            );
+        }
+    }
 }

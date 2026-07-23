@@ -1,12 +1,24 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Duration, Utc};
 
 use async_trait::async_trait;
+use muriarc_application::{
+    ActivityQueryRequest, AnimalContextRequest, AuditQueryRequest, BusinessReadAccess,
+    BusinessReadError, BusinessReadResult, BusinessReadService, BusinessSourceRef,
+    ExperimentGroupingRequest, GenotypingQueryRequest, GroupingCandidate, MAX_GROUPING_CANDIDATES,
+    ProjectContextRequest, ProvenanceQueryRequest, ResourceSearchRequest,
+    build_experiment_grouping_plan,
+};
 use muriarc_core::{
-    AiAutonomyMode, AnimalFilter, AnimalStatus, EntityType, ExperimentFilter, ExperimentStatus,
-    Measurement, MeasurementFilter, MeasurementValue, MuriArcStore, ParticipationFilter, Project,
-    ProjectStatus, SampleFilter, StoreError,
+    AiAutonomyMode, AiExperimentGroupingApplication, AiGroupingAnimalRevision,
+    AiGroupingLatestWeightRevision, AnimalFilter, AnimalStatus, Cohort, EntityType,
+    ExperimentFilter, ExperimentStatus, Measurement, MeasurementFilter, MeasurementValue,
+    MuriArcStore, Participation, ParticipationFilter, Project, ProjectStatus, SampleFilter,
+    StoreError,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -23,14 +35,11 @@ const MAX_LIMIT: usize = 100;
 const MAX_OFFSET: usize = 10_000;
 const MAX_QUERY_LENGTH: usize = 256;
 const MAX_SHORT_TEXT_LENGTH: usize = 128;
-const STORE_READ_TOOLS: [ToolName; 7] = [
-    ToolName::AnimalSearch,
-    ToolName::AnimalTimeline,
-    ToolName::CageList,
-    ToolName::ProjectList,
-    ToolName::ExperimentStatus,
-    ToolName::MeasurementQuery,
-    ToolName::SampleInventory,
+const STORE_MODEL_READ_TOOLS: [ToolName; 4] = [
+    ToolName::ResourceSearch,
+    ToolName::GenotypingQuery,
+    ToolName::AnimalContext,
+    ToolName::ProjectContext,
 ];
 
 /// Store-level access already resolved by the authenticated application layer.
@@ -43,6 +52,9 @@ pub struct StoreToolAccessContext {
     lab_id: Uuid,
     allowed_project_ids: BTreeSet<Uuid>,
     lab_registry_read: bool,
+    activity_read: bool,
+    audit_read: bool,
+    current_user_id: Option<Uuid>,
     writable_project_ids: BTreeSet<Uuid>,
 }
 
@@ -52,6 +64,9 @@ impl StoreToolAccessContext {
             lab_id,
             allowed_project_ids: allowed_project_ids.into_iter().collect(),
             lab_registry_read: false,
+            activity_read: false,
+            audit_read: false,
+            current_user_id: None,
             writable_project_ids: BTreeSet::new(),
         }
     }
@@ -60,6 +75,21 @@ impl StoreToolAccessContext {
     /// Admin or Animal Manager. Project membership alone must not set this.
     pub const fn with_lab_registry_read(mut self, allowed: bool) -> Self {
         self.lab_registry_read = allowed;
+        self
+    }
+
+    pub const fn with_activity_read(mut self, allowed: bool) -> Self {
+        self.activity_read = allowed;
+        self
+    }
+
+    pub const fn with_audit_read(mut self, allowed: bool) -> Self {
+        self.audit_read = allowed;
+        self
+    }
+
+    pub const fn with_current_user(mut self, user_id: Uuid) -> Self {
+        self.current_user_id = Some(user_id);
         self
     }
 
@@ -90,6 +120,14 @@ impl StoreToolAccessContext {
         self.lab_registry_read
     }
 
+    pub const fn can_read_activity(&self) -> bool {
+        self.activity_read
+    }
+
+    pub const fn can_read_audit(&self) -> bool {
+        self.audit_read
+    }
+
     pub fn can_write_project(&self, project_id: Uuid) -> bool {
         self.writable_project_ids.contains(&project_id)
     }
@@ -102,18 +140,32 @@ impl StoreToolAccessContext {
 /// Read-only implementation of MuriArc's fixed domain tools.
 ///
 /// This executor only calls `MuriArcStore` read methods. It has no raw-SQL or
-/// write API and advertises only the seven V1 read tools it implements.
+/// write API. Models see the aggregate context tools and one focused Genetics
+/// v2 query, plus `audit_query` only
+/// when explicitly authorized; legacy V1 read names remain executable only for
+/// compatibility with trusted existing callers.
 #[derive(Clone)]
 pub struct StoreDomainToolExecutor {
     store: Arc<dyn MuriArcStore>,
     access: StoreToolAccessContext,
+    business_reads: BusinessReadService,
     data_tools: Option<(AiDataAccessContext, Arc<dyn AiDataToolBackend>)>,
     autonomy_mode: AiAutonomyMode,
 }
 
 impl StoreDomainToolExecutor {
     pub fn new(store: Arc<dyn MuriArcStore>, access: StoreToolAccessContext) -> Self {
+        let read_access =
+            BusinessReadAccess::new(access.lab_id, access.allowed_project_ids.iter().copied())
+                .with_lab_registry_read(access.lab_registry_read)
+                .with_activity_read(access.activity_read)
+                .with_audit_read(access.audit_read);
+        let read_access = match access.current_user_id {
+            Some(user_id) => read_access.with_current_user(user_id),
+            None => read_access,
+        };
         Self {
+            business_reads: BusinessReadService::new(store.clone(), read_access),
             store,
             access,
             data_tools: None,
@@ -188,6 +240,103 @@ impl StoreDomainToolExecutor {
         read_items(animals, page, citations)
     }
 
+    async fn resource_search(
+        &self,
+        arguments: Value,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        let request: ResourceSearchRequest = parse_arguments(arguments)?;
+        let result = self
+            .business_reads
+            .resource_search(request)
+            .await
+            .map_err(map_business_read_error)?;
+        business_read_output(result)
+    }
+
+    async fn genotyping_query(
+        &self,
+        arguments: Value,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        let request: GenotypingQueryRequest = parse_arguments(arguments)?;
+        let result = self
+            .business_reads
+            .genotyping_query(request)
+            .await
+            .map_err(map_business_read_error)?;
+        business_read_output(result)
+    }
+
+    async fn animal_context(
+        &self,
+        arguments: Value,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        let request: AnimalContextRequest = parse_arguments(arguments)?;
+        let result = self
+            .business_reads
+            .animal_context(request)
+            .await
+            .map_err(map_business_read_error)?;
+        business_read_output(result)
+    }
+
+    async fn project_context(
+        &self,
+        arguments: Value,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        let request: ProjectContextRequest = parse_arguments(arguments)?;
+        let result = self
+            .business_reads
+            .project_context(request)
+            .await
+            .map_err(map_business_read_error)?;
+        business_read_output(result)
+    }
+
+    async fn audit_query(&self, arguments: Value) -> Result<DomainToolOutput, ToolExecutionError> {
+        if !self.access.audit_read {
+            return Err(rejected("audit_forbidden"));
+        }
+        let request: AuditQueryRequest = parse_arguments(arguments)?;
+        let result = self
+            .business_reads
+            .audit_query(request)
+            .await
+            .map_err(map_business_read_error)?;
+        business_read_output(result)
+    }
+
+    async fn activity_query(
+        &self,
+        arguments: Value,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        if !self.access.activity_read {
+            return Err(rejected("activity_forbidden"));
+        }
+        let request: ActivityQueryRequest = parse_arguments(arguments)?;
+        let result = self
+            .business_reads
+            .activity_query(request)
+            .await
+            .map_err(map_business_read_error)?;
+        business_read_output(result)
+    }
+
+    async fn provenance_query(
+        &self,
+        arguments: Value,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        if !self.access.audit_read {
+            return Err(rejected("audit_forbidden"));
+        }
+        let request: ProvenanceQueryRequest = parse_arguments(arguments)?;
+        let result = self
+            .business_reads
+            .provenance_query(request)
+            .await
+            .map_err(map_business_read_error)?;
+        business_read_output(result)
+    }
+
     async fn animal_timeline(
         &self,
         arguments: Value,
@@ -211,17 +360,16 @@ impl StoreDomainToolExecutor {
             let Some(project_id) = arguments.project_id else {
                 return Err(rejected("project_required"));
             };
-            let participations = self
+            let assignments = self
                 .store
-                .list_participations(&ParticipationFilter {
-                    project_id,
-                    experiment_id: None,
+                .list_project_animal_assignments(&muriarc_core::ProjectAnimalAssignmentFilter {
+                    lab_id: self.access.lab_id,
+                    project_id: Some(project_id),
                     animal_id: Some(animal.id),
-                    cohort_id: None,
                 })
                 .await
                 .map_err(map_store_error)?;
-            if participations.is_empty() {
+            if assignments.is_empty() {
                 return Err(rejected("animal_forbidden"));
             }
         }
@@ -512,6 +660,245 @@ impl StoreDomainToolExecutor {
         Ok(DomainToolOutput::write_draft(draft, citations))
     }
 
+    async fn experiment_grouping_draft(
+        &self,
+        request: &DomainToolRequest,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        let arguments: ExperimentGroupingDraftArgs = parse_arguments(request.arguments.clone())?;
+        if !self.access.can_write_project(arguments.project_id) {
+            return Err(rejected("project_write_forbidden"));
+        }
+        arguments.validate()?;
+        let project = self.authorize_project(arguments.project_id).await?;
+        if project.status != ProjectStatus::Active {
+            return Err(rejected("grouping_project_inactive"));
+        }
+        let experiment = self
+            .store
+            .get_experiment(arguments.experiment_id)
+            .await
+            .map_err(map_store_error)?;
+        if experiment.lab_id != self.access.lab_id
+            || experiment.project_id != project.id
+            || !matches!(
+                experiment.status,
+                ExperimentStatus::Draft | ExperimentStatus::Active
+            )
+        {
+            return Err(rejected("experiment_forbidden"));
+        }
+
+        // One bounded aggregate query supplies all authorized project animals,
+        // their latest weights and optimistic revisions. The model never
+        // supplies an animal UUID list.
+        let overviews = self
+            .store
+            .list_animal_overviews(
+                &AnimalFilter {
+                    lab_id: self.access.lab_id,
+                    project_id: Some(project.id),
+                    cage_id: None,
+                    status: None,
+                    query: None,
+                },
+                0,
+                (MAX_GROUPING_CANDIDATES + 1) as u32,
+            )
+            .await
+            .map_err(map_store_error)?;
+        if overviews.is_empty() {
+            return Err(rejected("grouping_candidates_empty"));
+        }
+        if overviews.len() > MAX_GROUPING_CANDIDATES {
+            return Err(rejected("grouping_candidates_limit_exceeded"));
+        }
+        let existing = self
+            .store
+            .list_participations(&ParticipationFilter {
+                project_id: project.id,
+                experiment_id: Some(experiment.id),
+                animal_id: None,
+                cohort_id: None,
+            })
+            .await
+            .map_err(map_store_error)?
+            .into_iter()
+            .map(|participation| participation.animal_id)
+            .collect::<BTreeSet<_>>();
+        let now = Utc::now();
+        let stratify_by = arguments
+            .stratify_by
+            .iter()
+            .map(|factor| factor.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let balance_by = arguments
+            .balance_by
+            .iter()
+            .map(|factor| factor.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let tracks_latest_weight = arguments
+            .balance_by
+            .contains(&GroupingBalanceFactor::WeightGrams);
+        let candidates = overviews
+            .iter()
+            .map(|overview| {
+                let animal = &overview.animal;
+                let mut strata = BTreeMap::new();
+                for factor in &arguments.stratify_by {
+                    strata.insert(
+                        factor.as_str().to_owned(),
+                        factor
+                            .value(animal)
+                            .unwrap_or_else(|| "<missing>".to_owned()),
+                    );
+                }
+                let mut covariates = BTreeMap::new();
+                for factor in &arguments.balance_by {
+                    if let Some(value) = factor.value(overview, now) {
+                        covariates.insert(factor.as_str().to_owned(), value);
+                    }
+                }
+                let exclusion_reason =
+                    grouping_exclusion_reason(animal, &existing, &arguments, &strata, &covariates);
+                GroupingCandidate {
+                    animal_id: animal.id,
+                    expected_revision: animal.meta.revision,
+                    strata,
+                    covariates,
+                    exclusion_reason,
+                }
+            })
+            .collect();
+        let plan = build_experiment_grouping_plan(ExperimentGroupingRequest {
+            project_id: project.id,
+            expected_project_revision: project.meta.revision,
+            experiment_id: experiment.id,
+            expected_experiment_revision: experiment.meta.revision,
+            seed: arguments.seed,
+            cohort_names: arguments.cohort_names,
+            stratify_by,
+            balance_by,
+            candidates,
+        })
+        .map_err(|_| rejected("grouping_plan_invalid"))?;
+        if plan.assignments.is_empty() {
+            return Err(rejected("grouping_candidates_empty"));
+        }
+
+        let cohorts = plan
+            .cohort_names
+            .iter()
+            .map(|name| {
+                let mut cohort = Cohort::new(experiment.id, name, now)
+                    .map_err(|_| rejected("grouping_cohort_invalid"))?;
+                cohort.description = Some(format!("AI deterministic grouping, seed {}", plan.seed));
+                Ok(cohort)
+            })
+            .collect::<Result<Vec<_>, ToolExecutionError>>()?;
+        let cohort_ids = cohorts.iter().map(|cohort| cohort.id).collect::<Vec<_>>();
+        let participations = plan
+            .assignments
+            .iter()
+            .map(|assignment| {
+                let mut participation =
+                    Participation::enroll(experiment.id, assignment.animal_id, now);
+                participation.cohort_id = Some(cohort_ids[assignment.cohort_index]);
+                participation
+            })
+            .collect::<Vec<_>>();
+        let application = AiExperimentGroupingApplication {
+            lab_id: self.access.lab_id,
+            project_id: project.id,
+            expected_project_revision: project.meta.revision,
+            experiment_id: experiment.id,
+            expected_experiment_revision: experiment.meta.revision,
+            input_snapshot_sha256: plan.input_snapshot_sha256.clone(),
+            cohorts: cohorts.clone(),
+            participations: participations.clone(),
+            expected_animal_revisions: plan
+                .assignments
+                .iter()
+                .map(|assignment| AiGroupingAnimalRevision {
+                    animal_id: assignment.animal_id,
+                    expected_revision: assignment.expected_revision,
+                })
+                .chain(
+                    plan.exclusions
+                        .iter()
+                        .map(|exclusion| AiGroupingAnimalRevision {
+                            animal_id: exclusion.animal_id,
+                            expected_revision: exclusion.expected_revision,
+                        }),
+                )
+                .collect(),
+            expected_latest_weights: if tracks_latest_weight {
+                overviews
+                    .iter()
+                    .map(|overview| AiGroupingLatestWeightRevision {
+                        animal_id: overview.animal.id,
+                        measurement_id: overview
+                            .latest_weight
+                            .as_ref()
+                            .map(|weight| weight.measurement_id),
+                        expected_revision: overview
+                            .latest_weight
+                            .as_ref()
+                            .map(|weight| weight.revision),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        };
+        let mut changes = cohorts
+            .iter()
+            .map(|cohort| FieldChange {
+                path: format!("/cohorts/{}", cohort.id),
+                before: None,
+                after: serde_json::to_value(cohort).ok(),
+            })
+            .collect::<Vec<_>>();
+        changes.extend(participations.iter().map(|participation| FieldChange {
+            path: format!("/participations/{}", participation.id),
+            before: None,
+            after: serde_json::to_value(participation).ok(),
+        }));
+        let draft = WriteDraft::new(
+            DraftKind::ResearchPlan,
+            ToolName::ExperimentGroupingDraft,
+            ProposalActor::Ai {
+                user_id: request.user_id,
+                tool_run_id: request.tool_run_id,
+            },
+            Some(project.id),
+            changes,
+            json!({
+                "operation": "apply_experiment_grouping",
+                "plan": plan,
+                "application": application,
+            }),
+            now,
+            now + Duration::hours(24),
+        )
+        .map_err(|_| rejected("grouping_draft_invalid"))?;
+        let mut citations = vec![
+            Citation::new(EntityType::Project, project.id, Some(project.meta.revision)),
+            Citation::new(
+                EntityType::Experiment,
+                experiment.id,
+                Some(experiment.meta.revision),
+            ),
+        ];
+        citations.extend(overviews.iter().map(|overview| {
+            Citation::new(
+                EntityType::Animal,
+                overview.animal.id,
+                Some(overview.animal.meta.revision),
+            )
+        }));
+        Ok(DomainToolOutput::write_draft(draft, citations))
+    }
+
     async fn sample_inventory(
         &self,
         arguments: Value,
@@ -551,21 +938,29 @@ impl StoreDomainToolExecutor {
 impl DomainToolExecutor for StoreDomainToolExecutor {
     fn supported_tools(&self) -> Vec<ToolName> {
         let policy = AiActionPolicy::new(self.autonomy_mode);
-        let mut tools = STORE_READ_TOOLS
+        let mut tools = STORE_MODEL_READ_TOOLS
             .into_iter()
-            .filter(|tool| {
-                policy.allows_tool(*tool)
-                    && (self.access.lab_registry_read || *tool != ToolName::CageList)
-            })
+            .filter(|tool| policy.allows_tool(*tool))
             .collect::<Vec<_>>();
         if !self.access.writable_project_ids.is_empty() {
             tools.push(ToolName::MutationDraft);
+            tools.push(ToolName::ExperimentGroupingDraft);
+        }
+        if self.access.activity_read {
+            tools.push(ToolName::ActivityQuery);
+        }
+        if self.access.audit_read {
+            tools.push(ToolName::AuditQuery);
+            tools.push(ToolName::ProvenanceQuery);
         }
         if let Some((access, backend)) = &self.data_tools {
             for tool in backend.supported_tools(access) {
                 if matches!(
                     tool,
-                    ToolName::ImportPreview | ToolName::ImportCommitDraft | ToolName::ExportCreate
+                    ToolName::SourceImportPreview
+                        | ToolName::ImportPreview
+                        | ToolName::ImportCommitDraft
+                        | ToolName::ExportCreate
                 ) && policy.allows_tool(tool)
                     && !tools.contains(&tool)
                 {
@@ -584,6 +979,22 @@ impl DomainToolExecutor for StoreDomainToolExecutor {
             return Err(rejected("autonomy_confirmation_required"));
         }
         match request.tool {
+            ToolName::ResourceSearch => self.resource_search(request.arguments).await,
+            ToolName::GenotypingQuery => self.genotyping_query(request.arguments).await,
+            ToolName::AnimalContext => self.animal_context(request.arguments).await,
+            ToolName::ProjectContext => self.project_context(request.arguments).await,
+            ToolName::ActivityQuery if self.access.activity_read => {
+                self.activity_query(request.arguments).await
+            }
+            ToolName::ActivityQuery => Err(rejected("activity_forbidden")),
+            ToolName::AuditQuery if self.access.audit_read => {
+                self.audit_query(request.arguments).await
+            }
+            ToolName::AuditQuery => Err(rejected("audit_forbidden")),
+            ToolName::ProvenanceQuery if self.access.audit_read => {
+                self.provenance_query(request.arguments).await
+            }
+            ToolName::ProvenanceQuery => Err(rejected("audit_forbidden")),
             ToolName::AnimalSearch => self.animal_search(request.arguments).await,
             ToolName::AnimalTimeline => self.animal_timeline(request.arguments).await,
             ToolName::CageList => self.cage_list(request.arguments).await,
@@ -595,7 +1006,14 @@ impl DomainToolExecutor for StoreDomainToolExecutor {
                 self.measurement_draft(&request).await
             }
             ToolName::MutationDraft => Err(rejected("unsupported_tool")),
-            ToolName::ImportPreview | ToolName::ImportCommitDraft | ToolName::ExportCreate => {
+            ToolName::ExperimentGroupingDraft if !self.access.writable_project_ids.is_empty() => {
+                self.experiment_grouping_draft(&request).await
+            }
+            ToolName::ExperimentGroupingDraft => Err(rejected("unsupported_tool")),
+            ToolName::SourceImportPreview
+            | ToolName::ImportPreview
+            | ToolName::ImportCommitDraft
+            | ToolName::ExportCreate => {
                 let Some((access, backend)) = &self.data_tools else {
                     return Err(rejected("unsupported_tool"));
                 };
@@ -632,6 +1050,159 @@ struct MeasurementDraftArgs {
     #[serde(default)]
     unit: Option<String>,
     measured_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GroupingStratifyFactor {
+    Sex,
+    Strain,
+    CurrentStatus,
+}
+
+impl GroupingStratifyFactor {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sex => "sex",
+            Self::Strain => "strain",
+            Self::CurrentStatus => "current_status",
+        }
+    }
+
+    fn value(self, animal: &muriarc_core::Animal) -> Option<String> {
+        match self {
+            Self::Sex => serde_json::to_value(animal.sex)
+                .ok()?
+                .as_str()
+                .map(str::to_owned),
+            Self::Strain => animal
+                .strain
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            Self::CurrentStatus => serde_json::to_value(animal.current_status)
+                .ok()?
+                .as_str()
+                .map(str::to_owned),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GroupingBalanceFactor {
+    AgeDays,
+    WeightGrams,
+}
+
+impl GroupingBalanceFactor {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgeDays => "age_days",
+            Self::WeightGrams => "weight_grams",
+        }
+    }
+
+    fn value(self, overview: &muriarc_core::AnimalOverview, now: DateTime<Utc>) -> Option<f64> {
+        match self {
+            Self::AgeDays => overview
+                .animal
+                .birth_date
+                .map(|birth_date| (now.date_naive() - birth_date).num_days())
+                .filter(|days| *days >= 0)
+                .map(|days| days as f64),
+            Self::WeightGrams => {
+                let weight = overview.latest_weight.as_ref()?;
+                let unit = weight.unit.as_deref()?.trim().to_ascii_lowercase();
+                match unit.as_str() {
+                    "g" | "gram" | "grams" => Some(weight.value),
+                    "mg" => Some(weight.value / 1_000.0),
+                    "kg" => Some(weight.value * 1_000.0),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GroupingExclusionArgs {
+    #[serde(default)]
+    statuses: Vec<AnimalStatus>,
+    #[serde(default)]
+    missing_factors: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExperimentGroupingDraftArgs {
+    project_id: Uuid,
+    experiment_id: Uuid,
+    seed: u64,
+    cohort_names: Vec<String>,
+    #[serde(default)]
+    stratify_by: Vec<GroupingStratifyFactor>,
+    #[serde(default)]
+    balance_by: Vec<GroupingBalanceFactor>,
+    #[serde(default)]
+    exclusion: GroupingExclusionArgs,
+}
+
+impl ExperimentGroupingDraftArgs {
+    fn validate(&self) -> Result<(), ToolExecutionError> {
+        if self.project_id.is_nil()
+            || self.experiment_id.is_nil()
+            || !(2..=20).contains(&self.cohort_names.len())
+            || self.stratify_by.len() > 3
+            || self.balance_by.len() > 2
+            || self.exclusion.statuses.len() > 8
+            || self.stratify_by.iter().collect::<BTreeSet<_>>().len() != self.stratify_by.len()
+            || self.balance_by.iter().collect::<BTreeSet<_>>().len() != self.balance_by.len()
+            || self
+                .exclusion
+                .statuses
+                .iter()
+                .enumerate()
+                .any(|(index, status)| self.exclusion.statuses[..index].contains(status))
+        {
+            return Err(rejected("grouping_arguments_invalid"));
+        }
+        Ok(())
+    }
+}
+
+fn grouping_exclusion_reason(
+    animal: &muriarc_core::Animal,
+    existing: &BTreeSet<Uuid>,
+    arguments: &ExperimentGroupingDraftArgs,
+    strata: &BTreeMap<String, String>,
+    covariates: &BTreeMap<String, f64>,
+) -> Option<String> {
+    if existing.contains(&animal.id) {
+        return Some("already_participates_in_experiment".to_owned());
+    }
+    if !matches!(
+        animal.current_status,
+        AnimalStatus::Alive | AnimalStatus::InExperiment | AnimalStatus::Sampled
+    ) {
+        return Some("animal_status_not_enrollable".to_owned());
+    }
+    if arguments
+        .exclusion
+        .statuses
+        .contains(&animal.current_status)
+    {
+        return Some("explicit_status_exclusion".to_owned());
+    }
+    if arguments.exclusion.missing_factors
+        && (strata.values().any(|value| value == "<missing>")
+            || covariates.len() != arguments.balance_by.len())
+    {
+        return Some("missing_requested_factor".to_owned());
+    }
+    None
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -731,6 +1302,29 @@ fn map_store_error(error: StoreError) -> ToolExecutionError {
         | StoreError::Conflict(_)
         | StoreError::Validation(_) => ToolExecutionError::Unavailable,
     }
+}
+
+fn map_business_read_error(error: BusinessReadError) -> ToolExecutionError {
+    match error {
+        BusinessReadError::Rejected(code) => rejected(code),
+        BusinessReadError::Store(error) => map_store_error(error),
+    }
+}
+
+fn business_read_output<T: Serialize>(
+    result: BusinessReadResult<T>,
+) -> Result<DomainToolOutput, ToolExecutionError> {
+    let data = serde_json::to_value(result.data).map_err(|_| ToolExecutionError::Unavailable)?;
+    let citations = result
+        .sources
+        .into_iter()
+        .map(citation_from_source)
+        .collect();
+    Ok(DomainToolOutput::read(data, citations))
+}
+
+fn citation_from_source(source: BusinessSourceRef) -> Citation {
+    Citation::new(source.entity_type, source.entity_id, source.revision)
 }
 
 fn rejected(code: &'static str) -> ToolExecutionError {

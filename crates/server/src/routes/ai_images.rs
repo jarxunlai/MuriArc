@@ -484,9 +484,7 @@ struct WireExtraction {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WireItem {
-    definition_id: Uuid,
-    subject_type: ObservationSubjectType,
-    subject_id: Uuid,
+    definition_key: String,
     value: ObservationValueData,
     confidence: f64,
     source_label: Option<String>,
@@ -566,12 +564,11 @@ async fn create_extraction(
             )
             .with_request_id(m.request_id.clone())
         })?;
-    let schema=defs.iter().map(|d|serde_json::json!({"definition_id":d.id,"key":d.key,"label":d.label,"value_type":d.value_type,"unit":d.unit,"categories":d.categories})).collect::<Vec<_>>();
+    let schema=defs.iter().map(|d|serde_json::json!({"definition_key":d.key,"label":d.label,"value_type":d.value_type,"unit":d.unit,"categories":d.categories})).collect::<Vec<_>>();
     let prompt = format!(
-        "Extract only clearly visible cells mapped to these definitions: {}. Return strict JSON {{\"items\":[{{\"definition_id\":\"uuid\",\"subject_type\":\"experiment|animal|sample|artifact\",\"subject_id\":\"uuid\",\"value\":{{\"type\":\"number|text|boolean|date|category|json\",\"value\":...}},\"confidence\":0.0,\"source_label\":\"visible label\"}}]}}. Do not invent values. Experiment subject id: {}.",
+        "Extract only clearly visible cells mapped to these definitions: {}. Return strict JSON {{\"items\":[{{\"definition_key\":\"listed key\",\"value\":{{\"type\":\"number|text|boolean|date|category|json\",\"value\":...}},\"confidence\":0.0,\"source_label\":\"visible label\"}}]}}. Do not invent values or return entity identifiers. Every accepted item is bound server-side to the current experiment.",
         serde_json::to_string(&schema)
-            .map_err(|_| ApiError::internal().with_request_id(m.request_id.clone()))?,
-        q.experiment_id
+            .map_err(|_| ApiError::internal().with_request_id(m.request_id.clone()))?
     );
     let ResolvedAiProvider {
         provider,
@@ -630,28 +627,26 @@ async fn create_extraction(
         )
         .with_request_id(m.request_id));
     }
-    let map: HashMap<Uuid, &ObservationDefinition> = defs.iter().map(|d| (d.id, d)).collect();
+    let map: HashMap<&str, &ObservationDefinition> = defs
+        .iter()
+        .map(|definition| (definition.key.as_str(), definition))
+        .collect();
     let now = Utc::now();
     let mut items = Vec::new();
     for src in wire.items {
         let def = map
-            .get(&src.definition_id)
+            .get(src.definition_key.trim())
             .ok_or_else(|| invalid_vision("unknown observation definition", &m))?;
         def.validate_value(&src.value)
             .map_err(|_| invalid_vision("value type mismatch", &m))?;
-        if src.subject_type == ObservationSubjectType::Experiment
-            && src.subject_id != q.experiment_id
-        {
-            return Err(invalid_vision("invalid experiment subject", &m));
-        }
         let observation = Observation::new(
             p.lab_id,
             q.project_id,
             q.experiment_id,
             q.experiment_event_id,
-            src.definition_id,
-            src.subject_type,
-            src.subject_id,
+            def.id,
+            ObservationSubjectType::Experiment,
+            q.experiment_id,
             now,
         )
         .map_err(|_| invalid_vision("invalid observation", &m))?;
@@ -954,6 +949,7 @@ fn ensure_admin(p: &AuthPrincipal, m: &RequestMetadata) -> Result<(), ApiError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn strips_exif() {
         let b = [
@@ -963,5 +959,41 @@ mod tests {
         ]
         .concat();
         assert!(!strip_jpeg_exif(&b).windows(4).any(|x| x == b"Exif"))
+    }
+
+    #[test]
+    fn visual_extraction_wire_format_never_accepts_model_authored_entity_ids() {
+        let safe = serde_json::json!({
+            "items": [{
+                "definition_key": "body_weight",
+                "value": {"type": "number", "value": 23.4},
+                "confidence": 0.92,
+                "source_label": "23.4 g"
+            }]
+        });
+        let parsed: WireExtraction = serde_json::from_value(safe).unwrap();
+        assert_eq!(parsed.items[0].definition_key, "body_weight");
+
+        for forbidden in [
+            serde_json::json!({
+                "items": [{
+                    "definition_key": "body_weight",
+                    "subject_id": Uuid::new_v4(),
+                    "value": {"type": "number", "value": 23.4},
+                    "confidence": 0.92,
+                    "source_label": null
+                }]
+            }),
+            serde_json::json!({
+                "items": [{
+                    "definition_id": Uuid::new_v4(),
+                    "value": {"type": "number", "value": 23.4},
+                    "confidence": 0.92,
+                    "source_label": null
+                }]
+            }),
+        ] {
+            assert!(serde_json::from_value::<WireExtraction>(forbidden).is_err());
+        }
     }
 }

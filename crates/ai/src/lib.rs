@@ -13,6 +13,7 @@ pub mod data_tools;
 pub mod provider;
 pub mod query;
 pub mod scopes;
+pub mod source_context;
 pub mod store_executor;
 pub mod transport;
 pub mod workflow;
@@ -22,16 +23,20 @@ pub use approval::{
     FieldChange, HumanApprover, ProposalActor, WriteDraft,
 };
 pub use assistant::{
-    AssistantConfigError, AssistantError, AssistantLimits, AssistantRequest, AssistantResponse,
-    AssistantRuntimeConfig, AssistantService, AssistantUsage, Citation, ContextManagementTrace,
-    DomainToolExecutor, DomainToolOutput, DomainToolRequest, ToolExecutionError, ToolRunOutcome,
-    ToolRunTrace, estimate_completion_input_tokens, fixed_tool_definitions,
+    AssistantConfigError, AssistantError, AssistantIncompleteReason, AssistantLimits,
+    AssistantRequest, AssistantResponse, AssistantRuntimeConfig, AssistantService, AssistantUsage,
+    Citation, ContextManagementTrace, DomainToolExecutor, DomainToolOutput, DomainToolRequest,
+    ToolExecutionError, ToolRunOutcome, ToolRunTrace, estimate_completion_input_tokens,
+    fixed_tool_definitions,
 };
 pub use autonomy::AiActionPolicy;
 pub use data_tools::{
-    AiDataAccessContext, AiDataApplyResult, AiDataToolBackend, AiExportFormat, AiExportResource,
-    ExportCreateArguments, ImportCommitDraftArguments, ImportCommitDraftPayload,
-    ImportPreviewArguments, valid_sha256,
+    AiDataAccessContext, AiDataApplyResult, AiDataToolBackend, AiExportArtifactView,
+    AiExportFormat, AiExportResource, AiSourceImportKind, ExportCreateArguments,
+    ImportCommitDraftArguments, ImportCommitDraftPayload, ImportDraftIssueSeverity,
+    ImportDraftPreviewIssue, ImportDraftPreviewRow, ImportDraftPreviewSummary,
+    ImportPreviewArguments, SOURCE_IMPORT_JOB_BINDING_KEY, SourceImportJobBinding,
+    SourceImportPreviewArguments, valid_sha256,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use provider::MockProvider;
@@ -47,11 +52,17 @@ pub use query::{
     SafeQuery, SortDirection, SortSpec, ValidationError,
 };
 pub use scopes::{AccessGrant, ScopeSet, ToolAuthorizationError, ToolName, ToolScope};
+pub use source_context::{
+    AssistantSourceBundle, AssistantSourceError, AssistantSourceResolutionRequest,
+    AssistantSourceResolver, MAX_ASSISTANT_SOURCE_CONTEXT_BYTES, MAX_ASSISTANT_SOURCES,
+    ResolvedAssistantSource,
+};
 pub use store_executor::{StoreDomainToolExecutor, StoreToolAccessContext};
 pub use transport::{
     AiAutonomyUpdateRequest, AiAutonomyView, AssistantConversationDetail,
-    AssistantConversationMessage, AssistantConversationSummary, AssistantTrace,
-    AssistantTurnRequest, AssistantTurnResponse, DraftDecisionRequest, WriteDraftSummary,
+    AssistantConversationMessage, AssistantConversationSourceRef, AssistantConversationSummary,
+    AssistantTrace, AssistantTurnRequest, AssistantTurnResponse, DraftDecisionRequest,
+    WriteDraftSummary,
 };
 
 pub use workflow::{AiExecutionContext, AiWorkflowError, AiWorkflowService, DraftDecisionResponse};

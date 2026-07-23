@@ -950,6 +950,521 @@ fn snapshot<T: Serialize>(value: &T) -> StoreResult<Value> {
     serde_json::to_value(value).map_err(|e| StoreError::Serialization(e.to_string()))
 }
 
+async fn archive_import_source(
+    tx: &mut PgTransaction<'_>,
+    plan: &ImportPlan,
+    options: &ImportCommitOptions,
+    audit: &AuditContext,
+    committed_at: DateTime<Utc>,
+) -> StoreResult<()> {
+    let Some(binding) = options.source_archive else {
+        return Ok(());
+    };
+    let actor_id = audit.actor.user_id.ok_or_else(|| {
+        StoreError::Validation("import source archive requires a human actor".to_owned())
+    })?;
+    let source_row = sqlx::query(
+        "SELECT id,lab_id,user_id,conversation_id,project_id,attachment_id,kind,status,last_activity_at,expires_at,archived_at,error_code,created_at,updated_at,deleted_at,revision
+         FROM ai_conversation_sources WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(binding.source_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound {
+        entity: "ai_conversation_source",
+        id: binding.source_id,
+    })?;
+    let mut source = workspace::ai_conversation_source_from_row(&source_row)?;
+    if source.lab_id != plan.lab_id
+        || source.user_id != actor_id
+        || source.meta.revision != binding.expected_revision
+        || source.attachment_id != binding.attachment_id
+        || source.project_id != binding.project_id
+        || source.conversation_id != Some(binding.conversation_id)
+        || !matches!(
+            source.status,
+            AiConversationSourceStatus::Ready | AiConversationSourceStatus::Archived
+        )
+        || (source.status == AiConversationSourceStatus::Ready && source.expires_at <= committed_at)
+    {
+        return Err(StoreError::Conflict(
+            "AI import source binding changed after preview".to_owned(),
+        ));
+    }
+
+    let attachment_row = sqlx::query(&format!(
+        "SELECT {ATTACHMENT_COLUMNS} FROM attachments
+         WHERE id=$1 AND deleted_at IS NULL FOR UPDATE"
+    ))
+    .bind(binding.attachment_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound {
+        entity: "attachment",
+        id: binding.attachment_id,
+    })?;
+    let mut attachment = attachment_from_row(&attachment_row)?;
+    let expected_current_project = if source.status == AiConversationSourceStatus::Archived {
+        binding.project_id
+    } else {
+        None
+    };
+    if attachment.meta.revision != binding.expected_attachment_revision
+        || attachment.lab_id != source.lab_id
+        || attachment.project_id != expected_current_project
+        || attachment.entity_type != "ai_conversation_source"
+        || attachment.entity_id != source.id
+    {
+        return Err(StoreError::Conflict(
+            "AI import source attachment changed after preview".to_owned(),
+        ));
+    }
+
+    let source_before = source.clone();
+    let attachment_before = attachment.clone();
+    source.conversation_id = Some(binding.conversation_id);
+    source.project_id = binding.project_id;
+    source.status = AiConversationSourceStatus::Archived;
+    source.archived_at = Some(committed_at);
+    if source_before.status == AiConversationSourceStatus::Ready {
+        source.last_activity_at = committed_at;
+    }
+    source.meta.touch(committed_at);
+    source
+        .validate()
+        .map_err(|error| StoreError::Validation(error.to_owned()))?;
+    attachment.project_id = binding.project_id;
+    attachment.meta.touch(committed_at);
+
+    let source_updated = sqlx::query(
+        "UPDATE ai_conversation_sources
+         SET conversation_id=$1,project_id=$2,status=$3,last_activity_at=$4,archived_at=$5,updated_at=$6,revision=$7
+         WHERE id=$8 AND revision=$9 AND deleted_at IS NULL",
+    )
+    .bind(source.conversation_id)
+    .bind(source.project_id)
+    .bind(encode(&source.status)?)
+    .bind(source.last_activity_at)
+    .bind(source.archived_at)
+    .bind(source.meta.updated_at)
+    .bind(source.meta.revision)
+    .bind(source.id)
+    .bind(binding.expected_revision)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    let attachment_updated = sqlx::query(
+        "UPDATE attachments SET project_id=$1,updated_at=$2,revision=$3
+         WHERE id=$4 AND revision=$5 AND deleted_at IS NULL",
+    )
+    .bind(attachment.project_id)
+    .bind(attachment.meta.updated_at)
+    .bind(attachment.meta.revision)
+    .bind(attachment.id)
+    .bind(binding.expected_attachment_revision)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    if source_updated.rows_affected() != 1 || attachment_updated.rows_affected() != 1 {
+        return Err(StoreError::Conflict(
+            "AI import source revision changed during confirmation".to_owned(),
+        ));
+    }
+
+    write_audit(
+        tx,
+        plan.lab_id,
+        binding.project_id,
+        EntityType::AiConversationSource,
+        source.id,
+        AuditAction::Archive,
+        audit,
+        Some(
+            ai_conversation_source_audit_snapshot(&source_before)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        ),
+        Some(
+            ai_conversation_source_audit_snapshot(&source)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        ),
+    )
+    .await?;
+    write_audit(
+        tx,
+        plan.lab_id,
+        binding.project_id,
+        EntityType::Attachment,
+        attachment.id,
+        AuditAction::Archive,
+        audit,
+        Some(
+            ai_source_attachment_audit_snapshot(&attachment_before)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        ),
+        Some(
+            ai_source_attachment_audit_snapshot(&attachment)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        ),
+    )
+    .await?;
+    for (entity_type, entity_id) in [
+        (EntityType::AiConversationSource, source.id),
+        (EntityType::Attachment, attachment.id),
+    ] {
+        let mut provenance = Provenance::from_audit(
+            plan.lab_id,
+            binding.project_id,
+            entity_type,
+            entity_id,
+            audit,
+            committed_at,
+        );
+        provenance.source = ProvenanceSource::Import;
+        provenance.import_job_id = options.job_id;
+        provenance.import_commit_id = Some(plan.commit_id);
+        insert_provenance(tx, &provenance).await?;
+    }
+    Ok(())
+}
+
+async fn validate_import_source_replay(
+    tx: &mut PgTransaction<'_>,
+    receipt: &ImportCommitResult,
+    options: &ImportCommitOptions,
+) -> StoreResult<()> {
+    let rows = sqlx::query(
+        "SELECT entity_type,entity_id,project_id,import_job_id
+         FROM provenance
+         WHERE import_commit_id=$1 AND entity_type IN ($2,$3)
+         ORDER BY entity_type,entity_id",
+    )
+    .bind(receipt.commit_id)
+    .bind(EntityType::AiConversationSource.as_str())
+    .bind(EntityType::Attachment.as_str())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    let Some(binding) = options.source_archive else {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        return Err(StoreError::Conflict(
+            "import replay source binding does not match the original commit".to_owned(),
+        ));
+    };
+    if rows.len() != 2 {
+        return Err(StoreError::Conflict(
+            "import replay source provenance is invalid".to_owned(),
+        ));
+    }
+    let mut source_seen = false;
+    let mut attachment_seen = false;
+    for row in &rows {
+        let project_id: Option<Uuid> = row.try_get("project_id").map_err(map_sqlx)?;
+        let job_id: Option<Uuid> = row.try_get("import_job_id").map_err(map_sqlx)?;
+        if project_id != binding.project_id || job_id != options.job_id {
+            return Err(StoreError::Conflict(
+                "import replay source provenance is invalid".to_owned(),
+            ));
+        }
+        let entity_type: String = row.try_get("entity_type").map_err(map_sqlx)?;
+        let entity_id: Uuid = row.try_get("entity_id").map_err(map_sqlx)?;
+        source_seen |= entity_type == EntityType::AiConversationSource.as_str()
+            && entity_id == binding.source_id;
+        attachment_seen |=
+            entity_type == EntityType::Attachment.as_str() && entity_id == binding.attachment_id;
+    }
+    if !source_seen || !attachment_seen {
+        return Err(StoreError::Conflict(
+            "import replay source binding does not match the original commit".to_owned(),
+        ));
+    }
+    let source_row = sqlx::query(
+        "SELECT id,lab_id,user_id,conversation_id,project_id,attachment_id,kind,status,last_activity_at,expires_at,archived_at,error_code,created_at,updated_at,deleted_at,revision
+         FROM ai_conversation_sources WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+    )
+    .bind(binding.source_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    let Some(source_row) = source_row else {
+        return Err(StoreError::Conflict(
+            "import replay source binding does not match the archived source".to_owned(),
+        ));
+    };
+    let source = workspace::ai_conversation_source_from_row(&source_row)?;
+    if source.status != AiConversationSourceStatus::Archived
+        || source.conversation_id != Some(binding.conversation_id)
+        || source.project_id != binding.project_id
+        || source.attachment_id != binding.attachment_id
+    {
+        return Err(StoreError::Conflict(
+            "import replay source binding does not match the archived source".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_import_receipt(receipt: &ImportCommitResult) -> ImportCommitResult {
+    let mut receipt = receipt.clone();
+    receipt.replayed = false;
+    receipt
+}
+
+fn completed_ai_import_tool_run(
+    resolution: &AiImportResolution,
+    job_id: Uuid,
+    receipt: &ImportCommitResult,
+) -> StoreResult<ToolRun> {
+    let mut tool_run = resolution.tool_run.clone();
+    let output = tool_run
+        .output
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            StoreError::Validation("AI import tool output must be an object".to_owned())
+        })?;
+    output.insert("job_id".to_owned(), snapshot(&job_id)?);
+    output.insert(
+        "result".to_owned(),
+        snapshot(&canonical_import_receipt(receipt))?,
+    );
+    Ok(tool_run)
+}
+
+fn completed_ai_import_job_result(
+    job: &Job,
+    resolution: &AiImportResolution,
+    receipt: &ImportCommitResult,
+) -> StoreResult<Value> {
+    let mut result = snapshot(&canonical_import_receipt(receipt))?;
+    let result_object = result.as_object_mut().ok_or_else(|| {
+        StoreError::Serialization("AI import receipt must serialize as an object".to_owned())
+    })?;
+    if let Some(existing) = job.result.as_ref().and_then(Value::as_object) {
+        for (key, value) in existing {
+            if key.starts_with('_') {
+                result_object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    result_object.insert(
+        "_ai_draft_id".to_owned(),
+        snapshot(&resolution.approval.id)?,
+    );
+    result_object.insert(
+        "_ai_expected_revision".to_owned(),
+        Value::from(resolution.expected_job_revision),
+    );
+    Ok(result)
+}
+
+fn validate_ai_import_job_identity(
+    job: &Job,
+    plan: &ImportPlan,
+    job_id: Uuid,
+    resolution: &AiImportResolution,
+    audit: &AuditContext,
+) -> StoreResult<()> {
+    let project_id = plan
+        .source_archive_project_id()
+        .map_err(|error| StoreError::Validation(error.to_string()))?;
+    let preview_matches = import_job_preview_hash(job.result.as_ref())
+        .is_some_and(|value| value.eq_ignore_ascii_case(&plan.preview_hash));
+    if job.id != job_id
+        || job.lab_id != plan.lab_id
+        || job.project_id != project_id
+        || job.created_by != audit.actor.user_id.unwrap_or_default()
+        || job.kind != JobKind::Import
+        || job.idempotency_key != plan.idempotency_key
+        || resolution.tool_run.lab_id != job.lab_id
+        || resolution.tool_run.project_id != job.project_id
+        || resolution.tool_run.user_id != job.created_by
+        || resolution.tool_run.source != WriteSource::Ai
+        || resolution.approval.decided_by != Some(job.created_by)
+        || !preview_matches
+    {
+        return Err(StoreError::Conflict(
+            "AI import Job no longer matches the approved import".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn ai_import_job(tx: &mut PgTransaction<'_>, job_id: Uuid) -> StoreResult<Job> {
+    let row = sqlx::query(&format!(
+        "SELECT {JOB_COLUMNS} FROM jobs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE"
+    ))
+    .bind(job_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound {
+        entity: "job",
+        id: job_id,
+    })?;
+    job_from_row(&row)
+}
+
+async fn validate_ai_source_import_resolution(
+    tx: &mut PgTransaction<'_>,
+    options: &ImportCommitOptions,
+) -> StoreResult<()> {
+    let Some(job_id) = options.job_id else {
+        return Ok(());
+    };
+    let row = sqlx::query(&format!(
+        "SELECT {JOB_COLUMNS} FROM jobs WHERE id=$1 AND deleted_at IS NULL FOR UPDATE"
+    ))
+    .bind(job_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    if row
+        .as_ref()
+        .map(job_from_row)
+        .transpose()?
+        .as_ref()
+        .is_some_and(is_ai_source_import_job)
+        && (options.source_archive.is_none() || options.ai_resolution.is_none())
+    {
+        return Err(StoreError::Conflict(
+            "AI source import requires its source archive and approval resolution".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn complete_ai_import(
+    tx: &mut PgTransaction<'_>,
+    plan: &ImportPlan,
+    options: &ImportCommitOptions,
+    receipt: &ImportCommitResult,
+    audit: &AuditContext,
+) -> StoreResult<()> {
+    let Some(resolution) = &options.ai_resolution else {
+        return Ok(());
+    };
+    let job_id = options.job_id.ok_or_else(|| {
+        StoreError::Validation("AI import resolution requires an owning Job".to_owned())
+    })?;
+    let before = ai_import_job(tx, job_id).await?;
+    validate_ai_import_job_identity(&before, plan, job_id, resolution, audit)?;
+    if before.status != JobStatus::AwaitingConfirmation
+        || before.meta.revision != resolution.expected_job_revision
+        || before.cancellation_requested
+    {
+        return Err(StoreError::Conflict(
+            "AI import Job changed before confirmation".to_owned(),
+        ));
+    }
+
+    let completed_tool_run = completed_ai_import_tool_run(resolution, job_id, receipt)?;
+    ai_operations::update_resolution_tx(
+        tx,
+        &completed_tool_run,
+        resolution.expected_tool_run_revision,
+        &resolution.approval,
+        resolution.expected_approval_revision,
+        audit,
+    )
+    .await?;
+
+    let mut completed = before.clone();
+    completed.status = JobStatus::Completed;
+    completed.progress_current = completed.progress_total.unwrap_or(3);
+    completed.result = Some(completed_ai_import_job_result(
+        &before, resolution, receipt,
+    )?);
+    completed.error_report = None;
+    completed.meta.touch(receipt.committed_at);
+    validate_job(&completed)?;
+    let updated = sqlx::query(
+        "UPDATE jobs
+         SET status=$1,progress_current=$2,progress_total=$3,result_json=$4,error_report_json=$5,
+             cancellation_requested=$6,updated_at=$7,deleted_at=$8,revision=$9
+         WHERE id=$10 AND revision=$11 AND deleted_at IS NULL",
+    )
+    .bind(encode(&completed.status)?)
+    .bind(completed.progress_current)
+    .bind(completed.progress_total)
+    .bind(&completed.result)
+    .bind(&completed.error_report)
+    .bind(completed.cancellation_requested)
+    .bind(completed.meta.updated_at)
+    .bind(completed.meta.deleted_at)
+    .bind(completed.meta.revision)
+    .bind(completed.id)
+    .bind(resolution.expected_job_revision)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::Conflict(
+            "AI import Job revision changed during confirmation".to_owned(),
+        ));
+    }
+    write_audit(
+        tx,
+        completed.lab_id,
+        completed.project_id,
+        EntityType::Job,
+        completed.id,
+        AuditAction::Update,
+        audit,
+        Some(snapshot(&before)?),
+        Some(snapshot(&completed)?),
+    )
+    .await
+}
+
+async fn validate_ai_import_replay(
+    tx: &mut PgTransaction<'_>,
+    plan: &ImportPlan,
+    options: &ImportCommitOptions,
+    receipt: &ImportCommitResult,
+    audit: &AuditContext,
+) -> StoreResult<()> {
+    let Some(resolution) = &options.ai_resolution else {
+        return Ok(());
+    };
+    let job_id = options.job_id.ok_or_else(|| {
+        StoreError::Validation("AI import resolution requires an owning Job".to_owned())
+    })?;
+    let completed = ai_import_job(tx, job_id).await?;
+    validate_ai_import_job_identity(&completed, plan, job_id, resolution, audit)?;
+    let expected_result = completed_ai_import_job_result(&completed, resolution, receipt)?;
+    let recorded_draft_id = completed
+        .result
+        .as_ref()
+        .and_then(|value| value.get("_ai_draft_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok());
+    let recorded_revision = completed
+        .result
+        .as_ref()
+        .and_then(|value| value.get("_ai_expected_revision"))
+        .and_then(Value::as_i64);
+    if completed.status != JobStatus::Completed
+        || completed.meta.revision != resolution.expected_job_revision + 1
+        || completed.cancellation_requested
+        || completed.error_report.is_some()
+        || completed.progress_current != completed.progress_total.unwrap_or(3)
+        || completed.result.as_ref() != Some(&expected_result)
+        || recorded_draft_id != Some(resolution.approval.id)
+        || recorded_revision != Some(resolution.expected_job_revision)
+    {
+        return Err(StoreError::Conflict(
+            "AI import replay does not match the completed Job".to_owned(),
+        ));
+    }
+    let completed_tool_run = completed_ai_import_tool_run(resolution, job_id, receipt)?;
+    ai_operations::validate_resolution_replay_tx(tx, &completed_tool_run, &resolution.approval)
+        .await
+}
+
 async fn fetch_optional(
     pool: &PgPool,
     table: &str,
@@ -2874,7 +3389,7 @@ impl MuriArcStore for PostgresStore {
         }
 
         let mut weight_query = QueryBuilder::<Postgres>::new(
-            "SELECT animal_id, value_number, unit, measured_at FROM (SELECT m.animal_id, m.value_number, m.unit, m.measured_at, ROW_NUMBER() OVER (PARTITION BY m.animal_id ORDER BY m.measured_at DESC, m.id DESC) AS row_number FROM measurements m WHERE m.deleted_at IS NULL AND m.value_number IS NOT NULL AND lower(m.measurement_key) IN ('weight', 'body_weight')",
+            "SELECT animal_id, measurement_id, revision, value_number, unit, measured_at FROM (SELECT m.animal_id, m.id AS measurement_id, m.revision, m.value_number, m.unit, m.measured_at, ROW_NUMBER() OVER (PARTITION BY m.animal_id ORDER BY m.measured_at DESC, m.id DESC) AS row_number FROM measurements m WHERE m.deleted_at IS NULL AND m.value_number IS NOT NULL AND lower(m.measurement_key) IN ('weight', 'body_weight')",
         );
         if let Some(project_id) = filter.project_id {
             weight_query
@@ -2898,6 +3413,8 @@ impl MuriArcStore for PostgresStore {
             let animal_id: Uuid = row.try_get("animal_id").map_err(map_sqlx)?;
             if let Some(overview) = overviews.get_mut(&animal_id) {
                 overview.latest_weight = Some(LatestAnimalWeight {
+                    measurement_id: row.try_get("measurement_id").map_err(map_sqlx)?,
+                    revision: row.try_get("revision").map_err(map_sqlx)?,
                     value: row.try_get("value_number").map_err(map_sqlx)?,
                     unit: row.try_get("unit").map_err(map_sqlx)?,
                     measured_at: row.try_get("measured_at").map_err(map_sqlx)?,
@@ -5011,6 +5528,90 @@ impl MuriArcStore for PostgresStore {
             latest.insert(record.genotype_definition_id, record);
         }
         Ok(latest.into_values().collect())
+    }
+
+    async fn list_current_genotyping_record_overviews(
+        &self,
+        filter: &CurrentGenotypingRecordFilter,
+        offset: u32,
+        limit: u32,
+    ) -> StoreResult<Vec<CurrentGenotypingRecordOverview>> {
+        const MAX_PAGE: u32 = 1_000;
+        if filter.lab_id.is_nil() || limit == 0 || limit > MAX_PAGE {
+            return Err(StoreError::Validation(format!(
+                "current genotyping overview limit must be between 1 and {MAX_PAGE}"
+            )));
+        }
+
+        let mut query = QueryBuilder::<Postgres>::new(
+            "SELECT current_records.*, animals.display_id AS animal_display_id, definitions.name AS genotype_definition_name \
+             FROM (\
+                 SELECT records.*, ROW_NUMBER() OVER (\
+                     PARTITION BY records.animal_id, records.genotype_definition_id \
+                     ORDER BY records.created_at DESC, records.id DESC\
+                 ) AS current_rank \
+                 FROM genotyping_records records \
+                 WHERE records.lab_id = ",
+        );
+        query.push_bind(filter.lab_id).push(
+            " AND records.deleted_at IS NULL AND records.voided_at IS NULL\
+             ) current_records \
+             JOIN animals ON animals.id = current_records.animal_id \
+                 AND animals.lab_id = current_records.lab_id \
+                 AND animals.deleted_at IS NULL \
+             JOIN genotype_definitions definitions \
+                 ON definitions.id = current_records.genotype_definition_id \
+                 AND definitions.lab_id = current_records.lab_id \
+             WHERE current_records.current_rank = 1",
+        );
+        if let Some(project_id) = filter.project_id {
+            query.push(
+                " AND EXISTS (\
+                    SELECT 1 FROM project_animal_assignments assignments \
+                    WHERE assignments.lab_id = current_records.lab_id \
+                      AND assignments.project_id = ",
+            );
+            query.push_bind(project_id).push(
+                " AND assignments.animal_id = current_records.animal_id \
+                      AND assignments.deleted_at IS NULL\
+                )",
+            );
+        }
+        if let Some(animal_id) = filter.animal_id {
+            query
+                .push(" AND current_records.animal_id = ")
+                .push_bind(animal_id);
+        }
+        if let Some(state) = filter.state {
+            query
+                .push(" AND current_records.state = ")
+                .push_bind(encode(&state)?);
+        }
+        query
+            .push(
+                " ORDER BY animals.display_id, definitions.name, current_records.genotype_definition_id \
+                  LIMIT ",
+            )
+            .push_bind(i64::from(limit))
+            .push(" OFFSET ")
+            .push_bind(i64::from(offset));
+
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+        rows.iter()
+            .map(|row| {
+                Ok(CurrentGenotypingRecordOverview {
+                    record: genotyping_record_from_row(row)?,
+                    animal_display_id: row.try_get("animal_display_id").map_err(map_sqlx)?,
+                    genotype_definition_name: row
+                        .try_get("genotype_definition_name")
+                        .map_err(map_sqlx)?,
+                })
+            })
+            .collect()
     }
 
     async fn void_genotyping_record(
@@ -7492,6 +8093,9 @@ impl MuriArcStore for PostgresStore {
     ) -> StoreResult<ImportCommitResult> {
         plan.validate()
             .map_err(|error| StoreError::Validation(error.to_string()))?;
+        options
+            .validate_for_plan(plan)
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
         if options.cancellation_requested {
             return Err(StoreError::Conflict(
                 "import confirmation was cancelled before it started".to_owned(),
@@ -7529,6 +8133,7 @@ impl MuriArcStore for PostgresStore {
         let committed_at = Utc::now();
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        validate_ai_source_import_resolution(&mut tx, &options).await?;
 
         // Claim the idempotency key before doing any entity work. PostgreSQL's
         // unique-index wait makes concurrent confirmations serialize here. A
@@ -7599,11 +8204,14 @@ impl MuriArcStore for PostgresStore {
                 committed_at: row.try_get("committed_at").map_err(map_sqlx)?,
                 replayed: true,
             };
+            validate_import_source_replay(&mut tx, &result, &options).await?;
+            validate_ai_import_replay(&mut tx, plan, &options, &result, audit).await?;
             tx.commit().await.map_err(map_sqlx)?;
             return Ok(result);
         }
 
         validate_import_cages(&mut tx, plan).await?;
+        archive_import_source(&mut tx, plan, &options, audit, committed_at).await?;
 
         let import_source = if audit.source == WriteSource::Migration {
             ProvenanceSource::Migration
@@ -7810,14 +8418,16 @@ impl MuriArcStore for PostgresStore {
             append_derived_animal_event(&mut tx, &event, audit).await?;
         }
 
-        tx.commit().await.map_err(map_sqlx)?;
-        Ok(ImportCommitResult {
+        let receipt = ImportCommitResult {
             commit_id: plan.commit_id,
             preview_hash,
             counts,
             committed_at,
             replayed: false,
-        })
+        };
+        complete_ai_import(&mut tx, plan, &options, &receipt, audit).await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(receipt)
     }
 
     async fn list_audit_entries(&self, filter: &AuditFilter) -> StoreResult<Vec<AuditEntry>> {
@@ -7919,7 +8529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_credential_lifecycle_migration_supports_fresh_and_incremental_databases() {
+    async fn incremental_migrations_preserve_auth_and_ai_conversation_data() {
         let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
             eprintln!(
                 "skipping PostgreSQL migration contract: MURIARC_TEST_DATABASE_URL is not set"
@@ -7992,6 +8602,7 @@ mod tests {
 
         let lab_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
         let legacy_hash = "legacy-password-hash-preserved-0001";
         sqlx::query(
             "INSERT INTO labs (id, name, created_at, updated_at, deleted_at, revision) VALUES ($1, 'Migration Lab', now(), now(), NULL, 1)",
@@ -8017,6 +8628,15 @@ mod tests {
         .execute(&incremental_pool)
         .await
         .expect("legacy credential fixture must be inserted");
+        sqlx::query(
+            "INSERT INTO ai_conversations (id, lab_id, project_id, user_id, title, created_at, updated_at, deleted_at, revision) VALUES ($1, $2, NULL, $3, 'Legacy conversation', now(), now(), NULL, 1)",
+        )
+        .bind(conversation_id)
+        .bind(lab_id)
+        .bind(user_id)
+        .execute(&incremental_pool)
+        .await
+        .expect("legacy AI conversation fixture must be inserted");
 
         MIGRATOR
             .run(&incremental_pool)
@@ -8034,6 +8654,18 @@ mod tests {
         .await
         .expect("migrated credential must be readable");
         assert_eq!(credential, (legacy_hash.to_owned(), false, 1));
+        let conversation: (String, Option<DateTime<Utc>>, Option<DateTime<Utc>>, i64) =
+            sqlx::query_as(
+                "SELECT title, pinned_at, archived_at, revision FROM ai_conversations WHERE id = $1",
+            )
+            .bind(conversation_id)
+            .fetch_one(&incremental_pool)
+            .await
+            .expect("migrated AI conversation must be readable");
+        assert_eq!(
+            conversation,
+            ("Legacy conversation".to_owned(), None, None, 1)
+        );
         let lifecycle_migration_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 18")
                 .fetch_one(&incremental_pool)

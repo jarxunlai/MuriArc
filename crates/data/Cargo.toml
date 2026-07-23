@@ -9,15 +9,20 @@ description = "Shared bounded import, export, artifact and snapshot workflows fo
 
 [dependencies]
 chrono.workspace = true
+csv = "1.4.0"
+lopdf = "0.42.0"
 muriarc-core = { path = "../core" }
 muriarc-importer = { path = "../importer" }
 muriarc-snapshot = { path = "../snapshot" }
+pdf-extract = "0.12.0"
+quick-xml = { version = "0.38.4", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10.9"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 uuid.workspace = true
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 muriarc-store-sqlite = { path = "../store-sqlite" }

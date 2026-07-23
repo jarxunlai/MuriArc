@@ -113,7 +113,7 @@ pub struct ProvenanceFilter {
 /// Callers construct validated domain entities. Implementations must apply each
 /// write and its audit entry in one database transaction.
 #[async_trait]
-pub trait MuriArcStore: crate::WorkspaceStore + Send + Sync {
+pub trait MuriArcStore: crate::WorkspaceStore + crate::AiOperationStore + Send + Sync {
     async fn migrate(&self) -> StoreResult<()>;
     async fn health_check(&self) -> StoreResult<()>;
 
@@ -390,6 +390,16 @@ pub trait MuriArcStore: crate::WorkspaceStore + Send + Sync {
         &self,
         animal_id: Uuid,
     ) -> StoreResult<Vec<crate::GenotypingRecord>>;
+    /// Lists a bounded page of current Genetics v2 facts. State filtering is
+    /// applied after resolving the latest non-voided record for each
+    /// animal/definition pair, so an older pending result can never shadow a
+    /// newer confirmed or rejected result.
+    async fn list_current_genotyping_record_overviews(
+        &self,
+        filter: &crate::CurrentGenotypingRecordFilter,
+        offset: u32,
+        limit: u32,
+    ) -> StoreResult<Vec<crate::CurrentGenotypingRecordOverview>>;
     async fn void_genotyping_record(
         &self,
         id: Uuid,

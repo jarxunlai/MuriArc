@@ -4,6 +4,7 @@ use axum::{Json, Router, extract::State, routing::get};
 use chrono::{DateTime, Utc};
 use muriarc_core::{
     Actor, AuditAction, AuditEntry, AuditFilter, EntityType, Permission, WriteSource,
+    protect_public_audit_entries,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -131,6 +132,7 @@ async fn list(
         &metadata,
     )
     .await?;
+    protect_public_audit_entries(&mut entries);
     entries.reverse();
     entries.retain(|entry| {
         query
@@ -283,6 +285,7 @@ fn in_scope(entity_type: EntityType, scope: OperationScope) -> bool {
             entity_type,
             EntityType::AiConversation
                 | EntityType::AiConversationMessage
+                | EntityType::AiConversationSource
                 | EntityType::AiProviderSettings
                 | EntityType::AiPrivateImage
                 | EntityType::AiExtractionDraft
@@ -438,6 +441,7 @@ const fn entity_label(entity_type: EntityType) -> &'static str {
         EntityType::AiExtractionDraft => "AI 提取草稿",
         EntityType::AiConversation => "AI 会话",
         EntityType::AiConversationMessage => "AI 消息",
+        EntityType::AiConversationSource => "AI 会话来源",
         EntityType::AiAutonomyGrant => "AI 会话授权",
         EntityType::AiProviderSettings => "AI Provider 设置",
         EntityType::AiProviderEndpoint => "AI Provider 端点",

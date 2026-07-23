@@ -10,7 +10,9 @@ use axum::{
 };
 use chrono::Utc;
 use futures_util::TryStreamExt;
-use muriarc_core::{ImportCommitResult, Job, JobKind, JobStatus, Permission, RecordMeta};
+use muriarc_core::{
+    ImportCommitResult, Job, JobKind, JobStatus, Permission, RecordMeta, is_ai_source_import_job,
+};
 use muriarc_data::{
     AnimalImportPreviewResponse, ArtifactKind, ArtifactMetadata, DataError, DataFiles,
     ExportFormat, ImportKind, ImportRemapJobResult, artifact_metadata, build_lab_snapshot,
@@ -322,6 +324,12 @@ async fn remap_import(
         .await
         .map_err(|error| job_error(error, &metadata))?;
     ensure_owned_job(&previous, &principal, JobKind::Import, &metadata)?;
+    if is_ai_source_import_job(&previous) {
+        return Err(conflict(
+            "AI source imports cannot be remapped through the ordinary import route",
+            &metadata,
+        ));
+    }
     authorize(
         &principal,
         Permission::ImportData,
@@ -624,6 +632,12 @@ async fn confirm_import(
         .await
         .map_err(|error| job_error(error, &metadata))?;
     ensure_owned_job(&job, &principal, JobKind::Import, &metadata)?;
+    if is_ai_source_import_job(&job) {
+        return Err(conflict(
+            "AI source imports require confirmation through their reviewed AI draft",
+            &metadata,
+        ));
+    }
     authorize(
         &principal,
         Permission::ImportData,

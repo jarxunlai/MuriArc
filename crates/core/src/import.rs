@@ -2,14 +2,46 @@ use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    Animal, AnimalEvent, AnimalEventKind, GenotypingRecord, Measurement, Pedigree, RecordStatus,
+    Animal, AnimalEvent, AnimalEventKind, Approval, ApprovalDecision, GenotypingRecord, Job,
+    JobKind, Measurement, Pedigree, RecordStatus, ToolRun, ToolRunStatus, WriteSource,
 };
 
 pub const MAX_IMPORT_ENTITIES: usize = 50_000;
+pub const AI_SOURCE_IMPORT_JOB_BINDING_KEY: &str = "_muriarc_ai_source_binding";
+pub const AI_SOURCE_IMPORT_IDEMPOTENCY_PREFIX: &str = "ai-source-import:";
+
+/// Returns true only for the private import Jobs created from an AI
+/// conversation source. The idempotency prefix is a defense-in-depth fallback
+/// for historical or damaged Job snapshots that no longer contain the binding.
+pub fn is_ai_source_import_job(job: &Job) -> bool {
+    job.kind == JobKind::Import
+        && (job
+            .result
+            .as_ref()
+            .and_then(Value::as_object)
+            .is_some_and(|value| value.contains_key(AI_SOURCE_IMPORT_JOB_BINDING_KEY))
+            || job
+                .idempotency_key
+                .starts_with(AI_SOURCE_IMPORT_IDEMPOTENCY_PREFIX))
+}
+
+/// Reads the preview digest from current camelCase Job DTO snapshots while
+/// retaining compatibility with older snake_case rows.
+pub fn import_job_preview_hash(result: Option<&Value>) -> Option<&str> {
+    result
+        .and_then(Value::as_object)
+        .and_then(|value| {
+            value
+                .get("previewHash")
+                .or_else(|| value.get("preview_hash"))
+        })
+        .and_then(Value::as_str)
+}
 
 /// Fully resolved, reviewable input for one atomic import confirmation.
 ///
@@ -59,6 +91,33 @@ impl ImportPlan {
             pedigrees: self.pedigrees.len(),
             measurements: self.measurements.len(),
         }
+    }
+
+    /// Returns the formal scope accepted by an ordinary source-derived import.
+    ///
+    /// Animal Registry imports are lab-wide (`None`). Measurement imports are
+    /// bound to exactly one project. A source archive cannot accompany a mixed
+    /// animal/measurement plan.
+    pub fn source_archive_project_id(&self) -> Result<Option<Uuid>, ImportPlanError> {
+        if self.measurements.is_empty() {
+            return Ok(None);
+        }
+        if !self.animals.is_empty()
+            || !self.animal_events.is_empty()
+            || !self.genotyping_records.is_empty()
+            || !self.pedigrees.is_empty()
+        {
+            return Err(ImportPlanError::InvalidSourceArchive);
+        }
+        let project_ids = self
+            .measurements
+            .iter()
+            .map(|measurement| measurement.project_id)
+            .collect::<BTreeSet<_>>();
+        if project_ids.len() != 1 {
+            return Err(ImportPlanError::InvalidSourceArchive);
+        }
+        Ok(project_ids.into_iter().next())
     }
 
     pub fn validate(&self) -> Result<(), ImportPlanError> {
@@ -224,13 +283,170 @@ impl ImportPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportSourceArchive {
+    pub source_id: Uuid,
+    pub expected_revision: i64,
+    pub attachment_id: Uuid,
+    pub expected_attachment_revision: i64,
+    pub conversation_id: Uuid,
+    pub project_id: Option<Uuid>,
+}
+
+impl ImportSourceArchive {
+    pub fn validate(self) -> Result<(), ImportPlanError> {
+        if self.source_id.is_nil()
+            || self.expected_revision < 1
+            || self.attachment_id.is_nil()
+            || self.expected_attachment_revision < 1
+            || self.conversation_id.is_nil()
+        {
+            Err(ImportPlanError::InvalidSourceArchive)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Final AI approval/tool projection that must commit in the same database
+/// transaction as the confirmed import, owning Job, and source archive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiImportResolution {
+    /// Revision of the owning AwaitingConfirmation Job that the human
+    /// reviewed. The adapter advances it exactly once in the import
+    /// transaction.
+    pub expected_job_revision: i64,
+    pub tool_run: ToolRun,
+    pub expected_tool_run_revision: i64,
+    pub approval: Approval,
+    pub expected_approval_revision: i64,
+}
+
+impl AiImportResolution {
+    fn validate(&self) -> Result<(), ImportPlanError> {
+        let approval_draft = self.approval.requested_diff.get("draft");
+        let tool_draft = self
+            .tool_run
+            .output
+            .as_ref()
+            .and_then(|value| value.get("draft"));
+        let applied_draft_matches = approval_draft == tool_draft
+            && approval_draft.is_some_and(|draft| {
+                draft.get("status").and_then(serde_json::Value::as_str) == Some("applied")
+                    && draft
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|value| Uuid::parse_str(value).ok())
+                        == Some(self.approval.id)
+            });
+        if self.expected_job_revision < 1
+            || self.tool_run.id.is_nil()
+            || self.approval.id.is_nil()
+            || self.approval.tool_run_id != self.tool_run.id
+            || self.tool_run.conversation_id.is_none()
+            || self.tool_run.tool_name != "import_commit_draft"
+            || self.expected_tool_run_revision < 1
+            || self.expected_approval_revision < 1
+            || self.tool_run.meta.revision != self.expected_tool_run_revision + 1
+            || self.approval.meta.revision != self.expected_approval_revision + 1
+            || self.tool_run.status != ToolRunStatus::Completed
+            || self.tool_run.source != WriteSource::Ai
+            || self.tool_run.completed_at.is_none()
+            || self.tool_run.error.is_some()
+            || self.approval.decision != ApprovalDecision::Approved
+            || self.approval.decided_by.is_none()
+            || self.approval.decided_at.is_none()
+            || !applied_draft_matches
+        {
+            Err(ImportPlanError::InvalidAiResolution)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImportCommitOptions {
     /// Snapshot of the owning Job cancellation flag immediately before the
     /// adapter starts its transaction.
     pub cancellation_requested: bool,
     /// Owning import Job, recorded in entity provenance during confirmation.
     pub job_id: Option<Uuid>,
+    /// Optional trusted AI conversation source to archive atomically with the
+    /// import. This is constructed by an application backend from persisted
+    /// source binding metadata, never from model approval arguments.
+    pub source_archive: Option<ImportSourceArchive>,
+    /// Present only for an AI-confirmed import. Adapters must update this
+    /// resolution and the owning Job in the same transaction as domain rows.
+    pub ai_resolution: Option<AiImportResolution>,
+}
+
+impl ImportCommitOptions {
+    pub fn validate_for_plan(&self, plan: &ImportPlan) -> Result<(), ImportPlanError> {
+        if self.job_id.is_some_and(|value| value.is_nil()) {
+            return Err(ImportPlanError::InvalidSourceArchive);
+        }
+        if let Some(source_archive) = self.source_archive {
+            source_archive.validate()?;
+            if self.job_id.is_none()
+                || source_archive.project_id != plan.source_archive_project_id()?
+            {
+                return Err(ImportPlanError::InvalidSourceArchive);
+            }
+        }
+        if let Some(resolution) = &self.ai_resolution {
+            resolution.validate()?;
+            let draft = resolution
+                .approval
+                .requested_diff
+                .get("draft")
+                .and_then(Value::as_object);
+            let payload = draft
+                .and_then(|draft| draft.get("payload"))
+                .and_then(Value::as_object);
+            let reviewed_job_id = payload
+                .and_then(|payload| payload.get("job_id"))
+                .and_then(Value::as_str)
+                .and_then(|value| Uuid::parse_str(value).ok());
+            let reviewed_revision = payload
+                .and_then(|payload| payload.get("expected_revision"))
+                .and_then(Value::as_i64);
+            let reviewed_hash = payload
+                .and_then(|payload| payload.get("preview_hash"))
+                .and_then(Value::as_str);
+            if self.job_id.is_none()
+                || resolution.tool_run.lab_id != plan.lab_id
+                || resolution.tool_run.project_id != plan.source_archive_project_id()?
+                || draft
+                    .and_then(|draft| draft.get("kind"))
+                    .and_then(Value::as_str)
+                    != Some("bulk_import")
+                || draft
+                    .and_then(|draft| draft.get("tool"))
+                    .and_then(Value::as_str)
+                    != Some("import_commit_draft")
+                || reviewed_job_id != self.job_id
+                || reviewed_revision != Some(resolution.expected_job_revision)
+                || !reviewed_hash
+                    .is_some_and(|value| value.eq_ignore_ascii_case(&plan.preview_hash))
+            {
+                return Err(ImportPlanError::InvalidAiResolution);
+            }
+            if let Some(source_archive) = self.source_archive
+                && resolution.tool_run.conversation_id != Some(source_archive.conversation_id)
+            {
+                return Err(ImportPlanError::InvalidAiResolution);
+            }
+        }
+        if plan
+            .idempotency_key
+            .starts_with(AI_SOURCE_IMPORT_IDEMPOTENCY_PREFIX)
+            && (self.source_archive.is_none() || self.ai_resolution.is_none())
+        {
+            return Err(ImportPlanError::InvalidAiResolution);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +473,38 @@ pub struct ImportCommitResult {
     /// True only when the same idempotency key and preview hash were already
     /// committed and no entity write was repeated.
     pub replayed: bool,
+}
+
+/// Returns the canonical receipt embedded in durable Job and ToolRun records.
+///
+/// A replay response may set `replayed=true`, but the original durable
+/// operation is always compared against the first successful receipt.
+pub fn canonical_import_receipt(receipt: &ImportCommitResult) -> ImportCommitResult {
+    let mut receipt = receipt.clone();
+    receipt.replayed = false;
+    receipt
+}
+
+/// Builds the exact completed ToolRun projection used by both Store adapters
+/// and by application-level completed-import replay validation.
+pub fn completed_ai_import_tool_run(
+    resolution: &AiImportResolution,
+    job_id: Uuid,
+    receipt: &ImportCommitResult,
+) -> Result<ToolRun, ImportPlanError> {
+    let mut tool_run = resolution.tool_run.clone();
+    let output = tool_run
+        .output
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or(ImportPlanError::InvalidAiResolution)?;
+    output.insert("job_id".to_owned(), Value::String(job_id.to_string()));
+    output.insert(
+        "result".to_owned(),
+        serde_json::to_value(canonical_import_receipt(receipt))
+            .map_err(|_| ImportPlanError::InvalidAiResolution)?,
+    );
+    Ok(tool_run)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -287,6 +535,10 @@ pub enum ImportPlanError {
     InvalidMeasurement,
     #[error("import plan contains a duplicate animal/key/time measurement")]
     DuplicateMeasurement,
+    #[error("import source archive binding is invalid")]
+    InvalidSourceArchive,
+    #[error("AI import approval resolution is invalid")]
+    InvalidAiResolution,
 }
 
 fn unique_ids(
@@ -323,6 +575,23 @@ mod tests {
     fn simple_animal_plan_is_valid() {
         let (plan, _, _) = simple_animal_plan();
         assert_eq!(plan.validate(), Ok(()));
+    }
+
+    #[test]
+    fn import_job_preview_hash_accepts_current_and_legacy_snapshot_keys() {
+        let current = serde_json::json!({"previewHash": "a".repeat(64)});
+        let legacy = serde_json::json!({"preview_hash": "b".repeat(64)});
+        let current_hash = "a".repeat(64);
+        let legacy_hash = "b".repeat(64);
+        assert_eq!(
+            import_job_preview_hash(Some(&current)),
+            Some(current_hash.as_str())
+        );
+        assert_eq!(
+            import_job_preview_hash(Some(&legacy)),
+            Some(legacy_hash.as_str())
+        );
+        assert_eq!(import_job_preview_hash(Some(&serde_json::json!({}))), None);
     }
 
     #[test]

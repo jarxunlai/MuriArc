@@ -3,6 +3,8 @@ use tauri::Manager;
 
 mod ai;
 mod ai_data_tools;
+mod ai_source_resolver;
+mod ai_sources;
 mod animal_details;
 mod application;
 mod data;
@@ -10,8 +12,10 @@ mod research_extensions;
 mod settings;
 
 use ai::{
-    DesktopAiError, DesktopAiState, DesktopAutonomyInput, DesktopDraftDecisionInput, parse_uuid,
+    DesktopAiError, DesktopAiState, DesktopAutonomyInput, DesktopConversationCreateInput,
+    DesktopConversationUpdateInput, DesktopDraftDecisionInput, parse_uuid,
 };
+use ai_sources::{AiSourceView, ArchiveAiSourceInput, ListAiSourcesInput, UploadAiSourceInput};
 use animal_details::{
     AlleleView, AnimalDetailView, CreateAlleleInput, CreateAnimalSampleInput, CreateGeneLocusInput,
     CreateGenotypeInput, CreatePedigreeInput, GeneLocusView, GenotypeView, PedigreeRelationView,
@@ -36,6 +40,7 @@ use muriarc_ai::{
     AssistantTurnRequest, AssistantTurnResponse, DraftDecisionResponse, DraftStatus,
     WriteDraftSummary,
 };
+use muriarc_core::AiConversationArchiveFilter;
 use research_extensions::{
     BreedingPredictionInput, CorrectGenotypingRecordInput, CorrectGenotypingRecordView,
     CreateBreedingLineInput, CreateBreedingPairInput,
@@ -792,11 +797,38 @@ async fn ai_turn(
 async fn list_ai_conversations(
     state: tauri::State<'_, DesktopAiState>,
     project_id: Option<String>,
+    title_query: Option<String>,
+    archive: Option<AiConversationArchiveFilter>,
     limit: Option<u32>,
 ) -> CommandResult<Vec<AssistantConversationSummary>> {
     let project_id = project_id.as_deref().map(parse_uuid).transpose()?;
     state
-        .list_conversations(project_id, limit.unwrap_or(50))
+        .list_conversations(
+            project_id,
+            title_query,
+            archive.unwrap_or_default(),
+            limit.unwrap_or(50),
+        )
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn create_ai_conversation(
+    state: tauri::State<'_, DesktopAiState>,
+    input: DesktopConversationCreateInput,
+) -> CommandResult<AssistantConversationSummary> {
+    state.create_conversation(input).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn update_ai_conversation(
+    state: tauri::State<'_, DesktopAiState>,
+    conversation_id: String,
+    input: DesktopConversationUpdateInput,
+) -> CommandResult<AssistantConversationSummary> {
+    state
+        .update_conversation(parse_uuid(&conversation_id)?, input)
         .await
         .map_err(Into::into)
 }
@@ -811,6 +843,42 @@ async fn get_ai_conversation(
         .get_conversation(parse_uuid(&conversation_id)?, limit.unwrap_or(200))
         .await
         .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn upload_ai_source(
+    state: tauri::State<'_, DesktopDataState>,
+    input: UploadAiSourceInput,
+) -> CommandResult<AiSourceView> {
+    state.upload_ai_source(input).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn list_ai_sources(
+    state: tauri::State<'_, DesktopDataState>,
+    input: ListAiSourcesInput,
+) -> CommandResult<Vec<AiSourceView>> {
+    state.list_ai_sources(input).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn archive_ai_source(
+    state: tauri::State<'_, DesktopDataState>,
+    source_id: String,
+    input: ArchiveAiSourceInput,
+) -> CommandResult<AiSourceView> {
+    state
+        .archive_ai_source(&source_id, input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn delete_ai_source(
+    state: tauri::State<'_, DesktopDataState>,
+    source_id: String,
+) -> CommandResult<()> {
+    state.delete_ai_source(&source_id).await.map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1074,7 +1142,13 @@ pub fn run() {
             clear_ai_api_key,
             ai_turn,
             list_ai_conversations,
+            create_ai_conversation,
+            update_ai_conversation,
             get_ai_conversation,
+            upload_ai_source,
+            list_ai_sources,
+            archive_ai_source,
+            delete_ai_source,
             get_ai_autonomy,
             set_ai_autonomy,
             list_ai_drafts,

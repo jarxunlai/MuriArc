@@ -10,6 +10,462 @@ fn contract_now() -> chrono::DateTime<Utc> {
         .expect("the current UTC timestamp is representable")
 }
 
+async fn create_ai_source_contract_fixture<S>(
+    store: &S,
+    conversation: &AiConversation,
+    status: AiConversationSourceStatus,
+    size_bytes: i64,
+    last_activity_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+    audit: &AuditContext,
+) -> StoreResult<(AiConversationSource, Attachment)>
+where
+    S: MuriArcStore + AiOperationStore + ?Sized,
+{
+    let source_id = uuid::Uuid::new_v4();
+    let attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: conversation.lab_id,
+        project_id: None,
+        entity_type: "ai_conversation_source".to_owned(),
+        entity_id: source_id,
+        file_name: format!("{source_id}.txt"),
+        media_type: Some("text/plain".to_owned()),
+        relative_path: format!("contract/{}", uuid::Uuid::new_v4()),
+        size_bytes,
+        sha256: "a".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(last_activity_at),
+    };
+    let source = AiConversationSource {
+        id: source_id,
+        lab_id: conversation.lab_id,
+        user_id: conversation.user_id,
+        conversation_id: Some(conversation.id),
+        project_id: conversation.project_id,
+        attachment_id: attachment.id,
+        kind: AiConversationSourceKind::Text,
+        status,
+        last_activity_at,
+        expires_at,
+        archived_at: None,
+        error_code: (status == AiConversationSourceStatus::Failed)
+            .then(|| "contract_failure".to_owned()),
+        meta: RecordMeta::new(last_activity_at),
+    };
+    store
+        .create_ai_conversation_source(&attachment, &source, audit)
+        .await?;
+    Ok((source, attachment))
+}
+
+/// Shared adapter contract for owner quotas and deterministic retention
+/// candidates. The target store must point at an isolated database.
+pub async fn run_ai_conversation_source_retention_contract<S>(store: &S)
+where
+    S: MuriArcStore + AiOperationStore + ?Sized,
+{
+    store.migrate().await.unwrap();
+    let now = contract_now();
+    let audit = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new(format!("AI source retention {}", uuid::Uuid::new_v4()), now).unwrap();
+    store.create_lab(&lab, &audit).await.unwrap();
+    let project = Project::new(lab.id, "AI source quota project", now).unwrap();
+    store.create_project(&project, &audit).await.unwrap();
+
+    let count_user = User::new(
+        lab.id,
+        format!("count-{}@example.test", uuid::Uuid::new_v4()),
+        "Count owner",
+        now,
+    )
+    .unwrap();
+    store.create_user(&count_user, &audit).await.unwrap();
+    let count_conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: count_user.id,
+        title: "Count quota".to_owned(),
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_conversation(&count_conversation, &audit)
+        .await
+        .unwrap();
+    let mut counted = Vec::new();
+    let mut audited_creation = None;
+    for index in 0..MAX_ACTIVE_AI_CONVERSATION_SOURCES_PER_OWNER {
+        let status = match index % 3 {
+            0 => AiConversationSourceStatus::Ready,
+            1 => AiConversationSourceStatus::Staged,
+            _ => AiConversationSourceStatus::Failed,
+        };
+        let created = create_ai_source_contract_fixture(
+            store,
+            &count_conversation,
+            status,
+            1,
+            now,
+            now + Duration::days(30),
+            &audit,
+        )
+        .await
+        .unwrap();
+        if index == 0 {
+            audited_creation = Some(created.clone());
+        }
+        counted.push(created.0);
+    }
+    let (audited_source, audited_attachment) = audited_creation.unwrap();
+    let attachment_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: None,
+            entity_id: Some(audited_attachment.id),
+        })
+        .await
+        .unwrap();
+    let attachment_after = attachment_audits
+        .iter()
+        .find(|entry| {
+            entry.entity_type == EntityType::Attachment && entry.action == AuditAction::Create
+        })
+        .and_then(|entry| entry.after.as_ref())
+        .expect("AI source attachment create audit exists");
+    assert_eq!(
+        attachment_after
+            .get("entity_type")
+            .and_then(serde_json::Value::as_str),
+        Some("ai_conversation_source")
+    );
+    assert!(attachment_after.get("relative_path").is_none());
+    assert!(attachment_after.get("sha256").is_none());
+    assert!(
+        !attachment_after
+            .to_string()
+            .contains(&audited_attachment.relative_path)
+    );
+    assert!(
+        !attachment_after
+            .to_string()
+            .contains(&audited_attachment.sha256)
+    );
+
+    let source_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: None,
+            entity_id: Some(audited_source.id),
+        })
+        .await
+        .unwrap();
+    let source_after = source_audits
+        .iter()
+        .find(|entry| {
+            entry.entity_type == EntityType::AiConversationSource
+                && entry.action == AuditAction::Create
+        })
+        .and_then(|entry| entry.after.as_ref())
+        .expect("AI conversation source create audit exists");
+    assert!(source_after.get("attachment_id").is_none());
+    assert!(
+        !source_after
+            .to_string()
+            .contains(&audited_attachment.id.to_string())
+    );
+    assert!(matches!(
+        create_ai_source_contract_fixture(
+            store,
+            &count_conversation,
+            AiConversationSourceStatus::Ready,
+            1,
+            now,
+            now + Duration::days(30),
+            &audit,
+        )
+        .await,
+        Err(StoreError::Conflict(message))
+            if message == AI_CONVERSATION_SOURCE_QUOTA_EXCEEDED
+    ));
+    store
+        .archive_ai_conversation_source(
+            counted[0].id,
+            project.id,
+            counted[0].meta.revision,
+            now + Duration::seconds(1),
+            &audit,
+        )
+        .await
+        .unwrap();
+    create_ai_source_contract_fixture(
+        store,
+        &count_conversation,
+        AiConversationSourceStatus::Ready,
+        1,
+        now,
+        now + Duration::days(30),
+        &audit,
+    )
+    .await
+    .unwrap();
+
+    let byte_user = User::new(
+        lab.id,
+        format!("bytes-{}@example.test", uuid::Uuid::new_v4()),
+        "Byte owner",
+        now,
+    )
+    .unwrap();
+    store.create_user(&byte_user, &audit).await.unwrap();
+    let byte_conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: byte_user.id,
+        title: "Byte quota".to_owned(),
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_conversation(&byte_conversation, &audit)
+        .await
+        .unwrap();
+    let byte_limit = create_ai_source_contract_fixture(
+        store,
+        &byte_conversation,
+        AiConversationSourceStatus::Ready,
+        MAX_ACTIVE_AI_CONVERSATION_SOURCE_BYTES_PER_OWNER,
+        now,
+        now + Duration::days(30),
+        &audit,
+    )
+    .await
+    .unwrap()
+    .0;
+    assert!(matches!(
+        create_ai_source_contract_fixture(
+            store,
+            &byte_conversation,
+            AiConversationSourceStatus::Staged,
+            1,
+            now,
+            now + Duration::days(30),
+            &audit,
+        )
+        .await,
+        Err(StoreError::Conflict(message))
+            if message == AI_CONVERSATION_SOURCE_QUOTA_EXCEEDED
+    ));
+    store
+        .archive_ai_conversation_source(
+            byte_limit.id,
+            project.id,
+            byte_limit.meta.revision,
+            now + Duration::seconds(1),
+            &audit,
+        )
+        .await
+        .unwrap();
+    create_ai_source_contract_fixture(
+        store,
+        &byte_conversation,
+        AiConversationSourceStatus::Ready,
+        1,
+        now,
+        now + Duration::days(30),
+        &audit,
+    )
+    .await
+    .unwrap();
+
+    let retention_user = User::new(
+        lab.id,
+        format!("retention-{}@example.test", uuid::Uuid::new_v4()),
+        "Retention owner",
+        now,
+    )
+    .unwrap();
+    store.create_user(&retention_user, &audit).await.unwrap();
+    let retention_conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: retention_user.id,
+        title: "Retention candidates".to_owned(),
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_conversation(&retention_conversation, &audit)
+        .await
+        .unwrap();
+    let mut eligible = Vec::new();
+    for (status, activity_hours, expiry_hours) in [
+        (AiConversationSourceStatus::Ready, -6, -5),
+        (AiConversationSourceStatus::Staged, -5, -4),
+        (AiConversationSourceStatus::Failed, -4, -3),
+    ] {
+        eligible.push(
+            create_ai_source_contract_fixture(
+                store,
+                &retention_conversation,
+                status,
+                1,
+                now + Duration::hours(activity_hours),
+                now + Duration::hours(expiry_hours),
+                &audit,
+            )
+            .await
+            .unwrap()
+            .0,
+        );
+    }
+    let future = create_ai_source_contract_fixture(
+        store,
+        &retention_conversation,
+        AiConversationSourceStatus::Ready,
+        1,
+        now,
+        now + Duration::days(10),
+        &audit,
+    )
+    .await
+    .unwrap()
+    .0;
+    let archive_protected = create_ai_source_contract_fixture(
+        store,
+        &retention_conversation,
+        AiConversationSourceStatus::Ready,
+        1,
+        now,
+        now + Duration::days(1),
+        &audit,
+    )
+    .await
+    .unwrap()
+    .0;
+    let archived = store
+        .archive_ai_conversation_source(
+            archive_protected.id,
+            project.id,
+            archive_protected.meta.revision,
+            now + Duration::seconds(1),
+            &audit,
+        )
+        .await
+        .unwrap();
+
+    let first_page = store
+        .list_expired_ai_conversation_sources(lab.id, now + Duration::days(2), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|candidate| candidate.source.id)
+            .collect::<Vec<_>>(),
+        eligible[..2]
+            .iter()
+            .map(|source| source.id)
+            .collect::<Vec<_>>()
+    );
+    let all = store
+        .list_expired_ai_conversation_sources(lab.id, now + Duration::days(2), 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|candidate| candidate.source.id)
+            .collect::<Vec<_>>(),
+        eligible.iter().map(|source| source.id).collect::<Vec<_>>()
+    );
+    assert!(all.iter().all(|candidate| {
+        candidate.attachment.id == candidate.source.attachment_id
+            && candidate.attachment.entity_id == candidate.source.id
+            && candidate.attachment.entity_type == "ai_conversation_source"
+    }));
+    assert!(all.iter().all(|candidate| candidate.source.id != future.id));
+    assert!(
+        all.iter()
+            .all(|candidate| candidate.source.id != archived.id)
+    );
+    assert!(matches!(
+        store
+            .list_expired_ai_conversation_sources(lab.id, now, 0)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store
+            .list_expired_ai_conversation_sources(lab.id, now, 101)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store
+            .discard_ai_conversation_source(
+                eligible[0].id,
+                eligible[0].meta.revision + 1,
+                now,
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .discard_ai_conversation_source(
+                archived.id,
+                archived.meta.revision,
+                now + Duration::days(2),
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let discarded = store
+        .discard_ai_conversation_source(eligible[0].id, eligible[0].meta.revision, now, &audit)
+        .await
+        .unwrap();
+    let pending = store
+        .list_pending_ai_conversation_source_object_deletions(lab.id, 100)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].source, discarded);
+    assert_eq!(pending[0].attachment.id, discarded.attachment_id);
+    store
+        .complete_ai_conversation_source_object_deletion(
+            discarded.id,
+            discarded.attachment_id,
+            now + Duration::seconds(1),
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .list_pending_ai_conversation_source_object_deletions(lab.id, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .complete_ai_conversation_source_object_deletion(
+            discarded.id,
+            discarded.attachment_id,
+            now + Duration::seconds(2),
+            &audit,
+        )
+        .await
+        .unwrap();
+}
+
 async fn assign_project_animal(
     store: &dyn MuriArcStore,
     lab_id: uuid::Uuid,
@@ -1049,7 +1505,10 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
 
 /// Runs the shared Genetics v2, Breeding and Observation persistence contract.
 /// The target store may already be migrated, but must be connected to a test database.
-pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
+pub async fn run_research_extensions_contract<S>(store: &S)
+where
+    S: MuriArcStore + AiOperationStore,
+{
     store.migrate().await.expect("migration succeeds");
     let now = contract_now();
     let setup_audit = AuditContext::system(WriteSource::Migration);
@@ -1722,6 +2181,246 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         vec![private_image.clone()]
     );
 
+    let project_source_conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        title: "Project source contract".to_owned(),
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let lab_source_conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: None,
+        user_id: user.id,
+        title: "Lab source contract".to_owned(),
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_conversation(&project_source_conversation, &human_audit)
+        .await
+        .unwrap();
+    store
+        .create_ai_conversation(&lab_source_conversation, &human_audit)
+        .await
+        .unwrap();
+
+    let source_id = uuid::Uuid::new_v4();
+    let source_attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: None,
+        entity_type: "ai_conversation_source".to_owned(),
+        entity_id: source_id,
+        file_name: "workspace-contract.csv".to_owned(),
+        media_type: Some("text/csv".to_owned()),
+        relative_path: format!("ai-source/{}.csv", uuid::Uuid::new_v4()),
+        size_bytes: 48,
+        sha256: "d".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    let mut source = AiConversationSource {
+        id: source_id,
+        lab_id: lab.id,
+        user_id: user.id,
+        conversation_id: None,
+        project_id: Some(project.id),
+        attachment_id: source_attachment.id,
+        kind: AiConversationSourceKind::DelimitedText,
+        status: AiConversationSourceStatus::Ready,
+        last_activity_at: now,
+        expires_at: now + Duration::days(30),
+        archived_at: None,
+        error_code: None,
+        meta: RecordMeta::new(now),
+    };
+    assert!(matches!(
+        store
+            .create_ai_conversation_source(&source_attachment, &source, &human_audit)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    source.conversation_id = Some(lab_source_conversation.id);
+    assert!(matches!(
+        store
+            .create_ai_conversation_source(&source_attachment, &source, &human_audit)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    source.conversation_id = Some(project_source_conversation.id);
+    store
+        .create_ai_conversation_source(&source_attachment, &source, &human_audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_ai_conversation_sources(&AiConversationSourceFilter {
+                lab_id: lab.id,
+                user_id: user.id,
+                project_id: Some(project.id),
+                ..AiConversationSourceFilter::default()
+            })
+            .await
+            .unwrap(),
+        vec![source.clone()]
+    );
+    let consumed_source_message = AiConversationMessage::new(
+        project_source_conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        1,
+        AiConversationMessageRole::User,
+        "Use the attached source.",
+        None,
+        now + Duration::milliseconds(1),
+    )
+    .and_then(|message| {
+        message.with_source_refs(vec![AiConversationSourceRef {
+            source_id: source.id,
+            source_revision: source.meta.revision,
+            attachment_id: source.attachment_id,
+            file_name: source_attachment.file_name.clone(),
+            media_type: source_attachment.media_type.clone(),
+            size_bytes: source_attachment.size_bytes,
+        }])
+    })
+    .unwrap();
+    let consumed_source_response = AiConversationMessage::new(
+        project_source_conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        2,
+        AiConversationMessageRole::Assistant,
+        "Source processed.",
+        Some(serde_json::json!({"content": "Source processed."})),
+        now + Duration::milliseconds(2),
+    )
+    .unwrap();
+    let ai_audit = AuditContext {
+        actor: Actor {
+            actor_type: ActorType::Ai,
+            user_id: Some(user.id),
+            display_name: "MuriArc AI".to_owned(),
+        },
+        source: WriteSource::Ai,
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        reason: Some("shared research source consumption contract".to_owned()),
+    };
+    store
+        .append_ai_turn_messages(
+            &consumed_source_message,
+            &consumed_source_response,
+            0,
+            &ai_audit,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .list_ai_conversation_sources(&AiConversationSourceFilter {
+                lab_id: lab.id,
+                user_id: user.id,
+                conversation_id: Some(project_source_conversation.id),
+                project_id: Some(project.id),
+                status: Some(AiConversationSourceStatus::Ready),
+                unconsumed_only: true,
+            })
+            .await
+            .unwrap()
+            .is_empty(),
+        "composer listings must never requeue an already submitted source"
+    );
+    let archived_source = store
+        .archive_ai_conversation_source(
+            source.id,
+            project.id,
+            source.meta.revision,
+            now + Duration::seconds(1),
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_source.status, AiConversationSourceStatus::Archived);
+    assert_eq!(archived_source.project_id, Some(project.id));
+    assert!(archived_source.archived_at.is_some());
+    assert_eq!(
+        store
+            .get_attachment(source_attachment.id)
+            .await
+            .unwrap()
+            .project_id,
+        Some(project.id)
+    );
+    assert!(matches!(
+        store
+            .discard_ai_conversation_source(
+                archived_source.id,
+                archived_source.meta.revision,
+                now + Duration::seconds(2),
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let discard_id = uuid::Uuid::new_v4();
+    let discard_attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: None,
+        entity_type: "ai_conversation_source".to_owned(),
+        entity_id: discard_id,
+        file_name: "discard.txt".to_owned(),
+        media_type: Some("text/plain".to_owned()),
+        relative_path: format!("ai-source/{}.txt", uuid::Uuid::new_v4()),
+        size_bytes: 8,
+        sha256: "e".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    let discard_source = AiConversationSource {
+        id: discard_id,
+        lab_id: lab.id,
+        user_id: user.id,
+        conversation_id: Some(lab_source_conversation.id),
+        project_id: None,
+        attachment_id: discard_attachment.id,
+        kind: AiConversationSourceKind::Text,
+        status: AiConversationSourceStatus::Staged,
+        last_activity_at: now,
+        expires_at: now + Duration::days(30),
+        archived_at: None,
+        error_code: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_conversation_source(&discard_attachment, &discard_source, &human_audit)
+        .await
+        .unwrap();
+    let discarded = store
+        .discard_ai_conversation_source(
+            discard_source.id,
+            discard_source.meta.revision,
+            now + Duration::seconds(1),
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(discarded.status, AiConversationSourceStatus::Expired);
+    assert!(discarded.meta.deleted_at.is_some());
+    assert!(matches!(
+        store.get_ai_conversation_source(discarded.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+
     let overwrite_observation = Observation::new(
         lab.id,
         project.id,
@@ -2034,6 +2733,8 @@ where
         project_id: Some(project.id),
         user_id: user.id,
         title: "Project conversation".to_owned(),
+        pinned_at: None,
+        archived_at: None,
         meta: RecordMeta::new(now),
     };
     let lab_conversation = AiConversation {
@@ -2042,6 +2743,8 @@ where
         project_id: None,
         user_id: user.id,
         title: "Lab conversation".to_owned(),
+        pinned_at: None,
+        archived_at: None,
         meta: RecordMeta::new(now - Duration::seconds(1)),
     };
     let hidden_conversation = AiConversation {
@@ -2050,6 +2753,8 @@ where
         project_id: Some(project.id),
         user_id: other_user.id,
         title: "Other user's conversation".to_owned(),
+        pinned_at: None,
+        archived_at: None,
         meta: RecordMeta::new(now),
     };
     for value in [&conversation, &lab_conversation, &hidden_conversation] {
@@ -2062,6 +2767,7 @@ where
                 lab_id: lab.id,
                 user_id: user.id,
                 project_id: None,
+                ..AiConversationFilter::default()
             },
             0,
             20,
@@ -2076,6 +2782,7 @@ where
                 lab_id: lab.id,
                 user_id: user.id,
                 project_id: Some(project.id),
+                ..AiConversationFilter::default()
             },
             0,
             20,
@@ -2083,6 +2790,223 @@ where
         .await
         .unwrap();
     assert_eq!(project_only, vec![conversation.clone()]);
+
+    let mut managed_conversation = store
+        .update_ai_conversation(
+            &AiConversationUpdate {
+                id: lab_conversation.id,
+                expected_revision: lab_conversation.meta.revision,
+                change: AiConversationChange::Rename {
+                    title: "  Global Study Notes  ".to_owned(),
+                },
+                updated_at: now - Duration::milliseconds(900),
+            },
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(managed_conversation.title, "Global Study Notes");
+    managed_conversation = store
+        .update_ai_conversation(
+            &AiConversationUpdate {
+                id: managed_conversation.id,
+                expected_revision: managed_conversation.meta.revision,
+                change: AiConversationChange::Pin,
+                updated_at: now - Duration::milliseconds(800),
+            },
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        managed_conversation.pinned_at,
+        Some(now - Duration::milliseconds(800))
+    );
+    let title_matches = store
+        .list_ai_conversations(
+            &AiConversationFilter {
+                lab_id: lab.id,
+                user_id: user.id,
+                title_query: Some("study".to_owned()),
+                ..AiConversationFilter::default()
+            },
+            0,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(title_matches, vec![managed_conversation.clone()]);
+    let pinned_first = store
+        .list_ai_conversations(
+            &AiConversationFilter {
+                lab_id: lab.id,
+                user_id: user.id,
+                ..AiConversationFilter::default()
+            },
+            0,
+            20,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pinned_first[0], managed_conversation);
+
+    managed_conversation = store
+        .update_ai_conversation(
+            &AiConversationUpdate {
+                id: managed_conversation.id,
+                expected_revision: managed_conversation.meta.revision,
+                change: AiConversationChange::Archive,
+                updated_at: now - Duration::milliseconds(700),
+            },
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .list_ai_conversations(
+                &AiConversationFilter {
+                    lab_id: lab.id,
+                    user_id: user.id,
+                    ..AiConversationFilter::default()
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap(),
+        vec![conversation.clone()]
+    );
+    assert_eq!(
+        store
+            .list_ai_conversations(
+                &AiConversationFilter {
+                    lab_id: lab.id,
+                    user_id: user.id,
+                    archive: AiConversationArchiveFilter::Archived,
+                    ..AiConversationFilter::default()
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap(),
+        vec![managed_conversation.clone()]
+    );
+    assert!(matches!(
+        store
+            .update_ai_conversation(
+                &AiConversationUpdate {
+                    id: managed_conversation.id,
+                    expected_revision: managed_conversation.meta.revision - 1,
+                    change: AiConversationChange::Unarchive,
+                    updated_at: now - Duration::milliseconds(600),
+                },
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let other_actor = AuditContext {
+        actor: Actor::human(other_user.id, other_user.display_name.clone()),
+        source: WriteSource::Desktop,
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        reason: Some("must not update another user's conversation".to_owned()),
+    };
+    assert!(matches!(
+        store
+            .update_ai_conversation(
+                &AiConversationUpdate {
+                    id: managed_conversation.id,
+                    expected_revision: managed_conversation.meta.revision,
+                    change: AiConversationChange::Unarchive,
+                    updated_at: now - Duration::milliseconds(600),
+                },
+                &other_actor,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    managed_conversation = store
+        .update_ai_conversation(
+            &AiConversationUpdate {
+                id: managed_conversation.id,
+                expected_revision: managed_conversation.meta.revision,
+                change: AiConversationChange::Unarchive,
+                updated_at: now - Duration::milliseconds(600),
+            },
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert!(managed_conversation.archived_at.is_none());
+    assert_eq!(
+        store
+            .list_ai_conversations(
+                &AiConversationFilter {
+                    lab_id: lab.id,
+                    user_id: user.id,
+                    ..AiConversationFilter::default()
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap()[0],
+        managed_conversation
+    );
+    managed_conversation = store
+        .update_ai_conversation(
+            &AiConversationUpdate {
+                id: managed_conversation.id,
+                expected_revision: managed_conversation.meta.revision,
+                change: AiConversationChange::Unpin,
+                updated_at: now - Duration::milliseconds(500),
+            },
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert!(managed_conversation.pinned_at.is_none());
+    assert_eq!(
+        store
+            .list_ai_conversations(
+                &AiConversationFilter {
+                    lab_id: lab.id,
+                    user_id: user.id,
+                    archive: AiConversationArchiveFilter::All,
+                    pinned_first: false,
+                    ..AiConversationFilter::default()
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap()[0],
+        conversation
+    );
+    let management_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: None,
+            entity_id: Some(managed_conversation.id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(management_audits.len(), 6);
+    assert!(
+        management_audits
+            .iter()
+            .filter(|entry| entry.action != AuditAction::Create)
+            .all(|entry| entry.before.is_some() && entry.after.is_some())
+    );
+    assert_eq!(
+        management_audits
+            .iter()
+            .filter(|entry| entry.action == AuditAction::Archive)
+            .count(),
+        1
+    );
 
     let mut autonomy = AiAutonomyGrant {
         id: uuid::Uuid::new_v4(),
@@ -2155,6 +3079,26 @@ where
         None,
         now + Duration::milliseconds(1),
     )
+    .and_then(|message| {
+        message.with_source_refs(vec![
+            AiConversationSourceRef {
+                source_id: uuid::Uuid::new_v4(),
+                source_revision: 2,
+                attachment_id: uuid::Uuid::new_v4(),
+                file_name: "weights.csv".to_owned(),
+                media_type: Some("text/csv".to_owned()),
+                size_bytes: 128,
+            },
+            AiConversationSourceRef {
+                source_id: uuid::Uuid::new_v4(),
+                source_revision: 1,
+                attachment_id: uuid::Uuid::new_v4(),
+                file_name: "notes.md".to_owned(),
+                media_type: Some("text/markdown".to_owned()),
+                size_bytes: 64,
+            },
+        ])
+    })
     .unwrap();
     let response = serde_json::json!({
         "conversationId": conversation.id,
@@ -2264,7 +3208,1506 @@ where
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].entity_type, EntityType::AiConversationMessage);
         assert_eq!(entries[0].actor.user_id, Some(user.id));
+        if message.id == user_message.id {
+            let after = entries[0]
+                .after
+                .as_ref()
+                .expect("message create audit contains a safe after snapshot");
+            let source_refs = after["source_refs"]
+                .as_array()
+                .expect("message audit retains public source references");
+            assert_eq!(source_refs.len(), user_message.source_refs.len());
+            assert!(
+                source_refs
+                    .iter()
+                    .all(|source_ref| source_ref.get("attachmentId").is_none())
+            );
+            assert!(!after.to_string().contains("attachment_id"));
+        }
     }
+
+    let completed_tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: Some(conversation.id),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "animal.list".to_owned(),
+        input: serde_json::json!({"status": "active"}),
+        output: Some(serde_json::json!({
+            "items": [],
+            "source_refs": user_message.source_refs,
+        })),
+        status: ToolRunStatus::Completed,
+        source: WriteSource::Ai,
+        started_at: Some(now + Duration::milliseconds(3)),
+        completed_at: Some(now + Duration::milliseconds(4)),
+        error: None,
+        meta: RecordMeta::new(now + Duration::milliseconds(3)),
+    };
+    let awaiting_tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: Some(conversation.id),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "measurement.create_draft".to_owned(),
+        input: serde_json::json!({"animalId": uuid::Uuid::new_v4()}),
+        output: Some(serde_json::json!({"draft": {"kind": "measurement"}})),
+        status: ToolRunStatus::AwaitingApproval,
+        source: WriteSource::Ai,
+        started_at: Some(now + Duration::milliseconds(4)),
+        completed_at: None,
+        error: None,
+        meta: RecordMeta::new(now + Duration::milliseconds(4)),
+    };
+    let pending_approval = Approval {
+        id: uuid::Uuid::new_v4(),
+        tool_run_id: awaiting_tool.id,
+        requested_diff: serde_json::json!({"draft": {"kind": "measurement"}}),
+        decision: ApprovalDecision::Pending,
+        decided_by: None,
+        decided_at: None,
+        reason: None,
+        meta: RecordMeta::new(now + Duration::milliseconds(4)),
+    };
+    let tool_user_message = AiConversationMessage::new(
+        conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        3,
+        AiConversationMessageRole::User,
+        "List active animals and prepare a measurement draft.",
+        None,
+        now + Duration::milliseconds(5),
+    )
+    .unwrap();
+    let tool_assistant_message = AiConversationMessage::new(
+        conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        4,
+        AiConversationMessageRole::Assistant,
+        "The list is ready and the measurement draft awaits approval.",
+        Some(serde_json::json!({
+            "content": "The list is ready and the measurement draft awaits approval.",
+            "toolRuns": [completed_tool.id, awaiting_tool.id],
+            "drafts": [pending_approval.id],
+        })),
+        now + Duration::milliseconds(6),
+    )
+    .unwrap();
+    let records_updated = store
+        .append_ai_turn_records(
+            &tool_user_message,
+            &tool_assistant_message,
+            &[completed_tool.clone(), awaiting_tool.clone()],
+            std::slice::from_ref(&pending_approval),
+            2,
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(records_updated.meta.revision, updated.meta.revision + 1);
+    assert_eq!(
+        store.get_tool_run(completed_tool.id).await.unwrap(),
+        completed_tool
+    );
+    assert_eq!(
+        store.get_tool_run(awaiting_tool.id).await.unwrap(),
+        awaiting_tool
+    );
+    assert_eq!(
+        store.get_approval(pending_approval.id).await.unwrap(),
+        pending_approval
+    );
+    assert_eq!(
+        store
+            .list_ai_conversation_messages(conversation.id, 20)
+            .await
+            .unwrap(),
+        vec![
+            user_message.clone(),
+            assistant_message.clone(),
+            tool_user_message,
+            tool_assistant_message,
+        ]
+    );
+    for (entity_id, entity_type) in [
+        (completed_tool.id, EntityType::ToolRun),
+        (awaiting_tool.id, EntityType::ToolRun),
+        (pending_approval.id, EntityType::Approval),
+    ] {
+        let entries = store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_id: Some(entity_id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].entity_type, entity_type);
+        assert_eq!(entries[0].actor.user_id, Some(user.id));
+        if entity_id == completed_tool.id {
+            let after = entries[0]
+                .after
+                .as_ref()
+                .expect("ToolRun create audit contains a safe after snapshot");
+            let source_refs = after
+                .pointer("/output/source_refs")
+                .and_then(serde_json::Value::as_array)
+                .expect("ToolRun audit retains public source references");
+            assert_eq!(source_refs.len(), user_message.source_refs.len());
+            assert!(
+                source_refs
+                    .iter()
+                    .all(|source_ref| source_ref.get("attachmentId").is_none())
+            );
+            assert!(!after.to_string().contains("attachment_id"));
+        }
+    }
+
+    // The adapter rejects incomplete approval bindings before opening the
+    // transaction, so no orphan ToolRun can be left behind.
+    let missing_approval_tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: Some(conversation.id),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "measurement.create_draft".to_owned(),
+        input: serde_json::json!({}),
+        output: Some(serde_json::json!({"draft": {}})),
+        status: ToolRunStatus::AwaitingApproval,
+        source: WriteSource::Ai,
+        started_at: Some(now + Duration::milliseconds(7)),
+        completed_at: None,
+        error: None,
+        meta: RecordMeta::new(now + Duration::milliseconds(7)),
+    };
+    let rejected_user = AiConversationMessage::new(
+        conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        5,
+        AiConversationMessageRole::User,
+        "This invalid turn must not persist.",
+        None,
+        now + Duration::milliseconds(8),
+    )
+    .unwrap();
+    let rejected_assistant = AiConversationMessage::new(
+        conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        6,
+        AiConversationMessageRole::Assistant,
+        "Missing approval.",
+        Some(serde_json::json!({"content": "Missing approval."})),
+        now + Duration::milliseconds(9),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .append_ai_turn_records(
+                &rejected_user,
+                &rejected_assistant,
+                std::slice::from_ref(&missing_approval_tool),
+                &[],
+                4,
+                &audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store.get_tool_run(missing_approval_tool.id).await,
+        Err(StoreError::NotFound {
+            entity: "ai_tool_run",
+            id,
+        }) if id == missing_approval_tool.id
+    ));
+
+    let wrong_source_tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        source: WriteSource::Mcp,
+        ..completed_tool.clone()
+    };
+    assert!(matches!(
+        store
+            .append_ai_turn_records(
+                &rejected_user,
+                &rejected_assistant,
+                std::slice::from_ref(&wrong_source_tool),
+                &[],
+                4,
+                &audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store.get_tool_run(wrong_source_tool.id).await,
+        Err(StoreError::NotFound {
+            entity: "ai_tool_run",
+            id,
+        }) if id == wrong_source_tool.id
+    ));
+
+    // Force a unique-key failure only after the new ToolRun and its audit have
+    // been inserted. The complete turn must roll back, including those rows.
+    let rollback_tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: Some(conversation.id),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "measurement.create_draft".to_owned(),
+        input: serde_json::json!({"retry": true}),
+        output: Some(serde_json::json!({"draft": {"retry": true}})),
+        status: ToolRunStatus::AwaitingApproval,
+        source: WriteSource::Ai,
+        started_at: Some(now + Duration::milliseconds(10)),
+        completed_at: None,
+        error: None,
+        meta: RecordMeta::new(now + Duration::milliseconds(10)),
+    };
+    let rollback_approval = Approval {
+        id: pending_approval.id,
+        tool_run_id: rollback_tool.id,
+        requested_diff: serde_json::json!({"draft": {"retry": true}}),
+        decision: ApprovalDecision::Pending,
+        decided_by: None,
+        decided_at: None,
+        reason: None,
+        meta: RecordMeta::new(now + Duration::milliseconds(10)),
+    };
+    let before_rollback = store.get_ai_conversation(conversation.id).await.unwrap();
+    assert!(matches!(
+        store
+            .append_ai_turn_records(
+                &rejected_user,
+                &rejected_assistant,
+                std::slice::from_ref(&rollback_tool),
+                std::slice::from_ref(&rollback_approval),
+                4,
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        store.get_ai_conversation(conversation.id).await.unwrap(),
+        before_rollback
+    );
+    assert_eq!(
+        store
+            .list_ai_conversation_messages(conversation.id, 20)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    assert!(matches!(
+        store.get_tool_run(rollback_tool.id).await,
+        Err(StoreError::NotFound {
+            entity: "ai_tool_run",
+            id,
+        }) if id == rollback_tool.id
+    ));
+    assert!(
+        store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_id: Some(rollback_tool.id),
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Shared provenance contract for an approved AI measurement draft. It is run
+/// against both SQLite and PostgreSQL adapters so provider/model extraction
+/// cannot drift between persistence implementations.
+pub async fn run_ai_measurement_approval_contract<S>(store: &S)
+where
+    S: MuriArcStore + AiOperationStore,
+{
+    store.migrate().await.expect("migration succeeds");
+    let now = contract_now();
+    let bootstrap = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new(
+        format!("AI Measurement Contract {}", uuid::Uuid::new_v4()),
+        now,
+    )
+    .unwrap();
+    store.create_lab(&lab, &bootstrap).await.unwrap();
+    let user = User::new(
+        lab.id,
+        format!("{}@measurement-contract.test", uuid::Uuid::new_v4()),
+        "Measurement Researcher",
+        now,
+    )
+    .unwrap();
+    store.create_user(&user, &bootstrap).await.unwrap();
+    let project = Project::new(lab.id, "Measurement Contract Project", now).unwrap();
+    store.create_project(&project, &bootstrap).await.unwrap();
+    let animal = Animal::new_mouse(
+        lab.id,
+        format!("AI-MEAS-{}", uuid::Uuid::new_v4()),
+        Sex::Female,
+        now,
+    )
+    .unwrap();
+    store.create_animal(&animal, &bootstrap).await.unwrap();
+    assign_project_animal(store, lab.id, project.id, animal.id, &bootstrap, now).await;
+    let experiment = Experiment::new(lab.id, project.id, "Measurement Contract", now).unwrap();
+    store
+        .create_experiment(&experiment, &bootstrap)
+        .await
+        .unwrap();
+    let participation = Participation::enroll(experiment.id, animal.id, now);
+    store
+        .create_participation(&participation, &bootstrap)
+        .await
+        .unwrap();
+    let animal = store.get_animal(animal.id).await.unwrap();
+    let ai_audit = AuditContext {
+        actor: Actor {
+            actor_type: ActorType::Ai,
+            user_id: Some(user.id),
+            display_name: "MuriArc AI".to_owned(),
+        },
+        source: WriteSource::Ai,
+        request_id: Some(format!("measurement-draft-{}", uuid::Uuid::new_v4())),
+        reason: Some("AI proposed a structured measurement".to_owned()),
+    };
+    let mut tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: None,
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "mutation_draft".to_owned(),
+        input: serde_json::json!({"operation": "create_measurement"}),
+        output: Some(serde_json::json!({
+            "draft": {"status": "pending_approval"},
+            "provider_id": "contract-provider",
+            "model": "contract-model",
+        })),
+        status: ToolRunStatus::AwaitingApproval,
+        source: WriteSource::Ai,
+        started_at: Some(now),
+        completed_at: None,
+        error: None,
+        meta: RecordMeta::new(now),
+    };
+    store.create_tool_run(&tool, &ai_audit).await.unwrap();
+    let mut approval = Approval {
+        id: uuid::Uuid::new_v4(),
+        tool_run_id: tool.id,
+        requested_diff: serde_json::json!({"draft": {"kind": "measurement_result"}}),
+        decision: ApprovalDecision::Pending,
+        decided_by: None,
+        decided_at: None,
+        reason: None,
+        meta: RecordMeta::new(now),
+    };
+    store.create_approval(&approval, &ai_audit).await.unwrap();
+    let mut measurement = Measurement::draft(
+        lab.id,
+        project.id,
+        animal.id,
+        "body_weight",
+        "Body weight",
+        MeasurementValue::Number(22.4),
+        now,
+        now,
+    )
+    .unwrap();
+    measurement.experiment_id = Some(experiment.id);
+    measurement.unit = Some("g".to_owned());
+    let decided_at = now + Duration::seconds(1);
+    let expected_tool_revision = tool.meta.revision;
+    tool.status = ToolRunStatus::Completed;
+    tool.completed_at = Some(decided_at);
+    tool.meta.touch(decided_at);
+    let expected_approval_revision = approval.meta.revision;
+    approval.decision = ApprovalDecision::Approved;
+    approval.decided_by = Some(user.id);
+    approval.decided_at = Some(decided_at);
+    approval.reason = Some("Verified source value".to_owned());
+    approval.meta.touch(decided_at);
+    let human_audit = AuditContext {
+        actor: Actor::human(user.id, user.display_name.clone()),
+        source: WriteSource::Web,
+        request_id: Some(format!("measurement-approval-{}", uuid::Uuid::new_v4())),
+        reason: approval.reason.clone(),
+    };
+
+    store
+        .apply_ai_measurement_draft(
+            &measurement,
+            animal.meta.revision,
+            &tool,
+            expected_tool_revision,
+            &approval,
+            expected_approval_revision,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+
+    let provenance = store
+        .list_provenance(&ProvenanceFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_type: Some(EntityType::Measurement),
+            entity_id: Some(measurement.id),
+            source: Some(ProvenanceSource::Ai),
+        })
+        .await
+        .unwrap();
+    assert_eq!(provenance.len(), 1);
+    assert_eq!(provenance[0].tool_run_id, Some(tool.id));
+    assert_eq!(provenance[0].provider.as_deref(), Some("contract-provider"));
+    assert_eq!(provenance[0].model.as_deref(), Some("contract-model"));
+}
+
+struct AiImportAtomicityFixture {
+    plan: ImportPlan,
+    measurement: Measurement,
+    job: Job,
+    tool_run: ToolRun,
+    approval: Approval,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_ai_import_atomicity_fixture<S>(
+    store: &S,
+    lab: &Lab,
+    project: &Project,
+    experiment: &Experiment,
+    animal: &Animal,
+    user: &User,
+    key_label: &str,
+    preview_hash: String,
+    now: chrono::DateTime<Utc>,
+    human_audit: &AuditContext,
+    ai_audit: &AuditContext,
+) -> AiImportAtomicityFixture
+where
+    S: MuriArcStore + AiOperationStore,
+{
+    let mut measurement = Measurement::draft(
+        lab.id,
+        project.id,
+        animal.id,
+        format!("ai_import_{key_label}"),
+        format!("AI import {key_label}"),
+        MeasurementValue::Number(20.0),
+        now,
+        now,
+    )
+    .unwrap();
+    measurement.experiment_id = Some(experiment.id);
+    measurement.unit = Some("g".to_owned());
+
+    let idempotency_key = format!("ai-import-{key_label}-{}", uuid::Uuid::new_v4());
+    let mut plan = ImportPlan::empty(lab.id, idempotency_key.clone(), preview_hash);
+    plan.measurements.push(measurement.clone());
+    plan.validate().unwrap();
+
+    let job = Job {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        created_by: user.id,
+        kind: JobKind::Import,
+        status: JobStatus::AwaitingConfirmation,
+        idempotency_key,
+        progress_current: 2,
+        progress_total: Some(3),
+        result: Some(serde_json::json!({
+            "preview_hash": plan.preview_hash,
+            "measurement_count": 1,
+        })),
+        error_report: None,
+        cancellation_requested: false,
+        meta: RecordMeta::new(now),
+    };
+    store.create_job(&job, human_audit).await.unwrap();
+
+    let conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        title: format!("AI import {key_label}"),
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_conversation(&conversation, human_audit)
+        .await
+        .unwrap();
+    let tool_run = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: Some(conversation.id),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "import_commit_draft".to_owned(),
+        input: serde_json::json!({
+            "job_id": job.id,
+            "expected_revision": job.meta.revision,
+        }),
+        output: Some(serde_json::json!({
+            "draft": {
+                "kind": "bulk_import",
+                "status": "pending_approval",
+            },
+            "provider_id": "contract-provider",
+            "model": "contract-model",
+        })),
+        status: ToolRunStatus::AwaitingApproval,
+        source: WriteSource::Ai,
+        started_at: Some(now),
+        completed_at: None,
+        error: None,
+        meta: RecordMeta::new(now),
+    };
+    store.create_tool_run(&tool_run, ai_audit).await.unwrap();
+    let approval = Approval {
+        id: uuid::Uuid::new_v4(),
+        tool_run_id: tool_run.id,
+        requested_diff: serde_json::json!({
+            "draft": {
+                "kind": "bulk_import",
+                "status": "pending_approval",
+                "job_id": job.id,
+            },
+        }),
+        decision: ApprovalDecision::Pending,
+        decided_by: None,
+        decided_at: None,
+        reason: None,
+        meta: RecordMeta::new(now),
+    };
+    store.create_approval(&approval, ai_audit).await.unwrap();
+
+    AiImportAtomicityFixture {
+        plan,
+        measurement,
+        job,
+        tool_run,
+        approval,
+    }
+}
+
+fn approved_ai_import_resolution(
+    fixture: &AiImportAtomicityFixture,
+    user: &User,
+    decided_at: chrono::DateTime<Utc>,
+) -> AiImportResolution {
+    let applied_draft = serde_json::json!({
+        "id": fixture.approval.id,
+        "kind": "bulk_import",
+        "status": "applied",
+        "tool": "import_commit_draft",
+        "payload": {
+            "job_id": fixture.job.id,
+            "expected_revision": fixture.job.meta.revision,
+            "preview_hash": fixture.plan.preview_hash,
+        },
+    });
+    let mut tool_run = fixture.tool_run.clone();
+    tool_run.output = Some(serde_json::json!({
+        "draft": applied_draft,
+        "provider_id": "contract-provider",
+        "model": "contract-model",
+    }));
+    tool_run.status = ToolRunStatus::Completed;
+    tool_run.completed_at = Some(decided_at);
+    tool_run.meta.touch(decided_at);
+
+    let mut approval = fixture.approval.clone();
+    approval.requested_diff = serde_json::json!({"draft": applied_draft});
+    approval.decision = ApprovalDecision::Approved;
+    approval.decided_by = Some(user.id);
+    approval.decided_at = Some(decided_at);
+    approval.reason = Some("Reviewed the import preview".to_owned());
+    approval.meta.touch(decided_at);
+
+    AiImportResolution {
+        expected_job_revision: fixture.job.meta.revision,
+        tool_run,
+        expected_tool_run_revision: fixture.tool_run.meta.revision,
+        approval,
+        expected_approval_revision: fixture.approval.meta.revision,
+    }
+}
+
+fn rejected_ai_import_resolution(
+    fixture: &AiImportAtomicityFixture,
+    user: &User,
+    decided_at: chrono::DateTime<Utc>,
+) -> (ToolRun, Approval) {
+    let rejected_draft = serde_json::json!({
+        "id": fixture.approval.id,
+        "kind": "bulk_import",
+        "status": "rejected",
+        "tool": "import_commit_draft",
+    });
+    let mut tool_run = fixture.tool_run.clone();
+    tool_run.output = Some(serde_json::json!({
+        "draft": rejected_draft,
+        "provider_id": "contract-provider",
+        "model": "contract-model",
+    }));
+    tool_run.status = ToolRunStatus::Cancelled;
+    tool_run.completed_at = Some(decided_at);
+    tool_run.meta.touch(decided_at);
+
+    let mut approval = fixture.approval.clone();
+    approval.requested_diff = serde_json::json!({"draft": rejected_draft});
+    approval.decision = ApprovalDecision::Rejected;
+    approval.decided_by = Some(user.id);
+    approval.decided_at = Some(decided_at);
+    approval.reason = Some("Rejected before import confirmation".to_owned());
+    approval.meta.touch(decided_at);
+    (tool_run, approval)
+}
+
+fn assert_ai_import_conflict(error: StoreError, expected_fragment: &str) {
+    match error {
+        StoreError::Conflict(message) => assert!(
+            message.contains(expected_fragment),
+            "expected AI import conflict containing {expected_fragment:?}, got {message:?}"
+        ),
+        other => panic!("expected AI import conflict, got {other:?}"),
+    }
+}
+
+/// Shared adapter contract for the compound AI import transaction. Domain
+/// rows, the durable import receipt, the owning Job, and the approval/tool-run
+/// projection must either all commit or all roll back.
+pub async fn run_ai_import_commit_atomicity_contract<S>(store: &S)
+where
+    S: MuriArcStore + AiOperationStore,
+{
+    store.migrate().await.expect("migration succeeds");
+    let now = contract_now();
+    let bootstrap = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new(
+        format!("AI Import Atomicity Contract {}", uuid::Uuid::new_v4()),
+        now,
+    )
+    .unwrap();
+    store.create_lab(&lab, &bootstrap).await.unwrap();
+    let user = User::new(
+        lab.id,
+        format!("{}@ai-import-contract.test", uuid::Uuid::new_v4()),
+        "AI Import Researcher",
+        now,
+    )
+    .unwrap();
+    store.create_user(&user, &bootstrap).await.unwrap();
+    let project = Project::new(lab.id, "AI Import Contract Project", now).unwrap();
+    store.create_project(&project, &bootstrap).await.unwrap();
+    let human_audit = AuditContext {
+        actor: Actor::human(user.id, user.display_name.clone()),
+        source: WriteSource::Web,
+        request_id: Some(format!("ai-import-approval-{}", uuid::Uuid::new_v4())),
+        reason: Some("Researcher reviewed the AI import preview".to_owned()),
+    };
+    let ai_audit = AuditContext {
+        actor: Actor {
+            actor_type: ActorType::Ai,
+            user_id: Some(user.id),
+            display_name: "MuriArc AI".to_owned(),
+        },
+        source: WriteSource::Ai,
+        request_id: Some(format!("ai-import-draft-{}", uuid::Uuid::new_v4())),
+        reason: Some("AI prepared an import confirmation draft".to_owned()),
+    };
+
+    let template = ExperimentTemplateVersion::draft(
+        lab.id,
+        format!("ai-import-template-{}", uuid::Uuid::new_v4()),
+        1,
+        "AI import contract template",
+        now,
+    )
+    .unwrap();
+    store
+        .create_template_version(&template, &bootstrap)
+        .await
+        .unwrap();
+    let published_template = store
+        .publish_template_version(
+            template.id,
+            template.meta.revision,
+            user.id,
+            now + Duration::milliseconds(1),
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    let mut experiment =
+        Experiment::new(lab.id, project.id, "AI Import Contract Experiment", now).unwrap();
+    experiment.status = ExperimentStatus::Active;
+    experiment.template_version_id = Some(published_template.id);
+    store
+        .create_experiment(&experiment, &bootstrap)
+        .await
+        .unwrap();
+    let animal = Animal::new_mouse(
+        lab.id,
+        format!("AI-IMPORT-{}", uuid::Uuid::new_v4()),
+        Sex::Unknown,
+        now,
+    )
+    .unwrap();
+    store.create_animal(&animal, &bootstrap).await.unwrap();
+    assign_project_animal(store, lab.id, project.id, animal.id, &bootstrap, now).await;
+    let participation = Participation::enroll(experiment.id, animal.id, now);
+    store
+        .create_participation(&participation, &bootstrap)
+        .await
+        .unwrap();
+
+    let successful = create_ai_import_atomicity_fixture(
+        store,
+        &lab,
+        &project,
+        &experiment,
+        &animal,
+        &user,
+        "success",
+        "b".repeat(64),
+        now + Duration::seconds(1),
+        &human_audit,
+        &ai_audit,
+    )
+    .await;
+    let successful_resolution =
+        approved_ai_import_resolution(&successful, &user, now + Duration::seconds(2));
+    let successful_options = ImportCommitOptions {
+        cancellation_requested: false,
+        job_id: Some(successful.job.id),
+        source_archive: None,
+        ai_resolution: Some(successful_resolution.clone()),
+    };
+    let receipt = store
+        .commit_import(&successful.plan, successful_options.clone(), &human_audit)
+        .await
+        .unwrap();
+    assert!(!receipt.replayed);
+    assert_eq!(receipt.commit_id, successful.plan.commit_id);
+    assert_eq!(receipt.counts, successful.plan.entity_counts());
+    assert_eq!(
+        store
+            .get_measurement(successful.measurement.id)
+            .await
+            .unwrap(),
+        successful.measurement
+    );
+
+    let completed_job = store.get_job(successful.job.id).await.unwrap();
+    assert_eq!(completed_job.status, JobStatus::Completed);
+    assert_eq!(
+        completed_job.meta.revision,
+        successful.job.meta.revision + 1
+    );
+    assert_eq!(
+        completed_job
+            .result
+            .as_ref()
+            .and_then(|value| value.get("_ai_draft_id"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| uuid::Uuid::parse_str(value).ok()),
+        Some(successful.approval.id)
+    );
+    assert_eq!(
+        completed_job
+            .result
+            .as_ref()
+            .and_then(|value| value.get("_ai_expected_revision"))
+            .and_then(serde_json::Value::as_i64),
+        Some(successful.job.meta.revision)
+    );
+    let completed_tool = store.get_tool_run(successful.tool_run.id).await.unwrap();
+    assert_eq!(completed_tool.status, ToolRunStatus::Completed);
+    assert_eq!(
+        completed_tool
+            .output
+            .as_ref()
+            .and_then(|value| value.get("job_id"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| uuid::Uuid::parse_str(value).ok()),
+        Some(successful.job.id)
+    );
+    assert!(
+        completed_tool
+            .output
+            .as_ref()
+            .unwrap()
+            .get("result")
+            .is_some()
+    );
+    let completed_approval = store.get_approval(successful.approval.id).await.unwrap();
+    assert_eq!(completed_approval.decision, ApprovalDecision::Approved);
+    assert_eq!(
+        completed_approval
+            .requested_diff
+            .pointer("/draft/status")
+            .and_then(serde_json::Value::as_str),
+        Some("applied")
+    );
+    let replay = store
+        .commit_import(&successful.plan, successful_options, &human_audit)
+        .await
+        .unwrap();
+    assert!(replay.replayed, "the compound receipt must be durable");
+
+    let rejected = create_ai_import_atomicity_fixture(
+        store,
+        &lab,
+        &project,
+        &experiment,
+        &animal,
+        &user,
+        "rejected",
+        "c".repeat(64),
+        now + Duration::seconds(3),
+        &human_audit,
+        &ai_audit,
+    )
+    .await;
+    let stale_approved_resolution =
+        approved_ai_import_resolution(&rejected, &user, now + Duration::seconds(5));
+    let rejected_options = ImportCommitOptions {
+        cancellation_requested: false,
+        job_id: Some(rejected.job.id),
+        source_archive: None,
+        ai_resolution: Some(stale_approved_resolution),
+    };
+    let (rejected_tool, rejected_approval) =
+        rejected_ai_import_resolution(&rejected, &user, now + Duration::seconds(4));
+    store
+        .finalize_ai_draft(
+            &rejected_tool,
+            rejected.tool_run.meta.revision,
+            &rejected_approval,
+            rejected.approval.meta.revision,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+
+    let error = store
+        .commit_import(&rejected.plan, rejected_options.clone(), &human_audit)
+        .await
+        .unwrap_err();
+    assert_ai_import_conflict(error, "AI draft changed before");
+    assert!(matches!(
+        store.get_measurement(rejected.measurement.id).await,
+        Err(StoreError::NotFound {
+            entity: "measurement",
+            id,
+        }) if id == rejected.measurement.id
+    ));
+    let unchanged_job = store.get_job(rejected.job.id).await.unwrap();
+    assert_eq!(unchanged_job.status, JobStatus::AwaitingConfirmation);
+    assert_eq!(unchanged_job.meta.revision, rejected.job.meta.revision);
+    assert_eq!(
+        store.get_tool_run(rejected.tool_run.id).await.unwrap(),
+        rejected_tool
+    );
+    assert_eq!(
+        store.get_approval(rejected.approval.id).await.unwrap(),
+        rejected_approval
+    );
+    assert!(
+        store
+            .list_provenance(&ProvenanceFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_type: Some(EntityType::Measurement),
+                entity_id: Some(rejected.measurement.id),
+                source: Some(ProvenanceSource::Import),
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Import receipts are intentionally not exposed as a standalone Store
+    // read model. Reusing the same preview hash with a different key therefore
+    // acts as a no-write port-level probe: if the failed transaction leaked its
+    // receipt, the adapter rejects the hash first; otherwise it reaches the
+    // deliberately mismatched Job identity and rolls this probe back too.
+    let mut receipt_probe = rejected.plan.clone();
+    receipt_probe.commit_id = uuid::Uuid::new_v4();
+    receipt_probe.idempotency_key = format!("{}-receipt-probe", rejected.plan.idempotency_key);
+    let probe_error = store
+        .commit_import(&receipt_probe, rejected_options, &human_audit)
+        .await
+        .unwrap_err();
+    assert_ai_import_conflict(probe_error, "AI import Job no longer matches");
+    assert!(matches!(
+        store.get_measurement(rejected.measurement.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert_eq!(
+        store.get_job(rejected.job.id).await.unwrap().status,
+        JobStatus::AwaitingConfirmation
+    );
+}
+
+/// Shared atomicity contract for human-approved deterministic experiment
+/// grouping. It is run against both SQLite and PostgreSQL adapters.
+pub async fn run_ai_experiment_grouping_contract<S>(store: &S)
+where
+    S: MuriArcStore + AiOperationStore,
+{
+    store.migrate().await.expect("migration succeeds");
+    let now = contract_now();
+    let bootstrap = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new(
+        format!("AI Grouping Contract {}", uuid::Uuid::new_v4()),
+        now,
+    )
+    .unwrap();
+    store.create_lab(&lab, &bootstrap).await.unwrap();
+    let user = User::new(
+        lab.id,
+        format!("{}@grouping-contract.test", uuid::Uuid::new_v4()),
+        "Grouping Researcher",
+        now,
+    )
+    .unwrap();
+    store.create_user(&user, &bootstrap).await.unwrap();
+    let project = Project::new(lab.id, "Grouping Contract Project", now).unwrap();
+    store.create_project(&project, &bootstrap).await.unwrap();
+    let experiment = Experiment::new(lab.id, project.id, "Grouping Contract", now).unwrap();
+    store
+        .create_experiment(&experiment, &bootstrap)
+        .await
+        .unwrap();
+    let human_audit = AuditContext {
+        actor: Actor::human(user.id, user.display_name.clone()),
+        source: WriteSource::Desktop,
+        request_id: Some(format!("grouping-approval-{}", uuid::Uuid::new_v4())),
+        reason: Some("Researcher signed deterministic grouping plan".to_owned()),
+    };
+    let ai_audit = AuditContext {
+        actor: Actor {
+            actor_type: ActorType::Ai,
+            user_id: Some(user.id),
+            display_name: "MuriArc AI".to_owned(),
+        },
+        source: WriteSource::Ai,
+        request_id: Some(format!("grouping-draft-{}", uuid::Uuid::new_v4())),
+        reason: Some("Deterministic grouping draft".to_owned()),
+    };
+
+    let locus = GeneLocus {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        symbol: format!("Grp{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+        description: None,
+        meta: RecordMeta::new(now),
+    };
+    store.create_gene_locus(&locus, &bootstrap).await.unwrap();
+    let allele_a = Allele {
+        id: uuid::Uuid::new_v4(),
+        locus_id: locus.id,
+        symbol: "+".to_owned(),
+        description: None,
+        is_wild_type: true,
+        meta: RecordMeta::new(now),
+    };
+    let allele_b = Allele {
+        id: uuid::Uuid::new_v4(),
+        locus_id: locus.id,
+        symbol: "group".to_owned(),
+        description: None,
+        is_wild_type: false,
+        meta: RecordMeta::new(now),
+    };
+    store.create_allele(&allele_a, &bootstrap).await.unwrap();
+    store.create_allele(&allele_b, &bootstrap).await.unwrap();
+    let mut definition = GenotypeDefinition::new(lab.id, "Grouping genotype", now).unwrap();
+    definition
+        .replace_components(vec![
+            GenotypeComponent::new(
+                definition.id,
+                locus.id,
+                allele_a.id,
+                Some(allele_b.id),
+                GenotypeComponentMode::Diploid,
+                0,
+                now,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+    store
+        .create_genotype_definition(&definition, &bootstrap)
+        .await
+        .unwrap();
+
+    let first = Animal::new_mouse(lab.id, "GRP-001", Sex::Female, now).unwrap();
+    let mut genotype = GenotypingRecord::new(
+        lab.id,
+        first.id,
+        definition.id,
+        GenotypingState::Expected,
+        None,
+        now,
+    )
+    .unwrap();
+    genotype.project_id = Some(project.id);
+    store
+        .create_animal_with_genotyping_records(&first, std::slice::from_ref(&genotype), &bootstrap)
+        .await
+        .unwrap();
+    let second = Animal::new_mouse(lab.id, "GRP-002", Sex::Male, now).unwrap();
+    store.create_animal(&second, &bootstrap).await.unwrap();
+    for animal_id in [first.id, second.id] {
+        assign_project_animal(store, lab.id, project.id, animal_id, &bootstrap, now).await;
+    }
+    let first = store.get_animal(first.id).await.unwrap();
+    let second = store.get_animal(second.id).await.unwrap();
+    let application = grouping_application(
+        &lab,
+        &project,
+        &experiment,
+        &[first, second],
+        now,
+        "success",
+    );
+    let (mut tool, mut approval) =
+        pending_grouping_resolution(&lab, &project, &user, &application, now);
+    store.create_tool_run(&tool, &ai_audit).await.unwrap();
+    store.create_approval(&approval, &ai_audit).await.unwrap();
+    let expected_tool_revision = tool.meta.revision;
+    let expected_approval_revision = approval.meta.revision;
+    tool.status = ToolRunStatus::Completed;
+    tool.completed_at = Some(now + Duration::seconds(1));
+    tool.meta.touch(now + Duration::seconds(1));
+    approval.decision = ApprovalDecision::Approved;
+    approval.decided_by = Some(user.id);
+    approval.decided_at = Some(now + Duration::seconds(1));
+    approval.reason = Some("I reviewed and sign this research plan".to_owned());
+    approval.meta.touch(now + Duration::seconds(1));
+    let applied = store
+        .apply_ai_experiment_grouping_draft(
+            &application,
+            &tool,
+            expected_tool_revision,
+            &approval,
+            expected_approval_revision,
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.len(), 2);
+    let first_participation = applied
+        .iter()
+        .find(|participation| participation.animal_id == genotype.animal_id)
+        .unwrap();
+    assert_eq!(
+        first_participation.genotype_snapshot,
+        vec![GenotypeSnapshotEntry {
+            genotyping_record_id: genotype.id,
+            genotype_definition_id: definition.id,
+            state: GenotypingState::Expected,
+            assessed_at: None,
+        }]
+    );
+    assert_eq!(
+        store.get_approval(approval.id).await.unwrap().decision,
+        ApprovalDecision::Approved
+    );
+    assert_eq!(
+        store.get_tool_run(tool.id).await.unwrap().status,
+        ToolRunStatus::Completed
+    );
+    for participation in &applied {
+        let provenance = store
+            .list_provenance(&ProvenanceFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_type: Some(EntityType::Participation),
+                entity_id: Some(participation.id),
+                source: Some(ProvenanceSource::Ai),
+            })
+            .await
+            .unwrap();
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0].tool_run_id, Some(tool.id));
+    }
+
+    // A stale animal revision rejects the complete batch, including cohorts
+    // and the approval/tool-run projection.
+    let drift_experiment =
+        Experiment::new(lab.id, project.id, "Grouping Drift Contract", now).unwrap();
+    store
+        .create_experiment(&drift_experiment, &bootstrap)
+        .await
+        .unwrap();
+    let drift_animal = Animal::new_mouse(lab.id, "GRP-DRIFT", Sex::Unknown, now).unwrap();
+    store
+        .create_animal(&drift_animal, &bootstrap)
+        .await
+        .unwrap();
+    assign_project_animal(store, lab.id, project.id, drift_animal.id, &bootstrap, now).await;
+    let drift_animal = store.get_animal(drift_animal.id).await.unwrap();
+    let drift_application = grouping_application(
+        &lab,
+        &project,
+        &drift_experiment,
+        std::slice::from_ref(&drift_animal),
+        now,
+        "drift",
+    );
+    let (mut drift_tool, mut drift_approval) =
+        pending_grouping_resolution(&lab, &project, &user, &drift_application, now);
+    store.create_tool_run(&drift_tool, &ai_audit).await.unwrap();
+    store
+        .create_approval(&drift_approval, &ai_audit)
+        .await
+        .unwrap();
+    let mut drift_event = AnimalEvent::new(
+        lab.id,
+        drift_animal.id,
+        AnimalEventKind::Note {
+            body: "concurrent update".to_owned(),
+        },
+        now,
+        now + Duration::seconds(2),
+    );
+    drift_event.project_id = Some(project.id);
+    store
+        .append_animal_event(&drift_event, &bootstrap)
+        .await
+        .unwrap();
+    let drift_tool_revision = drift_tool.meta.revision;
+    let drift_approval_revision = drift_approval.meta.revision;
+    drift_tool.status = ToolRunStatus::Completed;
+    drift_tool.completed_at = Some(now + Duration::seconds(3));
+    drift_tool.meta.touch(now + Duration::seconds(3));
+    drift_approval.decision = ApprovalDecision::Approved;
+    drift_approval.decided_by = Some(user.id);
+    drift_approval.decided_at = Some(now + Duration::seconds(3));
+    drift_approval.reason = Some("signed".to_owned());
+    drift_approval.meta.touch(now + Duration::seconds(3));
+    assert!(matches!(
+        store
+            .apply_ai_experiment_grouping_draft(
+                &drift_application,
+                &drift_tool,
+                drift_tool_revision,
+                &drift_approval,
+                drift_approval_revision,
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(
+        store
+            .list_cohorts(drift_experiment.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.get_tool_run(drift_tool.id).await.unwrap().status,
+        ToolRunStatus::AwaitingApproval
+    );
+    assert_eq!(
+        store
+            .get_approval(drift_approval.id)
+            .await
+            .unwrap()
+            .decision,
+        ApprovalDecision::Pending
+    );
+
+    // A newly recorded latest weight must invalidate a weight-balanced draft
+    // even though creating the Measurement does not advance Animal.revision.
+    let weight_experiment =
+        Experiment::new(lab.id, project.id, "Grouping Weight Drift Contract", now).unwrap();
+    store
+        .create_experiment(&weight_experiment, &bootstrap)
+        .await
+        .unwrap();
+    let weight_animal = Animal::new_mouse(lab.id, "GRP-WEIGHT-DRIFT", Sex::Unknown, now).unwrap();
+    store
+        .create_animal(&weight_animal, &bootstrap)
+        .await
+        .unwrap();
+    assign_project_animal(store, lab.id, project.id, weight_animal.id, &bootstrap, now).await;
+    let weight_animal = store.get_animal(weight_animal.id).await.unwrap();
+    let mut weight_application = grouping_application(
+        &lab,
+        &project,
+        &weight_experiment,
+        std::slice::from_ref(&weight_animal),
+        now,
+        "weight-drift",
+    );
+    weight_application.expected_latest_weights = vec![AiGroupingLatestWeightRevision {
+        animal_id: weight_animal.id,
+        measurement_id: None,
+        expected_revision: None,
+    }];
+    let (mut weight_tool, mut weight_approval) =
+        pending_grouping_resolution(&lab, &project, &user, &weight_application, now);
+    store
+        .create_tool_run(&weight_tool, &ai_audit)
+        .await
+        .unwrap();
+    store
+        .create_approval(&weight_approval, &ai_audit)
+        .await
+        .unwrap();
+    let mut concurrent_weight = Measurement::draft(
+        lab.id,
+        project.id,
+        weight_animal.id,
+        "body_weight",
+        "Concurrent body weight",
+        MeasurementValue::Number(22.0),
+        now + Duration::seconds(2),
+        now + Duration::seconds(2),
+    )
+    .unwrap();
+    concurrent_weight.unit = Some("g".to_owned());
+    store
+        .create_measurement(&concurrent_weight, &bootstrap)
+        .await
+        .unwrap();
+    let weight_tool_revision = weight_tool.meta.revision;
+    let weight_approval_revision = weight_approval.meta.revision;
+    weight_tool.status = ToolRunStatus::Completed;
+    weight_tool.completed_at = Some(now + Duration::seconds(3));
+    weight_tool.meta.touch(now + Duration::seconds(3));
+    weight_approval.decision = ApprovalDecision::Approved;
+    weight_approval.decided_by = Some(user.id);
+    weight_approval.decided_at = Some(now + Duration::seconds(3));
+    weight_approval.reason = Some("signed".to_owned());
+    weight_approval.meta.touch(now + Duration::seconds(3));
+    assert!(matches!(
+        store
+            .apply_ai_experiment_grouping_draft(
+                &weight_application,
+                &weight_tool,
+                weight_tool_revision,
+                &weight_approval,
+                weight_approval_revision,
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(
+        store
+            .list_cohorts(weight_experiment.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store.get_tool_run(weight_tool.id).await.unwrap().status,
+        ToolRunStatus::AwaitingApproval
+    );
+    assert_eq!(
+        store
+            .get_approval(weight_approval.id)
+            .await
+            .unwrap()
+            .decision,
+        ApprovalDecision::Pending
+    );
+
+    // Existing participation also rejects every proposed cohort and leaves
+    // the AI operation pending rather than partially resolving it.
+    let duplicate_experiment =
+        Experiment::new(lab.id, project.id, "Grouping Duplicate Contract", now).unwrap();
+    store
+        .create_experiment(&duplicate_experiment, &bootstrap)
+        .await
+        .unwrap();
+    let duplicate_animal = Animal::new_mouse(lab.id, "GRP-DUP", Sex::Female, now).unwrap();
+    store
+        .create_animal(&duplicate_animal, &bootstrap)
+        .await
+        .unwrap();
+    assign_project_animal(
+        store,
+        lab.id,
+        project.id,
+        duplicate_animal.id,
+        &bootstrap,
+        now,
+    )
+    .await;
+    store
+        .create_participation(
+            &Participation::enroll(duplicate_experiment.id, duplicate_animal.id, now),
+            &bootstrap,
+        )
+        .await
+        .unwrap();
+    let duplicate_animal = store.get_animal(duplicate_animal.id).await.unwrap();
+    let duplicate_application = grouping_application(
+        &lab,
+        &project,
+        &duplicate_experiment,
+        std::slice::from_ref(&duplicate_animal),
+        now,
+        "duplicate",
+    );
+    let (mut duplicate_tool, mut duplicate_approval) =
+        pending_grouping_resolution(&lab, &project, &user, &duplicate_application, now);
+    store
+        .create_tool_run(&duplicate_tool, &ai_audit)
+        .await
+        .unwrap();
+    store
+        .create_approval(&duplicate_approval, &ai_audit)
+        .await
+        .unwrap();
+    let duplicate_tool_revision = duplicate_tool.meta.revision;
+    let duplicate_approval_revision = duplicate_approval.meta.revision;
+    duplicate_tool.status = ToolRunStatus::Completed;
+    duplicate_tool.completed_at = Some(now + Duration::seconds(4));
+    duplicate_tool.meta.touch(now + Duration::seconds(4));
+    duplicate_approval.decision = ApprovalDecision::Approved;
+    duplicate_approval.decided_by = Some(user.id);
+    duplicate_approval.decided_at = Some(now + Duration::seconds(4));
+    duplicate_approval.reason = Some("signed".to_owned());
+    duplicate_approval.meta.touch(now + Duration::seconds(4));
+    assert!(matches!(
+        store
+            .apply_ai_experiment_grouping_draft(
+                &duplicate_application,
+                &duplicate_tool,
+                duplicate_tool_revision,
+                &duplicate_approval,
+                duplicate_approval_revision,
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(
+        store
+            .list_cohorts(duplicate_experiment.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_approval(duplicate_approval.id)
+            .await
+            .unwrap()
+            .decision,
+        ApprovalDecision::Pending
+    );
+}
+
+fn grouping_application(
+    lab: &Lab,
+    project: &Project,
+    experiment: &Experiment,
+    animals: &[Animal],
+    now: chrono::DateTime<Utc>,
+    hash_prefix: &str,
+) -> AiExperimentGroupingApplication {
+    let cohorts = ["Control", "Treatment"]
+        .into_iter()
+        .map(|name| Cohort::new(experiment.id, format!("{name}-{hash_prefix}"), now).unwrap())
+        .collect::<Vec<_>>();
+    let participations = animals
+        .iter()
+        .enumerate()
+        .map(|(index, animal)| {
+            let mut participation = Participation::enroll(experiment.id, animal.id, now);
+            participation.cohort_id = Some(cohorts[index % cohorts.len()].id);
+            participation
+        })
+        .collect();
+    AiExperimentGroupingApplication {
+        lab_id: lab.id,
+        project_id: project.id,
+        expected_project_revision: project.meta.revision,
+        experiment_id: experiment.id,
+        expected_experiment_revision: experiment.meta.revision,
+        input_snapshot_sha256: "a".repeat(64),
+        cohorts,
+        participations,
+        expected_animal_revisions: animals
+            .iter()
+            .map(|animal| AiGroupingAnimalRevision {
+                animal_id: animal.id,
+                expected_revision: animal.meta.revision,
+            })
+            .collect(),
+        expected_latest_weights: Vec::new(),
+    }
+}
+
+fn pending_grouping_resolution(
+    lab: &Lab,
+    project: &Project,
+    user: &User,
+    application: &AiExperimentGroupingApplication,
+    now: chrono::DateTime<Utc>,
+) -> (ToolRun, Approval) {
+    let tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: None,
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "experiment_grouping_draft".to_owned(),
+        input: serde_json::json!({"seed": 42}),
+        output: Some(serde_json::json!({
+            "input_snapshot_sha256": application.input_snapshot_sha256,
+        })),
+        status: ToolRunStatus::AwaitingApproval,
+        source: WriteSource::Ai,
+        started_at: Some(now),
+        completed_at: None,
+        error: None,
+        meta: RecordMeta::new(now),
+    };
+    let approval = Approval {
+        id: uuid::Uuid::new_v4(),
+        tool_run_id: tool.id,
+        requested_diff: serde_json::json!({"application": application}),
+        decision: ApprovalDecision::Pending,
+        decided_by: None,
+        decided_at: None,
+        reason: None,
+        meta: RecordMeta::new(now),
+    };
+    (tool, approval)
 }
 
 async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc>) {
@@ -2743,6 +5186,8 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
                 ImportCommitOptions {
                     cancellation_requested: true,
                     job_id: None,
+                    source_archive: None,
+                    ai_resolution: None,
                 },
                 &import_audit,
             )
@@ -2765,6 +5210,410 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
             .len(),
         cancelled_audit_count,
         "cancelled imports must write neither entities nor audits"
+    );
+}
+
+fn source_archive_fixture(
+    lab_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    conversation_id: uuid::Uuid,
+    last_activity_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+) -> (Attachment, AiConversationSource) {
+    let source_id = uuid::Uuid::new_v4();
+    let attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id,
+        project_id: None,
+        entity_type: "ai_conversation_source".to_owned(),
+        entity_id: source_id,
+        file_name: format!("{source_id}.csv"),
+        media_type: Some("text/csv".to_owned()),
+        relative_path: format!("ai-source/{source_id}.csv"),
+        size_bytes: 32,
+        sha256: "d".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(last_activity_at),
+    };
+    let source = AiConversationSource {
+        id: source_id,
+        lab_id,
+        user_id,
+        conversation_id: Some(conversation_id),
+        project_id: None,
+        attachment_id: attachment.id,
+        kind: AiConversationSourceKind::DelimitedText,
+        status: AiConversationSourceStatus::Ready,
+        last_activity_at,
+        expires_at,
+        archived_at: None,
+        error_code: None,
+        meta: RecordMeta::new(last_activity_at),
+    };
+    (attachment, source)
+}
+
+fn source_archive_plan(
+    lab_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    now: chrono::DateTime<Utc>,
+    preview_hash_byte: char,
+) -> (ImportPlan, Animal) {
+    let animal = Animal::new_mouse(
+        lab_id,
+        format!("SOURCE-IMPORT-{}", uuid::Uuid::new_v4()),
+        Sex::Unknown,
+        now,
+    )
+    .unwrap();
+    let mut registered = AnimalEvent::new(lab_id, animal.id, AnimalEventKind::Registered, now, now);
+    registered.recorded_by = Some(user_id);
+    let mut plan = ImportPlan::empty(
+        lab_id,
+        format!("source-import-contract-{}", uuid::Uuid::new_v4()),
+        preview_hash_byte.to_string().repeat(64),
+    );
+    plan.animals.push(animal.clone());
+    plan.animal_events.push(registered);
+    plan.validate().unwrap();
+    (plan, animal)
+}
+
+fn source_archive_job(lab_id: uuid::Uuid, user_id: uuid::Uuid, now: chrono::DateTime<Utc>) -> Job {
+    Job {
+        id: uuid::Uuid::new_v4(),
+        lab_id,
+        project_id: None,
+        created_by: user_id,
+        kind: JobKind::Import,
+        status: JobStatus::AwaitingConfirmation,
+        idempotency_key: format!("source-import-job-{}", uuid::Uuid::new_v4()),
+        progress_current: 2,
+        progress_total: Some(3),
+        result: None,
+        error_report: None,
+        cancellation_requested: false,
+        meta: RecordMeta::new(now),
+    }
+}
+
+fn source_archive_options(
+    source: &AiConversationSource,
+    attachment: &Attachment,
+    conversation_id: uuid::Uuid,
+    job_id: uuid::Uuid,
+) -> ImportCommitOptions {
+    ImportCommitOptions {
+        cancellation_requested: false,
+        job_id: Some(job_id),
+        source_archive: Some(ImportSourceArchive {
+            source_id: source.id,
+            expected_revision: source.meta.revision,
+            attachment_id: attachment.id,
+            expected_attachment_revision: attachment.meta.revision,
+            conversation_id,
+            project_id: None,
+        }),
+        ai_resolution: None,
+    }
+}
+
+/// Runs the cross-adapter contract for atomically consuming a trusted AI
+/// conversation source during ordinary import confirmation.
+pub async fn run_import_source_archive_contract<S>(store: &S)
+where
+    S: MuriArcStore + AiOperationStore + ?Sized,
+{
+    store.migrate().await.expect("migration succeeds");
+    let now = contract_now();
+    let bootstrap = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new(
+        format!("Source Import Contract {}", uuid::Uuid::new_v4()),
+        now,
+    )
+    .unwrap();
+    store.create_lab(&lab, &bootstrap).await.unwrap();
+    let user = User::new(
+        lab.id,
+        format!("{}@source-import-contract.test", uuid::Uuid::new_v4()),
+        "Source Import Contract User",
+        now,
+    )
+    .unwrap();
+    store.create_user(&user, &bootstrap).await.unwrap();
+    let audit = AuditContext {
+        actor: Actor::human(user.id, user.display_name.clone()),
+        source: WriteSource::Web,
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        reason: Some("confirm source-backed import contract".to_owned()),
+    };
+    let conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: None,
+        user_id: user.id,
+        title: "Source import contract".to_owned(),
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_conversation(&conversation, &audit)
+        .await
+        .unwrap();
+
+    let (attachment, source) = source_archive_fixture(
+        lab.id,
+        user.id,
+        conversation.id,
+        now,
+        now + Duration::days(1),
+    );
+    store
+        .create_ai_conversation_source(&attachment, &source, &audit)
+        .await
+        .unwrap();
+    let job = source_archive_job(lab.id, user.id, now);
+    store.create_job(&job, &audit).await.unwrap();
+    let (plan, animal) = source_archive_plan(lab.id, user.id, now, 'a');
+    let options = source_archive_options(&source, &attachment, conversation.id, job.id);
+
+    let result = store
+        .commit_import(&plan, options.clone(), &audit)
+        .await
+        .unwrap();
+    assert!(!result.replayed);
+    let archived_source = store.get_ai_conversation_source(source.id).await.unwrap();
+    assert_eq!(archived_source.status, AiConversationSourceStatus::Archived);
+    assert_eq!(archived_source.conversation_id, Some(conversation.id));
+    assert_eq!(
+        archived_source.project_id, None,
+        "Animal Registry source imports remain lab-wide"
+    );
+    assert_eq!(archived_source.meta.revision, source.meta.revision + 1);
+    assert!(archived_source.archived_at.is_some());
+    let archived_attachment = store.get_attachment(attachment.id).await.unwrap();
+    assert_eq!(archived_attachment.project_id, None);
+    assert_eq!(
+        archived_attachment.meta.revision,
+        attachment.meta.revision + 1
+    );
+    assert_eq!(store.get_animal(animal.id).await.unwrap(), animal);
+
+    for (entity_type, entity_id) in [
+        (EntityType::AiConversationSource, source.id),
+        (EntityType::Attachment, attachment.id),
+    ] {
+        let audits = store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: None,
+                entity_id: Some(entity_id),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|entry| {
+                    entry.entity_type == entity_type && entry.action == AuditAction::Archive
+                })
+                .count(),
+            1,
+            "source and attachment each receive one Archive audit"
+        );
+        let provenance = store
+            .list_provenance(&ProvenanceFilter {
+                lab_id: lab.id,
+                entity_type: Some(entity_type),
+                entity_id: Some(entity_id),
+                source: Some(ProvenanceSource::Import),
+                ..ProvenanceFilter::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(provenance.len(), 1);
+        assert_eq!(provenance[0].source, ProvenanceSource::Import);
+        assert_eq!(provenance[0].import_job_id, Some(job.id));
+        assert_eq!(provenance[0].import_commit_id, Some(plan.commit_id));
+    }
+
+    let source_audits_after_commit = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: None,
+            entity_id: Some(source.id),
+        })
+        .await
+        .unwrap()
+        .len();
+    let replay = store
+        .commit_import(&plan, options.clone(), &audit)
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.commit_id, result.commit_id);
+    assert_eq!(
+        store
+            .get_ai_conversation_source(source.id)
+            .await
+            .unwrap()
+            .meta
+            .revision,
+        archived_source.meta.revision
+    );
+    assert_eq!(
+        store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: None,
+                entity_id: Some(source.id),
+            })
+            .await
+            .unwrap()
+            .len(),
+        source_audits_after_commit,
+        "exact replay cannot repeat source archive audits"
+    );
+    assert!(matches!(
+        store
+            .commit_import(&plan, ImportCommitOptions::default(), &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let mut wrong_binding = options.clone();
+    wrong_binding.source_archive.as_mut().unwrap().source_id = uuid::Uuid::new_v4();
+    assert!(matches!(
+        store.commit_import(&plan, wrong_binding, &audit).await,
+        Err(StoreError::Conflict(_))
+    ));
+    let mut wrong_conversation = options;
+    wrong_conversation
+        .source_archive
+        .as_mut()
+        .unwrap()
+        .conversation_id = uuid::Uuid::new_v4();
+    assert!(matches!(
+        store.commit_import(&plan, wrong_conversation, &audit).await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let (drift_attachment, drift_source) = source_archive_fixture(
+        lab.id,
+        user.id,
+        conversation.id,
+        now,
+        now + Duration::days(1),
+    );
+    store
+        .create_ai_conversation_source(&drift_attachment, &drift_source, &audit)
+        .await
+        .unwrap();
+    let drift_job = source_archive_job(lab.id, user.id, now);
+    store.create_job(&drift_job, &audit).await.unwrap();
+    let (drift_plan, drift_animal) = source_archive_plan(lab.id, user.id, now, 'b');
+    let mut drift_options = source_archive_options(
+        &drift_source,
+        &drift_attachment,
+        conversation.id,
+        drift_job.id,
+    );
+    drift_options
+        .source_archive
+        .as_mut()
+        .unwrap()
+        .expected_revision += 1;
+    assert!(matches!(
+        store
+            .commit_import(&drift_plan, drift_options, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store.get_animal(drift_animal.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert_eq!(
+        store
+            .get_ai_conversation_source(drift_source.id)
+            .await
+            .unwrap(),
+        drift_source
+    );
+    assert_eq!(
+        store.get_attachment(drift_attachment.id).await.unwrap(),
+        drift_attachment
+    );
+    assert!(
+        store
+            .list_provenance(&ProvenanceFilter {
+                lab_id: lab.id,
+                entity_type: Some(EntityType::AiConversationSource),
+                entity_id: Some(drift_source.id),
+                source: Some(ProvenanceSource::Import),
+                ..ProvenanceFilter::default()
+            })
+            .await
+            .unwrap()
+            .is_empty(),
+        "revision drift rolls back source provenance"
+    );
+
+    let expired_last_activity = now - Duration::hours(2);
+    let (expired_attachment, expired_source) = source_archive_fixture(
+        lab.id,
+        user.id,
+        conversation.id,
+        expired_last_activity,
+        now - Duration::hours(1),
+    );
+    store
+        .create_ai_conversation_source(&expired_attachment, &expired_source, &audit)
+        .await
+        .unwrap();
+    let expired_job = source_archive_job(lab.id, user.id, now);
+    store.create_job(&expired_job, &audit).await.unwrap();
+    let (expired_plan, expired_animal) = source_archive_plan(lab.id, user.id, now, 'c');
+    let expired_options = source_archive_options(
+        &expired_source,
+        &expired_attachment,
+        conversation.id,
+        expired_job.id,
+    );
+    assert!(matches!(
+        store
+            .commit_import(&expired_plan, expired_options, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store.get_animal(expired_animal.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert_eq!(
+        store
+            .get_ai_conversation_source(expired_source.id)
+            .await
+            .unwrap(),
+        expired_source
+    );
+    assert_eq!(
+        store.get_attachment(expired_attachment.id).await.unwrap(),
+        expired_attachment
+    );
+    assert!(
+        store
+            .list_provenance(&ProvenanceFilter {
+                lab_id: lab.id,
+                entity_type: Some(EntityType::AiConversationSource),
+                entity_id: Some(expired_source.id),
+                source: Some(ProvenanceSource::Import),
+                ..ProvenanceFilter::default()
+            })
+            .await
+            .unwrap()
+            .is_empty(),
+        "expired sources roll back the entire import"
     );
 }
 
@@ -2960,6 +5809,8 @@ async fn run_relationship_contract(store: &dyn MuriArcStore, now: chrono::DateTi
     assert_eq!(
         project_a_subject.latest_weight,
         Some(LatestAnimalWeight {
+            measurement_id: project_a_weight.id,
+            revision: project_a_weight.meta.revision,
             value: 21.5,
             unit: Some("g".to_owned()),
             measured_at: now,
@@ -3002,6 +5853,8 @@ async fn run_relationship_contract(store: &dyn MuriArcStore, now: chrono::DateTi
     assert_eq!(
         project_a_other_overviews[0].latest_weight,
         Some(LatestAnimalWeight {
+            measurement_id: project_a_other_weight.id,
+            revision: project_a_other_weight.meta.revision,
             value: 27.5,
             unit: Some("g".to_owned()),
             measured_at: now + Duration::seconds(1),
@@ -3035,6 +5888,8 @@ async fn run_relationship_contract(store: &dyn MuriArcStore, now: chrono::DateTi
     assert_eq!(
         lab_subject.latest_weight,
         Some(LatestAnimalWeight {
+            measurement_id: project_a_other_weight.id,
+            revision: project_a_other_weight.meta.revision,
             value: 27.5,
             unit: Some("g".to_owned()),
             measured_at: now + Duration::seconds(1),

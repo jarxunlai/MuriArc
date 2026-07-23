@@ -74,6 +74,7 @@ pub enum EntityType {
     AttachmentLink,
     AttachmentDerivative,
     AiPrivateImage,
+    AiConversationSource,
     AiExtractionDraft,
     AiConversation,
     AiConversationMessage,
@@ -130,6 +131,7 @@ impl EntityType {
             Self::AttachmentLink => "attachment_link",
             Self::AttachmentDerivative => "attachment_derivative",
             Self::AiPrivateImage => "ai_private_image",
+            Self::AiConversationSource => "ai_conversation_source",
             Self::AiExtractionDraft => "ai_extraction_draft",
             Self::AiConversation => "ai_conversation",
             Self::AiConversationMessage => "ai_conversation_message",
@@ -228,6 +230,8 @@ pub enum DomainError {
     InvalidMembershipScope,
     #[error("AI conversation message is invalid")]
     InvalidAiConversationMessage,
+    #[error("AI conversation or requested state transition is invalid")]
+    InvalidAiConversation,
     #[error("user email must be a valid non-whitespace address of at most 320 bytes")]
     InvalidUserEmail,
     #[error("user display name must contain 1-200 non-control characters")]

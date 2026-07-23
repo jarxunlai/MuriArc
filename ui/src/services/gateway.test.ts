@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import { currentAuthSession, DemoGateway, LocalTauriGateway, RemoteHttpGateway, createGateway } from './gateway'
+import {
+  currentAuthSession,
+  DemoGateway,
+  GatewayError,
+  LocalTauriGateway,
+  RemoteHttpGateway,
+  createGateway,
+} from './gateway'
 import { currentProjectId } from './projectContext'
 
 describe('MuriArc gateway selection', () => {
@@ -23,6 +30,19 @@ describe('MuriArc gateway selection', () => {
       'move_animals',
       { input: { animalIds: ['animal-1'], targetCageId: 'cage-2' } },
     ]])
+  })
+
+  it('preserves structured Tauri error codes for UI recovery decisions', async () => {
+    const gateway = new LocalTauriGateway(async () => {
+      throw { code: 'conflict', message: 'AI 会话 revision 已变化' }
+    })
+
+    const operation = gateway.getAiConversation('conversation-1')
+    await expect(operation).rejects.toBeInstanceOf(GatewayError)
+    await expect(operation).rejects.toMatchObject({
+      code: 'conflict',
+      message: 'AI 会话 revision 已变化',
+    })
   })
 
   it('never forwards a Server password or client step-up claim to the local Tauri decision DTO', async () => {
@@ -240,13 +260,27 @@ describe('MuriArc gateway selection', () => {
       return {
         conversationId: 'conversation-1',
         content: '已找到 1 只动物',
-        citations: [{ entity_type: 'animal', entity_id: 'animal-1', revision: 3 }],
+        citations: [
+          { entity_type: 'animal', entity_id: 'animal-1', revision: 3 },
+          {
+            entity_type: 'project_animal_assignment',
+            entity_id: 'assignment-1',
+            revision: 7,
+          },
+          {
+            entity_type: 'ai_conversation_source',
+            entity_id: 'source-1',
+            revision: 2,
+          },
+          { entity_type: 'future_entity', entity_id: 'future-1', revision: 1 },
+        ],
         toolRuns: [{
           tool_run_id: 'run-1', provider_call_id: 'call-1', tool: 'animal_search',
           arguments: { display_id: 'M-001' }, outcome: 'read',
           citations: [{ entity_type: 'animal', entity_id: 'animal-1', revision: 3 }],
         }],
         drafts: [],
+        incompleteReason: 'tool_call_limit_exceeded',
         trace: {
           providerId: 'local-provider', model: 'test-model',
           usage: { provider_calls: 1, tool_calls: 1, input_tokens: 10, output_tokens: 5, total_tokens: 15 },
@@ -263,8 +297,32 @@ describe('MuriArc gateway selection', () => {
     expect(response.citations[0]).toEqual(expect.objectContaining({
       entityType: 'animal', entityId: 'animal-1', revision: 3, route: '/animals?animal=animal-1',
     }))
+    expect(response.citations[1]).toEqual(expect.objectContaining({
+      entityType: 'project_animal_assignment',
+      entityId: 'assignment-1',
+      revision: 7,
+      label: expect.stringContaining('项目动物关系'),
+      route: undefined,
+    }))
+    expect(response.citations[2]).toEqual(expect.objectContaining({
+      entityType: 'ai_conversation_source',
+      entityId: 'source-1',
+      revision: 2,
+      label: expect.stringContaining('AI 会话来源'),
+      route: undefined,
+    }))
+    expect(response.citations[3]).toEqual(expect.objectContaining({
+      entityType: 'future_entity',
+      entityId: 'future-1',
+      label: expect.stringContaining('未知实体（future_entity）'),
+      route: undefined,
+    }))
+    expect(response.citations.map((citation) => citation.label)).not.toContain(
+      expect.stringContaining('undefined'),
+    )
     expect(response.toolRuns[0]).toEqual(expect.objectContaining({ toolRunId: 'run-1', outcome: 'read' }))
     expect(response.trace.usage.totalTokens).toBe(15)
+    expect(response.incompleteReason).toBe('tool_call_limit_exceeded')
   })
 
   it('loads and maps persisted AI conversations through Tauri commands', async () => {
@@ -283,7 +341,14 @@ describe('MuriArc gateway selection', () => {
           createdAt: '2026-07-19T01:00:00Z', updatedAt: '2026-07-19T02:00:00Z',
         },
         messages: [{
-          id: 'message-1', sequence: 1, role: 'assistant', content: '已恢复',
+          id: 'message-1', sequence: 1, role: 'user', content: '检查文件',
+          sourceRefs: [{
+            sourceId: 'source-1', sourceRevision: 2,
+            fileName: 'weights.csv', mediaType: 'text/csv', sizeBytes: 2048,
+          }],
+          createdAt: '2026-07-19T01:59:59Z',
+        }, {
+          id: 'message-2', sequence: 2, role: 'assistant', content: '已恢复',
           createdAt: '2026-07-19T02:00:00Z',
           response: {
             conversationId: 'conversation-1', content: '已恢复',
@@ -306,7 +371,14 @@ describe('MuriArc gateway selection', () => {
       ['get_ai_conversation', { conversationId: 'conversation-1', limit: 40 }],
     ])
     expect(conversations[0].projectId).toBeUndefined()
-    expect(detail.messages[0].response?.citations[0]).toEqual(expect.objectContaining({
+    expect(detail.messages[0].sourceRefs).toEqual([{
+      sourceId: 'source-1',
+      sourceRevision: 2,
+      fileName: 'weights.csv',
+      mediaType: 'text/csv',
+      sizeBytes: 2048,
+    }])
+    expect(detail.messages[1].response?.citations[0]).toEqual(expect.objectContaining({
       entityId: 'animal-1', revision: 4,
     }))
   })
@@ -340,6 +412,291 @@ describe('MuriArc gateway selection', () => {
       'https://lab.example/api/v1/ai/conversations/conversation-1?limit=60',
     ])
     expect(requests.every((request) => new Headers(request.init?.headers).get('X-CSRF-Token') === null)).toBe(true)
+  })
+
+  it('uses revisioned conversation actions and opaque staged source APIs on Server', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const summary = {
+      id: 'conversation-1', projectId: 'project-1', title: '实验进度',
+      pinnedAt: '2026-07-23T09:00:00Z', archivedAt: null, revision: 3,
+      createdAt: '2026-07-23T08:00:00Z', updatedAt: '2026-07-23T09:00:00Z',
+    }
+    const source = {
+      id: 'source-1', conversationId: 'conversation-1', projectId: 'project-1',
+      fileName: 'measurements.xlsx',
+      mediaType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      sizeBytes: 4, status: 'ready', revision: 1,
+      createdAt: '2026-07-23T09:01:00Z', expiresAt: '2026-08-22T09:01:00Z',
+    }
+    const listedSources = [
+      source,
+      { ...source, id: 'source-staged', status: 'staged' },
+      { ...source, id: 'source-archived', status: 'archived', revision: 2 },
+      { ...source, id: 'source-failed', status: 'failed' },
+      { ...source, id: 'source-expired', status: 'expired' },
+    ]
+    const archivedSource = { ...source, status: 'archived', revision: 2 }
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      if (url.endsWith('/auth/login')) {
+        return new Response(JSON.stringify({ data: {
+          user: { id: 'user-1', lab_id: 'lab-1', display_name: '研究者', lab_roles: [], project_roles: [], authentication: 'session' },
+          csrf_token: 'csrf-ai-workbench', expires_at: '2026-07-23T12:00:00Z',
+        }, request_id: 'req-login' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/ai/sources/source-1/archive') && init?.method === 'POST') {
+        return new Response(JSON.stringify({ data: archivedSource, request_id: 'req-archive' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.includes('/ai/sources/source-1') && init?.method === 'DELETE') {
+        return new Response(null, { status: 204 })
+      }
+      if (url.includes('/ai/sources?')) {
+        const status = new URL(url).searchParams.get('status')
+        const data = status
+          ? listedSources.filter((candidate) => candidate.status === status)
+          : listedSources
+        return new Response(JSON.stringify({
+          data, count: data.length, request_id: 'req-source-list',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.includes('/ai/sources/upload')) {
+        return new Response(JSON.stringify({ data: source, request_id: 'req-source' }), {
+          status: 201, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/ai/conversations') && init?.method === 'POST') {
+        return new Response(JSON.stringify({ data: summary, request_id: 'req-create' }), {
+          status: 201, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/ai/conversations/conversation-1') && init?.method === 'PATCH') {
+        return new Response(JSON.stringify({ data: summary, request_id: 'req-update' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ data: [summary], count: 1, request_id: 'req-list' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchRequest,
+    })
+    await remote.login({ email: 'r@example.org', password: 'not-retained' })
+
+    await remote.createAiConversation({
+      projectId: 'project-1',
+      title: '新对话',
+    })
+    const conversations = await remote.queryAiConversations({
+      projectId: 'project-1',
+      titleQuery: '实验',
+      archive: 'active',
+      limit: 80,
+    })
+    await remote.updateAiConversation('conversation-1', {
+      action: 'rename',
+      title: '新的实验标题',
+      expectedRevision: 2,
+    })
+    const file = new File(['xlsx'], 'measurements.xlsx', {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    })
+    const uploaded = await remote.uploadAiSource({
+      file,
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    const sources = await remote.listAiSources({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    const archivedSources = await remote.listAiSources({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+      status: 'archived',
+    })
+    const archived = await remote.archiveAiSource(uploaded.id, {
+      projectId: 'project-1',
+      expectedRevision: uploaded.revision,
+    })
+    await remote.deleteAiSource(uploaded.id)
+
+    expect(conversations[0]).toEqual(expect.objectContaining({
+      id: 'conversation-1',
+      pinnedAt: '2026-07-23T09:00:00Z',
+      archivedAt: undefined,
+    }))
+    expect(sources.map((candidate) => candidate.status)).toEqual([
+      'ready', 'staged', 'archived', 'failed', 'expired',
+    ])
+    expect(archivedSources).toEqual([
+      expect.objectContaining({ id: 'source-archived', status: 'archived', revision: 2 }),
+    ])
+    expect(archived).toEqual(expect.objectContaining({
+      id: 'source-1',
+      status: 'archived',
+      revision: 2,
+    }))
+    const create = requests.find((request) =>
+      request.url.endsWith('/ai/conversations') && request.init?.method === 'POST')!
+    expect(JSON.parse(String(create.init?.body))).toEqual({
+      project_id: 'project-1',
+      title: '新对话',
+    })
+    expect(requests.some((request) => request.url.endsWith(
+      '/ai/conversations?archive=active&limit=80&project_id=project-1&q=%E5%AE%9E%E9%AA%8C',
+    ))).toBe(true)
+    const update = requests.find((request) =>
+      request.url.endsWith('/ai/conversations/conversation-1') && request.init?.method === 'PATCH')!
+    expect(JSON.parse(String(update.init?.body))).toEqual({
+      action: 'rename',
+      expected_revision: 2,
+      title: '新的实验标题',
+    })
+    const upload = requests.find((request) => request.url.includes('/ai/sources/upload?'))!
+    expect(new URL(upload.url).searchParams.get('conversation_id')).toBe('conversation-1')
+    expect(upload.init?.body).toBe(file)
+    expect(requests.some((request) => request.url.endsWith(
+      '/ai/sources?conversation_id=conversation-1&project_id=project-1',
+    ))).toBe(true)
+    expect(requests.some((request) => request.url.endsWith(
+      '/ai/sources?conversation_id=conversation-1&project_id=project-1&status=archived',
+    ))).toBe(true)
+    const archive = requests.find((request) =>
+      request.url.endsWith('/ai/sources/source-1/archive') && request.init?.method === 'POST')!
+    expect(JSON.parse(String(archive.init?.body))).toEqual({
+      project_id: 'project-1',
+      expected_revision: 1,
+    })
+    for (const request of requests.filter((request) =>
+      !request.url.endsWith('/auth/login')
+      && ['PATCH', 'POST', 'DELETE'].includes(request.init?.method ?? ''))) {
+      expect(new Headers(request.init?.headers).get('X-CSRF-Token')).toBe('csrf-ai-workbench')
+    }
+  })
+
+  it('sends source bytes and conversation actions through typed Tauri commands', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const summary = {
+      id: 'conversation-1', projectId: null, title: '已置顶', pinnedAt: '2026-07-23T09:00:00Z',
+      archivedAt: null, createdAt: '2026-07-23T08:00:00Z',
+      updatedAt: '2026-07-23T09:00:00Z', revision: 3,
+    }
+    const source = {
+      id: 'source-1', conversationId: 'conversation-1', projectId: 'project-1',
+      fileName: 'notes.txt', mediaType: 'text/plain', sizeBytes: 3,
+      status: 'ready', revision: 1, createdAt: '2026-07-23T09:00:00Z',
+      expiresAt: '2026-08-22T09:00:00Z',
+    }
+    const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      calls.push([command, args])
+      if (command === 'list_ai_conversations') return [summary] as T
+      if (command === 'create_ai_conversation') return summary as T
+      if (command === 'upload_ai_source') return source as T
+      if (command === 'list_ai_sources') {
+        return [
+          source,
+          { ...source, id: 'source-staged', status: 'staged' },
+          { ...source, id: 'source-archived', status: 'archived', revision: 2 },
+          { ...source, id: 'source-failed', status: 'failed' },
+          { ...source, id: 'source-expired', status: 'expired' },
+        ] as T
+      }
+      if (command === 'archive_ai_source') {
+        return { ...source, status: 'archived', revision: 2 } as T
+      }
+      return summary as T
+    }
+    const local = new LocalTauriGateway(invokeCommand)
+
+    await local.createAiConversation({ projectId: 'project-1', title: '新对话' })
+    await local.queryAiConversations({ titleQuery: '置顶', archive: 'all', limit: 40 })
+    await local.updateAiConversation('conversation-1', {
+      action: 'pin',
+      expectedRevision: 2,
+    })
+    const file = {
+      name: 'notes.txt',
+      type: 'text/plain',
+      size: 3,
+      arrayBuffer: async () => Uint8Array.from([97, 98, 99]).buffer,
+    } as File
+    await local.uploadAiSource({
+      file,
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    const sources = await local.listAiSources({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    const archived = await local.archiveAiSource('source-1', {
+      projectId: 'project-1',
+      expectedRevision: 1,
+    })
+    await local.deleteAiSource('source-1')
+
+    expect(sources.map((candidate) => candidate.status)).toEqual([
+      'ready', 'staged', 'archived', 'failed', 'expired',
+    ])
+    expect(archived).toEqual(expect.objectContaining({
+      id: 'source-1',
+      status: 'archived',
+      revision: 2,
+    }))
+    expect(calls).toEqual([
+      ['create_ai_conversation', {
+        input: { projectId: 'project-1', title: '新对话' },
+      }],
+      ['list_ai_conversations', {
+        projectId: undefined, titleQuery: '置顶', archive: 'all', limit: 40,
+      }],
+      ['update_ai_conversation', {
+        conversationId: 'conversation-1',
+        input: { action: 'pin', expectedRevision: 2 },
+      }],
+      ['upload_ai_source', { input: {
+        fileName: 'notes.txt', mediaType: 'text/plain',
+        conversationId: 'conversation-1', projectId: 'project-1', bytes: [97, 98, 99],
+      } }],
+      ['list_ai_sources', { input: {
+        conversationId: 'conversation-1', projectId: 'project-1', status: undefined,
+      } }],
+      ['archive_ai_source', {
+        sourceId: 'source-1',
+        input: { projectId: 'project-1', expectedRevision: 1 },
+      }],
+      ['delete_ai_source', { sourceId: 'source-1' }],
+    ])
+  })
+
+  it('rejects unknown AI source states instead of silently treating them as ready', async () => {
+    const local = new LocalTauriGateway(async <T>(command: string): Promise<T> => {
+      if (command !== 'list_ai_sources') return undefined as T
+      return [{
+        id: 'source-unknown',
+        conversationId: 'conversation-1',
+        projectId: 'project-1',
+        fileName: 'unknown.csv',
+        mediaType: 'text/csv',
+        sizeBytes: 12,
+        status: 'mystery',
+        revision: 1,
+        createdAt: '2026-07-23T09:00:00Z',
+        expiresAt: '2026-08-22T09:00:00Z',
+      }] as T
+    })
+
+    const operation = local.listAiSources({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    await expect(operation).rejects.toBeInstanceOf(GatewayError)
+    await expect(operation).rejects.toMatchObject({ code: 'invalid_ai_source_status' })
   })
 
   it('keeps workspace settings local while exposing per-user Server AI settings', () => {
@@ -647,6 +1004,80 @@ describe('MuriArc gateway selection', () => {
     expect(String(decision?.init?.body)).not.toContain('stepUpVerified')
   })
 
+  it('keeps an explicit lab-wide AI scope independent from the top-bar project', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    currentProjectId.value = 'top-bar-project'
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      if (url.endsWith('/auth/login')) {
+        return new Response(JSON.stringify({
+          data: {
+            user: {
+              id: 'lab-reader',
+              lab_id: 'lab-1',
+              display_name: 'Lab reader',
+              lab_roles: [],
+              project_roles: [],
+              authentication: 'session',
+            },
+            csrf_token: 'csrf-lab-scope',
+            expires_at: '2026-07-24T12:00:00Z',
+          },
+          request_id: 'req-lab-login',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/ai/turns')) {
+        return new Response(JSON.stringify({
+          data: {
+            conversationId: 'lab-conversation',
+            content: '只读查询完成',
+            citations: [],
+            toolRuns: [],
+            drafts: [],
+            trace: {
+              providerId: 'server-provider',
+              model: 'gpt-test',
+              usage: {
+                provider_calls: 1,
+                tool_calls: 0,
+                input_tokens: 2,
+                output_tokens: 2,
+                total_tokens: 4,
+              },
+            },
+          },
+          request_id: 'req-lab-turn',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        data: [],
+        count: 0,
+        request_id: 'req-lab-drafts',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchRequest,
+    })
+    await remote.login({ email: 'reader@example.org', password: 'not-retained' })
+
+    try {
+      await remote.aiTurn({ message: '跨项目只读汇总' })
+      await remote.listAiDrafts(undefined, 'pending_approval')
+    } finally {
+      currentProjectId.value = undefined
+    }
+
+    const turn = requests.find((request) => request.url.endsWith('/ai/turns'))
+    expect(JSON.parse(String(turn?.init?.body))).toEqual({
+      message: '跨项目只读汇总',
+    })
+    expect(requests.some((request) =>
+      request.url.endsWith('/ai/approvals?status=pending_approval'))).toBe(true)
+    expect(JSON.stringify(requests)).not.toContain('top-bar-project')
+  })
+
   it('uses session-only CSRF-protected admin routes without retaining passwords', async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = []
     const managedUser = {
@@ -952,12 +1383,18 @@ describe('MuriArc gateway selection', () => {
     const fetchRequest = vi.fn(async () => new Response(JSON.stringify({
       data: [
         {
-          id: 'job-failed', kind: 'import', status: 'failed', idempotency_key: 'failed-import',
-          progress_current: 2, progress_total: 5, meta: { created_at: '2026-07-19T09:00:00Z' },
+          id: 'job-failed', kind: 'import', status: 'failed',
+          progress_current: 2, progress_total: 5,
+          result_available: false, error_report_available: true,
+          cancellation_requested: false, revision: 2,
+          created_at: '2026-07-19T09:00:00Z', updated_at: '2026-07-19T09:01:00Z',
         },
         {
-          id: 'job-cancelled', kind: 'export', status: 'cancelled', idempotency_key: 'cancelled-export',
-          progress_current: 1, progress_total: 4, meta: { created_at: '2026-07-19T09:05:00Z' },
+          id: 'job-cancelled', kind: 'export', status: 'cancelled',
+          progress_current: 1, progress_total: 4,
+          result_available: false, error_report_available: false,
+          cancellation_requested: true, revision: 3,
+          created_at: '2026-07-19T09:05:00Z', updated_at: '2026-07-19T09:06:00Z',
         },
       ],
       count: 2,

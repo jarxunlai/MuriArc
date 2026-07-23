@@ -16,10 +16,19 @@ pub(crate) async fn write_object(
     id: Uuid,
     body: Body,
 ) -> Result<StoredObject, AttachmentFileError> {
+    write_object_with_limit(root, id, body, MAX_ATTACHMENT_BYTES).await
+}
+
+pub(crate) async fn write_object_with_limit(
+    root: &Path,
+    id: Uuid,
+    body: Body,
+    max_bytes: u64,
+) -> Result<StoredObject, AttachmentFileError> {
     let stream = body
         .into_data_stream()
         .map_err(|error| io::Error::other(error.to_string()));
-    AttachmentFiles::new(root)
+    AttachmentFiles::with_limit(root, max_bytes)
         .write_reader(id, StreamReader::new(stream))
         .await
 }

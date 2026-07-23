@@ -240,3 +240,34 @@ pub enum ProviderError {
     #[error("mock provider state is unavailable")]
     MockUnavailable,
 }
+
+impl ProviderError {
+    /// Stable transport-neutral code shared by Server and Desktop adapters.
+    ///
+    /// Provider request identifiers and response bodies remain diagnostic-only
+    /// and must never be copied into this public classification.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidConfig(_) | Self::InvalidRequest(_) => "invalid_provider",
+            Self::RequestTooLarge { .. } => "context_exceeded",
+            Self::ResponseTooLarge { .. } => "response_too_large",
+            Self::Transport {
+                kind: TransportFailure::Timeout,
+            } => "request_timeout",
+            Self::Transport {
+                kind: TransportFailure::Connection,
+            } => "provider_unreachable",
+            Self::Transport {
+                kind: TransportFailure::Request,
+            } => "provider_transport_error",
+            Self::HttpStatus {
+                status: 401 | 403, ..
+            } => "api_key_rejected",
+            Self::HttpStatus { status: 404, .. } => "model_not_found",
+            Self::HttpStatus { .. } => "provider_http_error",
+            Self::MalformedResponse | Self::EmptyResponse => "response_format_incompatible",
+            Self::OutputBudgetExhausted => "output_budget_exhausted",
+            Self::MockExhausted | Self::MockUnavailable => "provider_unavailable",
+        }
+    }
+}

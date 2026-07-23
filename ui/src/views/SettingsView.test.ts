@@ -32,7 +32,18 @@ vi.mock('@/services/gateway', () => ({
   },
 }))
 vi.mock('@/services/dataGateway', () => ({ createDataGateway: () => ({}) }))
-vi.mock('@/services/projectContext', () => ({ hasLabRegistryAccess: () => false }))
+vi.mock('@/services/projectContext', () => ({
+  currentAuthSession: {
+    value: {
+      user: {
+        id: 'editor-1', labId: 'lab-1', displayName: 'Editor', labRoles: [],
+        projectRoles: [], authentication: 'session', mustChangePassword: false,
+        isEnvironmentRoot: false,
+      },
+    },
+  },
+  hasLabRegistryAccess: () => false,
+}))
 vi.mock('vue-router', () => ({ useRouter: () => ({ replace: vi.fn() }) }))
 vi.mock('naive-ui', async (importOriginal) => {
   const actual = await importOriginal<typeof import('naive-ui')>()

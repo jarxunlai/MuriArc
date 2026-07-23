@@ -11,9 +11,9 @@ use muriarc_ai::{
     AiWorkflowError, AiWorkflowService, ApprovalDecision, ApprovalError, ApprovalRequirement,
     AssistantConversationDetail, AssistantConversationStartRequest,
     AssistantConversationStartResponse, AssistantConversationSummary, AssistantError,
-    AssistantTurnRequest, AssistantTurnResponse, ChatMessage, CompletionRequest,
-    DraftDecisionRequest, DraftDecisionResponse, DraftStatus, ProviderCredentials, ProviderError,
-    ScopeSet, ToolScope, TransportFailure, WriteDraftSummary,
+    AssistantTurnMedia, AssistantTurnRequest, AssistantTurnResponse, ChatMessage,
+    CompletionRequest, DraftDecisionRequest, DraftDecisionResponse, DraftStatus,
+    ProviderCredentials, ProviderError, ScopeSet, ToolScope, TransportFailure, WriteDraftSummary,
 };
 use muriarc_core::{AiAutonomyMode, AiModelProfileBinding, Permission, StoreError};
 use serde::{Deserialize, Deserializer};
@@ -559,19 +559,126 @@ async fn run_turn(
         api_key,
         runtime,
         model_profile,
+        supports_vision,
     } = resolved;
-    let response = workflow
-        .run_turn_with_config(
-            provider,
-            api_key.as_ref().map(|secret| secret.as_str()),
-            &context,
-            model_profile,
-            payload,
-            runtime,
-        )
+    workflow
+        .preflight_turn_request(&context, model_profile, &payload)
         .await
         .map_err(|error| workflow_error(error, &metadata))?;
+    let response = if payload.image_ids.is_empty() {
+        workflow
+            .run_turn_with_config(
+                provider,
+                api_key.as_ref().map(|secret| secret.as_str()),
+                &context,
+                model_profile,
+                payload,
+                runtime,
+            )
+            .await
+    } else {
+        let images = super::ai_images::prepare_assistant_images(
+            &state,
+            &principal,
+            &metadata,
+            payload.conversation_id,
+            payload.project_id,
+            &payload.image_ids,
+        )
+        .await?;
+        let media = if supports_vision {
+            AssistantTurnMedia::direct(images)
+        } else {
+            let vision = resolve_turn_vision_provider(
+                &state,
+                &principal,
+                payload.vision_model_profile_id,
+                &metadata,
+            )
+            .await?;
+            let observation = workflow
+                .observe_images(
+                    vision.provider,
+                    vision.api_key.as_ref().map(|secret| secret.as_str()),
+                    vision.model_profile,
+                    &images,
+                    vision.runtime,
+                )
+                .await
+                .map_err(|error| workflow_error(error, &metadata))?;
+            AssistantTurnMedia::relayed(images, observation)
+        }
+        .map_err(|error| workflow_error(error, &metadata))?;
+        workflow
+            .run_turn_with_media_config(
+                provider,
+                api_key.as_ref().map(|secret| secret.as_str()),
+                &context,
+                model_profile,
+                payload,
+                runtime,
+                media,
+            )
+            .await
+    }
+    .map_err(|error| workflow_error(error, &metadata))?;
     Ok(item(response, &metadata))
+}
+
+pub(super) async fn resolve_turn_vision_provider(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    explicit_profile_id: Option<Uuid>,
+    metadata: &RequestMetadata,
+) -> Result<ResolvedAiProvider, ApiError> {
+    let profile_id = match explicit_profile_id {
+        Some(profile_id) if !profile_id.is_nil() => profile_id,
+        Some(_) => return Err(vision_model_unavailable(metadata)),
+        None => state
+            .ai_providers
+            .get_model_defaults(principal.user_id)
+            .await
+            .map_err(|error| default_vision_model_error(error, metadata))?
+            .default_vision_profile_id
+            .ok_or_else(|| vision_model_selection_required(metadata))?,
+    };
+    let profile = state
+        .ai_providers
+        .get_model_profile(principal.user_id, profile_id)
+        .await
+        .map_err(|error| {
+            if explicit_profile_id.is_some() {
+                explicit_vision_model_error(error, metadata)
+            } else {
+                default_vision_model_error(error, metadata)
+            }
+        })?;
+    if profile.archived_at.is_some() || !profile.supports_vision {
+        return Err(if explicit_profile_id.is_some() {
+            vision_model_unavailable(metadata)
+        } else {
+            vision_model_selection_required(metadata)
+        });
+    }
+    let binding = AiModelProfileBinding {
+        profile_id,
+        profile_version: profile.current_version,
+    };
+    let resolved = state
+        .ai_providers
+        .resolve_for_profile(principal.user_id, binding)
+        .await
+        .map_err(|error| {
+            if explicit_profile_id.is_some() {
+                explicit_vision_model_error(error, metadata)
+            } else {
+                default_vision_model_error(error, metadata)
+            }
+        })?;
+    if !resolved.supports_vision {
+        return Err(vision_model_unavailable(metadata));
+    }
+    Ok(resolved)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1266,6 +1373,45 @@ fn model_unavailable(metadata: &RequestMetadata) -> ApiError {
     .with_request_id(metadata.request_id.clone())
 }
 
+pub(super) fn vision_model_selection_required(metadata: &RequestMetadata) -> ApiError {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "vision_model_selection_required",
+        "select an available vision model before sending images",
+    )
+    .with_request_id(metadata.request_id.clone())
+}
+
+pub(super) fn vision_model_unavailable(metadata: &RequestMetadata) -> ApiError {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "vision_model_unavailable",
+        "the selected vision model is not currently available",
+    )
+    .with_request_id(metadata.request_id.clone())
+}
+
+fn default_vision_model_error(error: AiProviderStoreError, metadata: &RequestMetadata) -> ApiError {
+    match error {
+        AiProviderStoreError::Storage
+        | AiProviderStoreError::Encryption
+        | AiProviderStoreError::InvalidMasterKey => provider_settings_error(error, metadata),
+        _ => vision_model_selection_required(metadata),
+    }
+}
+
+fn explicit_vision_model_error(
+    error: AiProviderStoreError,
+    metadata: &RequestMetadata,
+) -> ApiError {
+    match error {
+        AiProviderStoreError::Storage
+        | AiProviderStoreError::Encryption
+        | AiProviderStoreError::InvalidMasterKey => provider_settings_error(error, metadata),
+        _ => vision_model_unavailable(metadata),
+    }
+}
+
 fn default_model_error(error: AiProviderStoreError, metadata: &RequestMetadata) -> ApiError {
     match error {
         AiProviderStoreError::Storage
@@ -1450,6 +1596,16 @@ fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiErro
             "model_unavailable",
             error.to_string(),
         ),
+        AiWorkflowError::InvalidImageEvidence => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "image_evidence_invalid",
+            error.to_string(),
+        ),
+        AiWorkflowError::InvalidVisionObservation => ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "vision_response_invalid",
+            error.to_string(),
+        ),
         AiWorkflowError::InvalidStoredConversation => {
             tracing::error!(kind = ?error, "stored AI conversation data is invalid");
             ApiError::internal()
@@ -1464,9 +1620,16 @@ fn store_error(error: StoreError, metadata: &RequestMetadata) -> ApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc::{self, Receiver},
+        },
+        thread,
+        time::{Duration as StdDuration, Instant as StdInstant},
     };
 
     use super::*;
@@ -1476,7 +1639,9 @@ mod tests {
         Router,
         body::Body,
         http::{Method, Request, StatusCode, header},
+        response::IntoResponse,
     };
+    use base64::Engine as _;
     use chrono::{Duration, Utc};
     use http_body_util::BodyExt;
     use muriarc_ai::{
@@ -1512,6 +1677,109 @@ mod tests {
     const BEARER_TOKEN: &str = "mat_step_up_bearer_000000000000000000000000000000";
     const EXTERNAL_BEARER_TOKEN: &str = "mat_step_up_external_000000000000000000000000000000";
     const CORRECT_PASSWORD: &str = "correct current password";
+
+    fn request_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        request.len() >= header_end + content_length
+    }
+
+    fn chat_response(id: &str, model: &str, content: &str) -> String {
+        json!({
+            "id": id,
+            "model": model,
+            "choices": [{
+                "message": {"content": content, "tool_calls": []},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+        })
+        .to_string()
+    }
+
+    fn portable_png() -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            )
+            .unwrap()
+    }
+
+    fn spawn_provider_sequence(
+        bodies: Vec<String>,
+    ) -> (String, Receiver<Vec<String>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(StdDuration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request_complete(&request) {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(headers.as_bytes()).unwrap();
+                stream.write_all(body.as_bytes()).unwrap();
+            }
+            sender.send(requests).unwrap();
+        });
+        (format!("http://{address}/v1"), receiver, handle)
+    }
+
+    fn spawn_no_call_probe() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = calls.clone();
+        let handle = thread::spawn(move || {
+            let deadline = StdInstant::now() + StdDuration::from_millis(500);
+            while StdInstant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => {
+                        probe.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(StdDuration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (format!("http://{address}/v1"), calls, handle)
+    }
 
     #[test]
     fn connection_test_allows_reasoning_models_to_emit_final_content() {
@@ -1656,6 +1924,10 @@ mod tests {
         user_id: Uuid,
         profile_id: Uuid,
         default_profile: Option<Uuid>,
+        base_url: String,
+        supports_vision: bool,
+        vision_profile_id: Option<Uuid>,
+        vision_base_url: Option<String>,
         max_mode: AiAutonomyMode,
         archived: AtomicBool,
         resolve_calls: AtomicUsize,
@@ -1672,38 +1944,82 @@ mod tests {
                 user_id,
                 profile_id,
                 default_profile,
+                base_url: "http://127.0.0.1:9".to_owned(),
+                supports_vision: false,
+                vision_profile_id: None,
+                vision_base_url: None,
                 max_mode,
                 archived: AtomicBool::new(false),
                 resolve_calls: AtomicUsize::new(0),
             }
         }
 
-        fn profile(&self) -> AiModelProfileView {
+        fn with_vision_test_runtime(
+            mut self,
+            base_url: String,
+            supports_vision: bool,
+            vision_profile: Option<(Uuid, String)>,
+        ) -> Self {
+            self.base_url = base_url;
+            self.supports_vision = supports_vision;
+            if let Some((profile_id, base_url)) = vision_profile {
+                self.vision_profile_id = Some(profile_id);
+                self.vision_base_url = Some(base_url);
+            }
+            self
+        }
+
+        fn profile_for(&self, profile_id: Uuid) -> Option<AiModelProfileView> {
             let now = Utc::now();
-            AiModelProfileView {
-                id: self.profile_id,
-                name: "Conversation model".to_owned(),
+            let (name, base_url, model_id, supports_vision, archived_at) =
+                if profile_id == self.profile_id {
+                    (
+                        "Conversation model",
+                        self.base_url.as_str(),
+                        "conversation-test-model",
+                        self.supports_vision,
+                        self.archived.load(Ordering::SeqCst).then_some(now),
+                    )
+                } else if Some(profile_id) == self.vision_profile_id {
+                    (
+                        "Vision model",
+                        self.vision_base_url.as_deref()?,
+                        "vision-test-model",
+                        true,
+                        None,
+                    )
+                } else {
+                    return None;
+                };
+            Some(AiModelProfileView {
+                id: profile_id,
+                name: name.to_owned(),
                 current_version: 1,
                 protocol: muriarc_core::AiProviderProtocol::OpenaiChatCompletions,
                 transport: muriarc_core::AiProviderTransport::LocalHttp,
-                base_url: "http://127.0.0.1:9".to_owned(),
-                model_id: "conversation-test-model".to_owned(),
-                supports_vision: false,
+                base_url: base_url.to_owned(),
+                model_id: model_id.to_owned(),
+                supports_vision,
                 context_window_tokens: 32_768,
                 max_input_tokens: 16_384,
                 max_output_tokens: 2_048,
                 history_token_budget: 8_192,
                 history_turns: 20,
                 temperature: 0.0,
-                timeout_ms: 1_000,
+                timeout_ms: 2_000,
                 has_key: false,
-                archived_at: self.archived.load(Ordering::SeqCst).then_some(now),
-                is_default_conversation: self.default_profile == Some(self.profile_id),
-                is_default_vision: false,
+                archived_at,
+                is_default_conversation: self.default_profile == Some(profile_id),
+                is_default_vision: self.vision_profile_id == Some(profile_id),
                 revision: 1,
                 created_at: now,
                 updated_at: now,
-            }
+            })
+        }
+
+        fn profile(&self) -> AiModelProfileView {
+            self.profile_for(self.profile_id)
+                .expect("conversation test profile must exist")
         }
 
         fn resolved(
@@ -1712,22 +2028,23 @@ mod tests {
             binding: AiModelProfileBinding,
         ) -> Result<ResolvedAiProvider, AiProviderStoreError> {
             self.resolve_calls.fetch_add(1, Ordering::SeqCst);
-            if user_id != self.user_id
-                || binding
-                    != (AiModelProfileBinding {
-                        profile_id: self.profile_id,
-                        profile_version: 1,
-                    })
-            {
+            if user_id != self.user_id || binding.profile_version != 1 {
                 return Err(AiProviderStoreError::ModelProfileNotFound);
             }
-            if self.archived.load(Ordering::SeqCst) {
+            let profile = self
+                .profile_for(binding.profile_id)
+                .ok_or(AiProviderStoreError::ModelProfileNotFound)?;
+            if profile.archived_at.is_some() {
                 return Err(AiProviderStoreError::ProviderNotSelected);
             }
             let provider = BuiltinProvider::from_config(ProviderConfig::local_http(
-                "conversation-test-provider",
-                "conversation-test-model",
-                "http://127.0.0.1:9",
+                if binding.profile_id == self.profile_id {
+                    "conversation-test-provider"
+                } else {
+                    "vision-test-provider"
+                },
+                profile.model_id.clone(),
+                profile.base_url.clone(),
             ))
             .unwrap();
             Ok(ResolvedAiProvider {
@@ -1740,9 +2057,10 @@ mod tests {
                     history_token_budget: 8_192,
                     history_turns: 20,
                     temperature: 0.0,
-                    timeout_ms: 1_000,
+                    timeout_ms: 2_000,
                 },
                 model_profile: binding,
+                supports_vision: profile.supports_vision,
             })
         }
     }
@@ -1796,9 +2114,18 @@ mod tests {
 
         async fn resolve_vision(
             &self,
-            _user_id: Uuid,
+            user_id: Uuid,
         ) -> Result<ResolvedAiProvider, AiProviderStoreError> {
-            Err(AiProviderStoreError::ProviderNotSelected)
+            let profile_id = self
+                .vision_profile_id
+                .ok_or(AiProviderStoreError::ProviderNotSelected)?;
+            self.resolved(
+                user_id,
+                AiModelProfileBinding {
+                    profile_id,
+                    profile_version: 1,
+                },
+            )
         }
 
         async fn diagnostics(
@@ -1818,7 +2145,9 @@ mod tests {
                 custom_url_approval_required: true,
                 configured_user_count: 1,
                 enabled_user_count: 1,
-                vision_user_count: 0,
+                vision_user_count: i64::from(
+                    self.supports_vision || self.vision_profile_id.is_some(),
+                ),
                 revision: 1,
                 max_autonomy_mode: self.max_mode,
             })
@@ -1874,12 +2203,14 @@ mod tests {
             if user_id != self.user_id {
                 return Ok(Vec::new());
             }
-            let profile = self.profile();
-            if profile.archived_at.is_some() && !include_archived {
-                Ok(Vec::new())
-            } else {
-                Ok(vec![profile])
-            }
+            Ok([
+                Some(self.profile()),
+                self.vision_profile_id.and_then(|id| self.profile_for(id)),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|profile| include_archived || profile.archived_at.is_none())
+            .collect())
         }
 
         async fn get_model_profile(
@@ -1887,11 +2218,11 @@ mod tests {
             user_id: Uuid,
             profile_id: Uuid,
         ) -> Result<AiModelProfileView, AiProviderStoreError> {
-            if user_id == self.user_id && profile_id == self.profile_id {
-                Ok(self.profile())
-            } else {
-                Err(AiProviderStoreError::ModelProfileNotFound)
+            if user_id != self.user_id {
+                return Err(AiProviderStoreError::ModelProfileNotFound);
             }
+            self.profile_for(profile_id)
+                .ok_or(AiProviderStoreError::ModelProfileNotFound)
         }
 
         async fn create_model_profile(
@@ -1949,7 +2280,7 @@ mod tests {
             }
             Ok(AiModelDefaultsView {
                 default_conversation_profile_id: self.default_profile,
-                default_vision_profile_id: None,
+                default_vision_profile_id: self.vision_profile_id,
                 revision: 1,
             })
         }
@@ -1965,12 +2296,22 @@ mod tests {
     }
 
     struct ConversationFixture {
+        _temp: TempDir,
         app: Router,
+        state: AppState,
+        principal: AuthPrincipal,
         store: Arc<SqliteStore>,
         providers: Arc<ConversationProviderStore>,
         profile_id: Uuid,
+        vision_profile_id: Option<Uuid>,
         audit: AuditContext,
         verification_calls: Arc<AtomicUsize>,
+    }
+
+    struct ConversationProviderRuntime {
+        base_url: String,
+        supports_vision: bool,
+        vision_profile: Option<(Uuid, String)>,
     }
 
     impl ConversationFixture {
@@ -1978,11 +2319,52 @@ mod tests {
             Self::with_step_up_policy(default_selected, max_mode, AiStepUpPolicy::default()).await
         }
 
+        async fn with_vision_runtime(base_url: String, conversation_supports_vision: bool) -> Self {
+            let vision_profile =
+                (!conversation_supports_vision).then(|| (Uuid::new_v4(), base_url.clone()));
+            Self::configured(
+                true,
+                AiAutonomyMode::Full,
+                AiStepUpPolicy::default(),
+                Some(ConversationProviderRuntime {
+                    base_url,
+                    supports_vision: conversation_supports_vision,
+                    vision_profile,
+                }),
+            )
+            .await
+        }
+
+        async fn with_missing_vision_runtime(base_url: String) -> Self {
+            Self::configured(
+                true,
+                AiAutonomyMode::Full,
+                AiStepUpPolicy::default(),
+                Some(ConversationProviderRuntime {
+                    base_url,
+                    supports_vision: false,
+                    vision_profile: None,
+                }),
+            )
+            .await
+        }
+
         async fn with_step_up_policy(
             default_selected: bool,
             max_mode: AiAutonomyMode,
             policy: AiStepUpPolicy,
         ) -> Self {
+            Self::configured(default_selected, max_mode, policy, None).await
+        }
+
+        async fn configured(
+            default_selected: bool,
+            max_mode: AiAutonomyMode,
+            policy: AiStepUpPolicy,
+            provider_runtime: Option<ConversationProviderRuntime>,
+        ) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let attachment_root = temp.path().join("attachments");
             let store = Arc::new(SqliteStore::in_memory().await.unwrap());
             store.migrate().await.unwrap();
             let now = Utc::now();
@@ -2008,6 +2390,15 @@ mod tests {
                 reason: Some("prepare conversation model".to_owned()),
             });
             let profile_id = Uuid::new_v4();
+            let ConversationProviderRuntime {
+                base_url,
+                supports_vision,
+                vision_profile,
+            } = provider_runtime.unwrap_or_else(|| ConversationProviderRuntime {
+                base_url: "http://127.0.0.1:9".to_owned(),
+                supports_vision: false,
+                vision_profile: None,
+            });
             let profile = AiModelProfile {
                 id: profile_id,
                 lab_id: lab.id,
@@ -2022,10 +2413,10 @@ mod tests {
                 version: 1,
                 protocol: muriarc_core::AiProviderProtocol::OpenaiChatCompletions,
                 transport: muriarc_core::AiProviderTransport::LocalHttp,
-                base_url: "http://127.0.0.1:9".to_owned(),
-                normalized_base_url: "http://127.0.0.1:9".to_owned(),
+                base_url: base_url.clone(),
+                normalized_base_url: base_url.clone(),
                 model_id: "conversation-test-model".to_owned(),
-                supports_vision: false,
+                supports_vision,
                 context_window_tokens: 32_768,
                 max_input_tokens: 16_384,
                 max_output_tokens: 2_048,
@@ -2039,19 +2430,60 @@ mod tests {
                 .create_ai_model_profile(&profile, &version, &audit)
                 .await
                 .unwrap();
+            if let Some((vision_profile_id, vision_base_url)) = vision_profile.as_ref() {
+                let vision_profile_record = AiModelProfile {
+                    id: *vision_profile_id,
+                    lab_id: lab.id,
+                    user_id: user.id,
+                    name: "Vision model".to_owned(),
+                    current_version: 1,
+                    archived_at: None,
+                    meta: RecordMeta::new(now),
+                };
+                let vision_version = AiModelProfileVersion {
+                    profile_id: *vision_profile_id,
+                    version: 1,
+                    protocol: muriarc_core::AiProviderProtocol::OpenaiChatCompletions,
+                    transport: muriarc_core::AiProviderTransport::LocalHttp,
+                    base_url: vision_base_url.clone(),
+                    normalized_base_url: vision_base_url.clone(),
+                    model_id: "vision-test-model".to_owned(),
+                    supports_vision: true,
+                    context_window_tokens: 32_768,
+                    max_input_tokens: 16_384,
+                    max_output_tokens: 2_048,
+                    history_token_budget: 8_192,
+                    history_turns: 20,
+                    temperature: 0.0,
+                    timeout_ms: 2_000,
+                    created_at: now,
+                };
+                store
+                    .create_ai_model_profile(&vision_profile_record, &vision_version, &audit)
+                    .await
+                    .unwrap();
+            }
 
-            let providers = Arc::new(ConversationProviderStore::new(
-                user.id,
-                profile_id,
-                default_selected.then_some(profile_id),
-                max_mode,
-            ));
+            let providers = Arc::new(
+                ConversationProviderStore::new(
+                    user.id,
+                    profile_id,
+                    default_selected.then_some(profile_id),
+                    max_mode,
+                )
+                .with_vision_test_runtime(
+                    base_url,
+                    supports_vision,
+                    vision_profile.clone(),
+                ),
+            );
             let verification_calls = Arc::new(AtomicUsize::new(0));
             let sessions = TestSessions {
                 principal: principal.clone(),
                 session_id: Uuid::new_v4(),
                 verification_calls: verification_calls.clone(),
             };
+            let fixture_principal = principal.clone();
             let external = principal.clone().with_ai_scopes([AiScope::Read]);
             let authenticator = StaticTokenAuthenticator::new([
                 (BEARER_TOKEN.to_owned(), principal),
@@ -2065,12 +2497,17 @@ mod tests {
                     SessionCookieConfig::new(false, Duration::hours(1)).unwrap(),
                 )
                 .with_ai(store.clone(), store.clone(), providers.clone())
+                .with_data_storage(DataFiles::new(temp.path().join("data")), attachment_root)
                 .with_ai_step_up_limiter(AiStepUpRateLimiter::new(policy));
             Self {
-                app: application_router(state, None),
+                _temp: temp,
+                app: application_router(state.clone(), None),
+                state,
+                principal: fixture_principal,
                 store,
                 providers,
                 profile_id,
+                vision_profile_id: vision_profile.map(|(profile_id, _)| profile_id),
                 audit,
                 verification_calls,
             }
@@ -2353,6 +2790,173 @@ mod tests {
 
     async fn response_json(response: axum::response::Response) -> Value {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    async fn upload_test_image(fixture: &ConversationFixture) -> Uuid {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ai/images/upload?file_name=evidence.png&media_type=image%2Fpng")
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={SESSION_TOKEN}"),
+                    )
+                    .header(crate::auth::CSRF_HEADER_NAME, CSRF_TOKEN)
+                    .header(header::CONTENT_TYPE, "image/png")
+                    .body(Body::from(portable_png()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response_json(response).await["data"]["image"]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    async fn run_test_image_turn(
+        fixture: &ConversationFixture,
+        image_id: Uuid,
+    ) -> axum::response::Response {
+        fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({
+                    "message": "Describe only the visible evidence",
+                    "imageIds": [image_id],
+                })),
+            ))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_default_vision_model_fails_before_any_provider_resolution_or_call() {
+        let fixture = ConversationFixture::new(true, AiAutonomyMode::Full).await;
+        let metadata = RequestMetadata {
+            request_id: "missing-default-vision".to_owned(),
+            reason: None,
+        };
+        let error =
+            match resolve_turn_vision_provider(&fixture.state, &fixture.principal, None, &metadata)
+                .await
+            {
+                Ok(_) => panic!("a missing default vision model must fail closed"),
+                Err(error) => error,
+            };
+        assert_eq!(error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(error.into_response()).await["error"]["code"],
+            "vision_model_selection_required"
+        );
+        assert_eq!(
+            fixture.providers.resolve_calls.load(Ordering::SeqCst),
+            0,
+            "selection must fail before a Provider can be resolved or called"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_vision_http_chain_uploads_sanitizes_calls_once_and_traces_exact_profile() {
+        let (base_url, captured, handle) = spawn_provider_sequence(vec![chat_response(
+            "direct-final",
+            "conversation-test-model",
+            "Direct grounded answer",
+        )]);
+        let fixture = ConversationFixture::with_vision_runtime(base_url, true).await;
+        let image_id = upload_test_image(&fixture).await;
+        let response = run_test_image_turn(&fixture, image_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["data"]["content"], "Direct grounded answer");
+        assert_eq!(
+            response["data"]["trace"]["modelCalls"][0]["purpose"],
+            "vision_and_final"
+        );
+        assert_eq!(
+            response["data"]["trace"]["modelCalls"][0]["modelProfileId"],
+            fixture.profile_id.to_string()
+        );
+        assert_eq!(response["data"]["trace"]["usage"]["provider_calls"], 1);
+        assert_eq!(
+            response["data"]["trace"]["imageEvidence"][0]["imageId"],
+            image_id.to_string()
+        );
+
+        let requests = captured.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn relayed_vision_http_chain_records_two_stages_and_json_evidence_envelope() {
+        let observation = json!({
+            "observations": [{"imageIndex": 1, "description": "one visible panel"}]
+        })
+        .to_string();
+        let (base_url, captured, handle) = spawn_provider_sequence(vec![
+            chat_response("vision-observation", "vision-test-model", &observation),
+            chat_response(
+                "relay-final",
+                "conversation-test-model",
+                "Relayed grounded answer",
+            ),
+        ]);
+        let fixture = ConversationFixture::with_vision_runtime(base_url, false).await;
+        let image_id = upload_test_image(&fixture).await;
+        let response = run_test_image_turn(&fixture, image_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["data"]["content"], "Relayed grounded answer");
+        assert_eq!(
+            response["data"]["trace"]["modelCalls"][0]["purpose"],
+            "vision_observation"
+        );
+        assert_eq!(
+            response["data"]["trace"]["modelCalls"][0]["modelProfileId"],
+            fixture.vision_profile_id.unwrap().to_string()
+        );
+        assert_eq!(
+            response["data"]["trace"]["modelCalls"][1]["purpose"],
+            "final_answer"
+        );
+        assert_eq!(
+            response["data"]["trace"]["modelCalls"][1]["modelProfileId"],
+            fixture.profile_id.to_string()
+        );
+        assert_eq!(response["data"]["trace"]["usage"]["provider_calls"], 2);
+
+        let requests = captured.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("data:image/png;base64,"));
+        assert!(!requests[1].contains("data:image/png;base64,"));
+        assert!(requests[1].contains("MURIARC_VISION_EVIDENCE_V1="));
+        assert!(!requests[1].contains("<vision_observation>"));
+    }
+
+    #[tokio::test]
+    async fn missing_default_vision_http_chain_returns_selection_error_with_zero_network_calls() {
+        let (base_url, calls, handle) = spawn_no_call_probe();
+        let fixture = ConversationFixture::with_missing_vision_runtime(base_url).await;
+        let image_id = upload_test_image(&fixture).await;
+        let response = run_test_image_turn(&fixture, image_id).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "vision_model_selection_required"
+        );
+        handle.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

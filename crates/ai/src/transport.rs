@@ -2,7 +2,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use muriarc_core::{AiAutonomyMode, AiConversation, AiConversationMessageRole};
+use muriarc_core::{
+    AiAutonomyMode, AiConversation, AiConversationMessageRole, AiModelProfileBinding,
+};
 
 use crate::{
     ApprovalRequirement, AssistantResponse, AssistantUsage, Citation, ContextManagementTrace,
@@ -20,6 +22,10 @@ pub struct AssistantTurnRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model_profile_id: Option<Uuid>,
 }
 
 /// Starts an auditable empty conversation before the first Provider call.
@@ -180,6 +186,56 @@ pub struct AssistantTrace {
     pub model: String,
     pub usage: AssistantUsage,
     pub context: ContextManagementTrace,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_calls: Vec<AssistantModelCallTrace>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_evidence: Vec<AssistantImageEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantModelCallPurpose {
+    FinalAnswer,
+    VisionAndFinal,
+    VisionObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssistantModelCallTrace {
+    pub purpose: AssistantModelCallPurpose,
+    pub model_profile_id: Uuid,
+    pub model_profile_version: i64,
+    pub provider_id: String,
+    pub model: String,
+    pub usage: AssistantUsage,
+}
+
+impl AssistantModelCallTrace {
+    pub fn new(
+        purpose: AssistantModelCallPurpose,
+        binding: AiModelProfileBinding,
+        provider_id: impl Into<String>,
+        model: impl Into<String>,
+        usage: AssistantUsage,
+    ) -> Self {
+        Self {
+            purpose,
+            model_profile_id: binding.profile_id,
+            model_profile_version: binding.profile_version,
+            provider_id: provider_id.into(),
+            model: model.into(),
+            usage,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssistantImageEvidence {
+    pub image_id: Uuid,
+    /// SHA-256 of the verified, metadata-sanitized bytes sent to the Provider.
+    pub sanitized_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,7 +273,36 @@ impl AssistantTurnResponse {
         conversation_id: Uuid,
         response: AssistantResponse,
         autonomy: AiAutonomyView,
+        model_profile: AiModelProfileBinding,
+        purpose: AssistantModelCallPurpose,
+        mut prior_model_calls: Vec<AssistantModelCallTrace>,
+        image_evidence: Vec<AssistantImageEvidence>,
     ) -> Self {
+        let mut aggregate_usage = response.usage;
+        for call in &prior_model_calls {
+            aggregate_usage.provider_calls = aggregate_usage
+                .provider_calls
+                .saturating_add(call.usage.provider_calls);
+            aggregate_usage.tool_calls = aggregate_usage
+                .tool_calls
+                .saturating_add(call.usage.tool_calls);
+            aggregate_usage.input_tokens = aggregate_usage
+                .input_tokens
+                .saturating_add(call.usage.input_tokens);
+            aggregate_usage.output_tokens = aggregate_usage
+                .output_tokens
+                .saturating_add(call.usage.output_tokens);
+            aggregate_usage.total_tokens = aggregate_usage
+                .total_tokens
+                .saturating_add(call.usage.total_tokens);
+        }
+        prior_model_calls.push(AssistantModelCallTrace::new(
+            purpose,
+            model_profile,
+            response.provider_id.clone(),
+            response.model.clone(),
+            response.usage,
+        ));
         Self {
             conversation_id,
             content: response.content,
@@ -231,8 +316,10 @@ impl AssistantTurnResponse {
             trace: AssistantTrace {
                 provider_id: response.provider_id,
                 model: response.model,
-                usage: response.usage,
+                usage: aggregate_usage,
                 context: response.context,
+                model_calls: prior_model_calls,
+                image_evidence,
             },
             autonomy,
         }

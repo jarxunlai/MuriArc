@@ -1011,6 +1011,10 @@ impl DesktopDataState {
     pub(crate) fn files_ref(&self) -> &DataFiles {
         &self.files
     }
+
+    pub(crate) fn attachments_ref(&self) -> &AttachmentFiles {
+        &self.attachments
+    }
 }
 
 fn exact_local_remap_replay(

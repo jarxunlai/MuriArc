@@ -244,6 +244,174 @@ async fn local_http_provider_uses_openai_wire_format_and_call_credentials() {
 }
 
 #[tokio::test]
+async fn chat_completions_serializes_verified_images_as_data_urls() {
+    let body = serde_json::json!({
+        "id": "vision-chat-response",
+        "model": "vision-chat-model",
+        "choices": [{
+            "message": {"content": "visible", "tool_calls": []},
+            "finish_reason": "stop"
+        }]
+    })
+    .to_string();
+    let (base_url, captured, handle) = spawn_http_server("200 OK", body, Duration::ZERO);
+    let provider = LocalHttpProvider::new(ProviderConfig::local_http(
+        "vision-chat",
+        "vision-chat-model",
+        base_url,
+    ))
+    .unwrap();
+    provider
+        .complete(
+            CompletionRequest::new(vec![ChatMessage::user_with_images(
+                "Inspect",
+                vec![
+                    VisionImageInput {
+                        media_type: "image/jpeg".to_owned(),
+                        data_base64: "aGVsbG8=".to_owned(),
+                    },
+                    VisionImageInput {
+                        media_type: "image/png".to_owned(),
+                        data_base64: "d29ybGQ=".to_owned(),
+                    },
+                ],
+            )]),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+    let captured = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+    handle.join().unwrap();
+    let payload = captured_payload(&captured);
+    let parts = payload["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(
+        parts[0],
+        serde_json::json!({"type": "text", "text": "Inspect"})
+    );
+    assert_eq!(parts[1]["type"], "image_url");
+    assert_eq!(
+        parts[1]["image_url"]["url"],
+        "data:image/jpeg;base64,aGVsbG8="
+    );
+    assert_eq!(parts[1]["image_url"]["detail"], "high");
+    assert_eq!(
+        parts[2]["image_url"]["url"],
+        "data:image/png;base64,d29ybGQ="
+    );
+}
+
+#[tokio::test]
+async fn responses_protocol_serializes_verified_images_as_input_parts() {
+    let body = serde_json::json!({
+        "id": "vision-responses-response",
+        "model": "vision-responses-model",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "content": [{"type": "output_text", "text": "visible"}]
+        }]
+    })
+    .to_string();
+    let (base_url, captured, handle) = spawn_http_server("200 OK", body, Duration::ZERO);
+    let provider = LocalHttpProvider::new(ProviderConfig::local_http_with_protocol(
+        "vision-responses",
+        AiProviderProtocol::OpenaiResponses,
+        "vision-responses-model",
+        base_url,
+    ))
+    .unwrap();
+    provider
+        .complete(
+            CompletionRequest::new(vec![ChatMessage::user_with_images(
+                "Inspect",
+                vec![VisionImageInput {
+                    media_type: "image/webp".to_owned(),
+                    data_base64: "aGVsbG8=".to_owned(),
+                }],
+            )]),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+    let captured = captured.recv_timeout(Duration::from_secs(2)).unwrap();
+    handle.join().unwrap();
+    let payload = captured_payload(&captured);
+    let parts = payload["input"][0]["content"].as_array().unwrap();
+    assert_eq!(
+        parts[0],
+        serde_json::json!({"type": "input_text", "text": "Inspect"})
+    );
+    assert_eq!(parts[1]["type"], "input_image");
+    assert_eq!(parts[1]["image_url"], "data:image/webp;base64,aGVsbG8=");
+    assert_eq!(parts[1]["detail"], "high");
+}
+
+#[tokio::test]
+async fn every_protocol_rejects_invalid_image_payloads_before_network_io() {
+    for protocol in [
+        AiProviderProtocol::OpenaiChatCompletions,
+        AiProviderProtocol::OpenaiResponses,
+        AiProviderProtocol::AnthropicMessages,
+    ] {
+        let provider = LocalHttpProvider::new(ProviderConfig::local_http_with_protocol(
+            "invalid-image",
+            protocol,
+            "vision-model",
+            "http://127.0.0.1:9/v1",
+        ))
+        .unwrap();
+        let result = provider
+            .complete(
+                CompletionRequest::new(vec![ChatMessage::user_with_images(
+                    "Inspect",
+                    vec![VisionImageInput {
+                        media_type: "image/png".to_owned(),
+                        data_base64: "not base64!".to_owned(),
+                    }],
+                )]),
+                ProviderCredentials::none(),
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(ProviderError::InvalidRequest("invalid vision image"))
+            ),
+            "{protocol:?} must reject before attempting its configured endpoint"
+        );
+    }
+}
+
+#[tokio::test]
+async fn anthropic_rejects_nonportable_image_media_before_network_io() {
+    let provider = LocalHttpProvider::new(ProviderConfig::local_http_with_protocol(
+        "anthropic-image",
+        AiProviderProtocol::AnthropicMessages,
+        "claude-model",
+        "http://127.0.0.1:9/v1",
+    ))
+    .unwrap();
+    let result = provider
+        .complete(
+            CompletionRequest::new(vec![ChatMessage::user_with_images(
+                "Inspect",
+                vec![VisionImageInput {
+                    media_type: "image/bmp".to_owned(),
+                    data_base64: "aGVsbG8=".to_owned(),
+                }],
+            )]),
+            ProviderCredentials::none(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(ProviderError::InvalidRequest(
+            "image media type is unsupported by Anthropic Messages"
+        ))
+    ));
+}
+
+#[tokio::test]
 async fn deepseek_glm_and_kimi_compatible_requests_keep_credentials_and_models_isolated() {
     for (provider_id, model, api_key) in [
         ("deepseek", "deepseek-chat", "deepseek-key-a"),
@@ -575,12 +743,26 @@ async fn anthropic_protocol_maps_requests_responses_tools_usage_and_authenticati
     );
     assert_eq!(captured_header(&captured, "authorization"), None);
     assert_eq!(payload["system"], "Stay within the active project.");
+    assert_eq!(
+        payload["messages"][0]["content"][0],
+        serde_json::json!({"type": "text", "text": "Inspect the image"})
+    );
     assert_eq!(payload["messages"][0]["content"][1]["type"], "image");
+    assert_eq!(
+        payload["messages"][0]["content"][1]["source"],
+        serde_json::json!({
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "aGVsbG8="
+        })
+    );
     assert_eq!(payload["messages"][1]["content"][0]["type"], "tool_use");
     assert_eq!(payload["messages"][2]["content"][0]["type"], "tool_result");
     assert_eq!(payload["tools"][0]["input_schema"]["type"], "object");
     assert_eq!(payload["max_tokens"], 900);
 
+    assert_eq!(response.id.as_deref(), Some("msg_123"));
+    assert_eq!(response.model.as_deref(), Some("claude-model"));
     assert_eq!(response.content.as_deref(), Some("I will inspect M001."));
     assert_eq!(
         response.tool_calls,

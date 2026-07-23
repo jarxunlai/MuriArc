@@ -7873,6 +7873,330 @@ mod tests {
 
     use super::*;
 
+    struct Phase4SqlFixture {
+        lab_id: Uuid,
+        user_id: Uuid,
+        project_id: Uuid,
+        experiment_id: Uuid,
+        event_id: Uuid,
+        definition_id: Uuid,
+        image_id: Uuid,
+        attachment_id: Uuid,
+        profile_id: Uuid,
+        now: DateTime<Utc>,
+    }
+
+    async fn insert_phase4_draft(
+        pool: &PgPool,
+        fixture: &Phase4SqlFixture,
+        draft_id: Uuid,
+        include_cell: bool,
+        include_model_trace: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO ai_extraction_drafts(
+                id,lab_id,user_id,project_id,experiment_id,experiment_event_id,
+                private_image_id,attachment_id,image_sha256,provider,model,tool_run_id,
+                data_cell_definition_id,data_cell_subject_type,data_cell_subject_id,
+                model_profile_id,model_profile_version,model_purpose,
+                usage_input_tokens,usage_output_tokens,usage_total_tokens,
+                provider_request_id,trace_json,status,items_json,error_code,
+                created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+             )",
+        )
+        .bind(draft_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.user_id)
+        .bind(fixture.project_id)
+        .bind(fixture.experiment_id)
+        .bind(fixture.event_id)
+        .bind(fixture.image_id)
+        .bind(fixture.attachment_id)
+        .bind("a".repeat(64))
+        .bind("migration-provider")
+        .bind("migration-vision")
+        .bind(None::<Uuid>)
+        .bind(include_cell.then_some(fixture.definition_id))
+        .bind(include_cell.then_some("experiment"))
+        .bind(include_cell.then_some(fixture.experiment_id))
+        .bind(include_model_trace.then_some(fixture.profile_id))
+        .bind(include_model_trace.then_some(1_i64))
+        .bind(include_model_trace.then_some("vision"))
+        .bind(include_model_trace.then_some(10_i64))
+        .bind(include_model_trace.then_some(5_i64))
+        .bind(include_model_trace.then_some(15_i64))
+        .bind(None::<String>)
+        .bind(include_model_trace.then_some(serde_json::json!({
+            "route": "migration-test"
+        })))
+        .bind("pending_approval")
+        .bind(serde_json::json!([]))
+        .bind(None::<String>)
+        .bind(fixture.now)
+        .bind(fixture.now)
+        .bind(None::<DateTime<Utc>>)
+        .bind(1_i64)
+        .execute(pool)
+        .await
+        .map(|_| ())
+    }
+
+    async fn assert_phase4_migration_sql_constraints(pool: &PgPool) {
+        let fixture = Phase4SqlFixture {
+            lab_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            experiment_id: Uuid::new_v4(),
+            event_id: Uuid::new_v4(),
+            definition_id: Uuid::new_v4(),
+            image_id: Uuid::new_v4(),
+            attachment_id: Uuid::new_v4(),
+            profile_id: Uuid::new_v4(),
+            now: Utc::now(),
+        };
+        sqlx::query(
+            "INSERT INTO labs(id,name,created_at,updated_at,deleted_at,revision)
+             VALUES($1,'phase4 SQL constraints',$2,$2,NULL,1)",
+        )
+        .bind(fixture.lab_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO users(
+                id,lab_id,email,display_name,status,created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,'phase4 owner','active',$4,$4,NULL,1
+             )",
+        )
+        .bind(fixture.user_id)
+        .bind(fixture.lab_id)
+        .bind(format!("{}@phase4-migration.test", fixture.user_id))
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO projects(
+                id,lab_id,name,description,status,created_at,updated_at,deleted_at,revision
+             )VALUES($1,$2,'phase4 SQL constraints',NULL,'active',$3,$3,NULL,1)",
+        )
+        .bind(fixture.project_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO experiments(
+                id,lab_id,project_id,template_version_id,name,description,status,
+                starts_at,ends_at,created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,NULL,'phase4 SQL constraints',NULL,'draft',
+                NULL,NULL,$4,$4,NULL,1
+             )",
+        )
+        .bind(fixture.experiment_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.project_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO experiment_events(
+                id,lab_id,project_id,experiment_id,event_key,label,occurred_at,
+                details_json,created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,$4,'phase4_sql','Phase 4 SQL',$5,'{}'::jsonb,
+                $5,$5,NULL,1
+             )",
+        )
+        .bind(fixture.event_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.project_id)
+        .bind(fixture.experiment_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO observation_definitions(
+                id,lab_id,project_id,experiment_id,observation_key,label,value_type,
+                unit,categories_json,policy,created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,$4,'phase4_sql','Phase 4 SQL','number',NULL,
+                '[]'::jsonb,'versioned',$5,$5,NULL,1
+             )",
+        )
+        .bind(fixture.definition_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.project_id)
+        .bind(fixture.experiment_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO attachments(
+                id,lab_id,project_id,entity_type,entity_id,file_name,media_type,
+                relative_path,size_bytes,sha256,version,created_at,updated_at,
+                deleted_at,revision
+             )VALUES(
+                $1,$2,NULL,'ai_private_image',$3,'phase4.png','image/png',
+                'objects/phase4',64,$4,1,$5,$5,NULL,1
+             )",
+        )
+        .bind(fixture.attachment_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.image_id)
+        .bind("a".repeat(64))
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ai_private_images(
+                id,lab_id,user_id,conversation_id,attachment_id,project_id,status,
+                last_activity_at,expires_at,archived_at,created_at,updated_at,
+                deleted_at,revision
+             )VALUES(
+                $1,$2,$3,NULL,$4,NULL,'pending_approval',$5,
+                $5 + interval '30 days',NULL,$5,$5,NULL,1
+             )",
+        )
+        .bind(fixture.image_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.user_id)
+        .bind(fixture.attachment_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ai_model_profiles(
+                id,lab_id,user_id,name,current_version,created_at,updated_at,
+                archived_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,'phase4 migration vision',1,$4,$4,NULL,NULL,1
+             )",
+        )
+        .bind(fixture.profile_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.user_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ai_model_profile_versions(
+                profile_id,version,protocol,transport,base_url,normalized_base_url,
+                model_id,supports_vision,context_window_tokens,max_input_tokens,
+                max_output_tokens,history_token_budget,history_turns,temperature,
+                timeout_ms,created_at
+             )VALUES(
+                $1,1,'openai_responses','open_ai_compatible',
+                'https://vision.example.test/v1','https://vision.example.test/v1',
+                'migration-vision',TRUE,4096,2048,1024,1024,4,0,30000,$2
+             )",
+        )
+        .bind(fixture.profile_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        for (include_cell, include_model_trace) in [(true, false), (false, true)] {
+            assert!(
+                insert_phase4_draft(
+                    pool,
+                    &fixture,
+                    Uuid::new_v4(),
+                    include_cell,
+                    include_model_trace,
+                )
+                .await
+                .is_err(),
+                "data-cell and exact model trace bindings must be all-or-none"
+            );
+        }
+        let draft_id = Uuid::new_v4();
+        insert_phase4_draft(pool, &fixture, draft_id, true, true)
+            .await
+            .expect("a complete phase 4 binding must satisfy migration SQL");
+        sqlx::query(
+            "INSERT INTO ai_extraction_evidence(
+                draft_id,display_order,private_image_id,private_attachment_id,
+                promoted_attachment_id,original_sha256,sanitized_sha256,
+                created_at,updated_at,revision
+             )VALUES($1,0,$2,$3,NULL,$4,$5,$6,$6,1)",
+        )
+        .bind(draft_id)
+        .bind(fixture.image_id)
+        .bind(fixture.attachment_id)
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(
+                "UPDATE ai_extraction_evidence
+                 SET promoted_attachment_id=private_attachment_id,
+                     updated_at=$2
+                 WHERE draft_id=$1 AND display_order=0",
+            )
+            .bind(draft_id)
+            .bind(fixture.now + chrono::Duration::seconds(1))
+            .execute(pool)
+            .await
+            .is_err(),
+            "promotion must advance the evidence revision"
+        );
+        sqlx::query(
+            "UPDATE ai_extraction_evidence
+             SET promoted_attachment_id=private_attachment_id,
+                 updated_at=$2,revision=2
+             WHERE draft_id=$1 AND display_order=0",
+        )
+        .bind(draft_id)
+        .bind(fixture.now + chrono::Duration::seconds(1))
+        .execute(pool)
+        .await
+        .expect("the one-time evidence promotion transition must be allowed");
+        assert!(
+            sqlx::query(
+                "UPDATE ai_extraction_evidence
+                 SET updated_at=$2,revision=3
+                 WHERE draft_id=$1 AND display_order=0",
+            )
+            .bind(draft_id)
+            .bind(fixture.now + chrono::Duration::seconds(2))
+            .execute(pool)
+            .await
+            .is_err(),
+            "promoted evidence must reject even metadata-only updates"
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE ai_extraction_evidence
+                 SET promoted_attachment_id=NULL,updated_at=$2,revision=3
+                 WHERE draft_id=$1 AND display_order=0",
+            )
+            .bind(draft_id)
+            .bind(fixture.now + chrono::Duration::seconds(2))
+            .execute(pool)
+            .await
+            .is_err(),
+            "promoted evidence must never be cleared or rewritten"
+        );
+    }
+
     async fn create_migration_test_database(
         admin_pool: &PgPool,
         base_options: &PgConnectOptions,
@@ -8008,6 +8332,7 @@ mod tests {
                 "model_profile_version".to_owned(),
             ]
         );
+        assert_phase4_migration_sql_constraints(&fresh_pool).await;
         drop_migration_test_database(&admin_pool, &fresh_name, fresh_pool).await;
 
         let (incremental_name, incremental_pool) =

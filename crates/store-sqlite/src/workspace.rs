@@ -3,12 +3,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use muriarc_core::*;
 use sqlx::{QueryBuilder, Row, Sqlite, sqlite::SqliteRow};
-use std::collections::BTreeSet;
 use uuid::Uuid;
 const LC: &str = "id,lab_id,project_id,attachment_id,target_type,target_id,created_by,created_at,updated_at,deleted_at,revision";
 const DC: &str = "id,lab_id,project_id,attachment_id,kind,media_type,relative_path,size_bytes,sha256,status,error_code,created_at,updated_at,deleted_at,revision";
 const IC: &str = "id,lab_id,user_id,conversation_id,attachment_id,project_id,status,last_activity_at,expires_at,archived_at,created_at,updated_at,deleted_at,revision";
-const XC: &str = "id,lab_id,user_id,project_id,experiment_id,experiment_event_id,private_image_id,attachment_id,image_sha256,provider,model,tool_run_id,status,items_json,error_code,created_at,updated_at,deleted_at,revision";
+const XC: &str = "id,lab_id,user_id,project_id,experiment_id,experiment_event_id,private_image_id,attachment_id,image_sha256,provider,model,tool_run_id,data_cell_definition_id,data_cell_subject_type,data_cell_subject_id,model_profile_id,model_profile_version,model_purpose,usage_input_tokens,usage_output_tokens,usage_total_tokens,provider_request_id,trace_json,status,items_json,error_code,created_at,updated_at,deleted_at,revision";
+const EC: &str = "draft_id,display_order,private_image_id,private_attachment_id,promoted_attachment_id,original_sha256,sanitized_sha256,created_at,updated_at,revision";
 fn lr(r: &SqliteRow) -> StoreResult<AttachmentLink> {
     Ok(AttachmentLink {
         id: uuid(r.try_get("id").map_err(map_sqlx)?)?,
@@ -53,6 +53,97 @@ fn ir(r: &SqliteRow) -> StoreResult<PrivateAiImage> {
     })
 }
 fn xr(r: &SqliteRow) -> StoreResult<AiExtractionDraft> {
+    let data_cell_definition_id =
+        optional_uuid(r.try_get("data_cell_definition_id").map_err(map_sqlx)?)?;
+    let data_cell = match data_cell_definition_id {
+        Some(definition_id) => Some(AiObservationDataCell {
+            definition_id,
+            subject_type: decode(
+                &r.try_get::<Option<String>, _>("data_cell_subject_type")
+                    .map_err(map_sqlx)?
+                    .ok_or_else(|| {
+                        StoreError::Serialization(
+                            "extraction data cell subject type is missing".to_owned(),
+                        )
+                    })?,
+            )?,
+            subject_id: uuid(
+                &r.try_get::<Option<String>, _>("data_cell_subject_id")
+                    .map_err(map_sqlx)?
+                    .ok_or_else(|| {
+                        StoreError::Serialization(
+                            "extraction data cell subject id is missing".to_owned(),
+                        )
+                    })?,
+            )?,
+        }),
+        None => None,
+    };
+    let model_profile_id = optional_uuid(r.try_get("model_profile_id").map_err(map_sqlx)?)?;
+    let model_trace = match model_profile_id {
+        Some(profile_id) => {
+            let trace_json: String = r
+                .try_get::<Option<String>, _>("trace_json")
+                .map_err(map_sqlx)?
+                .ok_or_else(|| {
+                    StoreError::Serialization("extraction trace is missing".to_owned())
+                })?;
+            Some(AiExtractionModelTrace {
+                profile_id,
+                profile_version: r
+                    .try_get::<Option<i64>, _>("model_profile_version")
+                    .map_err(map_sqlx)?
+                    .ok_or_else(|| {
+                        StoreError::Serialization("extraction model version is missing".to_owned())
+                    })?,
+                purpose: decode(
+                    &r.try_get::<Option<String>, _>("model_purpose")
+                        .map_err(map_sqlx)?
+                        .ok_or_else(|| {
+                            StoreError::Serialization(
+                                "extraction model purpose is missing".to_owned(),
+                            )
+                        })?,
+                )?,
+                input_tokens: nonnegative_u64(
+                    r.try_get::<Option<i64>, _>("usage_input_tokens")
+                        .map_err(map_sqlx)?
+                        .ok_or_else(|| {
+                            StoreError::Serialization(
+                                "extraction input usage is missing".to_owned(),
+                            )
+                        })?,
+                    "extraction input usage",
+                )?,
+                output_tokens: nonnegative_u64(
+                    r.try_get::<Option<i64>, _>("usage_output_tokens")
+                        .map_err(map_sqlx)?
+                        .ok_or_else(|| {
+                            StoreError::Serialization(
+                                "extraction output usage is missing".to_owned(),
+                            )
+                        })?,
+                    "extraction output usage",
+                )?,
+                total_tokens: nonnegative_u64(
+                    r.try_get::<Option<i64>, _>("usage_total_tokens")
+                        .map_err(map_sqlx)?
+                        .ok_or_else(|| {
+                            StoreError::Serialization(
+                                "extraction total usage is missing".to_owned(),
+                            )
+                        })?,
+                    "extraction total usage",
+                )?,
+                provider_request_id: r
+                    .try_get::<Option<String>, _>("provider_request_id")
+                    .map_err(map_sqlx)?,
+                trace: serde_json::from_str(&trace_json)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?,
+            })
+        }
+        None => None,
+    };
     Ok(AiExtractionDraft {
         id: uuid(r.try_get("id").map_err(map_sqlx)?)?,
         lab_id: uuid(r.try_get("lab_id").map_err(map_sqlx)?)?,
@@ -66,12 +157,71 @@ fn xr(r: &SqliteRow) -> StoreResult<AiExtractionDraft> {
         provider: r.try_get("provider").map_err(map_sqlx)?,
         model: r.try_get("model").map_err(map_sqlx)?,
         tool_run_id: optional_uuid(r.try_get("tool_run_id").map_err(map_sqlx)?)?,
+        data_cell,
+        evidence: Vec::new(),
+        model_trace,
         status: decode(r.try_get("status").map_err(map_sqlx)?)?,
         items: serde_json::from_str(r.try_get("items_json").map_err(map_sqlx)?)
             .map_err(|e| StoreError::Serialization(e.to_string()))?,
         error_code: r.try_get("error_code").map_err(map_sqlx)?,
         meta: meta(r)?,
     })
+}
+
+fn er(r: &SqliteRow) -> StoreResult<AiExtractionEvidence> {
+    Ok(AiExtractionEvidence {
+        display_order: r.try_get("display_order").map_err(map_sqlx)?,
+        private_image_id: uuid(r.try_get("private_image_id").map_err(map_sqlx)?)?,
+        private_attachment_id: uuid(r.try_get("private_attachment_id").map_err(map_sqlx)?)?,
+        promoted_attachment_id: optional_uuid(
+            r.try_get("promoted_attachment_id").map_err(map_sqlx)?,
+        )?,
+        original_sha256: r.try_get("original_sha256").map_err(map_sqlx)?,
+        sanitized_sha256: r.try_get("sanitized_sha256").map_err(map_sqlx)?,
+        meta: RecordMeta {
+            created_at: r.try_get("created_at").map_err(map_sqlx)?,
+            updated_at: r.try_get("updated_at").map_err(map_sqlx)?,
+            deleted_at: None,
+            revision: r.try_get("revision").map_err(map_sqlx)?,
+        },
+    })
+}
+
+fn nonnegative_u64(value: i64, field: &str) -> StoreResult<u64> {
+    u64::try_from(value)
+        .map_err(|_| StoreError::Serialization(format!("{field} must not be negative")))
+}
+
+fn sqlite_i64(value: u64, field: &str) -> StoreResult<i64> {
+    i64::try_from(value).map_err(|_| StoreError::Validation(format!("{field} is too large")))
+}
+
+async fn load_evidence_sqlite(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    draft_id: Uuid,
+) -> StoreResult<Vec<AiExtractionEvidence>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {EC} FROM ai_extraction_evidence WHERE draft_id=? ORDER BY display_order"
+    ))
+    .bind(draft_id.to_string())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    rows.iter().map(er).collect()
+}
+
+async fn load_evidence_sqlite_pool(
+    pool: &sqlx::SqlitePool,
+    draft_id: Uuid,
+) -> StoreResult<Vec<AiExtractionEvidence>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {EC} FROM ai_extraction_evidence WHERE draft_id=? ORDER BY display_order"
+    ))
+    .bind(draft_id.to_string())
+    .fetch_all(pool)
+    .await
+    .map_err(map_sqlx)?;
+    rows.iter().map(er).collect()
 }
 async fn lab(tx: &mut sqlx::Transaction<'_, Sqlite>, t: &str, id: Uuid) -> StoreResult<Uuid> {
     let v: Option<String> = sqlx::query_scalar(&format!(
@@ -187,6 +337,373 @@ async fn io(
     }
     Ok(())
 }
+
+async fn validate_versioned_extraction_sqlite(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    draft: &AiExtractionDraft,
+) -> StoreResult<()> {
+    let Some(cell) = draft.data_cell.as_ref() else {
+        return Ok(());
+    };
+    let trace = draft
+        .model_trace
+        .as_ref()
+        .ok_or_else(|| StoreError::Validation("extraction model trace is required".to_owned()))?;
+    let profile = sqlx::query(
+        "SELECT p.lab_id,p.user_id,p.archived_at,p.deleted_at,v.model_id,v.supports_vision
+         FROM ai_model_profiles p
+         JOIN ai_model_profile_versions v ON v.profile_id=p.id
+         WHERE p.id=? AND v.version=?",
+    )
+    .bind(trace.profile_id.to_string())
+    .bind(trace.profile_version)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound {
+        entity: "ai_model_profile_version",
+        id: trace.profile_id,
+    })?;
+    let profile_lab = uuid(profile.try_get("lab_id").map_err(map_sqlx)?)?;
+    let profile_user = uuid(profile.try_get("user_id").map_err(map_sqlx)?)?;
+    let archived_at: Option<DateTime<Utc>> = profile.try_get("archived_at").map_err(map_sqlx)?;
+    let deleted_at: Option<DateTime<Utc>> = profile.try_get("deleted_at").map_err(map_sqlx)?;
+    let model_id: String = profile.try_get("model_id").map_err(map_sqlx)?;
+    let supports_vision: bool = profile.try_get("supports_vision").map_err(map_sqlx)?;
+    if (profile_lab, profile_user) != (draft.lab_id, draft.user_id)
+        || archived_at.is_some()
+        || deleted_at.is_some()
+        || !supports_vision
+        || model_id != draft.model
+    {
+        return Err(StoreError::Validation(
+            "extraction vision model binding is unavailable or out of scope".to_owned(),
+        ));
+    }
+    let event = sqlx::query(
+        "SELECT lab_id,project_id,experiment_id
+         FROM experiment_events WHERE id=? AND deleted_at IS NULL",
+    )
+    .bind(draft.experiment_event_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound {
+        entity: "experiment_event",
+        id: draft.experiment_event_id,
+    })?;
+    let event_scope = (
+        uuid(event.try_get("lab_id").map_err(map_sqlx)?)?,
+        uuid(event.try_get("project_id").map_err(map_sqlx)?)?,
+        uuid(event.try_get("experiment_id").map_err(map_sqlx)?)?,
+    );
+    if event_scope != (draft.lab_id, draft.project_id, draft.experiment_id) {
+        return Err(StoreError::Validation(
+            "extraction event scope is invalid".to_owned(),
+        ));
+    }
+    let definition = sqlx::query(
+        "SELECT lab_id,project_id,experiment_id
+         FROM observation_definitions WHERE id=? AND deleted_at IS NULL",
+    )
+    .bind(cell.definition_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound {
+        entity: "observation_definition",
+        id: cell.definition_id,
+    })?;
+    let definition_scope = (
+        uuid(definition.try_get("lab_id").map_err(map_sqlx)?)?,
+        uuid(definition.try_get("project_id").map_err(map_sqlx)?)?,
+        uuid(definition.try_get("experiment_id").map_err(map_sqlx)?)?,
+    );
+    if definition_scope != (draft.lab_id, draft.project_id, draft.experiment_id) {
+        return Err(StoreError::Validation(
+            "extraction definition scope is invalid".to_owned(),
+        ));
+    }
+    validate_observation_subject_sqlite(tx, &draft.items[0].observation).await?;
+    let existing: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM observations
+         WHERE experiment_event_id=? AND definition_id=? AND subject_type=?
+           AND subject_id=? AND deleted_at IS NULL",
+    )
+    .bind(draft.experiment_event_id.to_string())
+    .bind(cell.definition_id.to_string())
+    .bind(encode(&cell.subject_type)?)
+    .bind(cell.subject_id.to_string())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    if existing != 0 {
+        return Err(StoreError::Conflict(
+            "AI extraction cannot target an existing observation cell".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_extraction_evidence_sqlite(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    draft: &AiExtractionDraft,
+    evidence: &AiExtractionEvidence,
+) -> StoreResult<PrivateAiImage> {
+    let row = sqlx::query(&format!(
+        "SELECT {IC} FROM ai_private_images WHERE id=? AND deleted_at IS NULL"
+    ))
+    .bind(evidence.private_image_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound {
+        entity: "ai_private_image",
+        id: evidence.private_image_id,
+    })?;
+    let image = ir(&row)?;
+    let sha256: String =
+        sqlx::query_scalar("SELECT sha256 FROM attachments WHERE id=? AND deleted_at IS NULL")
+            .bind(evidence.private_attachment_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "attachment",
+                id: evidence.private_attachment_id,
+            })?;
+    if (image.lab_id, image.user_id, image.attachment_id)
+        != (draft.lab_id, draft.user_id, evidence.private_attachment_id)
+        || image.project_id.is_some()
+        || !matches!(
+            image.status,
+            PrivateImageStatus::Active | PrivateImageStatus::Processing
+        )
+        || sha256 != evidence.original_sha256
+        || evidence.promoted_attachment_id.is_some()
+    {
+        return Err(StoreError::Validation(
+            "extraction evidence owner, state, attachment, or original SHA is invalid".to_owned(),
+        ));
+    }
+    Ok(image)
+}
+
+async fn promote_extraction_evidence_sqlite(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    draft: &AiExtractionDraft,
+    evidence: &mut AiExtractionEvidence,
+    observations: &[Observation],
+    actor_user_id: Uuid,
+    now: DateTime<Utc>,
+    audit: &AuditContext,
+) -> StoreResult<(Attachment, Vec<AttachmentLink>)> {
+    let image_row = sqlx::query(&format!(
+        "SELECT {IC} FROM ai_private_images WHERE id=? AND deleted_at IS NULL"
+    ))
+    .bind(evidence.private_image_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound {
+        entity: "ai_private_image",
+        id: evidence.private_image_id,
+    })?;
+    let mut image = ir(&image_row)?;
+    let attachment_row = sqlx::query(&format!(
+        "SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE id=? AND deleted_at IS NULL"
+    ))
+    .bind(evidence.private_attachment_id.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound {
+        entity: "attachment",
+        id: evidence.private_attachment_id,
+    })?;
+    let mut attachment = attachment_from_row(&attachment_row)?;
+    if image.attachment_id != attachment.id
+        || image.project_id.is_some()
+        || image.status != PrivateImageStatus::PendingApproval
+        || attachment.project_id.is_some()
+        || attachment.entity_type != "ai_private_image"
+        || attachment.sha256 != evidence.original_sha256
+        || evidence.promoted_attachment_id.is_some()
+    {
+        return Err(StoreError::Conflict(
+            "AI extraction evidence changed before approval".to_owned(),
+        ));
+    }
+    let before_attachment = snapshot(&attachment)?;
+    let before_image = snapshot(&image)?;
+    let target_observation = observations.first().ok_or_else(|| {
+        StoreError::Validation("AI extraction evidence requires an approved observation".to_owned())
+    })?;
+    attachment.project_id = Some(draft.project_id);
+    attachment.entity_type = "observation".to_owned();
+    attachment.entity_id = target_observation.id;
+    attachment.meta.touch(now);
+    sqlx::query(
+        "UPDATE attachments
+         SET project_id=?,entity_type=?,entity_id=?,updated_at=?,revision=?
+         WHERE id=?",
+    )
+    .bind(draft.project_id.to_string())
+    .bind(&attachment.entity_type)
+    .bind(attachment.entity_id.to_string())
+    .bind(attachment.meta.updated_at)
+    .bind(attachment.meta.revision)
+    .bind(attachment.id.to_string())
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+
+    image.project_id = Some(draft.project_id);
+    image.status = PrivateImageStatus::Archived;
+    image.last_activity_at = now;
+    image.archived_at = Some(now);
+    image.meta.touch(now);
+    sqlx::query(
+        "UPDATE ai_private_images
+         SET project_id=?,status='archived',last_activity_at=?,archived_at=?,
+             updated_at=?,revision=?
+         WHERE id=?",
+    )
+    .bind(draft.project_id.to_string())
+    .bind(now)
+    .bind(now)
+    .bind(image.meta.updated_at)
+    .bind(image.meta.revision)
+    .bind(image.id.to_string())
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+
+    evidence.promoted_attachment_id = Some(attachment.id);
+    evidence.meta.touch(now);
+    sqlx::query(
+        "UPDATE ai_extraction_evidence
+         SET promoted_attachment_id=?,updated_at=?,revision=?
+         WHERE draft_id=? AND display_order=?",
+    )
+    .bind(attachment.id.to_string())
+    .bind(evidence.meta.updated_at)
+    .bind(evidence.meta.revision)
+    .bind(draft.id.to_string())
+    .bind(evidence.display_order)
+    .execute(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+
+    write_audit(
+        tx,
+        draft.lab_id,
+        Some(draft.project_id),
+        EntityType::Attachment,
+        attachment.id,
+        AuditAction::Approve,
+        audit,
+        Some(before_attachment),
+        Some(snapshot(&attachment)?),
+    )
+    .await?;
+    insert_provenance_tx(
+        tx,
+        &Provenance::from_audit(
+            draft.lab_id,
+            Some(draft.project_id),
+            EntityType::Attachment,
+            attachment.id,
+            audit,
+            now,
+        ),
+    )
+    .await?;
+    write_audit(
+        tx,
+        draft.lab_id,
+        Some(draft.project_id),
+        EntityType::AiPrivateImage,
+        image.id,
+        AuditAction::Archive,
+        audit,
+        Some(before_image),
+        Some(snapshot(&image)?),
+    )
+    .await?;
+    insert_provenance_tx(
+        tx,
+        &Provenance::from_audit(
+            draft.lab_id,
+            Some(draft.project_id),
+            EntityType::AiPrivateImage,
+            image.id,
+            audit,
+            now,
+        ),
+    )
+    .await?;
+
+    let mut links = Vec::with_capacity(observations.len());
+    for observation in observations {
+        let link = AttachmentLink {
+            id: Uuid::new_v4(),
+            lab_id: draft.lab_id,
+            project_id: draft.project_id,
+            attachment_id: attachment.id,
+            target_type: AttachmentLinkTarget::DataCell,
+            target_id: observation.id,
+            created_by: actor_user_id,
+            meta: RecordMeta::new(now),
+        };
+        sqlx::query(
+            "INSERT INTO attachment_links(
+                id,lab_id,project_id,attachment_id,target_type,target_id,created_by,
+                created_at,updated_at,deleted_at,revision
+             )VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(link.id.to_string())
+        .bind(link.lab_id.to_string())
+        .bind(link.project_id.to_string())
+        .bind(link.attachment_id.to_string())
+        .bind(encode(&link.target_type)?)
+        .bind(link.target_id.to_string())
+        .bind(link.created_by.to_string())
+        .bind(link.meta.created_at)
+        .bind(link.meta.updated_at)
+        .bind(link.meta.deleted_at)
+        .bind(link.meta.revision)
+        .execute(&mut **tx)
+        .await
+        .map_err(map_sqlx)?;
+        write_audit(
+            tx,
+            draft.lab_id,
+            Some(draft.project_id),
+            EntityType::AttachmentLink,
+            link.id,
+            AuditAction::Link,
+            audit,
+            None,
+            Some(snapshot(&link)?),
+        )
+        .await?;
+        insert_provenance_tx(
+            tx,
+            &Provenance::from_audit(
+                draft.lab_id,
+                Some(draft.project_id),
+                EntityType::AttachmentLink,
+                link.id,
+                audit,
+                now,
+            ),
+        )
+        .await?;
+        links.push(link);
+    }
+    Ok((attachment, links))
+}
 #[async_trait]
 impl WorkspaceStore for SqliteStore {
     async fn create_attachment_link(
@@ -230,6 +747,13 @@ impl WorkspaceStore for SqliteStore {
         d: &AttachmentDerivative,
         a: &AuditContext,
     ) -> StoreResult<()> {
+        if d.size_bytes.is_some_and(|value| value < 0)
+            || d.sha256.as_ref().is_some_and(|value| value.len() != 64)
+            || (d.status == DerivativeStatus::Ready
+                && (d.relative_path.is_none() || d.sha256.is_none()))
+        {
+            return Err(StoreError::Validation("invalid derivative".to_owned()));
+        }
         let mut t = self.pool.begin().await.map_err(map_sqlx)?;
         if lab(&mut t, "attachments", d.attachment_id).await? != d.lab_id {
             return Err(StoreError::Validation("derivative crosses labs".into()));
@@ -269,6 +793,8 @@ impl WorkspaceStore for SqliteStore {
             || at.project_id.is_some()
             || i.project_id.is_some()
             || i.expires_at <= i.last_activity_at
+            || at.sha256.len() != 64
+            || at.size_bytes < 0
         {
             return Err(StoreError::Validation("invalid private image".into()));
         }
@@ -400,6 +926,14 @@ impl WorkspaceStore for SqliteStore {
                 "private image revision changed".into(),
             ));
         }
+        if matches!(
+            i.status,
+            PrivateImageStatus::Processing
+                | PrivateImageStatus::PendingApproval
+                | PrivateImageStatus::Expired
+        ) {
+            return Err(StoreError::Conflict("private image busy or expired".into()));
+        }
         if lab(&mut t, "projects", p).await? != i.lab_id {
             return Err(StoreError::Validation(
                 "archive project crosses labs".into(),
@@ -412,25 +946,21 @@ impl WorkspaceStore for SqliteStore {
         i.last_activity_at = now;
         i.meta.touch(now);
         sqlx::query("UPDATE ai_private_images SET project_id=?,status=?,last_activity_at=?,archived_at=?,updated_at=?,revision=? WHERE id=?").bind(p.to_string()).bind(encode(&i.status)?).bind(i.last_activity_at).bind(i.archived_at).bind(i.meta.updated_at).bind(i.meta.revision).bind(id.to_string()).execute(&mut*t).await.map_err(map_sqlx)?;
-        sqlx::query(
-            "UPDATE attachments SET project_id=?,updated_at=?,revision=revision+1 WHERE id=?",
-        )
-        .bind(p.to_string())
-        .bind(now)
-        .bind(i.attachment_id.to_string())
-        .execute(&mut *t)
-        .await
-        .map_err(map_sqlx)?;
         write_audit(
             &mut t,
             i.lab_id,
-            Some(p),
+            None,
             EntityType::AiPrivateImage,
             id,
             AuditAction::Archive,
             a,
             Some(b),
             Some(snapshot(&i)?),
+        )
+        .await?;
+        insert_provenance_tx(
+            &mut t,
+            &Provenance::from_audit(i.lab_id, None, EntityType::AiPrivateImage, i.id, a, now),
         )
         .await?;
         t.commit().await.map_err(map_sqlx)?;
@@ -461,28 +991,188 @@ impl WorkspaceStore for SqliteStore {
     ) -> StoreResult<()> {
         d.validate().map_err(|e| StoreError::Validation(e.into()))?;
         let mut t = self.pool.begin().await.map_err(map_sqlx)?;
-        let r=sqlx::query("SELECT i.lab_id,i.user_id,i.attachment_id,a.sha256 FROM ai_private_images i JOIN attachments a ON a.id=i.attachment_id WHERE i.id=? AND i.deleted_at IS NULL").bind(d.private_image_id.to_string()).fetch_optional(&mut*t).await.map_err(map_sqlx)?.ok_or(StoreError::NotFound{entity:"ai_private_image",id:d.private_image_id})?;
-        if (
-            uuid(r.try_get("lab_id").map_err(map_sqlx)?)?,
-            uuid(r.try_get("user_id").map_err(map_sqlx)?)?,
-            uuid(r.try_get("attachment_id").map_err(map_sqlx)?)?,
-            r.try_get::<String, _>("sha256").map_err(map_sqlx)?,
-        ) != (d.lab_id, d.user_id, d.attachment_id, d.image_sha256.clone())
-        {
-            return Err(StoreError::Validation("extraction image mismatch".into()));
+        validate_versioned_extraction_sqlite(&mut t, d).await?;
+        let evidence = if d.evidence.is_empty() {
+            vec![AiExtractionEvidence {
+                display_order: 0,
+                private_image_id: d.private_image_id,
+                private_attachment_id: d.attachment_id,
+                promoted_attachment_id: None,
+                original_sha256: d.image_sha256.clone(),
+                sanitized_sha256: d.image_sha256.clone(),
+                meta: RecordMeta::new(d.meta.created_at),
+            }]
+        } else {
+            d.evidence.clone()
+        };
+        let mut images = Vec::with_capacity(evidence.len());
+        for item in &evidence {
+            images.push(validate_extraction_evidence_sqlite(&mut t, d, item).await?);
         }
-        sqlx::query("INSERT INTO ai_extraction_drafts(id,lab_id,user_id,project_id,experiment_id,experiment_event_id,private_image_id,attachment_id,image_sha256,provider,model,tool_run_id,status,items_json,error_code,created_at,updated_at,deleted_at,revision)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(d.id.to_string()).bind(d.lab_id.to_string()).bind(d.user_id.to_string()).bind(d.project_id.to_string()).bind(d.experiment_id.to_string()).bind(d.experiment_event_id.to_string()).bind(d.private_image_id.to_string()).bind(d.attachment_id.to_string()).bind(&d.image_sha256).bind(&d.provider).bind(&d.model).bind(d.tool_run_id.map(|v|v.to_string())).bind(encode(&d.status)?).bind(serde_json::to_string(&d.items).map_err(|e|StoreError::Serialization(e.to_string()))?).bind(&d.error_code).bind(d.meta.created_at).bind(d.meta.updated_at).bind(d.meta.deleted_at).bind(d.meta.revision).execute(&mut*t).await.map_err(map_sqlx)?;
-        sqlx::query("UPDATE ai_private_images SET status='pending_approval',last_activity_at=?,expires_at=?,updated_at=?,revision=revision+1 WHERE id=?").bind(d.meta.created_at).bind(d.meta.created_at+Duration::days(30)).bind(d.meta.created_at).bind(d.private_image_id.to_string()).execute(&mut*t).await.map_err(map_sqlx)?;
+        let cell = d.data_cell.as_ref();
+        let trace = d.model_trace.as_ref();
+        sqlx::query(
+            "INSERT INTO ai_extraction_drafts(
+                id,lab_id,user_id,project_id,experiment_id,experiment_event_id,
+                private_image_id,attachment_id,image_sha256,provider,model,tool_run_id,
+                data_cell_definition_id,data_cell_subject_type,data_cell_subject_id,
+                model_profile_id,model_profile_version,model_purpose,
+                usage_input_tokens,usage_output_tokens,usage_total_tokens,
+                provider_request_id,trace_json,status,items_json,error_code,
+                created_at,updated_at,deleted_at,revision
+             )VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(d.id.to_string())
+        .bind(d.lab_id.to_string())
+        .bind(d.user_id.to_string())
+        .bind(d.project_id.to_string())
+        .bind(d.experiment_id.to_string())
+        .bind(d.experiment_event_id.to_string())
+        .bind(d.private_image_id.to_string())
+        .bind(d.attachment_id.to_string())
+        .bind(&d.image_sha256)
+        .bind(&d.provider)
+        .bind(&d.model)
+        .bind(d.tool_run_id.map(|value| value.to_string()))
+        .bind(cell.map(|value| value.definition_id.to_string()))
+        .bind(cell.map(|value| encode(&value.subject_type)).transpose()?)
+        .bind(cell.map(|value| value.subject_id.to_string()))
+        .bind(trace.map(|value| value.profile_id.to_string()))
+        .bind(trace.map(|value| value.profile_version))
+        .bind(trace.map(|value| encode(&value.purpose)).transpose()?)
+        .bind(
+            trace
+                .map(|value| sqlite_i64(value.input_tokens, "input token usage"))
+                .transpose()?,
+        )
+        .bind(
+            trace
+                .map(|value| sqlite_i64(value.output_tokens, "output token usage"))
+                .transpose()?,
+        )
+        .bind(
+            trace
+                .map(|value| sqlite_i64(value.total_tokens, "total token usage"))
+                .transpose()?,
+        )
+        .bind(trace.and_then(|value| value.provider_request_id.clone()))
+        .bind(
+            trace
+                .map(|value| serde_json::to_string(&value.trace))
+                .transpose()
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        )
+        .bind(encode(&d.status)?)
+        .bind(
+            serde_json::to_string(&d.items)
+                .map_err(|error| StoreError::Serialization(error.to_string()))?,
+        )
+        .bind(&d.error_code)
+        .bind(d.meta.created_at)
+        .bind(d.meta.updated_at)
+        .bind(d.meta.deleted_at)
+        .bind(d.meta.revision)
+        .execute(&mut *t)
+        .await
+        .map_err(map_sqlx)?;
+        for item in &d.evidence {
+            sqlx::query(
+                "INSERT INTO ai_extraction_evidence(
+                    draft_id,display_order,private_image_id,private_attachment_id,
+                    promoted_attachment_id,original_sha256,sanitized_sha256,
+                    created_at,updated_at,revision
+                 )VALUES(?,?,?,?,?,?,?,?,?,?)",
+            )
+            .bind(d.id.to_string())
+            .bind(item.display_order)
+            .bind(item.private_image_id.to_string())
+            .bind(item.private_attachment_id.to_string())
+            .bind(item.promoted_attachment_id.map(|value| value.to_string()))
+            .bind(&item.original_sha256)
+            .bind(&item.sanitized_sha256)
+            .bind(item.meta.created_at)
+            .bind(item.meta.updated_at)
+            .bind(item.meta.revision)
+            .execute(&mut *t)
+            .await
+            .map_err(map_sqlx)?;
+        }
+        for mut image in images {
+            let before = snapshot(&image)?;
+            image.status = PrivateImageStatus::PendingApproval;
+            image.last_activity_at = d.meta.created_at;
+            image.expires_at = d.meta.created_at + Duration::days(30);
+            image.meta.touch(d.meta.created_at);
+            sqlx::query(
+                "UPDATE ai_private_images
+                 SET status='pending_approval',last_activity_at=?,expires_at=?,
+                     updated_at=?,revision=?
+                 WHERE id=?",
+            )
+            .bind(image.last_activity_at)
+            .bind(image.expires_at)
+            .bind(image.meta.updated_at)
+            .bind(image.meta.revision)
+            .bind(image.id.to_string())
+            .execute(&mut *t)
+            .await
+            .map_err(map_sqlx)?;
+            write_audit(
+                &mut t,
+                d.lab_id,
+                None,
+                EntityType::AiPrivateImage,
+                image.id,
+                AuditAction::Process,
+                a,
+                Some(before),
+                Some(snapshot(&image)?),
+            )
+            .await?;
+            insert_provenance_tx(
+                &mut t,
+                &Provenance::from_audit(
+                    d.lab_id,
+                    None,
+                    EntityType::AiPrivateImage,
+                    image.id,
+                    a,
+                    d.meta.created_at,
+                ),
+            )
+            .await?;
+        }
         write_audit(
             &mut t,
             d.lab_id,
-            Some(d.project_id),
+            None,
             EntityType::AiExtractionDraft,
             d.id,
             AuditAction::Process,
             a,
             None,
             Some(snapshot(d)?),
+        )
+        .await?;
+        insert_provenance_tx(
+            &mut t,
+            &Provenance {
+                id: Uuid::new_v4(),
+                lab_id: d.lab_id,
+                project_id: None,
+                entity_type: EntityType::AiExtractionDraft,
+                entity_id: d.id,
+                source: ProvenanceSource::Ai,
+                actor_user_id: Some(d.user_id),
+                import_job_id: None,
+                import_commit_id: None,
+                tool_run_id: d.tool_run_id,
+                provider: Some(d.provider.clone()),
+                model: Some(d.model.clone()),
+                confidence: None,
+                request_id: a.request_id.clone(),
+                recorded_at: d.meta.created_at,
+            },
         )
         .await?;
         t.commit().await.map_err(map_sqlx)
@@ -499,7 +1189,9 @@ impl WorkspaceStore for SqliteStore {
             entity: "ai_extraction_draft",
             id,
         })?;
-        xr(&r)
+        let mut draft = xr(&r)?;
+        draft.evidence = load_evidence_sqlite_pool(&self.pool, draft.id).await?;
+        Ok(draft)
     }
     async fn list_ai_extraction_drafts(
         &self,
@@ -518,19 +1210,33 @@ impl WorkspaceStore for SqliteStore {
             q.push(" AND project_id=").push_bind(v.to_string());
         }
         q.push(" ORDER BY created_at DESC,id");
-        let r = q.build().fetch_all(&self.pool).await.map_err(map_sqlx)?;
-        r.iter().map(xr).collect()
+        let rows = q.build().fetch_all(&self.pool).await.map_err(map_sqlx)?;
+        let mut drafts = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let mut draft = xr(row)?;
+            draft.evidence = load_evidence_sqlite_pool(&self.pool, draft.id).await?;
+            drafts.push(draft);
+        }
+        Ok(drafts)
     }
     async fn apply_ai_extraction_draft(
         &self,
         id: Uuid,
-        rev: i64,
-        xs: &[usize],
+        approval: &AiExtractionApprovalInput,
         a: &AuditContext,
     ) -> StoreResult<AppliedAiExtraction> {
-        let s: BTreeSet<usize> = xs.iter().copied().collect();
-        if s.is_empty() || s.len() != xs.len() {
-            return Err(StoreError::Validation("selected indexes invalid".into()));
+        approval
+            .validate()
+            .map_err(|error| StoreError::Validation(error.to_owned()))?;
+        let actor_user_id = a.actor.user_id.ok_or_else(|| {
+            StoreError::Validation("AI extraction approval requires a human actor".to_owned())
+        })?;
+        if a.actor.actor_type != ActorType::Human
+            || matches!(a.source, WriteSource::Ai | WriteSource::Mcp)
+        {
+            return Err(StoreError::Validation(
+                "AI extraction approval requires a human actor".to_owned(),
+            ));
         }
         let mut t = self.pool.begin().await.map_err(map_sqlx)?;
         let r = sqlx::query(&format!(
@@ -545,7 +1251,18 @@ impl WorkspaceStore for SqliteStore {
             id,
         })?;
         let mut d = xr(&r)?;
-        if d.meta.revision != rev {
+        d.evidence = load_evidence_sqlite(&mut t, d.id).await?;
+        if actor_user_id != d.user_id {
+            return Err(StoreError::Validation(
+                "AI extraction approval actor must own the draft".to_owned(),
+            ));
+        }
+        if d.data_cell.is_some() && d.evidence.is_empty() {
+            return Err(StoreError::Validation(
+                "versioned AI extraction evidence is missing".to_owned(),
+            ));
+        }
+        if d.meta.revision != approval.expected_revision {
             return Err(StoreError::Conflict("extraction revision changed".into()));
         }
         if !matches!(
@@ -554,23 +1271,120 @@ impl WorkspaceStore for SqliteStore {
         ) {
             return Err(StoreError::Conflict("extraction resolved".into()));
         }
-        if s.iter().any(|v| *v >= d.items.len()) {
+        if d.data_cell.is_some() && approval.selections.len() != 1 {
+            return Err(StoreError::Validation(
+                "a data-cell extraction must approve exactly one candidate".to_owned(),
+            ));
+        }
+        if approval
+            .selections
+            .iter()
+            .any(|selection| selection.item_index >= d.items.len())
+        {
             return Err(StoreError::Validation("selected index out of range".into()));
         }
         let b = snapshot(&d)?;
+        let now = Utc::now();
         let mut os = Vec::new();
         for n in 0..d.items.len() {
-            d.items[n].selected = s.contains(&n);
-            if d.items[n].selected {
-                let it = d.items[n].clone();
-                io(&mut t, &d, &it, a).await?;
-                os.push(it.observation)
+            let selection = approval
+                .selections
+                .iter()
+                .find(|selection| selection.item_index == n);
+            d.items[n].selected = selection.is_some();
+            if let Some(selection) = selection {
+                let mut item = d.items[n].clone();
+                item.value.value = selection.value.clone();
+                item.value.notes = selection.notes.clone();
+                item.value.recorded_by = Some(actor_user_id);
+                item.value.recorded_at = now;
+                item.value.meta = RecordMeta::new(now);
+                item.observation.current_value_version = 1;
+                item.observation.meta = RecordMeta::new(now);
+                item.validate()
+                    .map_err(|error| StoreError::Validation(error.to_owned()))?;
+                d.items[n] = item.clone();
+                io(&mut t, &d, &item, a).await?;
+                os.push(item.observation);
             }
         }
+        let mut attachments = Vec::with_capacity(d.evidence.len());
+        let mut links = Vec::new();
+        for index in 0..d.evidence.len() {
+            let mut evidence = d.evidence[index].clone();
+            let (attachment, mut evidence_links) = promote_extraction_evidence_sqlite(
+                &mut t,
+                &d,
+                &mut evidence,
+                &os,
+                actor_user_id,
+                now,
+                a,
+            )
+            .await?;
+            d.evidence[index] = evidence;
+            attachments.push(attachment);
+            links.append(&mut evidence_links);
+        }
+        if d.evidence.is_empty() {
+            let image_row = sqlx::query(&format!(
+                "SELECT {IC} FROM ai_private_images WHERE id=? AND deleted_at IS NULL"
+            ))
+            .bind(d.private_image_id.to_string())
+            .fetch_optional(&mut *t)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "ai_private_image",
+                id: d.private_image_id,
+            })?;
+            let mut image = ir(&image_row)?;
+            let before = snapshot(&image)?;
+            image.status = PrivateImageStatus::Active;
+            image.last_activity_at = now;
+            image.expires_at = now + Duration::days(30);
+            image.meta.touch(now);
+            sqlx::query(
+                "UPDATE ai_private_images
+                 SET status='active',last_activity_at=?,expires_at=?,updated_at=?,revision=?
+                 WHERE id=?",
+            )
+            .bind(image.last_activity_at)
+            .bind(image.expires_at)
+            .bind(image.meta.updated_at)
+            .bind(image.meta.revision)
+            .bind(image.id.to_string())
+            .execute(&mut *t)
+            .await
+            .map_err(map_sqlx)?;
+            write_audit(
+                &mut t,
+                d.lab_id,
+                Some(d.project_id),
+                EntityType::AiPrivateImage,
+                image.id,
+                AuditAction::Process,
+                a,
+                Some(before),
+                Some(snapshot(&image)?),
+            )
+            .await?;
+            insert_provenance_tx(
+                &mut t,
+                &Provenance::from_audit(
+                    d.lab_id,
+                    Some(d.project_id),
+                    EntityType::AiPrivateImage,
+                    image.id,
+                    a,
+                    now,
+                ),
+            )
+            .await?;
+        }
         d.status = AiExtractionStatus::Approved;
-        d.meta.touch(Utc::now());
+        d.meta.touch(now);
         sqlx::query("UPDATE ai_extraction_drafts SET status=?,items_json=?,updated_at=?,revision=? WHERE id=?").bind(encode(&d.status)?).bind(serde_json::to_string(&d.items).map_err(|e|StoreError::Serialization(e.to_string()))?).bind(d.meta.updated_at).bind(d.meta.revision).bind(id.to_string()).execute(&mut*t).await.map_err(map_sqlx)?;
-        sqlx::query("UPDATE ai_private_images SET status='active',last_activity_at=?,expires_at=?,updated_at=?,revision=revision+1 WHERE id=?").bind(d.meta.updated_at).bind(d.meta.updated_at+Duration::days(30)).bind(d.meta.updated_at).bind(d.private_image_id.to_string()).execute(&mut*t).await.map_err(map_sqlx)?;
         write_audit(
             &mut t,
             d.lab_id,
@@ -583,11 +1397,243 @@ impl WorkspaceStore for SqliteStore {
             Some(snapshot(&d)?),
         )
         .await?;
+        let mut approval_provenance = Provenance::from_audit(
+            d.lab_id,
+            Some(d.project_id),
+            EntityType::AiExtractionDraft,
+            d.id,
+            a,
+            now,
+        );
+        approval_provenance.tool_run_id = d.tool_run_id;
+        approval_provenance.provider = Some(d.provider.clone());
+        approval_provenance.model = Some(d.model.clone());
+        insert_provenance_tx(&mut t, &approval_provenance).await?;
         t.commit().await.map_err(map_sqlx)?;
         Ok(AppliedAiExtraction {
             draft: d,
             observations: os,
+            attachments,
+            links,
         })
+    }
+    async fn reject_ai_extraction_draft(
+        &self,
+        id: Uuid,
+        rejection: &AiExtractionRejectionInput,
+        a: &AuditContext,
+    ) -> StoreResult<AiExtractionDraft> {
+        rejection
+            .validate()
+            .map_err(|error| StoreError::Validation(error.to_owned()))?;
+        let actor_user_id = a.actor.user_id.ok_or_else(|| {
+            StoreError::Validation("AI extraction rejection requires a human actor".to_owned())
+        })?;
+        if a.actor.actor_type != ActorType::Human
+            || matches!(a.source, WriteSource::Ai | WriteSource::Mcp)
+        {
+            return Err(StoreError::Validation(
+                "AI extraction rejection requires a human actor".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let row = sqlx::query(&format!(
+            "SELECT {XC} FROM ai_extraction_drafts WHERE id=? AND deleted_at IS NULL"
+        ))
+        .bind(id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "ai_extraction_draft",
+            id,
+        })?;
+        let mut draft = xr(&row)?;
+        draft.evidence = load_evidence_sqlite(&mut tx, draft.id).await?;
+        if actor_user_id != draft.user_id {
+            return Err(StoreError::Validation(
+                "AI extraction rejection actor must own the draft".to_owned(),
+            ));
+        }
+        if draft.meta.revision != rejection.expected_revision {
+            return Err(StoreError::Conflict(
+                "extraction revision changed".to_owned(),
+            ));
+        }
+        if draft.status != AiExtractionStatus::PendingApproval {
+            return Err(StoreError::Conflict(
+                "only pending AI extraction drafts can be rejected".to_owned(),
+            ));
+        }
+        if draft.data_cell.is_some() && draft.evidence.is_empty() {
+            return Err(StoreError::Validation(
+                "versioned AI extraction evidence is missing".to_owned(),
+            ));
+        }
+        if draft
+            .evidence
+            .iter()
+            .any(|evidence| evidence.promoted_attachment_id.is_some())
+        {
+            return Err(StoreError::Conflict(
+                "promoted AI extraction evidence cannot be rejected".to_owned(),
+            ));
+        }
+        let bindings = if draft.evidence.is_empty() {
+            vec![(
+                draft.private_image_id,
+                draft.attachment_id,
+                draft.image_sha256.clone(),
+            )]
+        } else {
+            draft
+                .evidence
+                .iter()
+                .map(|evidence| {
+                    (
+                        evidence.private_image_id,
+                        evidence.private_attachment_id,
+                        evidence.original_sha256.clone(),
+                    )
+                })
+                .collect()
+        };
+        let mut images = Vec::with_capacity(bindings.len());
+        for (image_id, attachment_id, original_sha256) in bindings {
+            let image_row = sqlx::query(&format!(
+                "SELECT {IC} FROM ai_private_images WHERE id=? AND deleted_at IS NULL"
+            ))
+            .bind(image_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "ai_private_image",
+                id: image_id,
+            })?;
+            let image = ir(&image_row)?;
+            let attachment_row = sqlx::query(
+                "SELECT project_id,entity_type,entity_id,sha256
+                 FROM attachments WHERE id=? AND deleted_at IS NULL",
+            )
+            .bind(attachment_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "attachment",
+                id: attachment_id,
+            })?;
+            let attachment_project_id: Option<String> =
+                attachment_row.try_get("project_id").map_err(map_sqlx)?;
+            let attachment_entity_type: String =
+                attachment_row.try_get("entity_type").map_err(map_sqlx)?;
+            let attachment_entity_id =
+                uuid(attachment_row.try_get("entity_id").map_err(map_sqlx)?)?;
+            let attachment_sha256: String = attachment_row.try_get("sha256").map_err(map_sqlx)?;
+            if (image.lab_id, image.user_id, image.attachment_id)
+                != (draft.lab_id, draft.user_id, attachment_id)
+                || image.project_id.is_some()
+                || image.status != PrivateImageStatus::PendingApproval
+                || attachment_project_id.is_some()
+                || attachment_entity_type != "ai_private_image"
+                || attachment_entity_id != image.id
+                || attachment_sha256 != original_sha256
+            {
+                return Err(StoreError::Conflict(
+                    "AI extraction evidence changed before rejection".to_owned(),
+                ));
+            }
+            images.push(image);
+        }
+
+        let now = Utc::now();
+        for mut image in images {
+            let before = snapshot(&image)?;
+            image.status = PrivateImageStatus::Active;
+            image.last_activity_at = now;
+            image.expires_at = now + Duration::days(30);
+            image.archived_at = None;
+            image.meta.touch(now);
+            sqlx::query(
+                "UPDATE ai_private_images
+                 SET status='active',last_activity_at=?,expires_at=?,archived_at=NULL,
+                     updated_at=?,revision=?
+                 WHERE id=?",
+            )
+            .bind(image.last_activity_at)
+            .bind(image.expires_at)
+            .bind(image.meta.updated_at)
+            .bind(image.meta.revision)
+            .bind(image.id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            write_audit(
+                &mut tx,
+                draft.lab_id,
+                None,
+                EntityType::AiPrivateImage,
+                image.id,
+                AuditAction::Process,
+                a,
+                Some(before),
+                Some(snapshot(&image)?),
+            )
+            .await?;
+            insert_provenance_tx(
+                &mut tx,
+                &Provenance::from_audit(
+                    draft.lab_id,
+                    None,
+                    EntityType::AiPrivateImage,
+                    image.id,
+                    a,
+                    now,
+                ),
+            )
+            .await?;
+        }
+
+        let before_draft = snapshot(&draft)?;
+        draft.status = AiExtractionStatus::Rejected;
+        draft.meta.touch(now);
+        sqlx::query(
+            "UPDATE ai_extraction_drafts SET status='rejected',updated_at=?,revision=? WHERE id=?",
+        )
+        .bind(draft.meta.updated_at)
+        .bind(draft.meta.revision)
+        .bind(draft.id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        write_audit(
+            &mut tx,
+            draft.lab_id,
+            None,
+            EntityType::AiExtractionDraft,
+            draft.id,
+            AuditAction::Revoke,
+            a,
+            Some(before_draft),
+            Some(snapshot(&draft)?),
+        )
+        .await?;
+        insert_provenance_tx(
+            &mut tx,
+            &Provenance::from_audit(
+                draft.lab_id,
+                None,
+                EntityType::AiExtractionDraft,
+                draft.id,
+                a,
+                now,
+            ),
+        )
+        .await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(draft)
     }
     async fn list_project_attachments(&self, l: Uuid, p: Uuid) -> StoreResult<Vec<Attachment>> {
         let rows=sqlx::query(&format!("SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE lab_id=? AND project_id=? AND deleted_at IS NULL ORDER BY created_at DESC,id")).bind(l.to_string()).bind(p.to_string()).fetch_all(&self.pool).await.map_err(map_sqlx)?;

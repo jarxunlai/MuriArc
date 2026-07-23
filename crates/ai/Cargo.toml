@@ -13,11 +13,14 @@ test-support = []
 
 [dependencies]
 async-trait.workspace = true
+base64 = "0.22.1"
 chrono.workspace = true
+crc32fast = "1.5.0"
 muriarc-core = { path = "../core" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.10.9"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 uuid.workspace = true

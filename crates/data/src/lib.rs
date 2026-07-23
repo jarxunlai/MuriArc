@@ -20,11 +20,12 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use muriarc_core::{
-    AnimalFilter, AnimalStatus, Attachment, AuditContext, AuditFilter, ExperimentFilter,
-    FieldValueType, GenotypeComponentMode, GenotypingState, IdentifierScope, ImportCommitOptions,
-    ImportCommitResult, ImportPlan, Job, MeasurementFilter, MuriArcStore, ObservationFilter,
-    ParticipationFilter, ProjectAnimalAssignmentFilter, ProvenanceFilter, SampleFilter, Sex,
-    StoreError, TemplateStatus,
+    AiExtractionStatus, AnimalFilter, AnimalStatus, Attachment, AuditContext, AuditFilter,
+    DerivativeKind, EntityType, ExperimentFilter, FieldValueType, GenotypeComponentMode,
+    GenotypingState, IdentifierScope, ImportCommitOptions, ImportCommitResult, ImportPlan, Job,
+    MeasurementFilter, MuriArcStore, ObservationFilter, ParticipationFilter, PrivateImageFilter,
+    ProjectAnimalAssignmentFilter, ProvenanceFilter, SampleFilter, Sex, StoreError, TemplateStatus,
+    UserFilter,
 };
 use muriarc_importer::{
     AnimalDirectory, AnimalExportFilter, AnimalExportOptions, AnimalExportRecord, CageDirectory,
@@ -40,6 +41,7 @@ use muriarc_snapshot::{
     BundleEntry, EntryKind, SnapshotError, SnapshotManifest, sha256_hex, write_bundle,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -1316,7 +1318,115 @@ pub async fn build_lab_snapshot(
                 .await?,
         );
     }
+    let private_images = store
+        .list_private_ai_images(&PrivateImageFilter {
+            lab_id,
+            ..PrivateImageFilter::default()
+        })
+        .await?;
+    let mut ai_owner_ids = private_images
+        .iter()
+        .map(|image| image.user_id)
+        .collect::<BTreeSet<_>>();
+    ai_owner_ids.extend(
+        store
+            .list_users(&UserFilter {
+                lab_id,
+                status: None,
+            })
+            .await?
+            .into_iter()
+            .map(|user| user.id),
+    );
+    let mut extraction_drafts = Vec::new();
+    for user_id in ai_owner_ids {
+        extraction_drafts.extend(
+            store
+                .list_ai_extraction_drafts(lab_id, user_id, None)
+                .await?,
+        );
+    }
+
+    let private_image_ids = private_images
+        .iter()
+        .map(|image| image.id)
+        .collect::<BTreeSet<_>>();
+    let private_attachment_ids = private_images
+        .iter()
+        .map(|image| image.attachment_id)
+        .collect::<BTreeSet<_>>();
+    let approved_attachment_ids = extraction_drafts
+        .iter()
+        .filter(|draft| draft.status == AiExtractionStatus::Approved)
+        .flat_map(|draft| {
+            draft
+                .evidence
+                .iter()
+                .filter_map(|evidence| evidence.promoted_attachment_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let approved_draft_ids = extraction_drafts
+        .iter()
+        .filter(|draft| draft.status == AiExtractionStatus::Approved)
+        .map(|draft| draft.id)
+        .collect::<BTreeSet<_>>();
+    let unresolved_draft_ids = extraction_drafts
+        .iter()
+        .filter(|draft| draft.status != AiExtractionStatus::Approved)
+        .map(|draft| draft.id)
+        .collect::<BTreeSet<_>>();
+    let mut sensitive_attachment_ids = private_attachment_ids
+        .difference(&approved_attachment_ids)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut sensitive_entity_ids = private_image_ids.clone();
+    sensitive_entity_ids.extend(unresolved_draft_ids.iter().copied());
+    for draft in extraction_drafts
+        .iter()
+        .filter(|draft| draft.status != AiExtractionStatus::Approved)
+    {
+        sensitive_entity_ids.extend(
+            draft
+                .items
+                .iter()
+                .flat_map(|item| [item.observation.id, item.value.id]),
+        );
+        sensitive_entity_ids.extend(
+            draft
+                .evidence
+                .iter()
+                .map(|evidence| evidence.private_image_id),
+        );
+        sensitive_attachment_ids.extend(
+            draft
+                .evidence
+                .iter()
+                .map(|evidence| evidence.private_attachment_id),
+        );
+    }
+    // Approval wins over an earlier unresolved draft that referenced the same
+    // image. Rejection may release that image for a later draft whose approval
+    // formalizes the attachment in place.
+    sensitive_attachment_ids.retain(|id| !approved_attachment_ids.contains(id));
+    sensitive_entity_ids.extend(sensitive_attachment_ids.iter().copied());
+    for attachment_id in &private_attachment_ids {
+        sensitive_entity_ids.extend(
+            store
+                .list_attachment_derivatives(*attachment_id)
+                .await?
+                .into_iter()
+                .filter(|derivative| derivative.kind == DerivativeKind::AiInput)
+                .map(|derivative| derivative.id),
+        );
+    }
+
     let mut attachments = store.list_lab_attachments(lab_id).await?;
+    // Private AI material enters a business snapshot only after the approval
+    // transaction formalizes the original attachment as observation evidence.
+    attachments.retain(|attachment| {
+        attachment.entity_type != "ai_private_image"
+            && !sensitive_attachment_ids.contains(&attachment.id)
+    });
     let mut audits = store
         .list_audit_entries(&AuditFilter {
             lab_id,
@@ -1330,6 +1440,46 @@ pub async fn build_lab_snapshot(
             ..ProvenanceFilter::default()
         })
         .await?;
+    audits.retain(|entry| match entry.entity_type {
+        EntityType::AiPrivateImage => false,
+        EntityType::AiExtractionDraft => {
+            approved_draft_ids.contains(&entry.entity_id) && entry.project_id.is_some()
+        }
+        EntityType::Attachment if approved_attachment_ids.contains(&entry.entity_id) => {
+            entry.project_id.is_some()
+        }
+        _ => !sensitive_entity_ids.contains(&entry.entity_id),
+    });
+    for entry in &mut audits {
+        if entry.entity_type == EntityType::Attachment
+            && approved_attachment_ids.contains(&entry.entity_id)
+        {
+            // The approval audit's before-image still points at the private
+            // image container. The formal attachment after-image is sufficient
+            // for the business snapshot and does not expose that private link.
+            entry.before = None;
+        }
+        if entry.entity_type == EntityType::AiExtractionDraft
+            && approved_draft_ids.contains(&entry.entity_id)
+        {
+            if let Some(before) = entry.before.as_mut() {
+                redact_private_image_references(before);
+            }
+            if let Some(after) = entry.after.as_mut() {
+                redact_private_image_references(after);
+            }
+        }
+    }
+    provenance.retain(|record| match record.entity_type {
+        EntityType::AiPrivateImage => false,
+        EntityType::AiExtractionDraft => {
+            approved_draft_ids.contains(&record.entity_id) && record.project_id.is_some()
+        }
+        EntityType::Attachment if approved_attachment_ids.contains(&record.entity_id) => {
+            record.project_id.is_some()
+        }
+        _ => !sensitive_entity_ids.contains(&record.entity_id),
+    });
     sort_by_id(&mut events, |value| value.id);
     sort_by_id(&mut project_animal_assignments, |value| value.id);
     sort_by_id(&mut loci, |value| value.id);
@@ -1446,6 +1596,23 @@ async fn read_attachment_entry(
 
 fn sort_by_id<T>(values: &mut [T], id: impl Fn(&T) -> Uuid) {
     values.sort_by_key(id);
+}
+
+fn redact_private_image_references(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            object.remove("private_image_id");
+            for child in object.values_mut() {
+                redact_private_image_references(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                redact_private_image_references(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn ensure_pending_scope(
@@ -1825,21 +1992,211 @@ pub enum DataError {
 #[cfg(test)]
 mod tests {
     use muriarc_core::{
-        Actor, Allele, Animal, AnimalDraft, AuditContext, BreedingLine, BreedingMemberRole,
-        BreedingPair, BreedingPairMember, Colony, Experiment, ExperimentEvent,
-        ExperimentTemplateVersion, FieldValueType, GeneLocus, GenotypeComponent,
-        GenotypeComponentMode, GenotypeDefinition, GenotypingRecord, GenotypingState, Lab, Litter,
-        MatingEvent, MeasurementFilter, MuriArcStore, Observation, ObservationDefinition,
-        ObservationPolicy, ObservationSubjectType, ObservationValueData, ObservationValueRecord,
-        ObservationValueType, Participation, Project, RecordMeta, RecordStatus, Sex, TemplateField,
-        User, WriteSource,
+        Actor, AiExtractionApprovalInput, AiExtractionApprovalSelection, AiExtractionDraft,
+        AiExtractionEvidence, AiExtractionItem, AiExtractionModelTrace, AiExtractionRejectionInput,
+        AiExtractionStatus, AiModelProfile, AiModelProfileStore, AiModelProfileVersion,
+        AiModelPurpose, AiObservationDataCell, AiProviderProtocol, AiProviderTransport, Allele,
+        Animal, AnimalDraft, Attachment, AttachmentDerivative, AuditContext, BreedingLine,
+        BreedingMemberRole, BreedingPair, BreedingPairMember, Colony, DerivativeKind,
+        DerivativeStatus, Experiment, ExperimentEvent, ExperimentTemplateVersion, FieldValueType,
+        GeneLocus, GenotypeComponent, GenotypeComponentMode, GenotypeDefinition, GenotypingRecord,
+        GenotypingState, Lab, Litter, MatingEvent, MeasurementFilter, MuriArcStore, Observation,
+        ObservationDefinition, ObservationPolicy, ObservationSubjectType, ObservationValueData,
+        ObservationValueRecord, ObservationValueType, Participation, PrivateAiImage,
+        PrivateImageStatus, Project, RecordMeta, RecordStatus, Sex, TemplateField, User,
+        WorkspaceStore, WriteSource,
     };
     use muriarc_snapshot::verify_bundle;
     use muriarc_store_sqlite::SqliteStore;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
     use tempfile::tempdir;
 
     use super::*;
+
+    struct SnapshotAiFixture {
+        draft: AiExtractionDraft,
+        attachment: Attachment,
+        image: PrivateAiImage,
+        derivative: AttachmentDerivative,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_snapshot_ai_fixture(
+        store: &SqliteStore,
+        files: &AttachmentFiles,
+        lab_id: Uuid,
+        user_id: Uuid,
+        project_id: Uuid,
+        experiment: &Experiment,
+        event: &ExperimentEvent,
+        profile: &AiModelProfile,
+        profile_version: &AiModelProfileVersion,
+        definition_key: &str,
+        marker: &str,
+        status: AiExtractionStatus,
+        audit: &AuditContext,
+        now: DateTime<Utc>,
+    ) -> SnapshotAiFixture {
+        let mut definition = ObservationDefinition::new(
+            lab_id,
+            project_id,
+            experiment.id,
+            definition_key,
+            definition_key.replace('_', " "),
+            ObservationValueType::Number,
+            ObservationPolicy::Versioned,
+            now,
+        )
+        .unwrap();
+        definition.unit = Some("g".to_owned());
+        store
+            .create_observation_definition(&definition, audit)
+            .await
+            .unwrap();
+        let image_id = Uuid::new_v4();
+        let attachment_id = Uuid::new_v4();
+        let private_object = files
+            .write_bytes(attachment_id, format!("{marker}-private-bytes").as_bytes())
+            .await
+            .unwrap();
+        let attachment = Attachment {
+            id: attachment_id,
+            lab_id,
+            project_id: None,
+            entity_type: "ai_private_image".to_owned(),
+            entity_id: image_id,
+            file_name: format!("{marker}.png"),
+            media_type: Some("image/png".to_owned()),
+            relative_path: private_object.relative_path,
+            size_bytes: private_object.size_bytes,
+            sha256: private_object.sha256,
+            version: 1,
+            meta: RecordMeta::new(now),
+        };
+        let image = PrivateAiImage {
+            id: image_id,
+            lab_id,
+            user_id,
+            conversation_id: None,
+            attachment_id,
+            project_id: None,
+            status: PrivateImageStatus::Active,
+            last_activity_at: now,
+            expires_at: now + chrono::Duration::days(30),
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_private_ai_image(&attachment, &image, audit)
+            .await
+            .unwrap();
+        let derivative = AttachmentDerivative {
+            id: Uuid::new_v4(),
+            lab_id,
+            project_id: None,
+            attachment_id,
+            kind: DerivativeKind::AiInput,
+            media_type: Some("image/jpeg".to_owned()),
+            relative_path: Some(format!("ai-private/{marker}-sanitized.jpg")),
+            size_bytes: Some(32),
+            sha256: Some(sha256_hex(format!("{marker}-sanitized").as_bytes())),
+            status: DerivativeStatus::Ready,
+            error_code: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_attachment_derivative(&derivative, audit)
+            .await
+            .unwrap();
+        let observation = Observation::new(
+            lab_id,
+            project_id,
+            experiment.id,
+            event.id,
+            definition.id,
+            ObservationSubjectType::Experiment,
+            experiment.id,
+            now,
+        )
+        .unwrap();
+        let value = ObservationValueRecord::new(
+            observation.id,
+            1,
+            ObservationValueData::Number(7.0),
+            now,
+            now,
+        )
+        .unwrap();
+        let draft = AiExtractionDraft {
+            id: Uuid::new_v4(),
+            lab_id,
+            user_id,
+            project_id,
+            experiment_id: experiment.id,
+            experiment_event_id: event.id,
+            private_image_id: image.id,
+            attachment_id: attachment.id,
+            image_sha256: attachment.sha256.clone(),
+            provider: format!("{marker}-provider"),
+            model: profile_version.model_id.clone(),
+            tool_run_id: None,
+            data_cell: Some(AiObservationDataCell {
+                definition_id: definition.id,
+                subject_type: ObservationSubjectType::Experiment,
+                subject_id: experiment.id,
+            }),
+            evidence: vec![AiExtractionEvidence {
+                display_order: 0,
+                private_image_id: image.id,
+                private_attachment_id: attachment.id,
+                promoted_attachment_id: None,
+                original_sha256: attachment.sha256.clone(),
+                sanitized_sha256: derivative.sha256.clone().unwrap(),
+                meta: RecordMeta::new(now),
+            }],
+            model_trace: Some(AiExtractionModelTrace {
+                profile_id: profile.id,
+                profile_version: profile_version.version,
+                purpose: AiModelPurpose::Vision,
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 15,
+                provider_request_id: Some(format!("{marker}-provider-request")),
+                trace: serde_json::json!({"private_trace": marker}),
+            }),
+            status,
+            items: vec![AiExtractionItem {
+                observation,
+                value,
+                confidence: 0.75,
+                selected: false,
+                source_label: Some(format!("{marker}-candidate")),
+            }],
+            error_code: (status == AiExtractionStatus::Failed).then(|| format!("{marker}-failed")),
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_ai_extraction_draft(&draft, audit)
+            .await
+            .unwrap();
+        SnapshotAiFixture {
+            draft,
+            attachment,
+            image,
+            derivative,
+        }
+    }
+
+    fn snapshot_entry_text(snapshot: &[u8], path: &str) -> String {
+        let mut archive = zip::ZipArchive::new(Cursor::new(snapshot)).unwrap();
+        let mut text = String::new();
+        archive
+            .by_name(path)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    }
 
     #[tokio::test]
     async fn upload_preview_export_and_snapshot_are_real_and_checksummed() {
@@ -1919,6 +2276,367 @@ mod tests {
                 .entries
                 .iter()
                 .any(|entry| entry.path == "data/provenance.jsonl")
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_excludes_unpromoted_private_ai_images() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store.migrate().await.unwrap();
+        let now = Utc::now();
+        let bootstrap = AuditContext::system(WriteSource::Migration);
+        let lab = Lab::new("Private image snapshot boundary", now).unwrap();
+        store.create_lab(&lab, &bootstrap).await.unwrap();
+        let user = User::new(
+            lab.id,
+            format!("{}@snapshot.test", Uuid::new_v4()),
+            "Snapshot researcher",
+            now,
+        )
+        .unwrap();
+        store.create_user(&user, &bootstrap).await.unwrap();
+        let project = Project::new(lab.id, "Snapshot attachment project", now).unwrap();
+        store.create_project(&project, &bootstrap).await.unwrap();
+        let experiment =
+            Experiment::new(lab.id, project.id, "Private image snapshot study", now).unwrap();
+        store
+            .create_experiment(&experiment, &bootstrap)
+            .await
+            .unwrap();
+        let event = ExperimentEvent::new(
+            lab.id,
+            project.id,
+            experiment.id,
+            "snapshot",
+            "Snapshot",
+            now,
+            now,
+        )
+        .unwrap();
+        store
+            .create_experiment_event(&event, &bootstrap)
+            .await
+            .unwrap();
+        let owner_audit = AuditContext {
+            actor: Actor::human(user.id, "Snapshot researcher"),
+            source: WriteSource::Web,
+            request_id: Some("snapshot-ai-fixtures".to_owned()),
+            reason: Some("exercise private AI snapshot boundary".to_owned()),
+        };
+        let profile = AiModelProfile {
+            id: Uuid::new_v4(),
+            lab_id: lab.id,
+            user_id: user.id,
+            name: "Snapshot vision profile".to_owned(),
+            current_version: 1,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        let profile_version = AiModelProfileVersion {
+            profile_id: profile.id,
+            version: 1,
+            protocol: AiProviderProtocol::OpenaiResponses,
+            transport: AiProviderTransport::OpenAiCompatible,
+            base_url: "https://snapshot-vision.test/v1".to_owned(),
+            normalized_base_url: "https://snapshot-vision.test/v1".to_owned(),
+            model_id: "snapshot-vision-model".to_owned(),
+            supports_vision: true,
+            context_window_tokens: 16_384,
+            max_input_tokens: 8_192,
+            max_output_tokens: 1_024,
+            history_token_budget: 4_096,
+            history_turns: 8,
+            temperature: 0.0,
+            timeout_ms: 30_000,
+            created_at: now,
+        };
+        store
+            .create_ai_model_profile(&profile, &profile_version, &owner_audit)
+            .await
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let files = AttachmentFiles::new(temp.path());
+        let pending = create_snapshot_ai_fixture(
+            &store,
+            &files,
+            lab.id,
+            user.id,
+            project.id,
+            &experiment,
+            &event,
+            &profile,
+            &profile_version,
+            "pending_snapshot_cell",
+            "PRIVATE_PENDING_SENTINEL",
+            AiExtractionStatus::PendingApproval,
+            &owner_audit,
+            now,
+        )
+        .await;
+        let rejected = create_snapshot_ai_fixture(
+            &store,
+            &files,
+            lab.id,
+            user.id,
+            project.id,
+            &experiment,
+            &event,
+            &profile,
+            &profile_version,
+            "rejected_snapshot_cell",
+            "PRIVATE_REJECTED_SENTINEL",
+            AiExtractionStatus::PendingApproval,
+            &owner_audit,
+            now,
+        )
+        .await;
+        store
+            .reject_ai_extraction_draft(
+                rejected.draft.id,
+                &AiExtractionRejectionInput {
+                    expected_revision: rejected.draft.meta.revision,
+                },
+                &owner_audit,
+            )
+            .await
+            .unwrap();
+        let reuse_source = create_snapshot_ai_fixture(
+            &store,
+            &files,
+            lab.id,
+            user.id,
+            project.id,
+            &experiment,
+            &event,
+            &profile,
+            &profile_version,
+            "reused_snapshot_cell",
+            "REUSED_FORMAL_ATTACHMENT_SENTINEL",
+            AiExtractionStatus::PendingApproval,
+            &owner_audit,
+            now,
+        )
+        .await;
+        store
+            .reject_ai_extraction_draft(
+                reuse_source.draft.id,
+                &AiExtractionRejectionInput {
+                    expected_revision: reuse_source.draft.meta.revision,
+                },
+                &owner_audit,
+            )
+            .await
+            .unwrap();
+        let mut reused_approved_draft = reuse_source.draft.clone();
+        reused_approved_draft.id = Uuid::new_v4();
+        reused_approved_draft.provider = "REUSED_APPROVED_PROVIDER_SENTINEL".to_owned();
+        reused_approved_draft.status = AiExtractionStatus::PendingApproval;
+        reused_approved_draft.error_code = None;
+        reused_approved_draft.meta = RecordMeta::new(now);
+        reused_approved_draft.items[0].source_label =
+            Some("REUSED_APPROVED_CANDIDATE_SENTINEL".to_owned());
+        let reused_trace = reused_approved_draft.model_trace.as_mut().unwrap();
+        reused_trace.provider_request_id =
+            Some("REUSED_APPROVED_PROVIDER_REQUEST_SENTINEL".to_owned());
+        reused_trace.trace =
+            serde_json::json!({"approved_reuse_trace": "REUSED_APPROVED_TRACE_SENTINEL"});
+        store
+            .create_ai_extraction_draft(&reused_approved_draft, &owner_audit)
+            .await
+            .unwrap();
+        let reused_approved = SnapshotAiFixture {
+            draft: reused_approved_draft,
+            attachment: reuse_source.attachment.clone(),
+            image: reuse_source.image.clone(),
+            derivative: reuse_source.derivative.clone(),
+        };
+        let reused_applied = store
+            .apply_ai_extraction_draft(
+                reused_approved.draft.id,
+                &AiExtractionApprovalInput {
+                    expected_revision: reused_approved.draft.meta.revision,
+                    selections: vec![AiExtractionApprovalSelection {
+                        item_index: 0,
+                        value: ObservationValueData::Number(9.5),
+                        notes: Some("approved after reject and reuse".to_owned()),
+                    }],
+                },
+                &owner_audit,
+            )
+            .await
+            .unwrap();
+        let failed = create_snapshot_ai_fixture(
+            &store,
+            &files,
+            lab.id,
+            user.id,
+            project.id,
+            &experiment,
+            &event,
+            &profile,
+            &profile_version,
+            "failed_snapshot_cell",
+            "PRIVATE_FAILED_SENTINEL",
+            AiExtractionStatus::Failed,
+            &owner_audit,
+            now,
+        )
+        .await;
+        let approved = create_snapshot_ai_fixture(
+            &store,
+            &files,
+            lab.id,
+            user.id,
+            project.id,
+            &experiment,
+            &event,
+            &profile,
+            &profile_version,
+            "approved_snapshot_cell",
+            "APPROVED_EVIDENCE_SENTINEL",
+            AiExtractionStatus::PendingApproval,
+            &owner_audit,
+            now,
+        )
+        .await;
+        let applied = store
+            .apply_ai_extraction_draft(
+                approved.draft.id,
+                &AiExtractionApprovalInput {
+                    expected_revision: approved.draft.meta.revision,
+                    selections: vec![AiExtractionApprovalSelection {
+                        item_index: 0,
+                        value: ObservationValueData::Number(8.5),
+                        notes: Some("approved snapshot evidence".to_owned()),
+                    }],
+                },
+                &owner_audit,
+            )
+            .await
+            .unwrap();
+        assert_eq!(applied.observations.len(), 1);
+        assert_eq!(applied.attachments.len(), 1);
+
+        let snapshot = build_lab_snapshot(
+            &store,
+            temp.path(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            lab.id,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        let manifest = verify_bundle(Cursor::new(snapshot.as_slice())).unwrap();
+        let attachment_metadata = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.path == "data/attachment.jsonl")
+            .unwrap();
+        assert_eq!(attachment_metadata.record_count, Some(2));
+        assert!(manifest.entries.iter().any(|entry| {
+            entry.path
+                == format!(
+                    "attachments/{}/v{}/content",
+                    approved.attachment.id, approved.attachment.version
+                )
+        }));
+        assert!(manifest.entries.iter().any(|entry| {
+            entry.path
+                == format!(
+                    "attachments/{}/v{}/content",
+                    reused_approved.attachment.id, reused_approved.attachment.version
+                )
+        }));
+
+        let attachment_jsonl = snapshot_entry_text(&snapshot, "data/attachment.jsonl");
+        let observation_jsonl = snapshot_entry_text(&snapshot, "data/observation.jsonl");
+        let value_jsonl = snapshot_entry_text(&snapshot, "data/observation_value.jsonl");
+        let audit_jsonl = snapshot_entry_text(&snapshot, "data/audit.jsonl");
+        let provenance_jsonl = snapshot_entry_text(&snapshot, "data/provenance.jsonl");
+        let exported_metadata = format!(
+            "{attachment_jsonl}\n{observation_jsonl}\n{value_jsonl}\n{audit_jsonl}\n{provenance_jsonl}"
+        );
+
+        for (marker, fixture) in [
+            ("PRIVATE_PENDING_SENTINEL", &pending),
+            ("PRIVATE_REJECTED_SENTINEL", &rejected),
+            ("PRIVATE_FAILED_SENTINEL", &failed),
+        ] {
+            for private_value in [
+                marker.to_owned(),
+                fixture.draft.id.to_string(),
+                fixture.image.id.to_string(),
+                fixture.attachment.id.to_string(),
+                fixture.derivative.id.to_string(),
+                fixture.draft.items[0].observation.id.to_string(),
+                fixture.draft.items[0].value.id.to_string(),
+                fixture.attachment.file_name.clone(),
+                fixture.attachment.relative_path.clone(),
+                fixture.attachment.sha256.clone(),
+                fixture.derivative.relative_path.clone().unwrap(),
+                fixture.derivative.sha256.clone().unwrap(),
+            ] {
+                assert!(
+                    !exported_metadata.contains(&private_value),
+                    "unapproved AI value leaked into snapshot: {private_value}"
+                );
+            }
+            assert!(manifest.entries.iter().all(|entry| {
+                entry.path
+                    != format!(
+                        "attachments/{}/v{}/content",
+                        fixture.attachment.id, fixture.attachment.version
+                    )
+            }));
+        }
+
+        let approved_observation = &applied.observations[0];
+        assert!(attachment_jsonl.contains(&approved.attachment.id.to_string()));
+        assert!(attachment_jsonl.contains("APPROVED_EVIDENCE_SENTINEL.png"));
+        assert!(attachment_jsonl.contains(&approved.attachment.sha256));
+        assert!(observation_jsonl.contains(&approved_observation.id.to_string()));
+        assert!(value_jsonl.contains(&approved.draft.items[0].value.id.to_string()));
+        assert!(audit_jsonl.contains(&approved.draft.id.to_string()));
+        assert!(audit_jsonl.contains("APPROVED_EVIDENCE_SENTINEL-provider"));
+        assert!(audit_jsonl.contains("APPROVED_EVIDENCE_SENTINEL-provider-request"));
+        assert!(audit_jsonl.contains("\"private_trace\":\"APPROVED_EVIDENCE_SENTINEL\""));
+        assert!(provenance_jsonl.contains(&approved.draft.id.to_string()));
+        assert!(provenance_jsonl.contains("APPROVED_EVIDENCE_SENTINEL-provider"));
+        assert!(provenance_jsonl.contains(&profile_version.model_id));
+        assert!(
+            !exported_metadata.contains(&approved.image.id.to_string()),
+            "approved formal records must not retain the private image container id"
+        );
+        assert!(
+            !exported_metadata.contains(&approved.derivative.id.to_string()),
+            "approved formal records must not export the private AI input derivative"
+        );
+        assert!(
+            !exported_metadata.contains(&approved.derivative.relative_path.unwrap()),
+            "approved formal records must not export private derivative paths"
+        );
+
+        assert!(attachment_jsonl.contains(&reused_approved.attachment.id.to_string()));
+        assert!(attachment_jsonl.contains("REUSED_FORMAL_ATTACHMENT_SENTINEL.png"));
+        assert!(observation_jsonl.contains(&reused_applied.observations[0].id.to_string()));
+        assert!(audit_jsonl.contains(&reused_approved.draft.id.to_string()));
+        assert!(audit_jsonl.contains("REUSED_APPROVED_PROVIDER_REQUEST_SENTINEL"));
+        assert!(audit_jsonl.contains("REUSED_APPROVED_TRACE_SENTINEL"));
+        assert!(provenance_jsonl.contains("REUSED_APPROVED_PROVIDER_SENTINEL"));
+        assert!(
+            !exported_metadata.contains(&reuse_source.draft.id.to_string()),
+            "the rejected predecessor draft must remain private after evidence reuse"
+        );
+        assert!(
+            !exported_metadata.contains("REUSED_FORMAL_ATTACHMENT_SENTINEL-provider-request"),
+            "the rejected predecessor trace must remain private after evidence reuse"
+        );
+        assert!(
+            !exported_metadata.contains(&reuse_source.image.id.to_string()),
+            "the reused attachment must not expose its private image container"
         );
     }
 

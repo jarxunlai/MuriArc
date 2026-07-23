@@ -14,8 +14,26 @@ import {
   gateway,
   type AiModelDefaultsView,
   type AiModelProfileView,
+  type PrivateImageRecord,
 } from '@/services/gateway'
 
+export interface AiStagedImage {
+  localId: string
+  file: File
+  previewUrl: string
+  status: 'staged' | 'uploading' | 'ready' | 'error'
+  uploaded?: PrivateImageRecord
+  error?: string
+}
+
+const MAX_CHAT_IMAGES = 8
+const MAX_CHAT_IMAGE_BYTES = 10 * 1024 * 1024
+const CHAT_IMAGE_MEDIA_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+])
 const drawerOpen = ref(false)
 const contextTitle = ref('MuriArc')
 const contextRoute = ref('/cages')
@@ -34,6 +52,9 @@ const modelDefaults = ref<AiModelDefaultsView>({ revision: 0 })
 const modelsLoaded = ref(false)
 const selectedModelProfileId = ref<string>()
 const selectedModelWasExplicit = ref(false)
+const selectedVisionModelProfileId = ref<string>()
+const stagedImages = ref<AiStagedImage[]>([])
+const imageStageError = ref<string>()
 const requestedMode = ref<AiAutonomyMode>('full')
 const sending = ref(false)
 const startingConversation = ref(false)
@@ -49,6 +70,8 @@ let conversationListRequest = 0
 let conversationOpenRequest = 0
 let modelListRequest = 0
 let freshConversationRequested = false
+let imageComposerConsumers = 0
+const retainedMessagePreviewUrls = new Map<string, string>()
 
 function welcomeMessage(): AiMessage {
   return {
@@ -78,6 +101,57 @@ function readableError(error: unknown): string {
     if (typeof value.message === 'string') return value.message
   }
   return 'AI 请求失败，请检查模型设置或稍后重试'
+}
+
+function createPreviewUrl(file: File): string {
+  return typeof URL.createObjectURL === 'function' ? URL.createObjectURL(file) : ''
+}
+
+function revokePreviewUrl(value: string) {
+  if (value && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(value)
+}
+
+function resetUploadedImagesForNewConversation() {
+  stagedImages.value = stagedImages.value.map((image) => ({
+    ...image,
+    status: 'staged',
+    uploaded: undefined,
+    error: undefined,
+  }))
+}
+
+function releaseStagedImages(images: AiStagedImage[] = stagedImages.value) {
+  for (const image of images) revokePreviewUrl(image.previewUrl)
+  const released = new Set(images.map((image) => image.localId))
+  stagedImages.value = stagedImages.value.filter((image) => !released.has(image.localId))
+  if (!stagedImages.value.length) imageStageError.value = undefined
+}
+
+function consumeStagedImages(
+  images: AiStagedImage[],
+  uploaded: PrivateImageRecord[],
+  ownerConversationId: string,
+) {
+  const consumed = new Set(images.map((image) => image.localId))
+  for (const [index, image] of images.entries()) {
+    if (!image.previewUrl) continue
+    if (uploaded[index]?.previewHref) {
+      revokePreviewUrl(image.previewUrl)
+    } else {
+      retainedMessagePreviewUrls.set(image.previewUrl, ownerConversationId)
+    }
+  }
+  stagedImages.value = stagedImages.value.filter((image) => !consumed.has(image.localId))
+  imageStageError.value = undefined
+}
+
+function releaseConversationPreviewUrls(conversationId?: string) {
+  for (const [previewUrl, owner] of retainedMessagePreviewUrls) {
+    if (!conversationId || owner === conversationId) {
+      revokePreviewUrl(previewUrl)
+      retainedMessagePreviewUrls.delete(previewUrl)
+    }
+  }
 }
 
 function replaceDraft(updated: AiWriteDraft) {
@@ -127,6 +201,19 @@ export function useAiAssistant() {
     projects.value.find((project) => project.id === selectedProjectId.value))
   const selectedModel = computed(() =>
     modelProfiles.value.find((profile) => profile.id === selectedModelProfileId.value))
+  const visionModels = computed(() => modelProfiles.value.filter((profile) =>
+    profile.supportsVision && !profile.archivedAt))
+  const selectedVisionModel = computed(() => visionModels.value.find((profile) =>
+    profile.id === selectedVisionModelProfileId.value))
+  const visionModelOptions = computed(() => visionModels.value.map((profile) => ({
+    label: `${profile.name} · ${profile.modelId} · v${profile.currentVersion}${profile.isDefaultVision ? '（默认）' : ''}`,
+    value: profile.id,
+  })))
+  const currentModelSupportsVision = computed(() => Boolean(selectedModel.value?.supportsVision))
+  const visionRoute = computed<'none' | 'direct' | 'relay'>(() => {
+    if (!stagedImages.value.length) return 'none'
+    return currentModelSupportsVision.value ? 'direct' : 'relay'
+  })
   const reinforcedPasswordRequired = computed(() => gateway.mode === 'remote')
   const hasPersistedMessages = computed(() =>
     Boolean(conversationId.value)
@@ -184,6 +271,12 @@ export function useAiAssistant() {
     const profile = selectedModel.value
     if (!profile) return '所选模型当前不可用，请重新选择'
     if (profile.archivedAt) return '所选模型已归档，请重新选择'
+    if (stagedImages.value.length && !gateway.uploadPrivateImage) {
+      return '当前运行模式不支持私人图片上传'
+    }
+    if (visionRoute.value === 'relay' && !selectedVisionModel.value) {
+      return '当前对话模型不支持视觉，请明确选择一个可用的视觉模型'
+    }
     return undefined
   })
 
@@ -203,11 +296,20 @@ export function useAiAssistant() {
       : undefined
   }
 
+  function defaultVisionProfileId() {
+    const profileId = modelDefaults.value.defaultVisionProfileId ?? undefined
+    return visionModels.value.some((profile) => profile.id === profileId)
+      ? profileId
+      : undefined
+  }
+
   function resetConversation(
     explicit: boolean,
     profileId: string | undefined = defaultConversationProfileId(),
     explicitModelSelection = false,
   ) {
+    const changesConversation = Boolean(conversationId.value)
+    releaseConversationPreviewUrls(conversationId.value)
     conversationOpenRequest += 1
     conversationId.value = undefined
     currentConversation.value = undefined
@@ -218,6 +320,7 @@ export function useAiAssistant() {
     requestedMode.value = 'full'
     freshConversationRequested = explicit
     autonomy.value = defaultAutonomy()
+    if (changesConversation) resetUploadedImagesForNewConversation()
   }
 
   function open(title?: string, route?: string) {
@@ -245,6 +348,13 @@ export function useAiAssistant() {
       modelProfiles.value = profiles
       modelDefaults.value = defaults
       modelsLoaded.value = true
+      const selectedVisionIsActive = profiles.some((profile) =>
+        profile.id === selectedVisionModelProfileId.value
+        && profile.supportsVision
+        && !profile.archivedAt)
+      if (!selectedVisionIsActive) {
+        selectedVisionModelProfileId.value = defaultVisionProfileId()
+      }
       if (!currentConversation.value) {
         const selectedIsActive = profiles.some((profile) =>
           profile.id === selectedModelProfileId.value && !profile.archivedAt)
@@ -307,6 +417,99 @@ export function useAiAssistant() {
     return true
   }
 
+  function selectVisionModel(profileId?: string) {
+    if (!profileId) {
+      selectedVisionModelProfileId.value = undefined
+      return
+    }
+    const profile = visionModels.value.find((item) => item.id === profileId)
+    if (!profile) throw new Error('所选视觉模型当前不可用')
+    selectedVisionModelProfileId.value = profile.id
+  }
+
+  function stageImages(files: File[]) {
+    imageStageError.value = undefined
+    const available = MAX_CHAT_IMAGES - stagedImages.value.length
+    if (available <= 0) {
+      imageStageError.value = '每次最多暂存 8 张图片'
+      throw new Error(imageStageError.value)
+    }
+    const selected = files.slice(0, available)
+    if (files.length > available) {
+      imageStageError.value = `每次最多暂存 8 张图片，已保留前 ${available} 张`
+    }
+    const additions: AiStagedImage[] = []
+    for (const file of selected) {
+      if (!CHAT_IMAGE_MEDIA_TYPES.has(file.type.toLowerCase())) {
+        imageStageError.value = `${file.name} 不是三种协议共同支持的 JPEG、PNG、WebP 或 GIF`
+        continue
+      }
+      if (!file.size || file.size > MAX_CHAT_IMAGE_BYTES) {
+        imageStageError.value = `${file.name} 必须不超过 10 MiB`
+        continue
+      }
+      additions.push({
+        localId: crypto.randomUUID(),
+        file,
+        previewUrl: createPreviewUrl(file),
+        status: 'staged',
+      })
+    }
+    stagedImages.value.push(...additions)
+    if (!additions.length && imageStageError.value) throw new Error(imageStageError.value)
+  }
+
+  function removeStagedImage(localId: string) {
+    const image = stagedImages.value.find((entry) => entry.localId === localId)
+    if (!image) return
+    revokePreviewUrl(image.previewUrl)
+    stagedImages.value = stagedImages.value.filter((entry) => entry.localId !== localId)
+    if (!stagedImages.value.length) imageStageError.value = undefined
+  }
+
+  function retainImageComposer() {
+    imageComposerConsumers += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      imageComposerConsumers = Math.max(0, imageComposerConsumers - 1)
+      if (imageComposerConsumers === 0) {
+        releaseStagedImages()
+        releaseConversationPreviewUrls()
+      }
+    }
+  }
+
+  async function uploadStagedImages(): Promise<PrivateImageRecord[]> {
+    if (!stagedImages.value.length) return []
+    if (!gateway.uploadPrivateImage) throw new Error('当前运行模式不支持私人图片上传')
+    const activeConversationId = conversationId.value
+    if (!activeConversationId) throw new Error('请先开始会话，再上传图片')
+    const snapshot = [...stagedImages.value]
+    const uploaded: PrivateImageRecord[] = []
+    for (const image of snapshot) {
+      if (image.uploaded?.image.conversation_id === activeConversationId) {
+        uploaded.push(image.uploaded)
+        continue
+      }
+      image.status = 'uploading'
+      image.error = undefined
+      try {
+        const record = await gateway.uploadPrivateImage(image.file, activeConversationId)
+        image.uploaded = record
+        image.status = 'ready'
+        uploaded.push(record)
+      } catch (error) {
+        image.status = 'error'
+        image.error = readableError(error)
+        imageStageError.value = `${image.file.name}：${image.error}`
+        throw error
+      }
+    }
+    return uploaded
+  }
+
   async function refreshConversations(): Promise<AiConversationSummary[]> {
     const request = ++conversationListRequest
     const scope = conversationScopeVersion
@@ -338,6 +541,14 @@ export function useAiAssistant() {
           .filter((value): value is AiAutonomyView => Boolean(value))
           .at(-1) ?? defaultAutonomy()
       if (request !== conversationOpenRequest) return
+      if (stagedImages.value.some((image) =>
+        image.uploaded?.image.conversation_id
+        && image.uploaded.image.conversation_id !== detail.conversation.id)) {
+        resetUploadedImagesForNewConversation()
+      }
+      if (conversationId.value !== detail.conversation.id) {
+        releaseConversationPreviewUrls(conversationId.value)
+      }
       const projectChanged = selectedProjectId.value !== detail.conversation.projectId
       if (projectChanged) {
         selectedProjectId.value = detail.conversation.projectId
@@ -430,33 +641,47 @@ export function useAiAssistant() {
     prompt: string,
     startOptions: { fullConfirmed?: boolean; currentPassword?: string } = {},
   ) {
-    const value = prompt.trim()
-    if (!value || busy.value) return
+    const enteredValue = prompt.trim()
+    const stagedSnapshot = [...stagedImages.value]
+    if ((!enteredValue && !stagedSnapshot.length) || busy.value) return
+    const value = enteredValue || '请分析这些图片。'
     if (!conversationId.value) await startConversation(startOptions)
 
     const turnStateVersion = conversationOpenRequest
     const turnConversationId = conversationId.value
-    messages.value.push({
-      id: crypto.randomUUID(),
-      role: 'user',
-      content: value,
-      createdAt: new Date().toISOString(),
-    })
-    const pendingId = crypto.randomUUID()
-    messages.value.push({
-      id: pendingId,
-      role: 'assistant',
-      content: '正在查询已授权的数据…',
-      createdAt: new Date().toISOString(),
-      pending: true,
-    })
-    if (composerDraft.value.trim() === value) composerDraft.value = ''
+    let pendingId: string | undefined
     sending.value = true
     try {
+      const uploaded = await uploadStagedImages()
+      const userImages = stagedSnapshot.map((image, index) => ({
+        id: uploaded[index]?.image.id ?? image.localId,
+        fileName: image.file.name,
+        previewHref: uploaded[index]?.previewHref || image.previewUrl,
+      }))
+      messages.value.push({
+        id: crypto.randomUUID(),
+        role: 'user',
+        content: value,
+        images: userImages,
+        createdAt: new Date().toISOString(),
+      })
+      pendingId = crypto.randomUUID()
+      messages.value.push({
+        id: pendingId,
+        role: 'assistant',
+        content: stagedSnapshot.length ? '正在安全处理图片证据…' : '正在查询已授权的数据…',
+        createdAt: new Date().toISOString(),
+        pending: true,
+      })
       const response = await gateway.aiTurn({
         conversationId: turnConversationId,
         projectId: selectedProjectId.value,
         message: value,
+        imageIds: uploaded.map((entry) => entry.image.id),
+        ...(stagedSnapshot.length && visionRoute.value === 'relay'
+          && selectedVisionModelProfileId.value
+          ? { visionModelProfileId: selectedVisionModelProfileId.value }
+          : {}),
       })
       if (turnStateVersion !== conversationOpenRequest
         || turnConversationId !== conversationId.value) return
@@ -475,17 +700,23 @@ export function useAiAssistant() {
         trace: response.trace,
         createdAt: new Date().toISOString(),
       }
+      if (composerDraft.value.trim() === enteredValue) composerDraft.value = ''
+      consumeStagedImages(stagedSnapshot, uploaded, turnConversationId ?? response.conversationId)
       void refreshConversations().catch(() => undefined)
     } catch (error) {
       if (turnStateVersion !== conversationOpenRequest
         || turnConversationId !== conversationId.value) return
-      const index = messages.value.findIndex((message) => message.id === pendingId)
-      messages.value[index] = {
-        id: pendingId,
-        role: 'assistant',
-        content: readableError(error),
-        createdAt: new Date().toISOString(),
-        error: true,
+      if (pendingId) {
+        const index = messages.value.findIndex((message) => message.id === pendingId)
+        messages.value[index] = {
+          id: pendingId,
+          role: 'assistant',
+          content: readableError(error),
+          createdAt: new Date().toISOString(),
+          error: true,
+        }
+      } else {
+        throw error
       }
     } finally {
       sending.value = false
@@ -593,6 +824,13 @@ export function useAiAssistant() {
     selectedModelProfileId,
     selectedModel,
     modelOptions,
+    selectedVisionModelProfileId,
+    selectedVisionModel,
+    visionModelOptions,
+    currentModelSupportsVision,
+    visionRoute,
+    stagedImages,
+    imageStageError,
     loadingModels,
     requestedMode,
     startingConversation,
@@ -615,6 +853,10 @@ export function useAiAssistant() {
     newConversation,
     modelSwitchNeedsConfirmation,
     selectModel,
+    selectVisionModel,
+    stageImages,
+    removeStagedImage,
+    retainImageComposer,
     refreshConversations,
     openConversation,
     restoreLatestConversation,

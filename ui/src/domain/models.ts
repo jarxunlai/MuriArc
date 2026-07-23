@@ -704,12 +704,33 @@ export interface AiAssistantTrace {
     trimmedHistoryTurns: number
     trimReasons: string[]
   }
+  stages?: AiModelStageTrace[]
+  imageEvidence?: AiImageEvidence[]
+}
+
+export interface AiModelStageTrace {
+  profileId: string
+  profileVersion: number
+  purpose: 'vision_and_final' | 'vision_observation' | 'final_answer'
+  modelId?: string
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  providerRequestId?: string
+}
+
+export interface AiImageEvidence {
+  imageId: string
+  sha256: string
+  displayOrder: number
 }
 
 export interface AiTurnInput {
   conversationId?: string
   projectId?: string
   message: string
+  imageIds?: string[]
+  visionModelProfileId?: string
 }
 
 export interface StartAiConversationInput {
@@ -801,6 +822,11 @@ export interface AiMessage {
   role: 'user' | 'assistant'
   content: string
   createdAt: string
+  images?: Array<{
+    id: string
+    fileName: string
+    previewHref: string
+  }>
   citations?: AiCitation[]
   toolRuns?: AiToolRun[]
   drafts?: AiWriteDraft[]

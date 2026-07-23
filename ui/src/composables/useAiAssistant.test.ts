@@ -20,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   getAiAutonomy: vi.fn(),
   setAiAutonomy: vi.fn(),
   aiTurn: vi.fn(),
+  uploadPrivateImage: vi.fn(),
   decideAiDraft: vi.fn(),
 }))
 
@@ -137,6 +138,28 @@ const conversationDetail = (): AiConversationDetail => ({
   ],
 })
 
+const privateImage = (
+  id = 'image-1',
+  conversationId = 'conversation-1',
+  previewHref = '/api/v1/ai/images/image-1/content?preview=true',
+) => ({
+  image: {
+    id,
+    conversation_id: conversationId,
+    project_id: 'project-1',
+    status: 'active',
+    expires_at: '2026-08-18T01:00:00Z',
+    meta: { revision: 1 },
+  },
+  fileName: 'evidence.png',
+  mediaType: 'image/png',
+  sizeBytes: 4,
+  sha256: 'abc123',
+  contentHref: `/api/v1/ai/images/${id}/content`,
+  previewHref,
+  retentionDays: 30,
+})
+
 describe('useAiAssistant', () => {
   let ai: ReturnType<typeof useAiAssistant>
 
@@ -163,6 +186,7 @@ describe('useAiAssistant', () => {
     mocks.setAiAutonomy.mockImplementation(async (_id, input) =>
       autonomy(input.mode, input.mode))
     mocks.aiTurn.mockResolvedValue(turnResponse())
+    mocks.uploadPrivateImage.mockResolvedValue(privateImage())
     ai = useAiAssistant()
     ai.selectedProjectId.value = 'project-1'
     ai.pendingDrafts.value = []
@@ -185,11 +209,13 @@ describe('useAiAssistant', () => {
       conversationId: 'conversation-1',
       projectId: 'project-1',
       message: '总结实验进度',
+      imageIds: [],
     })
     expect(mocks.aiTurn).toHaveBeenNthCalledWith(2, {
       conversationId: 'conversation-1',
       projectId: 'project-1',
       message: '哪些动物缺少体重？',
+      imageIds: [],
     })
     expect(ai.messages.value.at(-1)).toEqual(expect.objectContaining({
       role: 'assistant', content: '查询完成',
@@ -219,6 +245,148 @@ describe('useAiAssistant', () => {
       role: 'assistant', error: true, content: '请先启用 AI 并配置所需密钥',
     }))
     expect(mocks.startAiConversation).toHaveBeenCalledOnce()
+  })
+
+  it('does not silently choose the first vision model when no default exists', async () => {
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile(),
+      modelProfile('vision-1', {
+        name: '视觉模型',
+        supportsVision: true,
+        isDefaultConversation: false,
+      }),
+    ])
+    mocks.getAiModelDefaults.mockResolvedValue({
+      defaultConversationProfileId: 'profile-1',
+      revision: 2,
+    })
+    await ai.loadModels(true)
+    ai.stageImages([new File(['data'], 'evidence.png', { type: 'image/png' })])
+
+    expect(ai.selectedVisionModelProfileId.value).toBeUndefined()
+    expect(ai.composerDisabledReason.value).toContain('明确选择')
+    await expect(ai.send('分析图片', { fullConfirmed: true })).rejects.toThrow('明确选择')
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.uploadPrivateImage).not.toHaveBeenCalled()
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
+    releaseComposer()
+  })
+
+  it('preserves the prompt and staged images when the provider call fails', async () => {
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { supportsVision: true }),
+      modelProfile('profile-2'),
+    ])
+    await ai.loadModels(true)
+    ai.composerDraft.value = '从图片读取体重'
+    ai.stageImages([new File(['data'], 'evidence.png', { type: 'image/png' })])
+    mocks.aiTurn.mockRejectedValueOnce(new Error('视觉 Provider 暂时不可用'))
+
+    await ai.send(ai.composerDraft.value, { fullConfirmed: true })
+
+    expect(ai.composerDraft.value).toBe('从图片读取体重')
+    expect(ai.stagedImages.value).toHaveLength(1)
+    expect(ai.stagedImages.value[0]).toEqual(expect.objectContaining({
+      status: 'ready',
+      uploaded: expect.objectContaining({ image: expect.objectContaining({ id: 'image-1' }) }),
+    }))
+    expect(ai.messages.value.at(-1)).toEqual(expect.objectContaining({
+      error: true,
+      content: '视觉 Provider 暂时不可用',
+    }))
+    releaseComposer()
+  })
+
+  it('keeps staged files but clears their conversation upload binding after a confirmed model switch', async () => {
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { supportsVision: true }),
+      modelProfile('profile-2', { supportsVision: true }),
+    ])
+    await ai.loadModels(true)
+    ai.composerDraft.value = '保留这段未发送输入'
+    ai.stageImages([new File(['data'], 'evidence.png', { type: 'image/png' })])
+    mocks.aiTurn.mockRejectedValueOnce(new Error('请求失败'))
+    await ai.send('先尝试一次', { fullConfirmed: true })
+
+    expect(ai.selectModel('profile-2')).toBe(false)
+    expect(ai.selectModel('profile-2', true)).toBe(true)
+    expect(ai.conversationId.value).toBeUndefined()
+    expect(ai.composerDraft.value).toBe('保留这段未发送输入')
+    expect(ai.stagedImages.value).toEqual([
+      expect.objectContaining({ status: 'staged', uploaded: undefined }),
+    ])
+    releaseComposer()
+  })
+
+  it('rejects image formats outside the common provider protocol set', () => {
+    expect(() => ai.stageImages([
+      new File(['bitmap'], 'legacy.bmp', { type: 'image/bmp' }),
+    ])).toThrow('JPEG、PNG、WebP 或 GIF')
+    expect(ai.stagedImages.value).toHaveLength(0)
+    expect(mocks.uploadPrivateImage).not.toHaveBeenCalled()
+  })
+
+  it('rejects chat images above 10 MiB before upload or Provider work', async () => {
+    const oversized = new File(['x'], 'oversized.png', { type: 'image/png' })
+    Object.defineProperty(oversized, 'size', { value: 10 * 1024 * 1024 + 1 })
+
+    expect(() => ai.stageImages([oversized])).toThrow('10 MiB')
+    expect(ai.stagedImages.value).toHaveLength(0)
+    expect(mocks.uploadPrivateImage).not.toHaveBeenCalled()
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
+  })
+
+  it('revokes the local preview immediately when a successful upload has a private preview URL', async () => {
+    const createPreview = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:success-preview')
+    const revokePreview = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { supportsVision: true }),
+    ])
+    await ai.loadModels(true)
+    ai.stageImages([new File(['data'], 'evidence.png', { type: 'image/png' })])
+
+    await ai.send('分析图片', { fullConfirmed: true })
+
+    expect(createPreview).toHaveBeenCalledOnce()
+    expect(revokePreview).toHaveBeenCalledWith('blob:success-preview')
+    expect(ai.stagedImages.value).toHaveLength(0)
+    expect(ai.messages.value.find((message) => message.role === 'user')?.images?.[0]?.previewHref)
+      .toBe('/api/v1/ai/images/image-1/content?preview=true')
+    releaseComposer()
+    createPreview.mockRestore()
+    revokePreview.mockRestore()
+  })
+
+  it('releases fallback message previews on conversation switch and staged previews on final unmount', async () => {
+    const createPreview = vi.spyOn(URL, 'createObjectURL')
+      .mockReturnValueOnce('blob:fallback-message')
+      .mockReturnValueOnce('blob:still-staged')
+    const revokePreview = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { supportsVision: true }),
+      modelProfile('profile-2', { supportsVision: true }),
+    ])
+    mocks.uploadPrivateImage.mockResolvedValueOnce(privateImage('image-1', 'conversation-1', ''))
+    await ai.loadModels(true)
+    ai.stageImages([new File(['data'], 'first.png', { type: 'image/png' })])
+    await ai.send('分析第一张', { fullConfirmed: true })
+
+    expect(revokePreview).not.toHaveBeenCalledWith('blob:fallback-message')
+    expect(ai.selectModel('profile-2', true)).toBe(true)
+    expect(revokePreview).toHaveBeenCalledWith('blob:fallback-message')
+
+    ai.stageImages([new File(['next'], 'second.png', { type: 'image/png' })])
+    releaseComposer()
+    expect(revokePreview).toHaveBeenCalledWith('blob:still-staged')
+    expect(ai.stagedImages.value).toHaveLength(0)
+    createPreview.mockRestore()
+    revokePreview.mockRestore()
   })
 
   it('requires an explicit selection when the saved default is unavailable', async () => {

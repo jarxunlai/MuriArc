@@ -15,6 +15,7 @@ pub mod query;
 pub mod scopes;
 pub mod store_executor;
 pub mod transport;
+pub mod vision;
 pub mod workflow;
 
 pub use approval::{
@@ -51,8 +52,17 @@ pub use store_executor::{StoreDomainToolExecutor, StoreToolAccessContext};
 pub use transport::{
     AiAutonomyUpdateRequest, AiAutonomyView, AiConversationReadOnlyReason,
     AssistantConversationDetail, AssistantConversationMessage, AssistantConversationStartRequest,
-    AssistantConversationStartResponse, AssistantConversationSummary, AssistantTrace,
-    AssistantTurnRequest, AssistantTurnResponse, DraftDecisionRequest, WriteDraftSummary,
+    AssistantConversationStartResponse, AssistantConversationSummary, AssistantImageEvidence,
+    AssistantModelCallPurpose, AssistantModelCallTrace, AssistantTrace, AssistantTurnRequest,
+    AssistantTurnResponse, DraftDecisionRequest, WriteDraftSummary,
+};
+pub use vision::{
+    DataCellVisionCandidate, DataCellVisionExtraction, DataCellVisionExtractionError,
+    DataCellVisionExtractionRequest, MAX_SANITIZED_VISION_INPUT_BYTES, SanitizedVisionInput,
+    VisionInputSanitizationError, extract_data_cell_vision, sanitize_vision_input,
 };
 
-pub use workflow::{AiExecutionContext, AiWorkflowError, AiWorkflowService, DraftDecisionResponse};
+pub use workflow::{
+    AiExecutionContext, AiWorkflowError, AiWorkflowService, AssistantTurnMedia,
+    AssistantVisionObservation, DraftDecisionResponse, PreparedAssistantImage,
+};

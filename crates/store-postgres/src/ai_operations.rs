@@ -121,6 +121,18 @@ fn autonomy_grant_from_row(row: &PgRow) -> StoreResult<AiAutonomyGrant> {
 }
 
 fn validate_autonomy_grant(value: &AiAutonomyGrant) -> StoreResult<()> {
+    let mode_metadata_is_valid = match value.mode {
+        muriarc_core::AiAutonomyMode::Full => {
+            value.session_id.is_some_and(|id| !id.is_nil())
+                && value.step_up_verified_at.is_some()
+                && value.expires_at.is_some()
+        }
+        muriarc_core::AiAutonomyMode::Ask | muriarc_core::AiAutonomyMode::Auto => {
+            value.session_id.is_none()
+                && value.step_up_verified_at.is_none()
+                && value.expires_at.is_none()
+        }
+    };
     if value.id.is_nil()
         || value.conversation_id.is_nil()
         || value.lab_id.is_nil()
@@ -128,7 +140,7 @@ fn validate_autonomy_grant(value: &AiAutonomyGrant) -> StoreResult<()> {
         || value.allowed_categories.is_empty()
         || value.batch_limit != value.mode.batch_limit()
         || value.batch_limit > 100
-        || (value.mode == muriarc_core::AiAutonomyMode::Full && value.expires_at.is_none())
+        || !mode_metadata_is_valid
     {
         return Err(StoreError::Validation(
             "invalid AI autonomy grant".to_owned(),
@@ -138,7 +150,11 @@ fn validate_autonomy_grant(value: &AiAutonomyGrant) -> StoreResult<()> {
 }
 
 fn validate_conversation(value: &AiConversation) -> StoreResult<()> {
-    if value.title.trim().is_empty()
+    if value.id.is_nil()
+        || value.lab_id.is_nil()
+        || value.user_id.is_nil()
+        || value.project_id.is_some_and(|id| id.is_nil())
+        || value.title.trim().is_empty()
         || value.title.chars().count() > 256
         || value
             .model_profile
@@ -150,6 +166,141 @@ fn validate_conversation(value: &AiConversation) -> StoreResult<()> {
                 .to_owned(),
         ));
     }
+    Ok(())
+}
+
+fn validate_initial_conversation_autonomy(
+    conversation: &AiConversation,
+    grant: &AiAutonomyGrant,
+    audit: &AuditContext,
+) -> StoreResult<()> {
+    validate_conversation(conversation)?;
+    validate_autonomy_grant(grant)?;
+    if conversation.meta.revision != 1
+        || conversation.meta.deleted_at.is_some()
+        || grant.meta.revision != 1
+        || grant.meta.deleted_at.is_some()
+        || grant.revoked_at.is_some()
+        || grant.conversation_id != conversation.id
+        || grant.lab_id != conversation.lab_id
+        || grant.project_id != conversation.project_id
+        || grant.user_id != conversation.user_id
+    {
+        return Err(StoreError::Validation(
+            "initial AI autonomy grant must match its new conversation scope and owner".to_owned(),
+        ));
+    }
+    if audit.actor.user_id != Some(conversation.user_id) {
+        return Err(StoreError::Validation(
+            "AI conversation audit actor must match its owner".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_conversation_references(
+    tx: &mut PgTransaction<'_>,
+    conversation: &AiConversation,
+) -> StoreResult<()> {
+    if let Some(project_id) = conversation.project_id {
+        let project_lab: Uuid = sqlx::query_scalar(
+            "SELECT lab_id FROM projects WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
+        )
+        .bind(project_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "project",
+            id: project_id,
+        })?;
+        if project_lab != conversation.lab_id {
+            return Err(StoreError::Validation(
+                "AI conversation project belongs to another lab".to_owned(),
+            ));
+        }
+    }
+    let binding = conversation.model_profile.ok_or_else(|| {
+        StoreError::Validation(
+            "new AI conversations require an immutable model profile binding".to_owned(),
+        )
+    })?;
+    let owner: Option<(Uuid, Uuid, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT p.lab_id, p.user_id, p.archived_at
+         FROM ai_model_profiles p
+         JOIN ai_model_profile_versions v
+           ON v.profile_id = p.id AND v.version = $1
+         WHERE p.id = $2 AND p.deleted_at IS NULL
+         FOR SHARE OF p",
+    )
+    .bind(binding.profile_version)
+    .bind(binding.profile_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    let Some((lab_id, user_id, archived_at)) = owner else {
+        return Err(StoreError::Validation(
+            "AI conversation model profile version does not exist".to_owned(),
+        ));
+    };
+    if lab_id != conversation.lab_id || user_id != conversation.user_id || archived_at.is_some() {
+        return Err(StoreError::Validation(
+            "AI conversation model profile is unavailable to this user".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn insert_conversation(
+    tx: &mut PgTransaction<'_>,
+    conversation: &AiConversation,
+) -> StoreResult<()> {
+    sqlx::query("INSERT INTO ai_conversations (id, lab_id, project_id, user_id, title, model_profile_id, model_profile_version, legacy_read_only, created_at, updated_at, deleted_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
+        .bind(conversation.id)
+        .bind(conversation.lab_id)
+        .bind(conversation.project_id)
+        .bind(conversation.user_id)
+        .bind(&conversation.title)
+        .bind(conversation.model_profile.map(|binding| binding.profile_id))
+        .bind(conversation.model_profile.map(|binding| binding.profile_version))
+        .bind(conversation.legacy_read_only)
+        .bind(conversation.meta.created_at)
+        .bind(conversation.meta.updated_at)
+        .bind(conversation.meta.deleted_at)
+        .bind(conversation.meta.revision)
+        .execute(&mut **tx)
+        .await
+        .map_err(map_sqlx)?;
+    Ok(())
+}
+
+async fn insert_autonomy_grant(
+    tx: &mut PgTransaction<'_>,
+    grant: &AiAutonomyGrant,
+) -> StoreResult<()> {
+    let categories = serde_json::to_value(&grant.allowed_categories)
+        .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    sqlx::query("INSERT INTO ai_autonomy_grants (id, conversation_id, lab_id, project_id, user_id, session_id, mode, allowed_categories_json, batch_limit, step_up_verified_at, last_used_at, expires_at, revoked_at, created_at, updated_at, deleted_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)")
+        .bind(grant.id)
+        .bind(grant.conversation_id)
+        .bind(grant.lab_id)
+        .bind(grant.project_id)
+        .bind(grant.user_id)
+        .bind(grant.session_id)
+        .bind(encode(&grant.mode)?)
+        .bind(categories)
+        .bind(grant.batch_limit as i32)
+        .bind(grant.step_up_verified_at)
+        .bind(grant.last_used_at)
+        .bind(grant.expires_at)
+        .bind(grant.revoked_at)
+        .bind(grant.meta.created_at)
+        .bind(grant.meta.updated_at)
+        .bind(grant.meta.deleted_at)
+        .bind(grant.meta.revision)
+        .execute(&mut **tx)
+        .await
+        .map_err(map_sqlx)?;
     Ok(())
 }
 
@@ -367,56 +518,8 @@ impl AiOperationStore for PostgresStore {
     ) -> StoreResult<()> {
         validate_conversation(value)?;
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        if let Some(project_id) = value.project_id {
-            let project_lab: Uuid = sqlx::query_scalar(
-                "SELECT lab_id FROM projects WHERE id = $1 AND deleted_at IS NULL",
-            )
-            .bind(project_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(map_sqlx)?
-            .ok_or(StoreError::NotFound {
-                entity: "project",
-                id: project_id,
-            })?;
-            if project_lab != value.lab_id {
-                return Err(StoreError::Validation(
-                    "AI conversation project belongs to another lab".to_owned(),
-                ));
-            }
-        }
-        if let Some(binding) = value.model_profile {
-            let owner: Option<(Uuid, Uuid, Option<chrono::DateTime<chrono::Utc>>)> =
-                sqlx::query_as(
-                    "SELECT p.lab_id, p.user_id, p.archived_at
-                     FROM ai_model_profiles p
-                     JOIN ai_model_profile_versions v
-                       ON v.profile_id = p.id AND v.version = $1
-                     WHERE p.id = $2 AND p.deleted_at IS NULL",
-                )
-                .bind(binding.profile_version)
-                .bind(binding.profile_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(map_sqlx)?;
-            let Some((lab_id, user_id, archived_at)) = owner else {
-                return Err(StoreError::Validation(
-                    "AI conversation model profile version does not exist".to_owned(),
-                ));
-            };
-            if lab_id != value.lab_id || user_id != value.user_id || archived_at.is_some() {
-                return Err(StoreError::Validation(
-                    "AI conversation model profile is unavailable to this user".to_owned(),
-                ));
-            }
-        }
-        sqlx::query("INSERT INTO ai_conversations (id, lab_id, project_id, user_id, title, model_profile_id, model_profile_version, legacy_read_only, created_at, updated_at, deleted_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
-            .bind(value.id).bind(value.lab_id).bind(value.project_id).bind(value.user_id).bind(&value.title)
-            .bind(value.model_profile.map(|binding| binding.profile_id))
-            .bind(value.model_profile.map(|binding| binding.profile_version))
-            .bind(value.legacy_read_only)
-            .bind(value.meta.created_at).bind(value.meta.updated_at).bind(value.meta.deleted_at).bind(value.meta.revision)
-            .execute(&mut *tx).await.map_err(map_sqlx)?;
+        validate_conversation_references(&mut tx, value).await?;
+        insert_conversation(&mut tx, value).await?;
         write_audit(
             &mut tx,
             value.lab_id,
@@ -427,6 +530,44 @@ impl AiOperationStore for PostgresStore {
             audit,
             None,
             Some(snapshot(value)?),
+        )
+        .await?;
+        tx.commit().await.map_err(map_sqlx)
+    }
+
+    async fn create_ai_conversation_with_autonomy(
+        &self,
+        conversation: &AiConversation,
+        grant: &AiAutonomyGrant,
+        audit: &AuditContext,
+    ) -> StoreResult<()> {
+        validate_initial_conversation_autonomy(conversation, grant, audit)?;
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        validate_conversation_references(&mut tx, conversation).await?;
+        insert_conversation(&mut tx, conversation).await?;
+        insert_autonomy_grant(&mut tx, grant).await?;
+        write_audit(
+            &mut tx,
+            conversation.lab_id,
+            conversation.project_id,
+            EntityType::AiConversation,
+            conversation.id,
+            AuditAction::Create,
+            audit,
+            None,
+            Some(snapshot(conversation)?),
+        )
+        .await?;
+        write_audit(
+            &mut tx,
+            grant.lab_id,
+            grant.project_id,
+            EntityType::AiAutonomyGrant,
+            grant.id,
+            AuditAction::Create,
+            audit,
+            None,
+            Some(snapshot(grant)?),
         )
         .await?;
         tx.commit().await.map_err(map_sqlx)
@@ -649,12 +790,7 @@ impl AiOperationStore for PostgresStore {
                 ));
             }
         } else {
-            sqlx::query("INSERT INTO ai_autonomy_grants (id, conversation_id, lab_id, project_id, user_id, session_id, mode, allowed_categories_json, batch_limit, step_up_verified_at, last_used_at, expires_at, revoked_at, created_at, updated_at, deleted_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)")
-                .bind(grant.id).bind(grant.conversation_id).bind(grant.lab_id).bind(grant.project_id).bind(grant.user_id)
-                .bind(grant.session_id).bind(encode(&grant.mode)?).bind(categories).bind(grant.batch_limit as i32)
-                .bind(grant.step_up_verified_at).bind(grant.last_used_at).bind(grant.expires_at).bind(grant.revoked_at)
-                .bind(grant.meta.created_at).bind(grant.meta.updated_at).bind(grant.meta.deleted_at).bind(grant.meta.revision)
-                .execute(&mut *tx).await.map_err(map_sqlx)?;
+            insert_autonomy_grant(&mut tx, grant).await?;
         }
         write_audit(
             &mut tx,

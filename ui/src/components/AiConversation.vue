@@ -2,12 +2,14 @@
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import {
+  AlertTriangle,
   Bot,
   Check,
   ChevronDown,
   CornerDownLeft,
   Database,
   FileSignature,
+  Layers3,
   ShieldCheck,
   UserRound,
   X,
@@ -18,7 +20,6 @@ import { useAiAssistant } from '@/composables/useAiAssistant'
 const props = withDefaults(defineProps<{ compact?: boolean }>(), { compact: false })
 const ai = useAiAssistant()
 const toast = useMessage()
-const prompt = ref('')
 const scrollArea = ref<HTMLElement | null>(null)
 const statements = reactive<Record<string, string>>({})
 const signed = reactive<Record<string, boolean>>({})
@@ -27,20 +28,29 @@ const currentPasswords = reactive<Record<string, string>>({})
 const autonomyModalOpen = ref(false)
 const autonomyPassword = ref('')
 const autonomyDeclared = ref(false)
-const modeOptions = computed(() => {
-  const rank: Record<AiAutonomyMode, number> = { ask: 0, auto: 1, full: 2 }
-  const max = ai.autonomy.value.maxMode
-  return [
-    { label: 'Ask', value: 'ask' as const, disabled: rank.ask > rank[max] },
-    { label: 'Auto', value: 'auto' as const, disabled: rank.auto > rank[max] },
-    { label: 'Full', value: 'full' as const, disabled: rank.full > rank[max] },
-  ]
-})
+const autonomyModalPurpose = ref<'start' | 'update'>('update')
+const pendingSendValue = ref('')
+const modelSwitchModalOpen = ref(false)
+const pendingModelProfileId = ref('')
+const modeOptions = [
+  { label: 'Ask', value: 'ask' as const },
+  { label: 'Auto', value: 'auto' as const },
+  { label: 'Full', value: 'full' as const },
+]
 const autonomyDescription = computed(() => ({
   ask: '查询自动执行；创建导出等产物前需要你确认。',
   auto: `查询和普通产物可自动执行；普通批量上限 ${ai.autonomy.value.batchLimit} 条。`,
   full: `当前会话内扩大普通操作授权，批量上限 ${ai.autonomy.value.batchLimit} 条；30 分钟无活动自动降级。`,
-})[ai.autonomy.value.effectiveMode])
+})[ai.conversationId.value ? ai.autonomy.value.effectiveMode : ai.requestedMode.value])
+const modeLabels: Record<AiAutonomyMode, string> = {
+  ask: 'Ask',
+  auto: 'Auto',
+  full: 'Full',
+}
+const requestedModeLabel = computed(() =>
+  `${modeLabels[ai.requestedMode.value]}${ai.fullActivationRequired.value ? '（待启用）' : ''}`)
+const effectiveModeLabel = computed(() =>
+  ai.conversationId.value ? modeLabels[ai.autonomy.value.effectiveMode] : '尚未开始')
 const suggestions = computed(() => props.compact
   ? ['这个页面有哪些异常？', '哪些数据还没记录？']
   : ['总结进行中的实验', '找出待确认的基因型', '哪些动物缺少近期体重？'])
@@ -49,7 +59,7 @@ const visibleDrafts = computed(() => {
   for (const message of ai.messages.value) {
     for (const draft of message.drafts ?? []) drafts.set(draft.id, draft)
   }
-  for (const draft of ai.pendingDrafts.value) drafts.set(draft.id, draft)
+  for (const draft of ai.conversationDrafts.value) drafts.set(draft.id, draft)
   return [...drafts.values()]
 })
 
@@ -67,9 +77,37 @@ const statusLabels: Record<AiWriteDraft['status'], string> = {
   expired: '已过期',
 }
 
-async function send(value = prompt.value) {
-  prompt.value = ''
-  await ai.send(value)
+function openFullModal(purpose: 'start' | 'update', value = '') {
+  autonomyModalPurpose.value = purpose
+  pendingSendValue.value = value
+  autonomyPassword.value = ''
+  autonomyDeclared.value = false
+  autonomyModalOpen.value = true
+}
+
+function closeFullModal() {
+  autonomyModalOpen.value = false
+  autonomyPassword.value = ''
+  autonomyDeclared.value = false
+  pendingSendValue.value = ''
+}
+
+async function send(value = ai.composerDraft.value) {
+  const normalized = value.trim()
+  if (!normalized || ai.busy.value) return
+  if (ai.composerDisabledReason.value) {
+    toast.error(ai.composerDisabledReason.value)
+    return
+  }
+  if (ai.fullActivationRequired.value) {
+    openFullModal('start', normalized)
+    return
+  }
+  try {
+    await ai.send(normalized)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法开始 AI 会话')
+  }
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -129,15 +167,17 @@ async function decide(draft: AiWriteDraft, decision: 'approve' | 'reject') {
 }
 
 async function selectAutonomy(mode: AiAutonomyMode) {
-  if (mode === ai.autonomy.value.mode) return
+  if (mode === ai.requestedMode.value) return
+  if (!ai.conversationId.value) {
+    await ai.requestMode(mode)
+    return
+  }
   if (mode === 'full') {
-    autonomyPassword.value = ''
-    autonomyDeclared.value = false
-    autonomyModalOpen.value = true
+    openFullModal('update')
     return
   }
   try {
-    await ai.updateAutonomy(mode)
+    await ai.requestMode(mode)
     toast.success(`当前会话已切换到 ${mode === 'ask' ? 'Ask' : 'Auto'} 模式`)
   } catch (error) {
     toast.error(error instanceof Error ? error.message : '无法更新 AI 授权')
@@ -147,15 +187,53 @@ async function selectAutonomy(mode: AiAutonomyMode) {
 async function applyFullAutonomy() {
   if (!autonomyDeclared.value) return
   try {
-    await ai.updateAutonomy('full', {
-      currentPassword: autonomyPassword.value || undefined,
-      declared: autonomyDeclared.value,
-    })
-    autonomyModalOpen.value = false
-    autonomyPassword.value = ''
-    toast.success('当前会话已启用 Full 模式，30 分钟无活动后自动降级')
+    if (autonomyModalPurpose.value === 'start') {
+      await ai.send(pendingSendValue.value, {
+        fullConfirmed: true,
+        currentPassword: autonomyPassword.value || undefined,
+      })
+      closeFullModal()
+      toast.success('新会话已按 Full 请求启动；实际模式以会话状态为准')
+    } else {
+      await ai.updateAutonomy('full', {
+        currentPassword: autonomyPassword.value || undefined,
+      })
+      closeFullModal()
+      toast.success('已请求 Full 模式；实际执行模式以会话状态为准')
+    }
   } catch (error) {
     toast.error(error instanceof Error ? error.message : '无法启用 Full 模式')
+  } finally {
+    autonomyPassword.value = ''
+  }
+}
+
+function selectModel(profileId: string) {
+  if (profileId === ai.selectedModelProfileId.value) return
+  if (ai.modelSwitchNeedsConfirmation(profileId)) {
+    pendingModelProfileId.value = profileId
+    modelSwitchModalOpen.value = true
+    return
+  }
+  try {
+    ai.selectModel(profileId)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法切换模型')
+  }
+}
+
+function cancelModelSwitch() {
+  pendingModelProfileId.value = ''
+  modelSwitchModalOpen.value = false
+}
+
+function confirmModelSwitch() {
+  try {
+    ai.selectModel(pendingModelProfileId.value, true)
+    cancelModelSwitch()
+    toast.success('已创建新的空会话，项目范围和未发送输入已保留')
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法切换模型')
   }
 }
 
@@ -169,21 +247,46 @@ watch(() => ai.messages.value.length, async () => {
   <section class="ai-conversation" :class="{ compact }">
     <div ref="scrollArea" class="message-list" aria-live="polite">
       <div class="context-strip">
-        <Database :size="14" />
-        <span>当前上下文：<strong>{{ ai.contextTitle.value }}</strong></span>
-        <span class="scope-divider">·</span>
-        <span>{{ ai.selectedProject.value?.name ?? '跨项目只读' }}</span>
-        <span class="scope-divider">·</span>
-        <n-select
-          class="autonomy-select"
-          size="tiny"
-          :value="ai.autonomy.value.mode"
-          :options="modeOptions"
-          :loading="ai.autonomyBusy.value"
-          :disabled="!ai.conversationId.value"
-          aria-label="AI 会话授权模式"
-          @update:value="selectAutonomy"
-        />
+        <div class="context-scope">
+          <Database :size="14" />
+          <span>当前上下文：<strong>{{ ai.contextTitle.value }}</strong></span>
+          <span class="scope-divider">·</span>
+          <span>{{ ai.selectedProject.value?.name ?? '跨项目只读' }}</span>
+        </div>
+        <div class="conversation-controls">
+          <label class="control-field model-field">
+            <span><Layers3 :size="13" />模型</span>
+            <n-select
+              data-testid="conversation-model-select"
+              size="small"
+              :value="ai.selectedModelProfileId.value ?? null"
+              :options="ai.modelOptions.value"
+              :loading="ai.loadingModels.value"
+              :disabled="ai.busy.value"
+              placeholder="明确选择模型"
+              aria-label="AI 对话模型"
+              @update:value="selectModel"
+            />
+          </label>
+          <label class="control-field mode-field">
+            <span><ShieldCheck :size="13" />请求模式</span>
+            <n-select
+              data-testid="conversation-mode-select"
+              size="small"
+              :value="ai.requestedMode.value"
+              :options="modeOptions"
+              :loading="ai.autonomyBusy.value"
+              :disabled="ai.busy.value || Boolean(ai.conversationReadOnlyReason.value)"
+              aria-label="AI 会话请求模式"
+              @update:value="selectAutonomy"
+            />
+          </label>
+          <div class="mode-status" data-testid="conversation-mode-status" aria-label="请求模式与实际模式">
+            <span>请求 <strong>{{ requestedModeLabel }}</strong></span>
+            <span class="mode-arrow" aria-hidden="true">→</span>
+            <span>实际 <strong>{{ effectiveModeLabel }}</strong></span>
+          </div>
+        </div>
       </div>
       <article v-for="entry in ai.messages.value" :key="entry.id" class="message" :class="entry.role">
         <div class="avatar">
@@ -302,24 +405,63 @@ watch(() => ai.messages.value.length, async () => {
 
     <div class="composer">
       <div class="suggestions">
-        <button v-for="item in suggestions" :key="item" type="button" @click="send(item)">{{ item }}</button>
+        <button
+          v-for="item in suggestions"
+          :key="item"
+          type="button"
+          :disabled="ai.busy.value || Boolean(ai.composerDisabledReason.value)"
+          @click="send(item)"
+        >{{ item }}</button>
+      </div>
+      <div
+        v-if="ai.composerDisabledReason.value"
+        class="composer-blocked"
+        role="status"
+        data-testid="composer-disabled-reason"
+      >
+        <AlertTriangle :size="15" />
+        <span>{{ ai.composerDisabledReason.value }}</span>
       </div>
       <div class="input-wrap">
-        <textarea v-model="prompt" rows="2" placeholder="询问动物、实验或数据…" :disabled="ai.busy.value" @keydown="onKeydown" />
-        <n-button type="primary" circle :disabled="!prompt.trim() || ai.busy.value" aria-label="发送" @click="send()">
+        <textarea
+          v-model="ai.composerDraft.value"
+          data-testid="ai-composer-input"
+          rows="2"
+          placeholder="询问动物、实验或数据…"
+          :disabled="ai.busy.value || Boolean(ai.composerDisabledReason.value)"
+          @keydown="onKeydown"
+        />
+        <n-button
+          type="primary"
+          circle
+          :disabled="!ai.composerDraft.value.trim() || ai.busy.value || Boolean(ai.composerDisabledReason.value)"
+          aria-label="发送"
+          data-testid="ai-composer-send"
+          @click="send()"
+        >
           <template #icon><CornerDownLeft :size="17" /></template>
         </n-button>
       </div>
       <div class="safety-note"><ShieldCheck :size="13" /> {{ autonomyDescription }} 科研签署和高风险操作始终由人工确认。</div>
     </div>
 
-    <n-modal v-model:show="autonomyModalOpen" preset="card" title="启用当前会话的 Full 模式" class="autonomy-modal">
+    <n-modal
+      v-model:show="autonomyModalOpen"
+      preset="card"
+      :title="autonomyModalPurpose === 'start' ? '以 Full 请求开始新会话' : '请求当前会话的 Full 模式'"
+      class="autonomy-modal"
+      @after-leave="closeFullModal"
+    >
       <n-alert type="warning" :bordered="false">
         Full 不是新角色，也不会扩大你的项目权限。动物转移/死亡、删除与批量导入、科研签署、繁育事实、账号权限和日志清理仍无法自动执行。
       </n-alert>
       <div class="autonomy-boundary-list">
         <span>仅当前会话</span><span>30 分钟无活动降级</span><span>普通批量最多 100 条</span>
       </div>
+      <p v-if="!ai.reinforcedPasswordRequired.value" class="native-confirmation-note">
+        <ShieldCheck :size="14" />
+        桌面端还会在原生边界确认本次启动声明；取消或验证失败时不会调用模型。
+      </p>
       <n-input
         v-if="ai.reinforcedPasswordRequired.value"
         v-model:value="autonomyPassword"
@@ -327,20 +469,51 @@ watch(() => ai.messages.value.length, async () => {
         show-password-on="click"
         autocomplete="current-password"
         maxlength="1024"
+        data-testid="full-start-password"
         placeholder="输入当前登录密码完成身份确认"
       />
-      <n-checkbox v-model:checked="autonomyDeclared">
+      <n-checkbox v-model:checked="autonomyDeclared" data-testid="full-start-declaration">
         我理解 Full 仅是当前会话的受限委托，不会绕过人工审批和签署
       </n-checkbox>
       <template #footer>
         <div class="modal-actions">
-          <n-button @click="autonomyModalOpen = false">取消</n-button>
+          <n-button
+            data-testid="cancel-full-start"
+            :disabled="ai.autonomyBusy.value || ai.startingConversation.value"
+            @click="closeFullModal"
+          >取消</n-button>
           <n-button
             type="primary"
-            :loading="ai.autonomyBusy.value"
+            :loading="ai.autonomyBusy.value || ai.startingConversation.value"
             :disabled="!autonomyDeclared || (ai.reinforcedPasswordRequired.value && !autonomyPassword)"
+            data-testid="confirm-full-start"
             @click="applyFullAutonomy"
           >确认启用</n-button>
+        </div>
+      </template>
+    </n-modal>
+
+    <n-modal
+      v-model:show="modelSwitchModalOpen"
+      preset="card"
+      title="使用所选模型开始新会话？"
+      class="autonomy-modal"
+      @after-leave="cancelModelSwitch"
+    >
+      <n-alert type="warning" :bordered="false">
+        当前会话已有持久消息，模型绑定不能修改。确认后会创建新的空会话。
+      </n-alert>
+      <ul class="switch-boundaries">
+        <li>保留当前科研项目范围</li>
+        <li>保留尚未发送的输入</li>
+        <li>不继承消息、工具结果、当前会话草稿或 Full 授权</li>
+      </ul>
+      <template #footer>
+        <div class="modal-actions">
+          <n-button data-testid="cancel-model-switch" @click="cancelModelSwitch">取消</n-button>
+          <n-button type="primary" data-testid="confirm-model-switch" @click="confirmModelSwitch">
+            开始新会话
+          </n-button>
         </div>
       </template>
     </n-modal>
@@ -350,7 +523,10 @@ watch(() => ai.messages.value.length, async () => {
 <style scoped>
 .ai-conversation { display: grid; grid-template-rows: minmax(0, 1fr) auto; min-height: 0; height: 100%; background: var(--muri-surface); }
 .message-list { overflow: auto; padding: 20px; }
-.context-strip { display: flex; align-items: center; gap: 6px; width: fit-content; margin: 0 auto 20px; padding: 6px 10px; border: 1px solid var(--muri-border); border-radius: 999px; color: var(--muri-text-secondary); background: var(--muri-surface-muted); font-size: 12px; }.scope-divider { color: var(--muri-border-strong); }.autonomy-select { width: 82px; }
+.context-strip { display: flex; width: min(100%, 760px); min-width: 0; margin: 0 auto 20px; padding: 10px; flex-direction: column; gap: 9px; border: 1px solid var(--muri-border); border-radius: 10px; color: var(--muri-text-secondary); background: var(--muri-surface-muted); font-size: 12px; }
+.context-scope { display: flex; min-width: 0; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; }.context-scope > svg { flex: 0 0 auto; color: var(--muri-primary); }.scope-divider { color: var(--muri-border-strong); }
+.conversation-controls { display: grid; min-width: 0; grid-template-columns: minmax(180px, 1.5fr) minmax(112px, .65fr) auto; align-items: end; gap: 9px; }
+.control-field { display: grid; min-width: 0; gap: 4px; }.control-field > span { display: flex; align-items: center; gap: 4px; color: var(--muri-text-tertiary); font-size: 10px; font-weight: 600; }.control-field > span svg { color: var(--muri-primary); }.control-field :deep(.n-select) { min-width: 0; width: 100%; }.mode-status { display: flex; min-height: 34px; align-items: center; justify-content: center; flex-wrap: wrap; gap: 5px; padding: 5px 8px; border: 1px solid var(--muri-border); border-radius: 7px; background: white; color: var(--muri-text-secondary); font-size: 11px; }.mode-status strong { color: var(--muri-text); }.mode-arrow { color: var(--muri-primary); }
 .message { display: flex; align-items: flex-start; gap: 10px; max-width: 760px; margin: 0 auto 16px; }.message.user { flex-direction: row-reverse; }
 .avatar { display: grid; flex: 0 0 30px; width: 30px; height: 30px; place-items: center; border: 1px solid var(--muri-border); border-radius: 50%; color: var(--muri-primary); background: white; }.user .avatar { color: var(--muri-text-secondary); }
 .bubble { max-width: min(82%, 640px); padding: 10px 13px; border: 1px solid var(--muri-border); border-radius: 4px 12px 12px; background: var(--muri-surface-muted); line-height: 1.65; }.user .bubble { border-color: #c8deef; border-radius: 12px 4px 12px 12px; background: var(--muri-primary-soft); }.bubble.error { border-color: #efd0d0; color: var(--muri-danger); background: #fff7f7; }.bubble.pending { color: var(--muri-text-secondary); animation: soft-pulse 1.3s ease-in-out infinite; }.bubble p { margin: 0; white-space: pre-wrap; }
@@ -360,10 +536,15 @@ watch(() => ai.messages.value.length, async () => {
 .draft-card { margin-bottom: 10px; padding: 13px; border: 1px solid #c8deef; border-radius: 9px; background: #fbfdff; }.draft-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }.draft-card header > div { display: flex; flex-direction: column; }.draft-card header span { color: var(--muri-text-tertiary); font-size: 11px; }.diff-list { margin: 11px 0; border: 1px solid var(--muri-border); border-radius: 6px; overflow: hidden; }.diff-row { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(80px, 1fr) 18px minmax(80px, 1fr); gap: 6px; align-items: center; padding: 7px 9px; border-bottom: 1px solid var(--muri-border); font-size: 11px; }.diff-row:last-child { border-bottom: 0; }.diff-row code { overflow: hidden; color: var(--muri-text-secondary); text-overflow: ellipsis; }.diff-row .before { color: var(--muri-danger); text-decoration: line-through; }.diff-row .after { color: var(--muri-success); }.arrow { color: var(--muri-text-tertiary); text-align: center; }
 .signature-box { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }.draft-actions { display: flex; gap: 8px; margin-top: 10px; }
 .composer { padding: 12px 18px 16px; border-top: 1px solid var(--muri-border); background: white; }.suggestions { display: flex; gap: 7px; max-width: 760px; margin: 0 auto 8px; overflow-x: auto; scrollbar-width: none; }.suggestions button { flex: 0 0 auto; padding: 5px 9px; border: 1px solid var(--muri-border); border-radius: 999px; color: var(--muri-text-secondary); background: white; cursor: pointer; transition: border-color var(--muri-transition-fast), color var(--muri-transition-fast); }.suggestions button:hover { border-color: var(--muri-primary); color: var(--muri-primary); }
+.suggestions button:focus-visible { outline: 3px solid rgba(15, 95, 170, .2); outline-offset: 1px; }.suggestions button:disabled { color: var(--muri-text-tertiary); background: var(--muri-surface-muted); cursor: not-allowed; opacity: .7; }
+.composer-blocked { display: flex; max-width: 760px; min-width: 0; align-items: flex-start; gap: 6px; margin: 0 auto 8px; padding: 7px 9px; border: 1px solid #efd8b7; border-radius: 7px; color: #8a5515; background: #fffaf2; font-size: 11px; line-height: 1.45; }.composer-blocked svg { flex: 0 0 auto; margin-top: 1px; }
 .input-wrap { display: flex; align-items: flex-end; gap: 8px; max-width: 760px; margin: 0 auto; padding: 8px; border: 1px solid var(--muri-border-strong); border-radius: 10px; transition: border-color var(--muri-transition-fast), box-shadow var(--muri-transition-fast); }.input-wrap:focus-within { border-color: var(--muri-primary); box-shadow: 0 0 0 3px rgba(15, 95, 170, 0.1); }textarea { flex: 1; min-height: 42px; max-height: 130px; padding: 3px 5px; resize: none; border: 0; outline: 0; color: var(--muri-text); background: transparent; line-height: 1.5; }.safety-note { display: flex; align-items: center; justify-content: center; gap: 5px; margin-top: 7px; color: var(--muri-text-tertiary); font-size: 11px; }
 .compact .message-list { padding: 16px 14px; }.compact .composer { padding: 10px 12px 12px; }.compact .suggestions { max-width: 100%; }
 .autonomy-modal { width: min(520px, calc(100vw - 28px)); }.autonomy-boundary-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }.autonomy-boundary-list span { padding: 4px 8px; border-radius: 999px; color: var(--muri-primary); background: var(--muri-primary-soft); font-size: 12px; }.autonomy-modal :deep(.n-checkbox) { margin-top: 14px; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.native-confirmation-note { display: flex; align-items: flex-start; gap: 6px; margin: 0 0 2px; color: var(--muri-text-secondary); font-size: 12px; line-height: 1.5; }.native-confirmation-note svg { flex: 0 0 auto; margin-top: 2px; color: var(--muri-primary); }
+.switch-boundaries { display: grid; gap: 7px; margin: 14px 0 0; padding-left: 22px; color: var(--muri-text-secondary); line-height: 1.55; }
 @keyframes soft-pulse { 50% { opacity: 0.55; } }
-@media (max-width: 620px) { .context-strip { max-width: 100%; flex-wrap: wrap; justify-content: center; }.diff-row { grid-template-columns: 1fr 18px 1fr; }.diff-row code { grid-column: 1 / -1; }.draft-card { padding: 11px; } }
+@media (max-width: 700px) { .conversation-controls { grid-template-columns: minmax(0, 1fr) minmax(104px, .48fr); }.mode-status { grid-column: 1 / -1; }.diff-row { grid-template-columns: 1fr 18px 1fr; }.diff-row code { grid-column: 1 / -1; }.draft-card { padding: 11px; } }
+@media (max-width: 430px) { .message-list { padding: 14px 10px; }.context-strip { padding: 9px; }.conversation-controls { grid-template-columns: minmax(0, 1fr); }.mode-status { grid-column: auto; }.composer { padding-inline: 10px; }.safety-note { align-items: flex-start; text-align: center; }.bubble { max-width: calc(100% - 40px); overflow-wrap: anywhere; } }
 @media (prefers-reduced-motion: reduce) { .bubble.pending { animation: none; }.tool-trace summary svg { transition: none; } }
 </style>

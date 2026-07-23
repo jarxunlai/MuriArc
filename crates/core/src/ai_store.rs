@@ -136,6 +136,16 @@ pub trait AiOperationStore: Send + Sync {
         audit: &AuditContext,
     ) -> StoreResult<()>;
 
+    /// Atomically creates one writable, immutable-model-bound conversation
+    /// together with its initial conversation-scoped autonomy grant and both
+    /// redacted audit entries.
+    async fn create_ai_conversation_with_autonomy(
+        &self,
+        conversation: &AiConversation,
+        grant: &AiAutonomyGrant,
+        audit: &AuditContext,
+    ) -> StoreResult<()>;
+
     async fn get_ai_conversation(&self, id: Uuid) -> StoreResult<AiConversation>;
 
     async fn list_ai_conversations(

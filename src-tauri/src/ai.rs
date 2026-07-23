@@ -1,8 +1,12 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use muriarc_ai::{
     AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiExecutionContext, AiWorkflowError,
     AiWorkflowService, ApprovalDecision, ApprovalRequirement, AssistantConversationDetail,
+    AssistantConversationStartRequest, AssistantConversationStartResponse,
     AssistantConversationSummary, AssistantTurnRequest, AssistantTurnResponse,
     DraftDecisionRequest, DraftDecisionResponse, DraftStatus, ScopeSet, ToolScope,
     WriteDraftSummary,
@@ -26,6 +30,42 @@ pub(crate) struct DesktopAiState {
     store: Arc<SqliteStore>,
     workflow: AiWorkflowService,
     settings: SettingsService,
+    startup: DesktopStartupAuthorization,
+}
+
+#[derive(Clone)]
+struct DesktopStartupAuthorization {
+    session_id: Uuid,
+    full_declared: Arc<AtomicBool>,
+    declaration_lock: Arc<Mutex<()>>,
+}
+
+impl DesktopStartupAuthorization {
+    fn new() -> Self {
+        Self {
+            session_id: Uuid::new_v4(),
+            full_declared: Arc::new(AtomicBool::new(false)),
+            declaration_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn confirm_full(&self, confirm: impl FnOnce() -> bool) -> bool {
+        let Ok(_guard) = self.declaration_lock.lock() else {
+            return false;
+        };
+        if self.full_declared() {
+            return true;
+        }
+        let confirmed = confirm();
+        if confirmed {
+            self.full_declared.store(true, Ordering::Release);
+        }
+        confirmed
+    }
+
+    fn full_declared(&self) -> bool {
+        self.full_declared.load(Ordering::Acquire)
+    }
 }
 
 impl DesktopAiState {
@@ -36,13 +76,104 @@ impl DesktopAiState {
         let store = Arc::new(data.store_ref().clone());
         let domain_store: Arc<dyn MuriArcStore> = store.clone();
         let operation_store: Arc<dyn AiOperationStore> = store.clone();
+        let model_profiles: Arc<dyn AiModelProfileStore> = store.clone();
         let data_tools = Arc::new(DesktopAiDataTools::new(data));
         Ok(Self {
             store,
             workflow: AiWorkflowService::new(domain_store, operation_store)
+                .with_model_profiles(model_profiles)
                 .with_data_tools(data_tools),
             settings,
+            startup: DesktopStartupAuthorization::new(),
         })
+    }
+
+    pub(crate) fn confirm_full_startup(
+        &self,
+        confirm: impl FnOnce() -> bool,
+    ) -> Result<(), DesktopAiError> {
+        self.startup
+            .confirm_full(confirm)
+            .then_some(())
+            .ok_or(DesktopAiError::AutonomyDeclarationRequired)
+    }
+
+    pub(crate) async fn start_conversation(
+        &self,
+        input: DesktopConversationStartInput,
+    ) -> Result<AssistantConversationStartResponse, DesktopAiError> {
+        let context = self.context().await?;
+        let full = input.requested_mode == AiAutonomyMode::Full;
+        if full && !self.startup.full_declared() {
+            return Err(DesktopAiError::AutonomyDeclarationRequired);
+        }
+        let model_profile = {
+            let _profile_operation = self.settings.profile_coordinator().lock().await;
+            let (profile_id, explicitly_selected) = match input.model_profile_id {
+                Some(profile_id) if !profile_id.is_nil() => (profile_id, true),
+                Some(_) => return Err(start_profile_unavailable(true, false)),
+                None => (
+                    self.store
+                        .get_ai_user_model_defaults(LOCAL_USER_ID)
+                        .await?
+                        .and_then(|defaults| defaults.default_conversation_profile_id)
+                        .ok_or(DesktopAiError::ModelSelectionRequired)?,
+                    false,
+                ),
+            };
+            let profile = match self.store.get_ai_model_profile(profile_id).await {
+                Ok(profile) => profile,
+                Err(StoreError::NotFound { .. }) if explicitly_selected => {
+                    return Err(start_profile_unavailable(true, false));
+                }
+                Err(StoreError::NotFound { .. }) => {
+                    return Err(start_profile_unavailable(false, false));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if profile.lab_id != LOCAL_LAB_ID
+                || profile.user_id != LOCAL_USER_ID
+                || profile.meta.deleted_at.is_some()
+            {
+                return Err(start_profile_unavailable(explicitly_selected, false));
+            }
+            if profile.archived_at.is_some() {
+                return Err(start_profile_unavailable(explicitly_selected, true));
+            }
+            let binding = AiModelProfileBinding {
+                profile_id,
+                profile_version: profile.current_version,
+            };
+            // Resolve the exact immutable version and credential before the
+            // conversation is persisted. This performs no Provider request.
+            if let Err(error) = self
+                .settings
+                .resolve_provider_for_profile(self.store.as_ref(), binding)
+                .await
+            {
+                return Err(start_model_resolution_error(error, explicitly_selected));
+            }
+            binding
+        };
+        let audit = AuditContext {
+            actor: Actor::human(context.user_id, context.user_display_name.clone()),
+            source: WriteSource::Desktop,
+            request_id: Some(Uuid::new_v4().to_string()),
+            reason: Some("start_ai_conversation".to_owned()),
+        };
+        self.workflow
+            .start_conversation(
+                &context,
+                model_profile,
+                AssistantConversationStartRequest {
+                    project_id: input.project_id,
+                    requested_mode: input.requested_mode,
+                },
+                full && self.startup.full_declared(),
+                &audit,
+            )
+            .await
+            .map_err(Into::into)
     }
 
     pub(crate) async fn turn(
@@ -138,7 +269,7 @@ impl DesktopAiState {
         input: DesktopAutonomyInput,
     ) -> Result<AiAutonomyView, DesktopAiError> {
         let context = self.context().await?;
-        if input.mode == AiAutonomyMode::Full && !input.declared {
+        if input.mode == AiAutonomyMode::Full && !self.startup.full_declared() {
             return Err(DesktopAiError::AutonomyDeclarationRequired);
         }
         let audit = AuditContext {
@@ -155,7 +286,7 @@ impl DesktopAiState {
                     mode: input.mode,
                     expected_revision: input.expected_revision,
                 },
-                input.mode == AiAutonomyMode::Full && input.declared,
+                input.mode == AiAutonomyMode::Full && self.startup.full_declared(),
                 &audit,
             )
             .await
@@ -236,7 +367,8 @@ impl DesktopAiState {
             project_ids.iter().copied(),
             project_ids.iter().copied(),
             true,
-        ))
+        )
+        .with_autonomy_context(Some(self.startup.session_id), AiAutonomyMode::Full))
     }
 }
 
@@ -250,13 +382,21 @@ pub(crate) struct DesktopDraftDecisionInput {
     pub statement: Option<String>,
 }
 
+/// The renderer may select only an editable profile identity and requested
+/// mode. Exact versions, startup proof and the process Session UUID are native.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DesktopConversationStartInput {
+    pub project_id: Option<Uuid>,
+    pub model_profile_id: Option<Uuid>,
+    pub requested_mode: AiAutonomyMode,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DesktopAutonomyInput {
     pub mode: AiAutonomyMode,
     pub expected_revision: i64,
-    #[serde(default)]
-    pub declared: bool,
 }
 
 fn trusted_desktop_decision(
@@ -304,14 +444,49 @@ pub(crate) enum DesktopAiError {
     InvalidApprovalStatement,
     #[error("Full 模式需要明确确认其仅适用于当前会话，且不会绕过人工审批边界")]
     AutonomyDeclarationRequired,
+    #[error("请选择一个可用的对话模型")]
+    ModelSelectionRequired,
+    #[error("所选模型已停用")]
+    SelectedModelArchived,
+    #[error("所选模型已停用或不可用")]
+    SelectedModelUnavailable,
+}
+
+fn start_model_resolution_error(error: SettingsError, explicitly_selected: bool) -> DesktopAiError {
+    if matches!(
+        &error,
+        SettingsError::Storage
+            | SettingsError::CredentialStore
+            | SettingsError::ModelProfileStore(
+                StoreError::Database(_) | StoreError::Serialization(_)
+            )
+    ) {
+        DesktopAiError::Settings(error)
+    } else if explicitly_selected {
+        DesktopAiError::SelectedModelUnavailable
+    } else {
+        DesktopAiError::ModelSelectionRequired
+    }
+}
+
+fn start_profile_unavailable(explicitly_selected: bool, archived: bool) -> DesktopAiError {
+    match (explicitly_selected, archived) {
+        (false, _) => DesktopAiError::ModelSelectionRequired,
+        (true, true) => DesktopAiError::SelectedModelArchived,
+        (true, false) => DesktopAiError::SelectedModelUnavailable,
+    }
 }
 
 impl DesktopAiError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::InvalidId
-            | Self::InvalidApprovalStatement
-            | Self::AutonomyDeclarationRequired => "validation",
+            Self::InvalidId | Self::InvalidApprovalStatement => "validation",
+            Self::AutonomyDeclarationRequired => "autonomy_declaration_required",
+            Self::ModelSelectionRequired => "model_selection_required",
+            Self::SelectedModelArchived
+            | Self::Workflow(AiWorkflowError::ConversationModelArchived) => "model_archived",
+            Self::SelectedModelUnavailable
+            | Self::Workflow(AiWorkflowError::ConversationModelUnavailable) => "model_unavailable",
             Self::Forbidden | Self::Workflow(AiWorkflowError::Forbidden) => "forbidden",
             Self::Settings(
                 SettingsError::MissingCredential | SettingsError::DefaultModelNotConfigured,
@@ -357,6 +532,9 @@ impl DesktopAiError {
             "storage_error" => "本地 AI 数据或安全存储操作失败".to_owned(),
             "ai_unavailable" => "AI Provider 暂时不可用，请检查配置后重试".to_owned(),
             "ai_not_configured" => "请先启用 AI 并配置所需密钥".to_owned(),
+            "model_selection_required" => "请选择一个可用的对话模型".to_owned(),
+            "model_archived" => "该会话绑定的模型已停用，只能查看历史记录".to_owned(),
+            "model_unavailable" => "该会话绑定的模型当前不可用，只能查看历史记录".to_owned(),
             _ => self.to_string(),
         }
     }
@@ -419,6 +597,82 @@ mod tests {
             .code(),
             "validation"
         );
+        assert_eq!(
+            DesktopAiError::Workflow(AiWorkflowError::ConversationModelArchived).code(),
+            "model_archived"
+        );
+        assert_eq!(
+            DesktopAiError::ModelSelectionRequired.code(),
+            "model_selection_required"
+        );
+        assert_eq!(
+            DesktopAiError::SelectedModelArchived.code(),
+            "model_archived"
+        );
+        assert_eq!(
+            start_model_resolution_error(SettingsError::MissingCredential, false).code(),
+            "model_selection_required"
+        );
+        assert_eq!(
+            start_model_resolution_error(SettingsError::MissingCredential, true).code(),
+            "model_unavailable"
+        );
+        assert_eq!(
+            start_profile_unavailable(false, true).code(),
+            "model_selection_required"
+        );
+        assert_eq!(
+            start_profile_unavailable(true, true).code(),
+            "model_archived"
+        );
+        assert_eq!(
+            start_profile_unavailable(true, false).code(),
+            "model_unavailable"
+        );
+    }
+
+    #[test]
+    fn desktop_startup_authorization_is_process_local_and_dtos_reject_proof_fields() {
+        let first = DesktopStartupAuthorization::new();
+        let second = DesktopStartupAuthorization::new();
+        assert_ne!(first.session_id, second.session_id);
+        assert!(!first.full_declared());
+        assert!(!second.full_declared());
+        assert!(!first.confirm_full(|| false));
+        assert!(!first.full_declared());
+        assert!(first.confirm_full(|| true));
+        assert!(first.full_declared());
+        assert!(first.confirm_full(|| panic!("confirmed startup must not prompt twice")));
+        assert!(!second.full_declared());
+
+        let valid = serde_json::json!({
+            "projectId": null,
+            "modelProfileId": null,
+            "requestedMode": "full",
+        });
+        assert!(serde_json::from_value::<DesktopConversationStartInput>(valid).is_ok());
+        for forbidden in ["declared", "sessionId", "currentPassword", "stepUpVerified"] {
+            let mut value = serde_json::json!({
+                "projectId": null,
+                "modelProfileId": null,
+                "requestedMode": "full",
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(forbidden.to_owned(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<DesktopConversationStartInput>(value).is_err(),
+                "{forbidden} must not cross the Tauri start contract"
+            );
+        }
+
+        let forged_autonomy = serde_json::json!({
+            "mode": "full",
+            "expectedRevision": 0,
+            "declared": true,
+        });
+        assert!(serde_json::from_value::<DesktopAutonomyInput>(forged_autonomy).is_err());
     }
 
     #[test]

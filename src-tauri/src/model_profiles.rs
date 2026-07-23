@@ -285,13 +285,14 @@ impl ModelProfileConfiguration {
 impl DesktopState {
     pub(crate) async fn list_ai_model_profiles(
         &self,
+        include_archived: bool,
     ) -> Result<Vec<AiModelProfileView>, DesktopError> {
         let profiles = self
             .domain_store()
             .list_ai_model_profiles(&AiModelProfileFilter {
                 lab_id: self.local_lab_id(),
                 user_id: self.local_user_id(),
-                include_archived: false,
+                include_archived,
             })
             .await?;
         let defaults = self
@@ -955,18 +956,26 @@ mod tests {
         assert_eq!(after.default_vision_profile_id, None);
         assert!(
             state
-                .list_ai_model_profiles()
+                .list_ai_model_profiles(false)
                 .await
                 .unwrap()
                 .iter()
                 .all(|profile| profile.id != created.id)
+        );
+        assert!(
+            state
+                .list_ai_model_profiles(true)
+                .await
+                .unwrap()
+                .iter()
+                .any(|profile| { profile.id == created.id && profile.archived_at.is_some() })
         );
     }
 
     #[tokio::test]
     async fn unsaved_validation_calls_provider_without_persisting_profile() {
         let (_directory, state) = state().await;
-        let before = state.list_ai_model_profiles().await.unwrap();
+        let before = state.list_ai_model_profiles(false).await.unwrap();
         let (base_url, server) = spawn_chat_server();
         let result = state
             .validate_ai_model_profile(ValidateAiModelProfileInput {
@@ -990,7 +999,7 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         assert!(result.ok);
-        assert_eq!(state.list_ai_model_profiles().await.unwrap(), before);
+        assert_eq!(state.list_ai_model_profiles(false).await.unwrap(), before);
     }
 
     #[tokio::test]

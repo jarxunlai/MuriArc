@@ -1,5 +1,6 @@
 use serde::Serialize;
 use tauri::Manager;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 mod ai;
 mod ai_data_tools;
@@ -11,7 +12,8 @@ mod research_extensions;
 mod settings;
 
 use ai::{
-    DesktopAiError, DesktopAiState, DesktopAutonomyInput, DesktopDraftDecisionInput, parse_uuid,
+    DesktopAiError, DesktopAiState, DesktopAutonomyInput, DesktopConversationStartInput,
+    DesktopDraftDecisionInput, parse_uuid,
 };
 use animal_details::{
     AlleleView, AnimalDetailView, CreateAlleleInput, CreateAnimalSampleInput, CreateGeneLocusInput,
@@ -37,9 +39,9 @@ use model_profiles::{
     SaveAiModelProfileInput, ValidateAiModelProfileInput,
 };
 use muriarc_ai::{
-    AiAutonomyView, AssistantConversationDetail, AssistantConversationSummary,
-    AssistantTurnRequest, AssistantTurnResponse, DraftDecisionResponse, DraftStatus,
-    WriteDraftSummary,
+    AiAutonomyView, AssistantConversationDetail, AssistantConversationStartResponse,
+    AssistantConversationSummary, AssistantTurnRequest, AssistantTurnResponse,
+    DraftDecisionResponse, DraftStatus, WriteDraftSummary,
 };
 use research_extensions::{
     BreedingPredictionInput, CorrectGenotypingRecordInput, CorrectGenotypingRecordView,
@@ -788,8 +790,12 @@ async fn clear_ai_api_key(state: tauri::State<'_, DesktopState>) -> CommandResul
 #[tauri::command]
 async fn list_ai_model_profiles(
     state: tauri::State<'_, DesktopState>,
+    include_archived: Option<bool>,
 ) -> CommandResult<Vec<AiModelProfileView>> {
-    state.list_ai_model_profiles().await.map_err(Into::into)
+    state
+        .list_ai_model_profiles(include_archived.unwrap_or(false))
+        .await
+        .map_err(Into::into)
 }
 
 #[tauri::command]
@@ -873,6 +879,42 @@ async fn save_ai_model_defaults(
         .save_ai_model_defaults(input)
         .await
         .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn declare_ai_full_startup(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopAiState>,
+) -> CommandResult<()> {
+    let state = state.inner().clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        state.confirm_full_startup(|| {
+            app.dialog()
+                .message(
+                    "Full 仅扩大本次桌面启动内、当前会话的普通操作委托；不会扩大项目权限，也不会绕过科研签署、高风险确认或草稿审批。",
+                )
+                .title("确认启用 MuriArc AI Full")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancelCustom(
+                    "确认启用".to_owned(),
+                    "取消".to_owned(),
+                ))
+                .blocking_show()
+        })
+    })
+    .await
+    {
+        Ok(result) => result.map_err(Into::into),
+        Err(_) => Err(DesktopAiError::AutonomyDeclarationRequired.into()),
+    }
+}
+
+#[tauri::command]
+async fn start_ai_conversation(
+    state: tauri::State<'_, DesktopAiState>,
+    input: DesktopConversationStartInput,
+) -> CommandResult<AssistantConversationStartResponse> {
+    state.start_conversation(input).await.map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1073,6 +1115,7 @@ async fn delete_attachment(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
@@ -1180,6 +1223,8 @@ pub fn run() {
             archive_ai_model_profile,
             get_ai_model_defaults,
             save_ai_model_defaults,
+            declare_ai_full_startup,
+            start_ai_conversation,
             ai_turn,
             list_ai_conversations,
             get_ai_conversation,

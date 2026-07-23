@@ -4,20 +4,22 @@ use chrono::{Duration, Utc};
 use muriarc_core::{
     Actor, ActorType, AiActionCategory, AiApprovalFilter, AiAutonomyGrant, AiAutonomyMode,
     AiConversation, AiConversationFilter, AiConversationMessage, AiConversationMessageRole,
-    AiModelProfileBinding, AiOperationStore, Approval, ApprovalDecision as StoredApprovalDecision,
-    AuditContext, Measurement, MuriArcStore, RecordMeta, StoreError, ToolRun, ToolRunStatus,
-    WriteSource,
+    AiModelProfileBinding, AiModelProfileStore, AiOperationStore, Approval,
+    ApprovalDecision as StoredApprovalDecision, AuditContext, Measurement, MuriArcStore,
+    RecordMeta, StoreError, ToolRun, ToolRunStatus, WriteSource,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiDataAccessContext, AiDataToolBackend,
-    AiProvider, ApprovalDecision, ApprovalError, AssistantConfigError, AssistantConversationDetail,
-    AssistantConversationMessage, AssistantConversationSummary, AssistantError, AssistantRequest,
-    AssistantRuntimeConfig, AssistantService, AssistantTurnRequest, AssistantTurnResponse,
-    ChatMessage, DraftDecisionRequest, DraftKind, DraftStatus, HumanApprover, ProposalActor,
+    AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiConversationReadOnlyReason,
+    AiDataAccessContext, AiDataToolBackend, AiProvider, ApprovalDecision, ApprovalError,
+    AssistantConfigError, AssistantConversationDetail, AssistantConversationMessage,
+    AssistantConversationStartRequest, AssistantConversationStartResponse,
+    AssistantConversationSummary, AssistantError, AssistantRequest, AssistantRuntimeConfig,
+    AssistantService, AssistantTurnRequest, AssistantTurnResponse, ChatMessage,
+    DraftDecisionRequest, DraftKind, DraftStatus, HumanApprover, ProposalActor,
     ProviderCredentials, StoreDomainToolExecutor, StoreToolAccessContext, ToolExecutionError,
     ToolName, WriteDraft, WriteDraftSummary,
 };
@@ -172,6 +174,7 @@ pub struct DraftDecisionResponse {
 pub struct AiWorkflowService {
     store: Arc<dyn MuriArcStore>,
     operations: Arc<dyn AiOperationStore>,
+    model_profiles: Option<Arc<dyn AiModelProfileStore>>,
     data_tools: Option<Arc<dyn AiDataToolBackend>>,
 }
 
@@ -188,13 +191,78 @@ impl AiWorkflowService {
         Self {
             store,
             operations,
+            model_profiles: None,
             data_tools: None,
         }
+    }
+
+    pub fn with_model_profiles(mut self, model_profiles: Arc<dyn AiModelProfileStore>) -> Self {
+        self.model_profiles = Some(model_profiles);
+        self
     }
 
     pub fn with_data_tools(mut self, data_tools: Arc<dyn AiDataToolBackend>) -> Self {
         self.data_tools = Some(data_tools);
         self
+    }
+
+    /// Persists an empty, immutable-model conversation and its initial
+    /// requested autonomy in one transaction before any Provider can run.
+    pub async fn start_conversation(
+        &self,
+        context: &AiExecutionContext,
+        model_profile: AiModelProfileBinding,
+        request: AssistantConversationStartRequest,
+        step_up_verified: bool,
+        audit: &AuditContext,
+    ) -> Result<AssistantConversationStartResponse, AiWorkflowError> {
+        if audit.actor.actor_type != ActorType::Human
+            || audit.actor.user_id != Some(context.user_id)
+            || model_profile.profile_id.is_nil()
+            || model_profile.profile_version <= 0
+            || request
+                .project_id
+                .is_some_and(|project_id| !context.allows_project(project_id))
+            || (request.requested_mode == AiAutonomyMode::Full
+                && (!step_up_verified || context.session_id.is_none()))
+        {
+            return Err(AiWorkflowError::Forbidden);
+        }
+
+        let now = Utc::now();
+        let conversation = AiConversation {
+            id: Uuid::new_v4(),
+            lab_id: context.lab_id,
+            project_id: request.project_id,
+            user_id: context.user_id,
+            title: conversation_title(""),
+            model_profile: Some(model_profile),
+            legacy_read_only: false,
+            meta: RecordMeta::new(now),
+        };
+        let grant = initial_autonomy_grant(
+            &conversation,
+            request.requested_mode,
+            context.session_id,
+            now,
+        );
+        // Enrich before the transaction so a transient post-commit profile
+        // read cannot turn a successful write into an apparent failed start.
+        // The Store still revalidates the exact binding inside the transaction.
+        let summary = self.conversation_summary(conversation.clone()).await?;
+        self.operations
+            .create_ai_conversation_with_autonomy(&conversation, &grant, audit)
+            .await?;
+        let autonomy = autonomy_view(
+            Some(&grant),
+            context.max_autonomy_mode,
+            context.session_id,
+            now,
+        );
+        Ok(AssistantConversationStartResponse {
+            conversation: summary,
+            autonomy,
+        })
     }
 
     pub async fn run_turn<P: AiProvider>(
@@ -316,14 +384,13 @@ impl AiWorkflowService {
     ) -> Result<AiAutonomyView, AiWorkflowError> {
         let conversation = self.operations.get_ai_conversation(conversation_id).await?;
         authorize_conversation(context, &conversation)?;
-        if conversation.legacy_read_only {
-            return Err(AiWorkflowError::LegacyConversationReadOnly);
-        }
+        self.ensure_conversation_model_available(&conversation)
+            .await?;
         if audit.actor.actor_type != ActorType::Human
             || audit.actor.user_id != Some(context.user_id)
             || request.expected_revision < 0
-            || request.mode > context.max_autonomy_mode
-            || (request.mode == AiAutonomyMode::Full && !step_up_verified)
+            || (request.mode == AiAutonomyMode::Full
+                && (!step_up_verified || context.session_id.is_none()))
         {
             return Err(AiWorkflowError::Forbidden);
         }
@@ -355,14 +422,7 @@ impl AiWorkflowService {
             meta: RecordMeta::new(now),
         });
         grant.mode = request.mode;
-        grant.allowed_categories = match request.mode {
-            AiAutonomyMode::Ask => vec![AiActionCategory::Read],
-            AiAutonomyMode::Auto | AiAutonomyMode::Full => vec![
-                AiActionCategory::Read,
-                AiActionCategory::Artifact,
-                AiActionCategory::ReversibleDraft,
-            ],
-        };
+        grant.allowed_categories = autonomy_categories(request.mode);
         grant.batch_limit = request.mode.batch_limit();
         grant.session_id = (request.mode == AiAutonomyMode::Full)
             .then_some(context.session_id)
@@ -404,6 +464,79 @@ impl AiWorkflowService {
         Ok((grant, view))
     }
 
+    async fn conversation_summary(
+        &self,
+        conversation: AiConversation,
+    ) -> Result<AssistantConversationSummary, AiWorkflowError> {
+        let mut summary = AssistantConversationSummary::from(conversation.clone());
+        if summary.read_only {
+            return Ok(summary);
+        }
+        let Some(binding) = conversation.model_profile else {
+            summary.read_only = true;
+            summary.read_only_reason = Some(AiConversationReadOnlyReason::LegacyModelUnknown);
+            return Ok(summary);
+        };
+        let Some(model_profiles) = self.model_profiles.as_ref() else {
+            return Ok(summary);
+        };
+
+        let profile = match model_profiles
+            .get_ai_model_profile(binding.profile_id)
+            .await
+        {
+            Ok(profile) => profile,
+            Err(StoreError::NotFound { .. }) => {
+                summary.read_only = true;
+                summary.read_only_reason = Some(AiConversationReadOnlyReason::ModelUnavailable);
+                return Ok(summary);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if profile.lab_id != conversation.lab_id || profile.user_id != conversation.user_id {
+            summary.read_only = true;
+            summary.read_only_reason = Some(AiConversationReadOnlyReason::ModelUnavailable);
+            return Ok(summary);
+        }
+        summary.model_profile_name = Some(profile.name.clone());
+        if profile.archived_at.is_some() || profile.meta.deleted_at.is_some() {
+            summary.read_only = true;
+            summary.read_only_reason = Some(AiConversationReadOnlyReason::ModelArchived);
+        }
+
+        match model_profiles
+            .get_ai_model_profile_version(binding.profile_id, binding.profile_version)
+            .await
+        {
+            Ok(version) => summary.model_id = Some(version.model_id),
+            Err(StoreError::NotFound { .. }) => {
+                summary.read_only = true;
+                summary.read_only_reason = Some(AiConversationReadOnlyReason::ModelUnavailable);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(summary)
+    }
+
+    async fn ensure_conversation_model_available(
+        &self,
+        conversation: &AiConversation,
+    ) -> Result<(), AiWorkflowError> {
+        let summary = self.conversation_summary(conversation.clone()).await?;
+        match summary.read_only_reason {
+            Some(AiConversationReadOnlyReason::LegacyModelUnknown) => {
+                Err(AiWorkflowError::LegacyConversationReadOnly)
+            }
+            Some(AiConversationReadOnlyReason::ModelArchived) => {
+                Err(AiWorkflowError::ConversationModelArchived)
+            }
+            Some(AiConversationReadOnlyReason::ModelUnavailable) => {
+                Err(AiWorkflowError::ConversationModelUnavailable)
+            }
+            None => Ok(()),
+        }
+    }
+
     pub async fn list_conversations(
         &self,
         context: &AiExecutionContext,
@@ -435,7 +568,11 @@ impl AiWorkflowService {
                     .is_some_and(|id| context.allows_project(id))
         });
         conversations.truncate(limit as usize);
-        Ok(conversations.into_iter().map(Into::into).collect())
+        let mut summaries = Vec::with_capacity(conversations.len());
+        for conversation in conversations {
+            summaries.push(self.conversation_summary(conversation).await?);
+        }
+        Ok(summaries)
     }
 
     pub async fn get_conversation(
@@ -491,7 +628,7 @@ impl AiWorkflowService {
             });
         }
         Ok(AssistantConversationDetail {
-            conversation: conversation.into(),
+            conversation: self.conversation_summary(conversation).await?,
             messages,
         })
     }
@@ -509,9 +646,8 @@ impl AiWorkflowService {
     ) -> Result<AiModelProfileBinding, AiWorkflowError> {
         let conversation = self.operations.get_ai_conversation(conversation_id).await?;
         authorize_conversation(context, &conversation)?;
-        if conversation.legacy_read_only {
-            return Err(AiWorkflowError::LegacyConversationReadOnly);
-        }
+        self.ensure_conversation_model_available(&conversation)
+            .await?;
         conversation
             .model_profile
             .ok_or(AiWorkflowError::InvalidStoredConversation)
@@ -741,9 +877,8 @@ impl AiWorkflowService {
         if let Some(conversation_id) = request.conversation_id {
             let conversation = self.operations.get_ai_conversation(conversation_id).await?;
             authorize_conversation(context, &conversation)?;
-            if conversation.legacy_read_only {
-                return Err(AiWorkflowError::LegacyConversationReadOnly);
-            }
+            self.ensure_conversation_model_available(&conversation)
+                .await?;
             if conversation.model_profile != Some(model_profile) {
                 return Err(AiWorkflowError::ConversationModelProfileMismatch);
             }
@@ -1095,6 +1230,42 @@ fn conversation_title(message: &str) -> String {
     }
 }
 
+fn autonomy_categories(mode: AiAutonomyMode) -> Vec<AiActionCategory> {
+    match mode {
+        AiAutonomyMode::Ask => vec![AiActionCategory::Read],
+        AiAutonomyMode::Auto | AiAutonomyMode::Full => vec![
+            AiActionCategory::Read,
+            AiActionCategory::Artifact,
+            AiActionCategory::ReversibleDraft,
+        ],
+    }
+}
+
+fn initial_autonomy_grant(
+    conversation: &AiConversation,
+    mode: AiAutonomyMode,
+    session_id: Option<Uuid>,
+    now: chrono::DateTime<Utc>,
+) -> AiAutonomyGrant {
+    let full = mode == AiAutonomyMode::Full;
+    AiAutonomyGrant {
+        id: Uuid::new_v4(),
+        conversation_id: conversation.id,
+        lab_id: conversation.lab_id,
+        project_id: conversation.project_id,
+        user_id: conversation.user_id,
+        session_id: full.then_some(session_id).flatten(),
+        mode,
+        allowed_categories: autonomy_categories(mode),
+        batch_limit: mode.batch_limit(),
+        step_up_verified_at: full.then_some(now),
+        last_used_at: now,
+        expires_at: full.then_some(now + Duration::minutes(30)),
+        revoked_at: None,
+        meta: RecordMeta::new(now),
+    }
+}
+
 fn ai_audit(context: &AiExecutionContext, reason: &'static str) -> AuditContext {
     AuditContext {
         actor: Actor {
@@ -1138,6 +1309,10 @@ pub enum AiWorkflowError {
     LegacyConversationReadOnly,
     #[error("the resolved model profile does not match the conversation's immutable binding")]
     ConversationModelProfileMismatch,
+    #[error("this AI conversation is read-only because its model profile is archived")]
+    ConversationModelArchived,
+    #[error("this AI conversation is read-only because its model profile is unavailable")]
+    ConversationModelUnavailable,
 }
 
 #[cfg(test)]
@@ -1239,6 +1414,17 @@ mod tests {
             audit: &AuditContext,
         ) -> muriarc_core::StoreResult<()> {
             self.inner.create_ai_conversation(conversation, audit).await
+        }
+
+        async fn create_ai_conversation_with_autonomy(
+            &self,
+            conversation: &AiConversation,
+            grant: &AiAutonomyGrant,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner
+                .create_ai_conversation_with_autonomy(conversation, grant, audit)
+                .await
         }
 
         async fn get_ai_conversation(&self, id: Uuid) -> muriarc_core::StoreResult<AiConversation> {
@@ -1438,6 +1624,226 @@ mod tests {
             profile_id: profile.id,
             profile_version: 1,
         }
+    }
+
+    async fn conversation_start_fixture(
+        max_mode: AiAutonomyMode,
+        with_session: bool,
+    ) -> (
+        Arc<SqliteStore>,
+        AiWorkflowService,
+        AiExecutionContext,
+        Project,
+        AiModelProfileBinding,
+        AuditContext,
+    ) {
+        let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+        store.migrate().await.unwrap();
+        let now = Utc::now();
+        let bootstrap = AuditContext::system(WriteSource::Migration);
+        let lab = Lab::new("Conversation start", now).unwrap();
+        store.create_lab(&lab, &bootstrap).await.unwrap();
+        let user = User::new(lab.id, "start@example.test", "Starter", now).unwrap();
+        store.create_user(&user, &bootstrap).await.unwrap();
+        let project = Project::new(lab.id, "Start project", now).unwrap();
+        store.create_project(&project, &bootstrap).await.unwrap();
+        let binding = create_model_profile(&store, lab.id, user.id, now).await;
+        let domain: Arc<dyn MuriArcStore> = store.clone();
+        let operations: Arc<dyn AiOperationStore> = store.clone();
+        let profiles: Arc<dyn AiModelProfileStore> = store.clone();
+        let workflow = AiWorkflowService::new(domain, operations).with_model_profiles(profiles);
+        let session_id = with_session.then(Uuid::new_v4);
+        let context = AiExecutionContext::new(
+            lab.id,
+            user.id,
+            user.display_name.clone(),
+            "conversation-start-request",
+            [project.id],
+            [project.id],
+            true,
+            AccessGrant::local_user(ScopeSet::new([ToolScope::Read, ToolScope::WriteDraft])),
+        )
+        .with_autonomy_context(session_id, max_mode);
+        let audit = AuditContext {
+            actor: Actor::human(user.id, user.display_name),
+            source: WriteSource::Web,
+            request_id: Some("conversation-start-audit".to_owned()),
+            reason: Some("start_ai_conversation".to_owned()),
+        };
+        (store, workflow, context, project, binding, audit)
+    }
+
+    #[tokio::test]
+    async fn conversation_start_persists_requested_full_and_applies_the_live_ceiling() {
+        let (store, workflow, context, project, binding, audit) =
+            conversation_start_fixture(AiAutonomyMode::Auto, true).await;
+
+        let started = workflow
+            .start_conversation(
+                &context,
+                binding,
+                AssistantConversationStartRequest {
+                    project_id: Some(project.id),
+                    requested_mode: AiAutonomyMode::Full,
+                },
+                true,
+                &audit,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(started.autonomy.mode, AiAutonomyMode::Full);
+        assert_eq!(started.autonomy.effective_mode, AiAutonomyMode::Auto);
+        assert_eq!(
+            started.autonomy.batch_limit,
+            AiAutonomyMode::Auto.batch_limit()
+        );
+        assert_eq!(
+            started.conversation.model_profile_id,
+            Some(binding.profile_id)
+        );
+        assert_eq!(started.conversation.model_profile_version, Some(1));
+        assert_eq!(
+            started.conversation.model_id.as_deref(),
+            Some("workflow-test-model")
+        );
+        assert!(!started.conversation.read_only);
+
+        let grant = store
+            .get_ai_autonomy_grant(started.conversation.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(grant.mode, AiAutonomyMode::Full);
+        assert_eq!(grant.session_id, context.session_id);
+        assert!(grant.step_up_verified_at.is_some());
+        assert!(
+            store
+                .list_ai_conversation_messages(started.conversation.id, 200)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_start_requires_both_trusted_proof_and_a_native_session() {
+        let (store, workflow, context, project, binding, audit) =
+            conversation_start_fixture(AiAutonomyMode::Full, false).await;
+        let request = AssistantConversationStartRequest {
+            project_id: Some(project.id),
+            requested_mode: AiAutonomyMode::Full,
+        };
+        assert!(matches!(
+            workflow
+                .start_conversation(&context, binding, request, true, &audit)
+                .await,
+            Err(AiWorkflowError::Forbidden)
+        ));
+
+        let context = context.with_autonomy_context(Some(Uuid::new_v4()), AiAutonomyMode::Full);
+        assert!(matches!(
+            workflow
+                .start_conversation(
+                    &context,
+                    binding,
+                    AssistantConversationStartRequest {
+                        project_id: Some(project.id),
+                        requested_mode: AiAutonomyMode::Full,
+                    },
+                    false,
+                    &audit,
+                )
+                .await,
+            Err(AiWorkflowError::Forbidden)
+        ));
+        assert!(
+            store
+                .list_ai_conversations(
+                    &AiConversationFilter {
+                        lab_id: context.lab_id,
+                        user_id: context.user_id,
+                        project_id: Some(project.id),
+                    },
+                    0,
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn archived_conversation_model_is_readable_but_fails_before_provider_access() {
+        let (store, workflow, context, project, binding, audit) =
+            conversation_start_fixture(AiAutonomyMode::Full, true).await;
+        let started = workflow
+            .start_conversation(
+                &context,
+                binding,
+                AssistantConversationStartRequest {
+                    project_id: Some(project.id),
+                    requested_mode: AiAutonomyMode::Ask,
+                },
+                false,
+                &audit,
+            )
+            .await
+            .unwrap();
+        let mut profile = store
+            .get_ai_model_profile(binding.profile_id)
+            .await
+            .unwrap();
+        let expected_revision = profile.meta.revision;
+        let archived_at = Utc::now();
+        profile.archived_at = Some(archived_at);
+        profile.meta.touch(archived_at);
+        store
+            .archive_ai_model_profile(&profile, expected_revision, &audit)
+            .await
+            .unwrap();
+
+        let detail = workflow
+            .get_conversation(&context, started.conversation.id, 200)
+            .await
+            .unwrap();
+        assert!(detail.conversation.read_only);
+        assert_eq!(
+            detail.conversation.read_only_reason,
+            Some(AiConversationReadOnlyReason::ModelArchived)
+        );
+
+        let provider = MockProvider::new(
+            "archived",
+            "archived-model",
+            [Ok(CompletionResponse {
+                id: None,
+                model: None,
+                content: Some("must not run".to_owned()),
+                tool_calls: Vec::new(),
+                finish_reason: Some("stop".to_owned()),
+                usage: None,
+            })],
+        );
+        let probe = provider.clone();
+        assert!(matches!(
+            workflow
+                .run_turn(
+                    provider,
+                    None,
+                    &context,
+                    binding,
+                    AssistantTurnRequest {
+                        conversation_id: Some(started.conversation.id),
+                        project_id: Some(project.id),
+                        message: "Do not send".to_owned(),
+                    },
+                )
+                .await,
+            Err(AiWorkflowError::ConversationModelArchived)
+        ));
+        assert!(probe.requests().unwrap().is_empty());
     }
 
     #[test]

@@ -10,7 +10,9 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Duration;
-use muriarc_core::{AiOperationStore, AiScope, LabRole, MuriArcStore, WriteSource};
+use muriarc_core::{
+    AiModelProfileStore, AiOperationStore, AiScope, LabRole, MuriArcStore, WriteSource,
+};
 use muriarc_data::DataFiles;
 use muriarc_server::{
     AiMasterKey, AppState, Authenticator, ChainedAuthenticator, EnvironmentRootConfig,
@@ -130,13 +132,14 @@ async fn configure_ai(
         master_key,
     ));
     let migrated_profile_secrets = providers.migrate_legacy_profile_secrets().await?;
-    let operations: Arc<dyn AiOperationStore> = store;
+    let operations: Arc<dyn AiOperationStore> = store.clone();
+    let model_profiles: Arc<dyn AiModelProfileStore> = store;
     tracing::info!(
         key_version,
         migrated_profile_secrets,
         "shared AI runtime is enabled with profile-bound encrypted credentials"
     );
-    Ok(state.with_ai(operations, providers))
+    Ok(state.with_ai(operations, model_profiles, providers))
 }
 
 fn load_or_create_ai_master_key_file(path: &Path) -> Result<String, Box<dyn Error>> {

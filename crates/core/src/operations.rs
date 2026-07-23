@@ -87,8 +87,7 @@ impl AiAutonomyGrant {
         if self.revoked_at.is_some()
             || self.expires_at.is_some_and(|expires_at| expires_at <= now)
             || (self.mode == AiAutonomyMode::Full
-                && self.session_id.is_some()
-                && self.session_id != session_id)
+                && (self.session_id.is_none() || self.session_id != session_id))
         {
             AiAutonomyMode::Ask
         } else {
@@ -148,6 +147,18 @@ mod autonomy_tests {
         let mut grant = grant(now, None);
         grant.revoked_at = Some(now);
 
+        assert_eq!(grant.effective_mode(now, None), AiAutonomyMode::Ask);
+    }
+
+    #[test]
+    fn legacy_full_grant_without_a_session_fails_closed() {
+        let now = Utc::now();
+        let grant = grant(now, None);
+
+        assert_eq!(
+            grant.effective_mode(now, Some(Uuid::new_v4())),
+            AiAutonomyMode::Ask
+        );
         assert_eq!(grant.effective_mode(now, None), AiAutonomyMode::Ask);
     }
 }

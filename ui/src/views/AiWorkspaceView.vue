@@ -54,10 +54,10 @@ function changeConversation(value: string | null) {
 onMounted(async () => {
   ai.setContext('全部已授权数据', '/ai')
   try {
-    await ai.loadProjects()
+    await Promise.all([ai.loadModels(true), ai.loadProjects()])
     await ai.restoreLatestConversation()
   } catch (error) {
-    toast.error(error instanceof Error ? error.message : '无法读取科研项目或历史会话')
+    toast.error(error instanceof Error ? error.message : '无法读取模型、科研项目或历史会话')
   }
   try {
     await ai.refreshDrafts()
@@ -72,7 +72,7 @@ onMounted(async () => {
   <div class="page ai-page">
     <PageHeader title="AI 助手" description="用自然语言查询和整理数据；回答保留来源，写入先展示 diff。">
       <template #actions>
-        <n-button type="primary" secondary @click="ai.newConversation">
+        <n-button type="primary" secondary :disabled="ai.busy.value" @click="ai.newConversation">
           <template #icon><MessageSquarePlus :size="17" /></template>新会话
         </n-button>
       </template>
@@ -86,6 +86,7 @@ onMounted(async () => {
           clearable
           filterable
           size="small"
+          :disabled="ai.busy.value"
           placeholder="跨项目只读"
           @update:value="changeProject"
         />
@@ -107,10 +108,20 @@ onMounted(async () => {
               :key="conversation.id"
               type="button"
               :class="{ active: conversation.id === ai.conversationId.value }"
-              :disabled="ai.loadingConversation.value"
+              :disabled="ai.loadingConversation.value || ai.busy.value"
               @click="openConversation(conversation.id)"
             >
-              <span>{{ conversation.title }}</span>
+              <span class="history-copy">
+                <strong>{{ conversation.title }}</strong>
+                <small>
+                  {{ conversation.modelProfileName ?? conversation.modelId
+                    ?? (conversation.modelProfileId ? '模型不可用' : '旧会话模型未知') }}
+                  <template v-if="conversation.modelProfileVersion">
+                    · v{{ conversation.modelProfileVersion }}
+                  </template>
+                  <template v-if="conversation.readOnly"> · 只读</template>
+                </small>
+              </span>
               <small>{{ formatConversationDate(conversation.updatedAt) }}</small>
             </button>
           </div>
@@ -146,6 +157,7 @@ onMounted(async () => {
             clearable
             filterable
             size="small"
+            :disabled="ai.busy.value"
             placeholder="跨项目只读"
             @update:value="changeProject"
           />
@@ -157,6 +169,7 @@ onMounted(async () => {
             clearable
             filterable
             size="small"
+            :disabled="ai.busy.value"
             placeholder="新会话"
             @update:value="changeConversation"
           />
@@ -176,7 +189,7 @@ onMounted(async () => {
 .conversation-history { margin: 0 -4px 8px; padding: 11px 4px 4px; border-top: 1px solid var(--muri-border); }
 .history-heading { display: flex; align-items: center; gap: 6px; margin-bottom: 7px; color: var(--muri-text); font-size: 12px; }.history-heading svg { color: var(--muri-primary); }.history-heading :deep(.n-spin-container) { margin-left: auto; }
 .history-list { display: flex; max-height: 190px; flex-direction: column; gap: 3px; overflow-y: auto; }
-.history-list button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; width: 100%; padding: 7px 8px; border: 1px solid transparent; border-radius: 6px; color: var(--muri-text-secondary); background: transparent; cursor: pointer; text-align: left; transition: color var(--muri-transition-fast), background var(--muri-transition-fast), border-color var(--muri-transition-fast); }.history-list button:hover { color: var(--muri-text); background: var(--muri-surface); }.history-list button.active { border-color: #c8deef; color: var(--muri-primary); background: var(--muri-primary-soft); }.history-list button:disabled { cursor: wait; opacity: .65; }.history-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.history-list small { color: var(--muri-text-tertiary); font-size: 10px; }
+.history-list button { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; width: 100%; padding: 7px 8px; border: 1px solid transparent; border-radius: 6px; color: var(--muri-text-secondary); background: transparent; cursor: pointer; text-align: left; transition: color var(--muri-transition-fast), background var(--muri-transition-fast), border-color var(--muri-transition-fast); }.history-list button:hover { color: var(--muri-text); background: var(--muri-surface); }.history-list button.active { border-color: #c8deef; color: var(--muri-primary); background: var(--muri-primary-soft); }.history-list button:disabled { cursor: wait; opacity: .65; }.history-list .history-copy { display: flex; min-width: 0; flex-direction: column; }.history-list .history-copy strong, .history-list .history-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.history-list .history-copy strong { font-size: 11px; font-weight: 600; }.history-list small { color: var(--muri-text-tertiary); font-size: 10px; }
 .history-empty { margin: 4px 8px 8px; color: var(--muri-text-tertiary); font-size: 11px; line-height: 1.5; }
 .tool-scope { display: flex; padding: 11px 4px; flex-direction: column; gap: 5px; margin-top: 4px; border-top: 1px solid var(--muri-border); color: var(--muri-text-secondary); font-size: 11px; }.tool-scope div { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; color: var(--muri-text); }.tool-scope div svg { color: var(--muri-primary); }.tool-scope > span::before { margin-right: 6px; color: var(--muri-success); content: '•'; }.tool-scope span.denied::before { color: var(--muri-danger); }
 .conversation-wrap { min-width: 0; min-height: 0; }.mobile-project-select { display: none; }

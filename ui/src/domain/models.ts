@@ -712,6 +712,14 @@ export interface AiTurnInput {
   message: string
 }
 
+export interface StartAiConversationInput {
+  projectId?: string
+  modelProfileId?: string
+  requestedMode: AiAutonomyMode
+  /** Server sessions only. LocalTauriGateway strips this before invoking Rust. */
+  currentPassword?: string
+}
+
 export interface AiTurnResponse {
   conversationId: string
   content: string
@@ -738,7 +746,6 @@ export interface AiAutonomyUpdateInput {
   mode: AiAutonomyMode
   expectedRevision: number
   currentPassword?: string
-  declared?: boolean
 }
 
 export interface AiConversationSummary {
@@ -747,10 +754,18 @@ export interface AiConversationSummary {
   title: string
   modelProfileId?: string
   modelProfileVersion?: number
+  modelProfileName?: string
+  modelId?: string
   readOnly: boolean
+  readOnlyReason?: 'legacy_model_unknown' | 'model_archived' | 'model_unavailable'
   createdAt: string
   updatedAt: string
   revision: number
+}
+
+export interface StartAiConversationResponse {
+  conversation: AiConversationSummary
+  autonomy: AiAutonomyView
 }
 
 export interface AiConversationMessage {

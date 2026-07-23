@@ -44,14 +44,12 @@ pub(crate) enum SettingsError {
     Storage,
     #[error("OS credential store is unavailable")]
     CredentialStore,
-    #[error("AI assistant is disabled")]
-    Disabled,
     #[error("the selected cloud provider requires an API key")]
     MissingCredential,
+    #[error("no default conversation model is configured")]
+    DefaultModelNotConfigured,
     #[error("AI model profile storage is unavailable")]
     ModelProfileStore(#[from] StoreError),
-    #[error("this Desktop build does not support the model profile protocol")]
-    UnsupportedProtocol,
 }
 
 impl SettingsError {
@@ -61,9 +59,8 @@ impl SettingsError {
             Self::InvalidProvider(_)
                 | Self::InvalidCredential
                 | Self::InvalidFile
-                | Self::Disabled
                 | Self::MissingCredential
-                | Self::UnsupportedProtocol
+                | Self::DefaultModelNotConfigured
         )
     }
 }
@@ -336,6 +333,15 @@ pub(crate) struct SettingsService {
     versioned_secrets: Arc<dyn VersionedSecretStore>,
     write_lock: Arc<Mutex<()>>,
     operation_lock: Arc<AsyncMutex<()>>,
+    profile_coordinator: Arc<AsyncMutex<()>>,
+}
+
+pub(crate) struct AppendModelProfileWithSecret<'a> {
+    pub profile: &'a AiModelProfile,
+    pub version: &'a AiModelProfileVersion,
+    pub expected_revision: i64,
+    pub api_key: Option<&'a str>,
+    pub preserve_from: Option<AiModelProfileBinding>,
 }
 
 impl fmt::Debug for SettingsService {
@@ -392,7 +398,12 @@ impl SettingsService {
             versioned_secrets,
             write_lock: Arc::new(Mutex::new(())),
             operation_lock: Arc::new(AsyncMutex::new(())),
+            profile_coordinator: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    pub(crate) fn profile_coordinator(&self) -> &AsyncMutex<()> {
+        self.profile_coordinator.as_ref()
     }
 
     /// Projects the legacy Desktop JSON settings into versioned SQLite model
@@ -401,6 +412,7 @@ impl SettingsService {
     /// Repeated calls are idempotent. When non-sensitive settings change, one
     /// immutable profile version is appended and the previous version remains
     /// available to historical conversations.
+    #[cfg(test)]
     pub(crate) async fn materialize_model_profiles<
         S: AiModelProfileStore + AiModelProfileSecretRefStore + ?Sized,
     >(
@@ -409,7 +421,96 @@ impl SettingsService {
         audit: &AuditContext,
     ) -> Result<AiModelProfileBinding, SettingsError> {
         let _operation = self.operation_lock.lock().await;
-        self.materialize_model_profiles_locked(store, audit, false, false)
+        self.materialize_model_profiles_locked(store, audit, false, false, true, &[])
+            .await
+    }
+
+    pub(crate) async fn initialize_model_profiles<
+        S: AiModelProfileStore + AiModelProfileSecretRefStore + ?Sized,
+    >(
+        &self,
+        store: &S,
+        audit: &AuditContext,
+    ) -> Result<AiModelProfileBinding, SettingsError> {
+        let _operation = self.operation_lock.lock().await;
+        if let Some(text_binding) =
+            existing_compatible_profile_binding(store, MIGRATED_LOCAL_PROFILE_ID).await?
+        {
+            let vision_binding =
+                existing_compatible_profile_binding(store, MIGRATED_LOCAL_VISION_PROFILE_ID)
+                    .await?;
+            let text_profile = store.get_ai_model_profile(text_binding.profile_id).await?;
+            if text_profile.archived_at.is_none()
+                && store
+                    .get_ai_user_model_defaults(LOCAL_USER_ID)
+                    .await?
+                    .is_none()
+            {
+                let vision_profile_id = match vision_binding {
+                    Some(binding) => {
+                        let profile = store.get_ai_model_profile(binding.profile_id).await?;
+                        let version = store
+                            .get_ai_model_profile_version(
+                                binding.profile_id,
+                                binding.profile_version,
+                            )
+                            .await?;
+                        (profile.archived_at.is_none() && version.supports_vision)
+                            .then_some(binding.profile_id)
+                    }
+                    None => None,
+                };
+                materialize_defaults(
+                    store,
+                    text_binding.profile_id,
+                    vision_profile_id,
+                    Utc::now(),
+                    audit,
+                    false,
+                )
+                .await?;
+            }
+            let copied_text = self
+                .ensure_profile_version_secret(store, text_binding, self.secrets.as_ref())
+                .await?;
+            if let Err(error) = self
+                .publish_copied_secret_refs(store, &copied_text, audit)
+                .await
+            {
+                self.compensate_copied_secret_entries(&copied_text);
+                return Err(error);
+            }
+            if let Some(binding) = vision_binding {
+                let copied_vision = self
+                    .ensure_profile_version_secret(store, binding, self.vision_secrets.as_ref())
+                    .await?;
+                if let Err(error) = self
+                    .publish_copied_secret_refs(store, &copied_vision, audit)
+                    .await
+                {
+                    self.compensate_copied_secret_entries(&copied_vision);
+                    self.compensate_copied_secret_entries(&copied_text);
+                    return Err(error);
+                }
+                if let Err(error) = self
+                    .reconcile_profile_secret_refs(store, binding, false, audit)
+                    .await
+                {
+                    self.compensate_copied_secret_entries(&copied_vision);
+                    self.compensate_copied_secret_entries(&copied_text);
+                    return Err(error);
+                }
+            }
+            if let Err(error) = self
+                .reconcile_profile_secret_refs(store, text_binding, false, audit)
+                .await
+            {
+                self.compensate_copied_secret_entries(&copied_text);
+                return Err(error);
+            }
+            return Ok(text_binding);
+        }
+        self.materialize_model_profiles_locked(store, audit, false, false, false, &[])
             .await
     }
 
@@ -421,6 +522,8 @@ impl SettingsService {
         audit: &AuditContext,
         force_text_credential_revision: bool,
         force_vision_credential_revision: bool,
+        apply_legacy_projection: bool,
+        intended_present_bindings: &[AiModelProfileBinding],
     ) -> Result<AiModelProfileBinding, SettingsError> {
         let settings = self.read_or_default()?;
         let runtime = settings.runtime()?;
@@ -452,7 +555,8 @@ impl SettingsService {
             base_url: settings.provider.base_url.clone(),
             runtime,
         };
-        let text_binding = materialize_profile(store, &text_spec, now, audit).await?;
+        let text_binding =
+            materialize_profile(store, &text_spec, now, audit, apply_legacy_projection).await?;
 
         let configured_vision_binding = if let Some(model_id) = vision_model {
             let vision_spec = ModelProfileSpec {
@@ -464,7 +568,10 @@ impl SettingsService {
                 base_url: settings.provider.base_url.clone(),
                 runtime,
             };
-            Some(materialize_profile(store, &vision_spec, now, audit).await?)
+            Some(
+                materialize_profile(store, &vision_spec, now, audit, apply_legacy_projection)
+                    .await?,
+            )
         } else {
             None
         };
@@ -475,26 +582,42 @@ impl SettingsService {
             configured_vision_binding.map(|binding| binding.profile_id),
             now,
             audit,
+            apply_legacy_projection,
         )
         .await?;
         let retained_vision_binding = match configured_vision_binding {
             Some(binding) => Some(binding),
             None => {
-                existing_compatible_profile_binding(
-                    store,
-                    MIGRATED_LOCAL_VISION_PROFILE_ID,
-                    "Migrated vision model",
-                )
-                .await?
+                existing_compatible_profile_binding(store, MIGRATED_LOCAL_VISION_PROFILE_ID).await?
             }
         };
+        // These bindings were written by the current save operation. Publish
+        // that explicit intent before conservative reconciliation can treat a
+        // missing metadata row as an orphaned residual Keyring entry.
+        self.publish_copied_secret_refs(store, intended_present_bindings, audit)
+            .await?;
         let copied_text = self
             .ensure_profile_version_secret(store, text_binding, self.secrets.as_ref())
             .await?;
+        if let Err(error) = self
+            .publish_copied_secret_refs(store, &copied_text, audit)
+            .await
+        {
+            self.compensate_copied_secret_entries(&copied_text);
+            return Err(error);
+        }
         if let Some(binding) = retained_vision_binding {
             let copied_vision = self
                 .ensure_profile_version_secret(store, binding, self.vision_secrets.as_ref())
                 .await?;
+            if let Err(error) = self
+                .publish_copied_secret_refs(store, &copied_vision, audit)
+                .await
+            {
+                self.compensate_copied_secret_entries(&copied_vision);
+                self.compensate_copied_secret_entries(&copied_text);
+                return Err(error);
+            }
             if let Err(error) = self
                 .reconcile_profile_secret_refs(
                     store,
@@ -550,7 +673,7 @@ impl SettingsService {
         let force_text_credential_revision = input.api_key.is_some();
         let force_vision_credential_revision =
             force_text_credential_revision && input.supports_vision;
-        let saved = match self.save(input) {
+        let (saved, intended_present_bindings) = match self.save_with_secret_plan(input) {
             Ok(saved) => saved,
             Err(error) => {
                 if matches!(
@@ -568,6 +691,8 @@ impl SettingsService {
                 audit,
                 force_text_credential_revision,
                 force_vision_credential_revision,
+                true,
+                &intended_present_bindings,
             )
             .await
         {
@@ -578,7 +703,15 @@ impl SettingsService {
         Ok(saved)
     }
 
+    #[cfg(test)]
     pub(crate) fn save(&self, input: SaveAiSettingsInput) -> Result<AiSettingsView, SettingsError> {
+        self.save_with_secret_plan(input).map(|(view, _)| view)
+    }
+
+    fn save_with_secret_plan(
+        &self,
+        input: SaveAiSettingsInput,
+    ) -> Result<(AiSettingsView, Vec<AiModelProfileBinding>), SettingsError> {
         let runtime = input.runtime()?;
         let provider_preset_id = validated_preset_id(&input.provider_preset_id)?;
         let mut provider = match input.provider_kind {
@@ -650,43 +783,63 @@ impl SettingsService {
         } else {
             current_vision_version
         };
+        let mut intended_present_bindings = Vec::new();
         if let Some(secret) = input.api_key.as_deref() {
             self.versioned_secrets.set_secret(
                 MIGRATED_LOCAL_PROFILE_ID,
                 next_text_version,
                 secret,
             )?;
+            intended_present_bindings.push(AiModelProfileBinding {
+                profile_id: MIGRATED_LOCAL_PROFILE_ID,
+                profile_version: next_text_version,
+            });
             if input.supports_vision {
                 self.versioned_secrets.set_secret(
                     MIGRATED_LOCAL_VISION_PROFILE_ID,
                     next_vision_version,
                     secret,
                 )?;
+                intended_present_bindings.push(AiModelProfileBinding {
+                    profile_id: MIGRATED_LOCAL_VISION_PROFILE_ID,
+                    profile_version: next_vision_version,
+                });
             }
         } else if identity_matches {
-            if next_text_version != current_text_version {
-                self.copy_version_secret_if_missing(
+            if next_text_version != current_text_version
+                && self.copy_version_secret_if_missing(
                     MIGRATED_LOCAL_PROFILE_ID,
                     current_text_version,
                     MIGRATED_LOCAL_PROFILE_ID,
                     next_text_version,
-                )?;
+                )?
+            {
+                intended_present_bindings.push(AiModelProfileBinding {
+                    profile_id: MIGRATED_LOCAL_PROFILE_ID,
+                    profile_version: next_text_version,
+                });
             }
             if input.supports_vision && next_vision_version != current_vision_version {
-                if current.supports_vision && current_vision_version > 0 {
+                let copied = if current.supports_vision && current_vision_version > 0 {
                     self.copy_version_secret_if_missing(
                         MIGRATED_LOCAL_VISION_PROFILE_ID,
                         current_vision_version,
                         MIGRATED_LOCAL_VISION_PROFILE_ID,
                         next_vision_version,
-                    )?;
+                    )?
                 } else {
                     self.copy_version_secret_if_missing(
                         MIGRATED_LOCAL_PROFILE_ID,
                         next_text_version,
                         MIGRATED_LOCAL_VISION_PROFILE_ID,
                         next_vision_version,
-                    )?;
+                    )?
+                };
+                if copied {
+                    intended_present_bindings.push(AiModelProfileBinding {
+                        profile_id: MIGRATED_LOCAL_VISION_PROFILE_ID,
+                        profile_version: next_vision_version,
+                    });
                 }
             }
         } else {
@@ -725,20 +878,22 @@ impl SettingsService {
             .versioned_secrets
             .get_secret(MIGRATED_LOCAL_PROFILE_ID, next_text_version)?
             .is_some();
-        Ok(AiSettingsView::from_file(file, has_key))
+        Ok((
+            AiSettingsView::from_file(file, has_key),
+            intended_present_bindings,
+        ))
     }
 
     /// Resolves one immutable profile version into the exact Provider/runtime
     /// used for a turn. Historical conversations must use this path rather
     /// than rebuilding a Provider from the mutable JSON projection.
-    pub(crate) async fn resolve_provider_for_profile<S: AiModelProfileStore + ?Sized>(
+    pub(crate) async fn resolve_provider_for_profile<
+        S: AiModelProfileStore + AiModelProfileSecretRefStore + ?Sized,
+    >(
         &self,
         store: &S,
         binding: AiModelProfileBinding,
     ) -> Result<ResolvedAiProvider, SettingsError> {
-        if !self.read_or_default()?.enabled {
-            return Err(SettingsError::Disabled);
-        }
         let profile = store.get_ai_model_profile(binding.profile_id).await?;
         if profile.lab_id != LOCAL_LAB_ID
             || profile.user_id != LOCAL_USER_ID
@@ -753,9 +908,6 @@ impl SettingsService {
         let version = store
             .get_ai_model_profile_version(binding.profile_id, binding.profile_version)
             .await?;
-        if version.protocol != AiProviderProtocol::OpenaiChatCompletions {
-            return Err(SettingsError::UnsupportedProtocol);
-        }
         let runtime = AssistantRuntimeConfig {
             context_window_tokens: version.context_window_tokens,
             max_input_tokens: version.max_input_tokens,
@@ -768,13 +920,17 @@ impl SettingsService {
         .validate()
         .map_err(|_| SettingsError::InvalidFile)?;
         let mut config = match version.transport {
-            AiProviderTransport::OpenAiCompatible => ProviderConfig::openai_compatible(
+            AiProviderTransport::OpenAiCompatible => {
+                ProviderConfig::openai_compatible_with_protocol(
+                    format!("desktop-profile-{}", binding.profile_id.simple()),
+                    version.protocol,
+                    version.model_id.clone(),
+                    version.base_url.clone(),
+                )
+            }
+            AiProviderTransport::LocalHttp => ProviderConfig::local_http_with_protocol(
                 format!("desktop-profile-{}", binding.profile_id.simple()),
-                version.model_id.clone(),
-                version.base_url.clone(),
-            ),
-            AiProviderTransport::LocalHttp => ProviderConfig::local_http(
-                format!("desktop-profile-{}", binding.profile_id.simple()),
+                version.protocol,
                 version.model_id.clone(),
                 version.base_url.clone(),
             ),
@@ -782,19 +938,7 @@ impl SettingsService {
         config.timeout_ms = version.timeout_ms;
         let provider =
             BuiltinProvider::from_config(config).map_err(SettingsError::InvalidProvider)?;
-        if !matches!(
-            binding.profile_id,
-            MIGRATED_LOCAL_PROFILE_ID | MIGRATED_LOCAL_VISION_PROFILE_ID
-        ) {
-            return Err(StoreError::Validation(
-                "the selected local AI model profile credential is unavailable".to_owned(),
-            )
-            .into());
-        }
-        let api_key = self
-            .versioned_secrets
-            .get_secret(binding.profile_id, binding.profile_version)?
-            .map(AiSecret::new);
+        let api_key = self.profile_key(store, binding).await?;
         if version.transport == AiProviderTransport::OpenAiCompatible && api_key.is_none() {
             return Err(SettingsError::MissingCredential);
         }
@@ -805,6 +949,215 @@ impl SettingsService {
         })
     }
 
+    pub(crate) async fn profile_has_key<S: AiModelProfileSecretRefStore + ?Sized>(
+        &self,
+        store: &S,
+        binding: AiModelProfileBinding,
+    ) -> Result<bool, SettingsError> {
+        Ok(self.profile_key(store, binding).await?.is_some())
+    }
+
+    pub(crate) async fn profile_key<S: AiModelProfileSecretRefStore + ?Sized>(
+        &self,
+        store: &S,
+        binding: AiModelProfileBinding,
+    ) -> Result<Option<AiSecret>, SettingsError> {
+        let expected_account =
+            KeyringSecretStore::for_profile_version(binding.profile_id, binding.profile_version)
+                .account();
+        let Some(secret_ref) = store
+            .get_ai_model_profile_secret_ref(binding.profile_id, binding.profile_version)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if secret_ref.credential_state != AiModelCredentialState::Present
+            || secret_ref.keyring_account != expected_account
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .versioned_secrets
+            .get_secret(binding.profile_id, binding.profile_version)?
+            .map(AiSecret::new))
+    }
+
+    pub(crate) async fn create_model_profile_with_secret<
+        S: AiModelProfileStore + AiModelProfileSecretRefStore + ?Sized,
+    >(
+        &self,
+        store: &S,
+        profile: &AiModelProfile,
+        version: &AiModelProfileVersion,
+        api_key: Option<&str>,
+        audit: &AuditContext,
+    ) -> Result<(), SettingsError> {
+        let _operation = self.operation_lock.lock().await;
+        store
+            .create_ai_model_profile(profile, version, audit)
+            .await?;
+        let binding = AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: version.version,
+        };
+        self.save_profile_secret_state(
+            store,
+            binding,
+            AiModelCredentialState::Revoked,
+            false,
+            audit,
+        )
+        .await?;
+        if let Some(api_key) = api_key {
+            self.versioned_secrets
+                .set_secret(profile.id, version.version, api_key)?;
+            if let Err(error) = self
+                .save_profile_secret_state(
+                    store,
+                    binding,
+                    AiModelCredentialState::Present,
+                    true,
+                    audit,
+                )
+                .await
+            {
+                let _ = self
+                    .versioned_secrets
+                    .clear_secret(profile.id, version.version);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn append_model_profile_with_secret<
+        S: AiModelProfileStore + AiModelProfileSecretRefStore + ?Sized,
+    >(
+        &self,
+        store: &S,
+        mutation: AppendModelProfileWithSecret<'_>,
+        audit: &AuditContext,
+    ) -> Result<(), SettingsError> {
+        let AppendModelProfileWithSecret {
+            profile,
+            version,
+            expected_revision,
+            api_key,
+            preserve_from,
+        } = mutation;
+        let _operation = self.operation_lock.lock().await;
+        let binding = AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: version.version,
+        };
+        store
+            .append_ai_model_profile_version(profile, version, expected_revision, audit)
+            .await?;
+        self.save_profile_secret_state(
+            store,
+            binding,
+            AiModelCredentialState::Revoked,
+            false,
+            audit,
+        )
+        .await?;
+        let preserved_secret = if api_key.is_none() {
+            match preserve_from {
+                Some(source) => self.profile_key(store, source).await?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let secret = api_key.or_else(|| preserved_secret.as_ref().map(AiSecret::as_str));
+        let Some(secret) = secret else {
+            self.versioned_secrets
+                .clear_secret(binding.profile_id, binding.profile_version)?;
+            return Ok(());
+        };
+        self.versioned_secrets
+            .set_secret(binding.profile_id, binding.profile_version, secret)?;
+        if let Err(error) = self
+            .save_profile_secret_state(store, binding, AiModelCredentialState::Present, true, audit)
+            .await
+        {
+            let _ = self
+                .versioned_secrets
+                .clear_secret(binding.profile_id, binding.profile_version);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn rotate_model_profile_secret<S: AiModelProfileSecretRefStore + ?Sized>(
+        &self,
+        store: &S,
+        binding: AiModelProfileBinding,
+        api_key: &str,
+        audit: &AuditContext,
+    ) -> Result<(), SettingsError> {
+        let _operation = self.operation_lock.lock().await;
+        self.save_profile_secret_state(
+            store,
+            binding,
+            AiModelCredentialState::Revoked,
+            true,
+            audit,
+        )
+        .await?;
+        self.versioned_secrets
+            .set_secret(binding.profile_id, binding.profile_version, api_key)?;
+        if let Err(error) = self
+            .save_profile_secret_state(store, binding, AiModelCredentialState::Present, true, audit)
+            .await
+        {
+            let _ = self
+                .versioned_secrets
+                .clear_secret(binding.profile_id, binding.profile_version);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn clear_model_profile_secrets<S: AiModelProfileSecretRefStore + ?Sized>(
+        &self,
+        store: &S,
+        binding: AiModelProfileBinding,
+        audit: &AuditContext,
+    ) -> Result<(), SettingsError> {
+        let _operation = self.operation_lock.lock().await;
+        let revoked = store
+            .revoke_ai_model_profile_secret_refs(binding.profile_id, Utc::now(), audit)
+            .await?;
+        let mut profile_versions = (1..=binding.profile_version).collect::<Vec<_>>();
+        profile_versions.extend(
+            revoked
+                .into_iter()
+                .map(|secret_ref| secret_ref.profile_version)
+                .filter(|profile_version| *profile_version > 0),
+        );
+        profile_versions.sort_unstable();
+        profile_versions.dedup();
+
+        // The redacted DB state is the usage gate. Physical Keyring cleanup
+        // starts only after every existing binding is durably revoked.
+        let mut first_error = None;
+        for profile_version in profile_versions {
+            if let Err(error) = self
+                .versioned_secrets
+                .clear_secret(binding.profile_id, profile_version)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn clear_key(&self) -> Result<AiSettingsView, SettingsError> {
         let _guard = self.write_lock.lock().map_err(|_| SettingsError::Storage)?;
         let mut settings = self.read_or_default()?;
@@ -831,33 +1184,81 @@ impl SettingsService {
         audit: &AuditContext,
     ) -> Result<AiSettingsView, SettingsError> {
         let _operation = self.operation_lock.lock().await;
-        let text_binding = existing_compatible_profile_binding(
-            store,
-            MIGRATED_LOCAL_PROFILE_ID,
-            "Migrated default model",
-        )
-        .await?;
-        let vision_binding = existing_compatible_profile_binding(
-            store,
-            MIGRATED_LOCAL_VISION_PROFILE_ID,
-            "Migrated vision model",
-        )
-        .await?;
+        let text_binding =
+            existing_compatible_profile_binding(store, MIGRATED_LOCAL_PROFILE_ID).await?;
+        let vision_binding =
+            existing_compatible_profile_binding(store, MIGRATED_LOCAL_VISION_PROFILE_ID).await?;
 
-        // Revoke first: if any later metadata write fails, no provider can
-        // continue using a credential whose audit projection is stale.
-        let view = self.clear_key()?;
         let text_binding = text_binding.ok_or(StoreError::NotFound {
             entity: "ai_model_profile",
             id: MIGRATED_LOCAL_PROFILE_ID,
         })?;
-        self.reconcile_profile_secret_refs(store, text_binding, true, audit)
+        let revoked_text = store
+            .revoke_ai_model_profile_secret_refs(text_binding.profile_id, Utc::now(), audit)
             .await?;
-        if let Some(binding) = vision_binding {
-            self.reconcile_profile_secret_refs(store, binding, true, audit)
-                .await?;
+        let revoked_vision = if let Some(binding) = vision_binding {
+            store
+                .revoke_ai_model_profile_secret_refs(binding.profile_id, Utc::now(), audit)
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        let mut text_versions = (1..=text_binding.profile_version).collect::<Vec<_>>();
+        text_versions.extend(
+            revoked_text
+                .into_iter()
+                .map(|secret_ref| secret_ref.profile_version)
+                .filter(|profile_version| *profile_version > 0),
+        );
+        text_versions.sort_unstable();
+        text_versions.dedup();
+        let mut vision_versions = vision_binding
+            .map(|binding| (1..=binding.profile_version).collect::<Vec<_>>())
+            .unwrap_or_default();
+        vision_versions.extend(
+            revoked_vision
+                .into_iter()
+                .map(|secret_ref| secret_ref.profile_version)
+                .filter(|profile_version| *profile_version > 0),
+        );
+        vision_versions.sort_unstable();
+        vision_versions.dedup();
+
+        let mut first_error = None;
+        for result in [
+            self.secrets.clear_secret(),
+            self.vision_secrets.clear_secret(),
+        ] {
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
         }
-        Ok(view)
+        for (profile_id, profile_versions) in [
+            (text_binding.profile_id, text_versions),
+            (MIGRATED_LOCAL_VISION_PROFILE_ID, vision_versions),
+        ] {
+            for profile_version in profile_versions {
+                if let Err(error) = self
+                    .versioned_secrets
+                    .clear_secret(profile_id, profile_version)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        let _guard = self.write_lock.lock().map_err(|_| SettingsError::Storage)?;
+        let mut settings = self.read_or_default()?;
+        settings.revision = settings.revision.saturating_add(1);
+        self.write_atomic(&settings)?;
+        Ok(AiSettingsView::from_file(settings, false))
     }
 
     fn read_or_default(&self) -> Result<AiSettingsFile, SettingsError> {
@@ -906,13 +1307,24 @@ impl SettingsService {
         Ok(())
     }
 
-    async fn ensure_profile_version_secret<S: AiModelProfileStore + ?Sized>(
+    async fn ensure_profile_version_secret<
+        S: AiModelProfileStore + AiModelProfileSecretRefStore + ?Sized,
+    >(
         &self,
         store: &S,
         binding: AiModelProfileBinding,
         legacy_secrets: &dyn SecretStore,
     ) -> Result<Vec<AiModelProfileBinding>, SettingsError> {
         let mut copied = Vec::new();
+        if store
+            .get_ai_model_profile_secret_ref(binding.profile_id, binding.profile_version)
+            .await?
+            .is_some_and(|secret_ref| {
+                secret_ref.credential_state == AiModelCredentialState::Revoked
+            })
+        {
+            return Ok(copied);
+        }
         if self
             .versioned_secrets
             .contains_secret_entry(binding.profile_id, binding.profile_version)?
@@ -927,6 +1339,15 @@ impl SettingsService {
                 .versioned_secrets
                 .contains_secret_entry(binding.profile_id, cursor)?
         {
+            if store
+                .get_ai_model_profile_secret_ref(binding.profile_id, cursor)
+                .await?
+                .is_some_and(|secret_ref| {
+                    secret_ref.credential_state == AiModelCredentialState::Revoked
+                })
+            {
+                return Ok(copied);
+            }
             let current = store
                 .get_ai_model_profile_version(binding.profile_id, cursor)
                 .await?;
@@ -945,6 +1366,15 @@ impl SettingsService {
                 .versioned_secrets
                 .contains_secret_entry(binding.profile_id, 1)?
         {
+            if store
+                .get_ai_model_profile_secret_ref(binding.profile_id, 1)
+                .await?
+                .is_some_and(|secret_ref| {
+                    secret_ref.credential_state == AiModelCredentialState::Revoked
+                })
+            {
+                return Ok(copied);
+            }
             let Some(secret) = legacy_secrets
                 .get_secret()?
                 .filter(|secret| !secret.is_empty())
@@ -1006,61 +1436,140 @@ impl SettingsService {
         Ok(true)
     }
 
+    async fn save_profile_secret_state<S: AiModelProfileSecretRefStore + ?Sized>(
+        &self,
+        store: &S,
+        binding: AiModelProfileBinding,
+        credential_state: AiModelCredentialState,
+        force_revision: bool,
+        audit: &AuditContext,
+    ) -> Result<(), SettingsError> {
+        let account =
+            KeyringSecretStore::for_profile_version(binding.profile_id, binding.profile_version)
+                .account();
+        let current = store
+            .get_ai_model_profile_secret_ref(binding.profile_id, binding.profile_version)
+            .await?;
+        if let Some(current) = &current {
+            if current.keyring_account != account {
+                return Err(StoreError::Validation(
+                    "AI model profile secret reference account does not match its immutable version"
+                        .to_owned(),
+                )
+                .into());
+            }
+            if current.credential_state == credential_state && !force_revision {
+                return Ok(());
+            }
+        }
+        let now = Utc::now();
+        let expected_revision = current.as_ref().map(|current| current.revision);
+        let value = match current {
+            Some(mut current) => {
+                current.credential_state = credential_state;
+                current.updated_at = now;
+                current.revision = current
+                    .revision
+                    .checked_add(1)
+                    .ok_or(SettingsError::InvalidFile)?;
+                current
+            }
+            None => AiModelProfileSecretRef {
+                profile_id: binding.profile_id,
+                profile_version: binding.profile_version,
+                keyring_account: account,
+                credential_state,
+                created_at: now,
+                updated_at: now,
+                revision: 1,
+            },
+        };
+        store
+            .save_ai_model_profile_secret_ref(&value, expected_revision, audit)
+            .await?;
+        Ok(())
+    }
+
+    async fn publish_copied_secret_refs<S: AiModelProfileSecretRefStore + ?Sized>(
+        &self,
+        store: &S,
+        copied: &[AiModelProfileBinding],
+        audit: &AuditContext,
+    ) -> Result<(), SettingsError> {
+        for binding in copied {
+            self.save_profile_secret_state(
+                store,
+                *binding,
+                AiModelCredentialState::Present,
+                false,
+                audit,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn reconcile_profile_secret_refs<S: AiModelProfileSecretRefStore + ?Sized>(
         &self,
         store: &S,
         binding: AiModelProfileBinding,
-        force_current_revision: bool,
+        force_current_present: bool,
         audit: &AuditContext,
     ) -> Result<(), SettingsError> {
         for profile_version in 1..=binding.profile_version {
+            let version_binding = AiModelProfileBinding {
+                profile_id: binding.profile_id,
+                profile_version,
+            };
             let account =
                 KeyringSecretStore::for_profile_version(binding.profile_id, profile_version)
                     .account();
-            let credential_state = if self
+            let has_secret = self
                 .versioned_secrets
                 .get_secret(binding.profile_id, profile_version)?
-                .is_some()
-            {
-                AiModelCredentialState::Present
-            } else {
-                AiModelCredentialState::Revoked
-            };
+                .map(Zeroizing::new)
+                .is_some();
             let current = store
                 .get_ai_model_profile_secret_ref(binding.profile_id, profile_version)
                 .await?;
-            if current.as_ref().is_some_and(|current| {
-                current.keyring_account == account
-                    && current.credential_state == credential_state
-                    && !(force_current_revision && profile_version == binding.profile_version)
-            }) {
-                continue;
-            }
-            let now = Utc::now();
-            let expected_revision = current.as_ref().map(|current| current.revision);
-            let value = match current {
-                Some(mut current) => {
-                    current.credential_state = credential_state;
-                    current.updated_at = now;
-                    current.revision = current
-                        .revision
-                        .checked_add(1)
-                        .ok_or(SettingsError::InvalidFile)?;
-                    current
+            let force_present =
+                force_current_present && profile_version == binding.profile_version && has_secret;
+            let credential_state = match current.as_ref() {
+                None if force_present => AiModelCredentialState::Present,
+                None => AiModelCredentialState::Revoked,
+                Some(current) if current.keyring_account != account => {
+                    return Err(StoreError::Validation(
+                        "AI model profile secret reference account does not match its immutable version"
+                            .to_owned(),
+                    )
+                    .into());
                 }
-                None => AiModelProfileSecretRef {
-                    profile_id: binding.profile_id,
-                    profile_version,
-                    keyring_account: account,
-                    credential_state,
-                    created_at: now,
-                    updated_at: now,
-                    revision: 1,
-                },
+                Some(_) if force_present => AiModelCredentialState::Present,
+                Some(current)
+                    if current.credential_state == AiModelCredentialState::Present
+                        && has_secret =>
+                {
+                    AiModelCredentialState::Present
+                }
+                Some(_) => AiModelCredentialState::Revoked,
             };
-            store
-                .save_ai_model_profile_secret_ref(&value, expected_revision, audit)
-                .await?;
+            if current
+                .as_ref()
+                .is_none_or(|current| current.credential_state == AiModelCredentialState::Revoked)
+                && has_secret
+                && !force_present
+            {
+                self.versioned_secrets
+                    .clear_secret(binding.profile_id, profile_version)?;
+            }
+            self.save_profile_secret_state(
+                store,
+                version_binding,
+                credential_state,
+                force_current_present && profile_version == binding.profile_version,
+                audit,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1153,6 +1662,7 @@ async fn materialize_profile<S: AiModelProfileStore + ?Sized>(
     spec: &ModelProfileSpec,
     now: DateTime<Utc>,
     audit: &AuditContext,
+    apply_legacy_projection: bool,
 ) -> Result<AiModelProfileBinding, SettingsError> {
     let mut profile = match store.get_ai_model_profile(spec.id).await {
         Ok(profile) => profile,
@@ -1178,16 +1688,20 @@ async fn materialize_profile<S: AiModelProfileStore + ?Sized>(
     };
     if profile.lab_id != LOCAL_LAB_ID
         || profile.user_id != LOCAL_USER_ID
-        || profile.name != spec.name
-        || profile.archived_at.is_some()
         || profile.meta.deleted_at.is_some()
+        || (apply_legacy_projection && profile.archived_at.is_some())
     {
         return Err(StoreError::Validation(
             "the deterministic local AI model profile identity is unavailable".to_owned(),
         )
         .into());
     }
-
+    if !apply_legacy_projection {
+        return Ok(AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: profile.current_version,
+        });
+    }
     let current = store
         .get_ai_model_profile_version(profile.id, profile.current_version)
         .await?;
@@ -1197,14 +1711,20 @@ async fn materialize_profile<S: AiModelProfileStore + ?Sized>(
             profile_version: profile.current_version,
         });
     }
-
     let expected_revision = profile.meta.revision;
-    profile.current_version += 1;
+    profile.current_version = profile
+        .current_version
+        .checked_add(1)
+        .ok_or(SettingsError::InvalidFile)?;
+    if profile.meta.revision == i64::MAX {
+        return Err(SettingsError::InvalidFile);
+    }
     profile.meta.touch(now);
     let next = spec.version(profile.current_version, now);
     store
         .append_ai_model_profile_version(&profile, &next, expected_revision, audit)
         .await?;
+
     Ok(AiModelProfileBinding {
         profile_id: profile.id,
         profile_version: profile.current_version,
@@ -1214,7 +1734,6 @@ async fn materialize_profile<S: AiModelProfileStore + ?Sized>(
 async fn existing_compatible_profile_binding<S: AiModelProfileStore + ?Sized>(
     store: &S,
     profile_id: Uuid,
-    expected_name: &str,
 ) -> Result<Option<AiModelProfileBinding>, SettingsError> {
     let profile = match store.get_ai_model_profile(profile_id).await {
         Ok(profile) => profile,
@@ -1223,8 +1742,6 @@ async fn existing_compatible_profile_binding<S: AiModelProfileStore + ?Sized>(
     };
     if profile.lab_id != LOCAL_LAB_ID
         || profile.user_id != LOCAL_USER_ID
-        || profile.name != expected_name
-        || profile.archived_at.is_some()
         || profile.meta.deleted_at.is_some()
     {
         return Err(StoreError::Validation(
@@ -1294,6 +1811,7 @@ async fn materialize_defaults<S: AiModelProfileStore + ?Sized>(
     vision_profile_id: Option<Uuid>,
     now: DateTime<Utc>,
     audit: &AuditContext,
+    apply_legacy_projection: bool,
 ) -> Result<(), SettingsError> {
     let current = store.get_ai_user_model_defaults(LOCAL_USER_ID).await?;
     if current.as_ref().is_some_and(|defaults| {
@@ -1302,9 +1820,15 @@ async fn materialize_defaults<S: AiModelProfileStore + ?Sized>(
     }) {
         return Ok(());
     }
+    if current.is_some() && !apply_legacy_projection {
+        return Ok(());
+    }
     let expected_revision = current.as_ref().map(|defaults| defaults.meta.revision);
     let defaults = match current {
         Some(mut defaults) => {
+            if defaults.meta.revision == i64::MAX {
+                return Err(SettingsError::InvalidFile);
+            }
             defaults.default_conversation_profile_id = Some(conversation_profile_id);
             defaults.default_vision_profile_id = vision_profile_id;
             defaults.meta.touch(now);
@@ -1585,7 +2109,13 @@ fn infer_preset_id(base_url: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Mutex};
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::*;
     use muriarc_core::{
@@ -1626,16 +2156,41 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FakeSecretOperation {
+        Set,
+        Clear,
+    }
+
     #[derive(Default)]
-    struct FakeVersionedSecretStore(Mutex<BTreeMap<(Uuid, i64), String>>);
+    struct FakeVersionedSecretStore {
+        entries: Mutex<BTreeMap<(Uuid, i64), String>>,
+        fail_next: Mutex<Option<FakeSecretOperation>>,
+    }
 
     impl FakeVersionedSecretStore {
         fn raw_secret(&self, profile_id: Uuid, profile_version: i64) -> Option<String> {
-            self.0
+            self.entries
                 .lock()
                 .unwrap()
                 .get(&(profile_id, profile_version))
                 .cloned()
+        }
+
+        fn fail_next(&self, operation: FakeSecretOperation) {
+            *self.fail_next.lock().unwrap() = Some(operation);
+        }
+
+        fn check_failure(&self, operation: FakeSecretOperation) -> Result<(), SettingsError> {
+            let mut fail_next = self
+                .fail_next
+                .lock()
+                .map_err(|_| SettingsError::CredentialStore)?;
+            if fail_next.as_ref() == Some(&operation) {
+                *fail_next = None;
+                return Err(SettingsError::CredentialStore);
+            }
+            Ok(())
         }
     }
 
@@ -1646,7 +2201,7 @@ mod tests {
             profile_version: i64,
         ) -> Result<Option<String>, SettingsError> {
             Ok(self
-                .0
+                .entries
                 .lock()
                 .map_err(|_| SettingsError::CredentialStore)?
                 .get(&(profile_id, profile_version))
@@ -1660,7 +2215,7 @@ mod tests {
             profile_version: i64,
         ) -> Result<bool, SettingsError> {
             Ok(self
-                .0
+                .entries
                 .lock()
                 .map_err(|_| SettingsError::CredentialStore)?
                 .contains_key(&(profile_id, profile_version)))
@@ -1672,7 +2227,8 @@ mod tests {
             profile_version: i64,
             secret: &str,
         ) -> Result<(), SettingsError> {
-            self.0
+            self.check_failure(FakeSecretOperation::Set)?;
+            self.entries
                 .lock()
                 .map_err(|_| SettingsError::CredentialStore)?
                 .insert((profile_id, profile_version), secret.to_owned());
@@ -1684,7 +2240,157 @@ mod tests {
             profile_id: Uuid,
             profile_version: i64,
         ) -> Result<(), SettingsError> {
-            self.set_secret(profile_id, profile_version, "")
+            self.check_failure(FakeSecretOperation::Clear)?;
+            self.entries
+                .lock()
+                .map_err(|_| SettingsError::CredentialStore)?
+                .insert((profile_id, profile_version), String::new());
+            Ok(())
+        }
+    }
+
+    struct FailingSecretRefStore {
+        inner: SqliteStore,
+        fail_on_save: usize,
+        save_calls: AtomicUsize,
+    }
+
+    impl FailingSecretRefStore {
+        fn new(inner: SqliteStore, fail_on_save: usize) -> Self {
+            Self {
+                inner,
+                fail_on_save,
+                save_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AiModelProfileStore for FailingSecretRefStore {
+        async fn create_ai_model_profile(
+            &self,
+            profile: &AiModelProfile,
+            version: &AiModelProfileVersion,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner
+                .create_ai_model_profile(profile, version, audit)
+                .await
+        }
+
+        async fn get_ai_model_profile(
+            &self,
+            id: Uuid,
+        ) -> muriarc_core::StoreResult<AiModelProfile> {
+            self.inner.get_ai_model_profile(id).await
+        }
+
+        async fn list_ai_model_profiles(
+            &self,
+            filter: &muriarc_core::AiModelProfileFilter,
+        ) -> muriarc_core::StoreResult<Vec<AiModelProfile>> {
+            self.inner.list_ai_model_profiles(filter).await
+        }
+
+        async fn get_ai_model_profile_version(
+            &self,
+            profile_id: Uuid,
+            version: i64,
+        ) -> muriarc_core::StoreResult<AiModelProfileVersion> {
+            self.inner
+                .get_ai_model_profile_version(profile_id, version)
+                .await
+        }
+
+        async fn append_ai_model_profile_version(
+            &self,
+            profile: &AiModelProfile,
+            version: &AiModelProfileVersion,
+            expected_revision: i64,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner
+                .append_ai_model_profile_version(profile, version, expected_revision, audit)
+                .await
+        }
+
+        async fn archive_ai_model_profile(
+            &self,
+            profile: &AiModelProfile,
+            expected_revision: i64,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner
+                .archive_ai_model_profile(profile, expected_revision, audit)
+                .await
+        }
+
+        async fn save_ai_user_model_defaults(
+            &self,
+            defaults: &AiUserModelDefaults,
+            expected_revision: Option<i64>,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            self.inner
+                .save_ai_user_model_defaults(defaults, expected_revision, audit)
+                .await
+        }
+
+        async fn get_ai_user_model_defaults(
+            &self,
+            user_id: Uuid,
+        ) -> muriarc_core::StoreResult<Option<AiUserModelDefaults>> {
+            self.inner.get_ai_user_model_defaults(user_id).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AiModelProfileSecretRefStore for FailingSecretRefStore {
+        async fn get_ai_model_profile_secret_ref(
+            &self,
+            profile_id: Uuid,
+            profile_version: i64,
+        ) -> muriarc_core::StoreResult<Option<AiModelProfileSecretRef>> {
+            self.inner
+                .get_ai_model_profile_secret_ref(profile_id, profile_version)
+                .await
+        }
+
+        async fn list_ai_model_profile_secret_refs(
+            &self,
+            profile_id: Uuid,
+        ) -> muriarc_core::StoreResult<Vec<AiModelProfileSecretRef>> {
+            self.inner
+                .list_ai_model_profile_secret_refs(profile_id)
+                .await
+        }
+
+        async fn save_ai_model_profile_secret_ref(
+            &self,
+            value: &AiModelProfileSecretRef,
+            expected_revision: Option<i64>,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<()> {
+            let call = self.save_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on_save {
+                return Err(StoreError::Database(
+                    "injected AI model secret reference failure".to_owned(),
+                ));
+            }
+            self.inner
+                .save_ai_model_profile_secret_ref(value, expected_revision, audit)
+                .await
+        }
+
+        async fn revoke_ai_model_profile_secret_refs(
+            &self,
+            profile_id: Uuid,
+            revoked_at: DateTime<Utc>,
+            audit: &AuditContext,
+        ) -> muriarc_core::StoreResult<Vec<AiModelProfileSecretRef>> {
+            self.inner
+                .revoke_ai_model_profile_secret_refs(profile_id, revoked_at, audit)
+                .await
         }
     }
 
@@ -1794,6 +2500,51 @@ mod tests {
         store
     }
 
+    fn cloud_profile(
+        id: Uuid,
+        name: &str,
+        version_number: i64,
+        now: DateTime<Utc>,
+    ) -> (AiModelProfile, AiModelProfileVersion) {
+        let profile = AiModelProfile {
+            id,
+            lab_id: LOCAL_LAB_ID,
+            user_id: LOCAL_USER_ID,
+            name: name.to_owned(),
+            current_version: version_number,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        let version = AiModelProfileVersion {
+            profile_id: id,
+            version: version_number,
+            protocol: AiProviderProtocol::OpenaiChatCompletions,
+            transport: AiProviderTransport::OpenAiCompatible,
+            base_url: "https://provider.example.test/v1".to_owned(),
+            normalized_base_url: "https://provider.example.test/v1".to_owned(),
+            model_id: format!("model-v{version_number}"),
+            supports_vision: false,
+            context_window_tokens: default_context_window_tokens(),
+            max_input_tokens: default_max_input_tokens(),
+            max_output_tokens: default_max_output_tokens(),
+            history_token_budget: default_history_token_budget(),
+            history_turns: default_history_turns(),
+            temperature: default_temperature(),
+            timeout_ms: default_timeout_ms(),
+            created_at: now,
+        };
+        (profile, version)
+    }
+
+    fn desktop_audit(reason: &str) -> AuditContext {
+        AuditContext {
+            actor: Actor::human(LOCAL_USER_ID, "Local profile operator"),
+            source: WriteSource::Desktop,
+            request_id: Some(format!("desktop-test-{reason}")),
+            reason: Some(reason.to_owned()),
+        }
+    }
+
     fn save_input(
         model: &str,
         base_url: &str,
@@ -1875,28 +2626,37 @@ mod tests {
         );
 
         service
-            .save(SaveAiSettingsInput {
-                enabled: true,
-                provider_kind: ProviderKind::OpenAiCompatible,
-                provider_preset_id: "deepseek".to_owned(),
-                model: "deepseek-chat-next".to_owned(),
-                base_url: "https://api.deepseek.com".to_owned(),
-                supports_vision: true,
-                vision_model: Some("deepseek-vision".to_owned()),
-                context_window_tokens: default_context_window_tokens(),
-                max_input_tokens: default_max_input_tokens(),
-                max_output_tokens: default_max_output_tokens(),
-                history_token_budget: default_history_token_budget(),
-                history_turns: default_history_turns(),
-                temperature: default_temperature(),
-                timeout_ms: default_timeout_ms(),
-                api_key: None,
-            })
-            .unwrap();
-        let changed = service
-            .materialize_model_profiles(&store, &audit)
+            .save_and_materialize(
+                &store,
+                SaveAiSettingsInput {
+                    enabled: true,
+                    provider_kind: ProviderKind::OpenAiCompatible,
+                    provider_preset_id: "deepseek".to_owned(),
+                    model: "deepseek-chat-next".to_owned(),
+                    base_url: "https://api.deepseek.com".to_owned(),
+                    supports_vision: true,
+                    vision_model: Some("deepseek-vision".to_owned()),
+                    context_window_tokens: default_context_window_tokens(),
+                    max_input_tokens: default_max_input_tokens(),
+                    max_output_tokens: default_max_output_tokens(),
+                    history_token_budget: default_history_token_budget(),
+                    history_turns: default_history_turns(),
+                    temperature: default_temperature(),
+                    timeout_ms: default_timeout_ms(),
+                    api_key: None,
+                },
+                &audit,
+            )
             .await
             .unwrap();
+        let changed_profile = store
+            .get_ai_model_profile(MIGRATED_LOCAL_PROFILE_ID)
+            .await
+            .unwrap();
+        let changed = AiModelProfileBinding {
+            profile_id: changed_profile.id,
+            profile_version: changed_profile.current_version,
+        };
         assert_eq!(changed.profile_version, 2);
         assert_eq!(
             store
@@ -1968,6 +2728,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(repeated_changed, changed);
+        service
+            .save(save_input(
+                "legacy-file-must-not-overwrite-db",
+                "https://api.deepseek.com",
+                false,
+                None,
+                None,
+            ))
+            .unwrap();
+        let startup_reconciliation = service
+            .initialize_model_profiles(&store, &audit)
+            .await
+            .unwrap();
+        assert_eq!(startup_reconciliation, changed);
+        assert_eq!(
+            store
+                .get_ai_model_profile(MIGRATED_LOCAL_PROFILE_ID)
+                .await
+                .unwrap()
+                .current_version,
+            2
+        );
+        assert_eq!(
+            store
+                .get_ai_user_model_defaults(LOCAL_USER_ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .default_vision_profile_id,
+            Some(MIGRATED_LOCAL_VISION_PROFILE_ID)
+        );
         assert_eq!(
             store
                 .get_ai_model_profile(MIGRATED_LOCAL_PROFILE_ID)
@@ -2007,17 +2798,17 @@ mod tests {
                 .contains("must-never-enter-the-database")
         );
 
-        let unsupported_profile = AiModelProfile {
+        let responses_profile = AiModelProfile {
             id: Uuid::new_v4(),
             lab_id: LOCAL_LAB_ID,
             user_id: LOCAL_USER_ID,
-            name: "Unsupported protocol profile".to_owned(),
+            name: "Responses protocol profile".to_owned(),
             current_version: 1,
             archived_at: None,
             meta: RecordMeta::new(Utc::now()),
         };
-        let unsupported_version = AiModelProfileVersion {
-            profile_id: unsupported_profile.id,
+        let responses_version = AiModelProfileVersion {
+            profile_id: responses_profile.id,
             version: 1,
             protocol: AiProviderProtocol::OpenaiResponses,
             transport: AiProviderTransport::OpenAiCompatible,
@@ -2034,22 +2825,226 @@ mod tests {
             timeout_ms: default_timeout_ms(),
             created_at: Utc::now(),
         };
-        store
-            .create_ai_model_profile(&unsupported_profile, &unsupported_version, &audit)
+        service
+            .create_model_profile_with_secret(
+                &store,
+                &responses_profile,
+                &responses_version,
+                Some("responses-secret"),
+                &audit,
+            )
             .await
             .unwrap();
-        assert!(matches!(
+        let resolved = service
+            .resolve_provider_for_profile(
+                &store,
+                AiModelProfileBinding {
+                    profile_id: responses_profile.id,
+                    profile_version: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved.provider.config().protocol,
+            AiProviderProtocol::OpenaiResponses
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_uses_migrated_database_without_parsing_stale_legacy_json() {
+        let (temp, service, legacy_secrets, _versioned_secrets) = service();
+        legacy_secrets.set_secret("legacy-credential").unwrap();
+        let store = local_profile_store(&temp.path().join("startup-db-first.sqlite3")).await;
+        let audit = AuditContext::system(WriteSource::Migration);
+        let (profile, version) = cloud_profile(
+            MIGRATED_LOCAL_PROFILE_ID,
+            "Already migrated profile",
+            1,
+            Utc::now(),
+        );
+        store
+            .create_ai_model_profile(&profile, &version, &audit)
+            .await
+            .unwrap();
+        let migrated = AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: 1,
+        };
+        fs::write(temp.path().join("ai-provider.json"), b"{stale-invalid-json").unwrap();
+
+        assert_eq!(
             service
-                .resolve_provider_for_profile(
-                    &store,
-                    AiModelProfileBinding {
-                        profile_id: unsupported_profile.id,
-                        profile_version: 1,
-                    },
-                )
-                .await,
-            Err(SettingsError::UnsupportedProtocol)
+                .initialize_model_profiles(&store, &audit)
+                .await
+                .unwrap(),
+            migrated
+        );
+        assert_eq!(
+            service
+                .profile_key(&store, migrated)
+                .await
+                .unwrap()
+                .as_ref()
+                .map(AiSecret::as_str),
+            Some("legacy-credential"),
+            "the DB-first startup may still copy a legacy Keyring item without parsing legacy JSON"
+        );
+        assert!(matches!(
+            service.materialize_model_profiles(&store, &audit).await,
+            Err(SettingsError::InvalidFile)
         ));
+        assert_eq!(
+            store
+                .get_ai_model_profile(MIGRATED_LOCAL_PROFILE_ID)
+                .await
+                .unwrap()
+                .current_version,
+            migrated.profile_version
+        );
+        assert_eq!(
+            store
+                .get_ai_user_model_defaults(LOCAL_USER_ID)
+                .await
+                .unwrap()
+                .unwrap()
+                .default_conversation_profile_id,
+            Some(MIGRATED_LOCAL_PROFILE_ID),
+            "an interrupted migration with no defaults row is repaired from DB identity only"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_never_promotes_an_unreferenced_residual_keyring_entry() {
+        let (temp, service, _legacy_secrets, versioned_secrets) = service();
+        let store = local_profile_store(&temp.path().join("startup-residual-key.sqlite3")).await;
+        let audit = AuditContext::system(WriteSource::Migration);
+        let (profile, version) = cloud_profile(
+            MIGRATED_LOCAL_PROFILE_ID,
+            "Interrupted credential profile",
+            1,
+            Utc::now(),
+        );
+        store
+            .create_ai_model_profile(&profile, &version, &audit)
+            .await
+            .unwrap();
+        versioned_secrets
+            .set_secret(profile.id, 1, "orphaned-before-ref-commit")
+            .unwrap();
+        fs::write(temp.path().join("ai-provider.json"), b"{stale-invalid-json").unwrap();
+
+        service
+            .initialize_model_profiles(&store, &audit)
+            .await
+            .unwrap();
+        let binding = AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: 1,
+        };
+        assert!(
+            service
+                .profile_key(&store, binding)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_ai_model_profile_secret_ref(profile.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_state,
+            AiModelCredentialState::Revoked
+        );
+        assert_eq!(
+            versioned_secrets.raw_secret(profile.id, 1).as_deref(),
+            Some("")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_explicit_empty_defaults_and_does_not_default_an_archived_profile() {
+        let (temp, settings, _legacy_secrets, _versioned_secrets) = service();
+        let store =
+            local_profile_store(&temp.path().join("startup-explicit-empty-defaults.sqlite3")).await;
+        let now = Utc::now();
+        let audit = desktop_audit("startup-explicit-empty-defaults");
+        let (profile, version) = cloud_profile(
+            MIGRATED_LOCAL_PROFILE_ID,
+            "Explicitly unselected model",
+            1,
+            now,
+        );
+        store
+            .create_ai_model_profile(&profile, &version, &audit)
+            .await
+            .unwrap();
+        let explicit_empty = AiUserModelDefaults {
+            user_id: LOCAL_USER_ID,
+            default_conversation_profile_id: None,
+            default_vision_profile_id: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .save_ai_user_model_defaults(&explicit_empty, None, &audit)
+            .await
+            .unwrap();
+        fs::write(temp.path().join("ai-provider.json"), b"{stale-invalid-json").unwrap();
+        settings
+            .initialize_model_profiles(&store, &audit)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_ai_user_model_defaults(LOCAL_USER_ID)
+                .await
+                .unwrap(),
+            Some(explicit_empty)
+        );
+
+        let (archived_temp, archived_service, _legacy, _versioned) = service();
+        let archived_store = local_profile_store(
+            &archived_temp
+                .path()
+                .join("startup-archived-without-defaults.sqlite3"),
+        )
+        .await;
+        let (mut archived_profile, archived_version) = cloud_profile(
+            MIGRATED_LOCAL_PROFILE_ID,
+            "Archived deterministic model",
+            1,
+            now,
+        );
+        archived_store
+            .create_ai_model_profile(&archived_profile, &archived_version, &audit)
+            .await
+            .unwrap();
+        archived_profile.archived_at = Some(now + chrono::Duration::milliseconds(1));
+        archived_profile
+            .meta
+            .touch(now + chrono::Duration::milliseconds(1));
+        archived_store
+            .archive_ai_model_profile(&archived_profile, 1, &audit)
+            .await
+            .unwrap();
+        fs::write(
+            archived_temp.path().join("ai-provider.json"),
+            b"{stale-invalid-json",
+        )
+        .unwrap();
+        archived_service
+            .initialize_model_profiles(&archived_store, &audit)
+            .await
+            .unwrap();
+        assert_eq!(
+            archived_store
+                .get_ai_user_model_defaults(LOCAL_USER_ID)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2135,13 +3130,35 @@ mod tests {
             .materialize_model_profiles(&store, &migration_audit)
             .await
             .unwrap();
-        let restored = store
+        let still_revoked = store
             .get_ai_model_profile_secret_ref(MIGRATED_LOCAL_PROFILE_ID, 1)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(restored.credential_state, AiModelCredentialState::Present);
-        assert_eq!(restored.revision, 3);
+        assert_eq!(
+            still_revoked.credential_state,
+            AiModelCredentialState::Revoked
+        );
+        assert_eq!(still_revoked.revision, 2);
+        assert_eq!(
+            versioned_secrets
+                .raw_secret(MIGRATED_LOCAL_PROFILE_ID, 1)
+                .as_deref(),
+            Some(""),
+            "a residual Keyring value must be cleared instead of reviving a revoked binding"
+        );
+        assert!(matches!(
+            service
+                .resolve_provider_for_profile(
+                    &store,
+                    AiModelProfileBinding {
+                        profile_id: MIGRATED_LOCAL_PROFILE_ID,
+                        profile_version: 1,
+                    },
+                )
+                .await,
+            Err(SettingsError::MissingCredential)
+        ));
 
         let audits = store
             .list_audit_entries(&AuditFilter {
@@ -2158,7 +3175,296 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn desktop_key_rotation_and_clear_audit_exact_versions_and_repair_missing_refs() {
+    async fn create_keyring_failure_leaves_a_persisted_but_revoked_profile() {
+        let (temp, service, _legacy_secrets, versioned_secrets) = service();
+        let store = local_profile_store(&temp.path().join("create-keyring-failure.sqlite3")).await;
+        let now = Utc::now();
+        let (profile, version) = cloud_profile(Uuid::new_v4(), "Create failure", 1, now);
+        let audit = desktop_audit("create-keyring-failure");
+        versioned_secrets.fail_next(FakeSecretOperation::Set);
+
+        assert!(matches!(
+            service
+                .create_model_profile_with_secret(
+                    &store,
+                    &profile,
+                    &version,
+                    Some("must-not-become-usable"),
+                    &audit,
+                )
+                .await,
+            Err(SettingsError::CredentialStore)
+        ));
+        assert_eq!(
+            store.get_ai_model_profile(profile.id).await.unwrap(),
+            profile,
+            "the immutable DB write may commit, but it must remain fail-closed"
+        );
+        let secret_ref = store
+            .get_ai_model_profile_secret_ref(profile.id, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(secret_ref.credential_state, AiModelCredentialState::Revoked);
+        assert!(
+            service
+                .profile_key(
+                    &store,
+                    AiModelProfileBinding {
+                        profile_id: profile.id,
+                        profile_version: 1,
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_metadata_finalize_failure_clears_the_key_and_keeps_the_gate_revoked() {
+        let (temp, service, _legacy_secrets, versioned_secrets) = service();
+        let store = local_profile_store(&temp.path().join("create-ref-failure.sqlite3")).await;
+        let failing_store = FailingSecretRefStore::new(store.clone(), 2);
+        let (profile, version) =
+            cloud_profile(Uuid::new_v4(), "Create metadata failure", 1, Utc::now());
+        let audit = desktop_audit("create-ref-failure");
+
+        assert!(matches!(
+            service
+                .create_model_profile_with_secret(
+                    &failing_store,
+                    &profile,
+                    &version,
+                    Some("must-be-cleared"),
+                    &audit,
+                )
+                .await,
+            Err(SettingsError::ModelProfileStore(StoreError::Database(_)))
+        ));
+        let secret_ref = store
+            .get_ai_model_profile_secret_ref(profile.id, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(secret_ref.credential_state, AiModelCredentialState::Revoked);
+        assert_eq!(
+            versioned_secrets.raw_secret(profile.id, 1).as_deref(),
+            Some("")
+        );
+        assert!(
+            service
+                .profile_key(
+                    &store,
+                    AiModelProfileBinding {
+                        profile_id: profile.id,
+                        profile_version: 1,
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn append_conflict_never_touches_the_winning_version_keyring_account() {
+        let (temp, service, _legacy_secrets, versioned_secrets) = service();
+        let store = local_profile_store(&temp.path().join("append-conflict-keyring.sqlite3")).await;
+        let now = Utc::now();
+        let (profile_v1, version_v1) = cloud_profile(Uuid::new_v4(), "Append conflict", 1, now);
+        let audit = desktop_audit("append-conflict");
+        service
+            .create_model_profile_with_secret(
+                &store,
+                &profile_v1,
+                &version_v1,
+                Some("version-one"),
+                &audit,
+            )
+            .await
+            .unwrap();
+
+        let mut profile_v2 = profile_v1.clone();
+        profile_v2.current_version = 2;
+        profile_v2
+            .meta
+            .touch(now + chrono::Duration::milliseconds(1));
+        let version_v2 = AiModelProfileVersion {
+            version: 2,
+            model_id: "winner-model".to_owned(),
+            created_at: now + chrono::Duration::milliseconds(1),
+            ..version_v1.clone()
+        };
+        store
+            .append_ai_model_profile_version(&profile_v2, &version_v2, 1, &audit)
+            .await
+            .unwrap();
+        versioned_secrets
+            .set_secret(profile_v1.id, 2, "winner-secret")
+            .unwrap();
+        service
+            .save_profile_secret_state(
+                &store,
+                AiModelProfileBinding {
+                    profile_id: profile_v1.id,
+                    profile_version: 2,
+                },
+                AiModelCredentialState::Present,
+                false,
+                &audit,
+            )
+            .await
+            .unwrap();
+
+        versioned_secrets.fail_next(FakeSecretOperation::Set);
+        assert!(matches!(
+            service
+                .append_model_profile_with_secret(
+                    &store,
+                    AppendModelProfileWithSecret {
+                        profile: &profile_v2,
+                        version: &version_v2,
+                        expected_revision: 1,
+                        api_key: Some("losing-secret"),
+                        preserve_from: None,
+                    },
+                    &audit,
+                )
+                .await,
+            Err(SettingsError::ModelProfileStore(StoreError::Conflict(_)))
+        ));
+        assert_eq!(
+            versioned_secrets.raw_secret(profile_v1.id, 2).as_deref(),
+            Some("winner-secret")
+        );
+        assert!(
+            versioned_secrets
+                .set_secret(Uuid::new_v4(), 1, "probe")
+                .is_err(),
+            "the injected set failure remains unused because conflict happens before Keyring"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_and_clear_failures_leave_database_gates_revoked() {
+        let (temp, service, _legacy_secrets, versioned_secrets) = service();
+        let store = local_profile_store(&temp.path().join("rotate-clear-failure.sqlite3")).await;
+        let now = Utc::now();
+        let (profile_v1, version_v1) = cloud_profile(Uuid::new_v4(), "Rotate failure", 1, now);
+        let audit = desktop_audit("rotate-clear-failure");
+        service
+            .create_model_profile_with_secret(
+                &store,
+                &profile_v1,
+                &version_v1,
+                Some("version-one"),
+                &audit,
+            )
+            .await
+            .unwrap();
+        let binding_v1 = AiModelProfileBinding {
+            profile_id: profile_v1.id,
+            profile_version: 1,
+        };
+        let failing_store = FailingSecretRefStore::new(store.clone(), 2);
+        assert!(matches!(
+            service
+                .rotate_model_profile_secret(&failing_store, binding_v1, "failed-rotation", &audit,)
+                .await,
+            Err(SettingsError::ModelProfileStore(StoreError::Database(_)))
+        ));
+        assert_eq!(
+            store
+                .get_ai_model_profile_secret_ref(profile_v1.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .credential_state,
+            AiModelCredentialState::Revoked
+        );
+        assert!(
+            service
+                .profile_key(&store, binding_v1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        service
+            .rotate_model_profile_secret(&store, binding_v1, "restored-version-one", &audit)
+            .await
+            .unwrap();
+        let mut profile_v2 = profile_v1.clone();
+        profile_v2.current_version = 2;
+        profile_v2
+            .meta
+            .touch(now + chrono::Duration::milliseconds(1));
+        let version_v2 = AiModelProfileVersion {
+            version: 2,
+            model_id: "model-v2".to_owned(),
+            created_at: now + chrono::Duration::milliseconds(1),
+            ..version_v1
+        };
+        service
+            .append_model_profile_with_secret(
+                &store,
+                AppendModelProfileWithSecret {
+                    profile: &profile_v2,
+                    version: &version_v2,
+                    expected_revision: 1,
+                    api_key: None,
+                    preserve_from: Some(binding_v1),
+                },
+                &audit,
+            )
+            .await
+            .unwrap();
+        versioned_secrets.fail_next(FakeSecretOperation::Clear);
+        assert!(matches!(
+            service
+                .clear_model_profile_secrets(
+                    &store,
+                    AiModelProfileBinding {
+                        profile_id: profile_v1.id,
+                        profile_version: 2,
+                    },
+                    &audit,
+                )
+                .await,
+            Err(SettingsError::CredentialStore)
+        ));
+        assert_eq!(
+            versioned_secrets.raw_secret(profile_v1.id, 1).as_deref(),
+            Some("restored-version-one"),
+            "physical cleanup may fail, but the DB gate must still deny use"
+        );
+        for profile_version in 1..=2 {
+            let binding = AiModelProfileBinding {
+                profile_id: profile_v1.id,
+                profile_version,
+            };
+            assert!(
+                service
+                    .profile_key(&store, binding)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                store
+                    .get_ai_model_profile_secret_ref(profile_v1.id, profile_version)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .credential_state,
+                AiModelCredentialState::Revoked
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn desktop_key_rotation_and_clear_audit_exact_versions_and_deny_missing_refs() {
         let (temp, service, legacy_secrets, versioned_secrets) = service();
         legacy_secrets
             .set_secret("legacy-credential-value")
@@ -2219,7 +3525,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(current.credential_state, AiModelCredentialState::Present);
-        assert_eq!(current.revision, 1);
+        assert_eq!(current.revision, 2);
 
         sqlx::query(
             "DELETE FROM ai_model_profile_secret_refs
@@ -2247,7 +3553,7 @@ mod tests {
             .list_ai_model_profile_secret_refs(MIGRATED_LOCAL_PROFILE_ID)
             .await
             .unwrap();
-        assert_eq!(references.len(), 2);
+        assert_eq!(references.len(), 1);
         assert!(references.iter().all(|reference| {
             reference.credential_state == AiModelCredentialState::Revoked
                 && reference.keyring_account
@@ -2257,10 +3563,16 @@ mod tests {
                     )
                     .account()
         }));
-        assert_eq!(references[0].profile_version, 1);
-        assert_eq!(references[0].revision, 1);
-        assert_eq!(references[1].profile_version, 2);
-        assert_eq!(references[1].revision, 2);
+        assert_eq!(references[0].profile_version, 2);
+        assert_eq!(references[0].revision, 3);
+        assert!(
+            store
+                .get_ai_model_profile_secret_ref(MIGRATED_LOCAL_PROFILE_ID, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "batch revocation does not invent metadata for an already-missing reference"
+        );
         for profile_version in 1..=2 {
             assert_eq!(
                 versioned_secrets
@@ -2317,18 +3629,27 @@ mod tests {
             .await
             .unwrap();
         service
-            .save(save_input(
-                "provider-b-model",
-                "https://provider-b.example/v1",
-                false,
-                None,
-                Some("credential-b"),
-            ))
-            .unwrap();
-        let version_two = service
-            .materialize_model_profiles(&store, &audit)
+            .save_and_materialize(
+                &store,
+                save_input(
+                    "provider-b-model",
+                    "https://provider-b.example/v1",
+                    false,
+                    None,
+                    Some("credential-b"),
+                ),
+                &audit,
+            )
             .await
             .unwrap();
+        let current = store
+            .get_ai_model_profile(MIGRATED_LOCAL_PROFILE_ID)
+            .await
+            .unwrap();
+        let version_two = AiModelProfileBinding {
+            profile_id: current.id,
+            profile_version: current.current_version,
+        };
         assert_eq!(version_one.profile_version, 1);
         assert_eq!(version_two.profile_version, 2);
 
@@ -2376,11 +3697,18 @@ mod tests {
             Some("local-credential"),
         );
         local_input.provider_kind = ProviderKind::LocalHttp;
-        service.save(local_input).unwrap();
-        let local_binding = service
-            .materialize_model_profiles(&store, &audit)
+        service
+            .save_and_materialize(&store, local_input, &audit)
             .await
             .unwrap();
+        let local_profile = store
+            .get_ai_model_profile(MIGRATED_LOCAL_PROFILE_ID)
+            .await
+            .unwrap();
+        let local_binding = AiModelProfileBinding {
+            profile_id: local_profile.id,
+            profile_version: local_profile.current_version,
+        };
         let local_version = store
             .get_ai_model_profile_version(local_binding.profile_id, local_binding.profile_version)
             .await
@@ -2400,18 +3728,27 @@ mod tests {
         );
 
         service
-            .save(save_input(
-                "shared-model",
-                "https://gateway.example.test/v1",
-                false,
-                None,
-                Some("cloud-credential"),
-            ))
-            .unwrap();
-        let cloud_binding = service
-            .materialize_model_profiles(&store, &audit)
+            .save_and_materialize(
+                &store,
+                save_input(
+                    "shared-model",
+                    "https://gateway.example.test/v1",
+                    false,
+                    None,
+                    Some("cloud-credential"),
+                ),
+                &audit,
+            )
             .await
             .unwrap();
+        let cloud_profile = store
+            .get_ai_model_profile(MIGRATED_LOCAL_PROFILE_ID)
+            .await
+            .unwrap();
+        let cloud_binding = AiModelProfileBinding {
+            profile_id: cloud_profile.id,
+            profile_version: cloud_profile.current_version,
+        };
         assert_eq!(
             store
                 .get_ai_model_profile_version(
@@ -2548,43 +3885,46 @@ mod tests {
             .await
             .unwrap();
         service
-            .save(save_input(
-                "deepseek-chat",
-                "https://api.deepseek.com",
-                true,
-                Some("vision-a"),
-                Some("credential-a"),
-            ))
-            .unwrap();
-        service
-            .materialize_model_profiles(&store, &audit)
+            .save_and_materialize(
+                &store,
+                save_input(
+                    "deepseek-chat",
+                    "https://api.deepseek.com",
+                    true,
+                    Some("vision-a"),
+                    Some("credential-a"),
+                ),
+                &audit,
+            )
             .await
             .unwrap();
 
         service
-            .save(save_input(
-                "provider-b-chat",
-                "https://provider-b.example/v1",
-                false,
-                Some("disabled-residual"),
-                Some("credential-b"),
-            ))
-            .unwrap();
-        service
-            .materialize_model_profiles(&store, &audit)
+            .save_and_materialize(
+                &store,
+                save_input(
+                    "provider-b-chat",
+                    "https://provider-b.example/v1",
+                    false,
+                    Some("disabled-residual"),
+                    Some("credential-b"),
+                ),
+                &audit,
+            )
             .await
             .unwrap();
         service
-            .save(save_input(
-                "provider-b-chat",
-                "https://provider-b.example/v1",
-                true,
-                Some("vision-b"),
-                None,
-            ))
-            .unwrap();
-        service
-            .materialize_model_profiles(&store, &audit)
+            .save_and_materialize(
+                &store,
+                save_input(
+                    "provider-b-chat",
+                    "https://provider-b.example/v1",
+                    true,
+                    Some("vision-b"),
+                    None,
+                ),
+                &audit,
+            )
             .await
             .unwrap();
 
@@ -2638,43 +3978,46 @@ mod tests {
             .unwrap();
 
         service
-            .save(save_input(
-                "deepseek-chat",
-                "https://api.deepseek.com",
-                true,
-                Some("vision-one"),
-                Some("credential-one"),
-            ))
-            .unwrap();
-        service
-            .materialize_model_profiles(&store, &audit)
+            .save_and_materialize(
+                &store,
+                save_input(
+                    "deepseek-chat",
+                    "https://api.deepseek.com",
+                    true,
+                    Some("vision-one"),
+                    Some("credential-one"),
+                ),
+                &audit,
+            )
             .await
             .unwrap();
         service
-            .save(save_input(
-                "deepseek-chat-two",
-                "https://api.deepseek.com",
-                true,
-                Some("vision-two"),
-                Some("credential-two"),
-            ))
-            .unwrap();
-        service
-            .materialize_model_profiles(&store, &audit)
+            .save_and_materialize(
+                &store,
+                save_input(
+                    "deepseek-chat-two",
+                    "https://api.deepseek.com",
+                    true,
+                    Some("vision-two"),
+                    Some("credential-two"),
+                ),
+                &audit,
+            )
             .await
             .unwrap();
 
         service
-            .save(save_input(
-                "deepseek-chat-two",
-                "https://api.deepseek.com",
-                false,
-                Some("must-be-ignored"),
-                None,
-            ))
-            .unwrap();
-        service
-            .materialize_model_profiles(&store, &audit)
+            .save_and_materialize(
+                &store,
+                save_input(
+                    "deepseek-chat-two",
+                    "https://api.deepseek.com",
+                    false,
+                    Some("must-be-ignored"),
+                    None,
+                ),
+                &audit,
+            )
             .await
             .unwrap();
         let settings_path = temp.path().join("ai-provider.json");

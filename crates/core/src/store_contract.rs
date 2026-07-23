@@ -2104,6 +2104,54 @@ where
         Vec::<AiModelProfile>::new()
     );
 
+    let max_history_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: other_user.id,
+        name: "Maximum history budget".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let max_history_version = AiModelProfileVersion {
+        profile_id: max_history_profile.id,
+        context_window_tokens: 1_200_000,
+        max_input_tokens: 1_100_000,
+        history_token_budget: 1_000_000,
+        ..first.clone()
+    };
+    store
+        .create_ai_model_profile(&max_history_profile, &max_history_version, &audit)
+        .await
+        .expect("history token budget accepts the documented inclusive maximum");
+
+    let excessive_history_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: other_user.id,
+        name: "Excessive history budget".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let excessive_history_version = AiModelProfileVersion {
+        profile_id: excessive_history_profile.id,
+        context_window_tokens: 1_200_000,
+        max_input_tokens: 1_100_000,
+        history_token_budget: 1_000_001,
+        ..first.clone()
+    };
+    assert!(matches!(
+        store
+            .create_ai_model_profile(
+                &excessive_history_profile,
+                &excessive_history_version,
+                &audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+
     let unicode_profile = AiModelProfile {
         id: uuid::Uuid::new_v4(),
         lab_id: lab.id,
@@ -2185,6 +2233,34 @@ where
         Some(defaults)
     );
 
+    let mut disable_default_vision_profile = profile.clone();
+    disable_default_vision_profile.current_version = 3;
+    disable_default_vision_profile
+        .meta
+        .touch(now + Duration::milliseconds(2));
+    let disable_default_vision = AiModelProfileVersion {
+        version: 3,
+        supports_vision: false,
+        created_at: now + Duration::milliseconds(2),
+        ..second.clone()
+    };
+    assert!(matches!(
+        store
+            .append_ai_model_profile_version(
+                &disable_default_vision_profile,
+                &disable_default_vision,
+                2,
+                &audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert_eq!(
+        store.get_ai_model_profile(profile.id).await.unwrap(),
+        profile,
+        "a default vision profile must retain vision support"
+    );
+
     profile.archived_at = Some(now + Duration::milliseconds(2));
     profile.meta.touch(now + Duration::milliseconds(2));
     store
@@ -2210,6 +2286,14 @@ where
         first,
         "archiving a profile must preserve historical versions"
     );
+    let archived_defaults = store
+        .get_ai_user_model_defaults(user.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(archived_defaults.default_conversation_profile_id, None);
+    assert_eq!(archived_defaults.default_vision_profile_id, None);
+    assert_eq!(archived_defaults.meta.revision, 2);
 
     let third = AiModelProfileVersion {
         version: 3,

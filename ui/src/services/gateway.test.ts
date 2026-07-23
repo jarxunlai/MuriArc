@@ -1107,6 +1107,276 @@ describe('MuriArc gateway selection', () => {
   })
 })
 
+describe('multi-model gateway contracts', () => {
+  const modelInput = {
+    name: '自由模型',
+    protocol: 'openai_responses' as const,
+    transport: 'open_ai_compatible' as const,
+    baseUrl: 'https://provider.example/v1',
+    modelId: 'organization/model:latest',
+    supportsVision: true,
+    contextWindowTokens: 131072,
+    maxInputTokens: 65536,
+    maxOutputTokens: 4096,
+    historyTokenBudget: 32768,
+    historyTurns: 20,
+    temperature: 0,
+    timeoutMs: 120000,
+    apiKey: 'write-only-secret',
+  }
+  const validationInput = {
+    protocol: modelInput.protocol,
+    transport: modelInput.transport,
+    baseUrl: modelInput.baseUrl,
+    modelId: modelInput.modelId,
+    supportsVision: modelInput.supportsVision,
+    contextWindowTokens: modelInput.contextWindowTokens,
+    maxInputTokens: modelInput.maxInputTokens,
+    maxOutputTokens: modelInput.maxOutputTokens,
+    historyTokenBudget: modelInput.historyTokenBudget,
+    historyTurns: modelInput.historyTurns,
+    temperature: modelInput.temperature,
+    timeoutMs: modelInput.timeoutMs,
+    apiKey: modelInput.apiKey,
+  }
+
+  it('uses stable, semantic Tauri commands for every model operation', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      calls.push([command, args])
+      return (command === 'list_ai_model_profiles' ? [] : {}) as T
+    }
+    const local = new LocalTauriGateway(invokeCommand)
+
+    await local.listAiModelProfiles()
+    await local.getAiModelProfile('profile-1')
+    await local.createAiModelProfile(modelInput)
+    await local.updateAiModelProfile('profile-1', { ...modelInput, expectedRevision: 3 })
+    await local.validateAiModelProfile({
+      ...validationInput,
+      profileId: 'profile-1',
+      currentVersion: 2,
+    })
+    await local.clearAiModelProfileKey('profile-1')
+    await local.archiveAiModelProfile('profile-1', 4)
+    await local.getAiModelDefaults()
+    await local.saveAiModelDefaults({
+      defaultConversationProfileId: 'profile-1',
+      defaultVisionProfileId: null,
+      expectedRevision: 2,
+    })
+
+    expect(calls).toEqual([
+      ['list_ai_model_profiles', undefined],
+      ['get_ai_model_profile', { id: 'profile-1' }],
+      ['create_ai_model_profile', { input: modelInput }],
+      ['update_ai_model_profile', {
+        id: 'profile-1',
+        input: { ...modelInput, expectedRevision: 3 },
+      }],
+      ['validate_ai_model_profile', {
+        input: { ...validationInput, profileId: 'profile-1', currentVersion: 2 },
+      }],
+      ['clear_ai_model_profile_key', { id: 'profile-1' }],
+      ['archive_ai_model_profile', { id: 'profile-1', expectedRevision: 4 }],
+      ['get_ai_model_defaults', undefined],
+      ['save_ai_model_defaults', {
+        input: {
+          defaultConversationProfileId: 'profile-1',
+          defaultVisionProfileId: null,
+          expectedRevision: 2,
+        },
+      }],
+    ])
+  })
+
+  it('uses versioned Server model routes and keeps write operations CSRF protected', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const profile = {
+      id: 'profile-1',
+      ...modelInput,
+      apiKey: undefined,
+      currentVersion: 1,
+      revision: 1,
+      hasKey: true,
+      isDefaultConversation: false,
+      isDefaultVision: false,
+    }
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      if (url.endsWith('/auth/login')) {
+        return new Response(JSON.stringify({ data: {
+          user: {
+            id: 'user-1',
+            lab_id: 'lab-1',
+            display_name: '研究者',
+            lab_roles: [],
+            project_roles: [],
+            authentication: 'session',
+          },
+          csrf_token: 'csrf-models',
+          expires_at: '2026-07-23T10:00:00Z',
+        } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/ai/models/defaults')) {
+        return new Response(JSON.stringify({ data: {
+          defaultConversationProfileId: 'profile-1',
+          revision: 2,
+        } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/ai/models/validate')) {
+        return new Response(JSON.stringify({ data: { ok: true, latencyMs: 18 } }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/ai/models') && !init?.method) {
+        return new Response(JSON.stringify({ data: [profile], count: 1 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ data: profile }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchRequest,
+    })
+    await remote.login({ email: 'researcher@example.test', password: 'not-retained' })
+
+    await remote.listAiModelProfiles()
+    await remote.getAiModelProfile('profile-1')
+    await remote.createAiModelProfile(modelInput)
+    await remote.updateAiModelProfile('profile-1', { ...modelInput, expectedRevision: 1 })
+    await remote.validateAiModelProfile({
+      ...validationInput,
+      profileId: 'profile-1',
+      currentVersion: 1,
+    })
+    await remote.clearAiModelProfileKey('profile-1')
+    await remote.archiveAiModelProfile('profile-1', 2)
+    await remote.getAiModelDefaults()
+    await remote.saveAiModelDefaults({
+      defaultConversationProfileId: 'profile-1',
+      defaultVisionProfileId: null,
+      expectedRevision: 2,
+    })
+
+    expect(requests.map(({ url, init }) => [
+      url.replace('https://lab.example/api/v1', ''),
+      init?.method ?? 'GET',
+    ])).toEqual([
+      ['/auth/login', 'POST'],
+      ['/ai/models', 'GET'],
+      ['/ai/models/profile-1', 'GET'],
+      ['/ai/models', 'POST'],
+      ['/ai/models/profile-1', 'PUT'],
+      ['/ai/models/validate', 'POST'],
+      ['/ai/models/profile-1/key', 'DELETE'],
+      ['/ai/models/profile-1/archive', 'POST'],
+      ['/ai/models/defaults', 'GET'],
+      ['/ai/models/defaults', 'PUT'],
+    ])
+    const mutations = requests.slice(3)
+      .filter(({ init }) => (init?.method ?? 'GET') !== 'GET')
+    expect(mutations.every(({ init }) =>
+      new Headers(init?.headers).get('X-CSRF-Token') === 'csrf-models')).toBe(true)
+    const validationRequest = requests.find(({ url }) => url.endsWith('/ai/models/validate'))
+    expect(JSON.parse(String(validationRequest?.init?.body))).toEqual({
+      ...validationInput,
+      profileId: 'profile-1',
+      currentVersion: 1,
+    })
+    expect(JSON.parse(String(validationRequest?.init?.body))).not.toHaveProperty('name')
+    expect(JSON.parse(String(requests.at(-1)?.init?.body))).toEqual({
+      defaultConversationProfileId: 'profile-1',
+      defaultVisionProfileId: null,
+      expectedRevision: 2,
+    })
+  })
+
+  it('implements credential isolation, validation, defaults, and archive in demo mode', async () => {
+    const demo = new DemoGateway()
+    const before = await demo.listAiModelProfiles()
+
+    await expect(demo.createAiModelProfile({
+      ...modelInput,
+      apiKey: undefined,
+    })).rejects.toThrow('首次保存必须填写 API Key')
+
+    const created = await demo.createAiModelProfile(modelInput)
+    expect(created).toEqual(expect.objectContaining({
+      modelId: 'organization/model:latest',
+      hasKey: true,
+    }))
+    expect(created).not.toHaveProperty('apiKey')
+
+    const validation = await demo.validateAiModelProfile({
+      ...validationInput,
+      apiKey: undefined,
+      profileId: created.id,
+      currentVersion: created.currentVersion,
+    })
+    expect(validation.ok).toBe(true)
+    await expect(demo.validateAiModelProfile({
+      ...validationInput,
+      profileId: created.id,
+    })).rejects.toThrow('必须同时提供')
+
+    const rotated = await demo.updateAiModelProfile(created.id, {
+      ...modelInput,
+      apiKey: 'rotated-write-only-secret',
+      expectedRevision: created.revision,
+    })
+    expect(rotated.currentVersion).toBe(created.currentVersion)
+    expect(rotated.revision).toBe(created.revision)
+
+    const emptyKeyUpdate = await demo.updateAiModelProfile(created.id, {
+      ...modelInput,
+      name: '自由模型（重命名）',
+      apiKey: '',
+      expectedRevision: rotated.revision,
+    })
+    expect(emptyKeyUpdate.hasKey).toBe(true)
+
+    await expect(demo.updateAiModelProfile(created.id, {
+      ...modelInput,
+      protocol: 'anthropic_messages',
+      apiKey: undefined,
+      expectedRevision: emptyKeyUpdate.revision,
+    })).rejects.toThrow('必须重新输入 API Key')
+
+    const updated = await demo.updateAiModelProfile(created.id, {
+      ...modelInput,
+      protocol: 'anthropic_messages',
+      expectedRevision: emptyKeyUpdate.revision,
+    })
+    const defaults = await demo.getAiModelDefaults()
+    await demo.saveAiModelDefaults({
+      defaultConversationProfileId: updated.id,
+      defaultVisionProfileId: updated.id,
+      expectedRevision: defaults.revision,
+    })
+    await expect(demo.updateAiModelProfile(updated.id, {
+      ...modelInput,
+      protocol: 'anthropic_messages',
+      supportsVision: false,
+      expectedRevision: updated.revision,
+    })).rejects.toThrow('取消默认视觉模型')
+    await demo.archiveAiModelProfile(updated.id, updated.revision)
+
+    const after = await demo.listAiModelProfiles()
+    const clearedDefaults = await demo.getAiModelDefaults()
+    expect(after).toHaveLength(before.length)
+    expect(clearedDefaults.defaultConversationProfileId).toBeUndefined()
+    expect(clearedDefaults.defaultVisionProfileId).toBeUndefined()
+  })
+})
+
 describe('browser demo gateway', () => {
   it('moves animals atomically and updates both projections', async () => {
     const gateway = new DemoGateway()

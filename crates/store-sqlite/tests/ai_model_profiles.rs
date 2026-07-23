@@ -331,3 +331,174 @@ async fn desktop_secret_refs_are_exact_versioned_revision_checked_and_redacted_i
     assert!(!serialized.contains("credential-value-must-never-be-audited"));
     assert!(!serialized.contains("\"api_key\""));
 }
+
+#[tokio::test]
+async fn desktop_secret_refs_are_batch_revoked_atomically_with_redacted_audits() {
+    let store = SqliteStore::in_memory().await.unwrap();
+    store.migrate().await.unwrap();
+    let now = Utc::now();
+    let migration_audit = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new("Desktop AI batch secret revocation", now).unwrap();
+    store.create_lab(&lab, &migration_audit).await.unwrap();
+    let user = User::new(
+        lab.id,
+        "desktop-batch-secret-owner@example.test",
+        "Desktop Batch Secret Owner",
+        now,
+    )
+    .unwrap();
+    store.create_user(&user, &migration_audit).await.unwrap();
+    let mut profile = AiModelProfile {
+        id: Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "Desktop batch model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_model_profile(
+            &profile,
+            &version(profile.id, 1, "desktop-batch-v1"),
+            &migration_audit,
+        )
+        .await
+        .unwrap();
+    profile.current_version = 2;
+    profile.meta.touch(now + Duration::seconds(1));
+    store
+        .append_ai_model_profile_version(
+            &profile,
+            &version(profile.id, 2, "desktop-batch-v2"),
+            1,
+            &migration_audit,
+        )
+        .await
+        .unwrap();
+
+    let desktop_audit = AuditContext {
+        actor: Actor::human(user.id, user.display_name.clone()),
+        source: WriteSource::Desktop,
+        request_id: Some("desktop-batch-secret-revoke-test".to_owned()),
+        reason: Some("clear_desktop_model_credentials".to_owned()),
+    };
+    for profile_version in 1..=2 {
+        store
+            .save_ai_model_profile_secret_ref(
+                &AiModelProfileSecretRef {
+                    profile_id: profile.id,
+                    profile_version,
+                    keyring_account: format!(
+                        "local-user-model-profile-{}-v{profile_version}-api-key",
+                        profile.id
+                    ),
+                    credential_state: AiModelCredentialState::Present,
+                    created_at: now,
+                    updated_at: now,
+                    revision: 1,
+                },
+                None,
+                &desktop_audit,
+            )
+            .await
+            .unwrap();
+    }
+
+    let revoked_at = now + Duration::seconds(2);
+    let revoked = store
+        .revoke_ai_model_profile_secret_refs(profile.id, revoked_at, &desktop_audit)
+        .await
+        .unwrap();
+    assert_eq!(revoked.len(), 2);
+    assert!(revoked.iter().all(|reference| {
+        reference.credential_state == AiModelCredentialState::Revoked
+            && reference.updated_at == revoked_at
+            && reference.revision == 2
+    }));
+    assert_eq!(
+        store
+            .revoke_ai_model_profile_secret_refs(
+                profile.id,
+                revoked_at + Duration::seconds(1),
+                &desktop_audit,
+            )
+            .await
+            .unwrap(),
+        revoked,
+        "retrying an already revoked batch must be idempotent"
+    );
+
+    for mut reference in revoked {
+        reference.credential_state = AiModelCredentialState::Present;
+        reference.updated_at = now + Duration::seconds(4);
+        reference.revision = 3;
+        store
+            .save_ai_model_profile_secret_ref(&reference, Some(2), &desktop_audit)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "UPDATE ai_model_profile_secret_refs
+         SET revision = ?
+         WHERE profile_id = ? AND profile_version = 2",
+    )
+    .bind(i64::MAX)
+    .bind(profile.id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        store
+            .revoke_ai_model_profile_secret_refs(
+                profile.id,
+                now + Duration::seconds(5),
+                &desktop_audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    let after_failed_batch = store
+        .list_ai_model_profile_secret_refs(profile.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after_failed_batch[0].credential_state,
+        AiModelCredentialState::Present,
+        "an error in a later reference must roll back earlier revocations"
+    );
+    assert_eq!(after_failed_batch[0].revision, 3);
+    assert_eq!(
+        after_failed_batch[1].credential_state,
+        AiModelCredentialState::Present
+    );
+    assert_eq!(after_failed_batch[1].revision, i64::MAX);
+
+    let revoke_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: None,
+            entity_id: Some(profile.id),
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| {
+            entry.entity_type == EntityType::AiModelProfile
+                && entry.action == AuditAction::Revoke
+                && entry
+                    .after
+                    .as_ref()
+                    .and_then(|after| after.get("keyring_account"))
+                    .is_some()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        revoke_audits.len(),
+        2,
+        "the failed batch must roll back its partial audit entries"
+    );
+    let serialized = serde_json::to_string(&revoke_audits).unwrap();
+    assert!(!serialized.contains("\"api_key\""));
+}

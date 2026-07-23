@@ -412,6 +412,23 @@ impl AiModelProfileStore for PostgresStore {
                 "AI model profile version changed concurrently".to_owned(),
             ));
         }
+        if !next.supports_vision {
+            let is_vision_default: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM ai_user_model_defaults
+                    WHERE default_vision_profile_id = $1 AND deleted_at IS NULL
+                )",
+            )
+            .bind(value.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            if is_vision_default {
+                return Err(StoreError::Validation(
+                    "clear the default vision model before disabling vision support".to_owned(),
+                ));
+            }
+        }
 
         insert_version(&mut tx, next).await?;
         let updated = sqlx::query(
@@ -529,6 +546,69 @@ impl AiModelProfileStore for PostgresStore {
             return Err(StoreError::Conflict(
                 "AI model profile changed before it was archived".to_owned(),
             ));
+        }
+        let defaults_row = sqlx::query(&format!(
+            "SELECT {DEFAULT_COLUMNS} FROM ai_user_model_defaults
+             WHERE user_id = $1 AND deleted_at IS NULL FOR UPDATE"
+        ))
+        .bind(value.user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(defaults_row) = defaults_row {
+            let before_defaults = defaults_from_row(&defaults_row)?;
+            if before_defaults.default_conversation_profile_id == Some(value.id)
+                || before_defaults.default_vision_profile_id == Some(value.id)
+            {
+                let mut after_defaults = before_defaults.clone();
+                if after_defaults.default_conversation_profile_id == Some(value.id) {
+                    after_defaults.default_conversation_profile_id = None;
+                }
+                if after_defaults.default_vision_profile_id == Some(value.id) {
+                    after_defaults.default_vision_profile_id = None;
+                }
+                after_defaults.meta.updated_at =
+                    after_defaults.meta.updated_at.max(value.meta.updated_at);
+                after_defaults.meta.revision =
+                    after_defaults.meta.revision.checked_add(1).ok_or_else(|| {
+                        StoreError::Validation(
+                            "AI user model defaults revision overflow".to_owned(),
+                        )
+                    })?;
+                let defaults_updated = sqlx::query(
+                    "UPDATE ai_user_model_defaults
+                     SET default_conversation_profile_id = $1,
+                         default_vision_profile_id = $2,
+                         updated_at = $3, revision = $4
+                     WHERE user_id = $5 AND revision = $6 AND deleted_at IS NULL",
+                )
+                .bind(after_defaults.default_conversation_profile_id)
+                .bind(after_defaults.default_vision_profile_id)
+                .bind(after_defaults.meta.updated_at)
+                .bind(after_defaults.meta.revision)
+                .bind(value.user_id)
+                .bind(before_defaults.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+                if defaults_updated.rows_affected() != 1 {
+                    return Err(StoreError::Conflict(
+                        "AI user model defaults changed while archiving the profile".to_owned(),
+                    ));
+                }
+                write_audit(
+                    &mut tx,
+                    value.lab_id,
+                    None,
+                    EntityType::AiUserModelDefaults,
+                    value.user_id,
+                    AuditAction::Update,
+                    audit,
+                    Some(snapshot(&before_defaults)?),
+                    Some(snapshot(&after_defaults)?),
+                )
+                .await?;
+            }
         }
         write_audit(
             &mut tx,

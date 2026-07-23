@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -64,6 +65,8 @@ pub trait AiModelProfileStore: Send + Sync {
         audit: &AuditContext,
     ) -> StoreResult<()>;
 
+    /// Soft-archives one profile and atomically clears any conversation or
+    /// vision default that still references it.
     async fn archive_ai_model_profile(
         &self,
         profile: &AiModelProfile,
@@ -108,6 +111,16 @@ pub trait AiModelProfileSecretRefStore: Send + Sync {
         expected_revision: Option<i64>,
         audit: &AuditContext,
     ) -> StoreResult<()>;
+
+    /// Atomically marks every existing exact-version binding for one profile
+    /// as revoked. Implementations write one redacted audit entry per changed
+    /// binding and return all bindings in their final state.
+    async fn revoke_ai_model_profile_secret_refs(
+        &self,
+        profile_id: Uuid,
+        revoked_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<AiModelProfileSecretRef>>;
 }
 
 /// Persistence boundary for AI orchestration records.

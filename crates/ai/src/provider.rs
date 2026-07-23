@@ -5,9 +5,10 @@ mod mock;
 mod types;
 
 pub use config::{
-    CredentialError, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT_MS, MAX_MAX_RESPONSE_BYTES,
-    MAX_REQUEST_BYTES, MAX_TIMEOUT_MS, MIN_MAX_RESPONSE_BYTES, MIN_TIMEOUT_MS, ProviderConfig,
-    ProviderConfigError, ProviderCredentials, ProviderError, ProviderKind, TransportFailure,
+    AiProviderProtocol, CredentialError, DEFAULT_MAX_RESPONSE_BYTES, DEFAULT_TIMEOUT_MS,
+    MAX_MAX_RESPONSE_BYTES, MAX_REQUEST_BYTES, MAX_TIMEOUT_MS, MIN_MAX_RESPONSE_BYTES,
+    MIN_TIMEOUT_MS, ProviderConfig, ProviderConfigError, ProviderCredentials, ProviderError,
+    ProviderKind, TransportFailure,
 };
 pub use http::{BuiltinProvider, LocalHttpProvider, OpenAiCompatibleProvider};
 #[cfg(any(test, feature = "test-support"))]

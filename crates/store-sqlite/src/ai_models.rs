@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use muriarc_core::{
-    ActorType, AiModelProfile, AiModelProfileFilter, AiModelProfileSecretRef,
-    AiModelProfileSecretRefStore, AiModelProfileStore, AiModelProfileVersion, AiUserModelDefaults,
-    AuditAction, AuditContext, EntityType, StoreError, StoreResult, WriteSource,
+    ActorType, AiModelCredentialState, AiModelProfile, AiModelProfileFilter,
+    AiModelProfileSecretRef, AiModelProfileSecretRefStore, AiModelProfileStore,
+    AiModelProfileVersion, AiUserModelDefaults, AuditAction, AuditContext, EntityType, StoreError,
+    StoreResult, WriteSource,
 };
 use sqlx::{Row, sqlite::SqliteRow};
 use uuid::Uuid;
@@ -98,6 +99,7 @@ fn validate(profile: &AiModelProfile, version: &AiModelProfileVersion) -> StoreR
         || !(1_024..=1_900_000).contains(&version.max_input_tokens)
         || !(1..=131_072).contains(&version.max_output_tokens)
         || version.max_input_tokens + version.max_output_tokens > version.context_window_tokens
+        || version.history_token_budget > 1_000_000
         || version.history_token_budget > version.max_input_tokens
         || version.history_turns > 100
         || !version.temperature.is_finite()
@@ -301,6 +303,21 @@ impl AiModelProfileStore for SqliteStore {
                 "archived AI model profile cannot receive new versions".to_owned(),
             ));
         }
+        if !next.supports_vision {
+            let is_vision_default: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM ai_user_model_defaults
+                 WHERE default_vision_profile_id = ? AND deleted_at IS NULL",
+            )
+            .bind(value.id.to_string())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            if is_vision_default != 0 {
+                return Err(StoreError::Validation(
+                    "clear the default vision model before disabling vision support".to_owned(),
+                ));
+            }
+        }
         insert_version(&mut tx, next).await?;
         let updated = sqlx::query("UPDATE ai_model_profiles SET name=?, current_version=?, updated_at=?, revision=? WHERE id=? AND revision=? AND archived_at IS NULL")
             .bind(&value.name).bind(value.current_version).bind(value.meta.updated_at)
@@ -393,6 +410,79 @@ impl AiModelProfileStore for SqliteStore {
             return Err(StoreError::Conflict(
                 "AI model profile changed concurrently".to_owned(),
             ));
+        }
+        let defaults_row = sqlx::query(
+            "SELECT user_id, default_conversation_profile_id, default_vision_profile_id,
+                created_at, updated_at, deleted_at, revision
+             FROM ai_user_model_defaults
+             WHERE user_id = ? AND deleted_at IS NULL",
+        )
+        .bind(value.user_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(defaults_row) = defaults_row {
+            let before_defaults = defaults(&defaults_row)?;
+            if before_defaults.default_conversation_profile_id == Some(value.id)
+                || before_defaults.default_vision_profile_id == Some(value.id)
+            {
+                let mut after_defaults = before_defaults.clone();
+                if after_defaults.default_conversation_profile_id == Some(value.id) {
+                    after_defaults.default_conversation_profile_id = None;
+                }
+                if after_defaults.default_vision_profile_id == Some(value.id) {
+                    after_defaults.default_vision_profile_id = None;
+                }
+                after_defaults.meta.updated_at =
+                    after_defaults.meta.updated_at.max(value.meta.updated_at);
+                after_defaults.meta.revision =
+                    after_defaults.meta.revision.checked_add(1).ok_or_else(|| {
+                        StoreError::Validation(
+                            "AI user model defaults revision overflow".to_owned(),
+                        )
+                    })?;
+                let defaults_updated = sqlx::query(
+                    "UPDATE ai_user_model_defaults
+                     SET default_conversation_profile_id = ?,
+                         default_vision_profile_id = ?,
+                         updated_at = ?, revision = ?
+                     WHERE user_id = ? AND revision = ? AND deleted_at IS NULL",
+                )
+                .bind(
+                    after_defaults
+                        .default_conversation_profile_id
+                        .map(|id| id.to_string()),
+                )
+                .bind(
+                    after_defaults
+                        .default_vision_profile_id
+                        .map(|id| id.to_string()),
+                )
+                .bind(after_defaults.meta.updated_at)
+                .bind(after_defaults.meta.revision)
+                .bind(value.user_id.to_string())
+                .bind(before_defaults.meta.revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+                if defaults_updated.rows_affected() != 1 {
+                    return Err(StoreError::Conflict(
+                        "AI user model defaults changed while archiving the profile".to_owned(),
+                    ));
+                }
+                write_audit(
+                    &mut tx,
+                    value.lab_id,
+                    None,
+                    EntityType::AiUserModelDefaults,
+                    value.user_id,
+                    AuditAction::Update,
+                    audit,
+                    Some(snapshot(&before_defaults)?),
+                    Some(snapshot(&after_defaults)?),
+                )
+                .await?;
+            }
         }
         write_audit(
             &mut tx,
@@ -693,5 +783,110 @@ impl AiModelProfileSecretRefStore for SqliteStore {
         )
         .await?;
         tx.commit().await.map_err(map_sqlx)
+    }
+
+    async fn revoke_ai_model_profile_secret_refs(
+        &self,
+        profile_id: Uuid,
+        revoked_at: chrono::DateTime<chrono::Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Vec<AiModelProfileSecretRef>> {
+        if profile_id.is_nil() {
+            return Err(StoreError::Validation(
+                "invalid AI model profile secret reference profile".to_owned(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let owner_row = sqlx::query(
+            "SELECT lab_id, user_id
+             FROM ai_model_profiles
+             WHERE id = ? AND deleted_at IS NULL",
+        )
+        .bind(profile_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "ai_model_profile",
+            id: profile_id,
+        })?;
+        let lab_id = uuid(owner_row.try_get("lab_id").map_err(map_sqlx)?)?;
+        let user_id = uuid(owner_row.try_get("user_id").map_err(map_sqlx)?)?;
+        validate_owner(user_id, audit)?;
+        if active_user_lab(&mut tx, user_id).await? != lab_id {
+            return Err(StoreError::Validation(
+                "AI model profile secret reference owner belongs to another lab".to_owned(),
+            ));
+        }
+
+        let rows = sqlx::query(
+            "SELECT profile_id, profile_version, keyring_account, credential_state,
+                created_at, updated_at, revision
+             FROM ai_model_profile_secret_refs
+             WHERE profile_id = ?
+             ORDER BY profile_version",
+        )
+        .bind(profile_id.to_string())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let before_values = rows
+            .iter()
+            .map(secret_ref)
+            .collect::<StoreResult<Vec<_>>>()?;
+        let mut after_values = Vec::with_capacity(before_values.len());
+
+        for before in before_values {
+            if before.credential_state == AiModelCredentialState::Revoked {
+                after_values.push(before);
+                continue;
+            }
+            let mut after = before.clone();
+            after.credential_state = AiModelCredentialState::Revoked;
+            after.updated_at = after.updated_at.max(revoked_at);
+            after.revision = after.revision.checked_add(1).ok_or_else(|| {
+                StoreError::Validation(
+                    "AI model profile secret reference revision overflow".to_owned(),
+                )
+            })?;
+            let updated = sqlx::query(
+                "UPDATE ai_model_profile_secret_refs
+                 SET credential_state = ?, updated_at = ?, revision = ?
+                 WHERE profile_id = ? AND profile_version = ? AND revision = ?
+                   AND credential_state = ?",
+            )
+            .bind(super::encode(&after.credential_state)?)
+            .bind(after.updated_at)
+            .bind(after.revision)
+            .bind(profile_id.to_string())
+            .bind(after.profile_version)
+            .bind(before.revision)
+            .bind(super::encode(&AiModelCredentialState::Present)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            if updated.rows_affected() != 1 {
+                return Err(StoreError::Conflict(
+                    "AI model profile secret references changed before revocation".to_owned(),
+                ));
+            }
+            write_audit(
+                &mut tx,
+                lab_id,
+                None,
+                EntityType::AiModelProfile,
+                profile_id,
+                AuditAction::Revoke,
+                audit,
+                Some(snapshot(&before)?),
+                Some(snapshot(&after)?),
+            )
+            .await?;
+            after_values.push(after);
+        }
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after_values)
     }
 }

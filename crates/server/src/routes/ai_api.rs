@@ -21,11 +21,13 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderEndpointView, AiProviderPresetView,
-    AiProviderSettingsView, AiProviderStoreError, ApiError, AppState, AuthError, AuthPrincipal,
-    AuthenticationMethod, RequestMetadata, ResolvedAiProvider, SaveAiLabSettingsInput,
-    SaveAiProviderEndpointInput, SaveAiProviderSettingsInput, ai_data_tools::ServerAiDataTools,
-    ai_step_up::AiStepUpLimit,
+    AiLabSettingsView, AiModelDefaultsView, AiModelProfileView, AiModelValidationView,
+    AiProviderDiagnosticsView, AiProviderEndpointView, AiProviderPresetView,
+    AiProviderSettingsView, AiProviderStoreError, ApiError, AppState, ArchiveAiModelProfileInput,
+    AuthError, AuthPrincipal, AuthenticationMethod, RequestMetadata, ResolvedAiProvider,
+    SaveAiLabSettingsInput, SaveAiModelDefaultsInput, SaveAiModelProfileInput,
+    SaveAiProviderEndpointInput, SaveAiProviderSettingsInput, ValidateAiModelProfileInput,
+    ai_data_tools::ServerAiDataTools, ai_step_up::AiStepUpLimit,
 };
 
 use super::{
@@ -39,6 +41,24 @@ pub(super) fn router() -> Router<AppState> {
             get(get_settings).put(save_settings).delete(clear_settings),
         )
         .route("/ai/settings/test", post(test_settings))
+        .route(
+            "/ai/models",
+            get(list_model_profiles).post(create_model_profile),
+        )
+        .route("/ai/models/validate", post(validate_model_profile))
+        .route(
+            "/ai/models/defaults",
+            get(get_model_defaults).put(save_model_defaults),
+        )
+        .route(
+            "/ai/models/{id}",
+            get(get_model_profile).put(update_model_profile),
+        )
+        .route(
+            "/ai/models/{id}/key",
+            axum::routing::delete(clear_model_profile_key),
+        )
+        .route("/ai/models/{id}/archive", post(archive_model_profile))
         .route("/ai/diagnostics", get(diagnostics))
         .route("/ai/provider-presets", get(list_provider_presets))
         .route("/admin/ai", get(get_lab_ai).put(save_lab_ai))
@@ -61,6 +81,171 @@ pub(super) fn router() -> Router<AppState> {
         .route("/ai/approvals", get(list_approvals))
         .route("/ai/approvals/{id}", get(get_approval))
         .route("/ai/approvals/{id}/decision", post(decide_approval))
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AiModelListQuery {
+    #[serde(default)]
+    include_archived: bool,
+}
+
+async fn list_model_profiles(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiQuery(query): ApiQuery<AiModelListQuery>,
+) -> Result<Json<CollectionResponse<AiModelProfileView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let profiles = state
+        .ai_providers
+        .list_model_profiles(principal.user_id, query.include_archived)
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(collection(profiles, &metadata))
+}
+
+async fn create_model_profile(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiJson(payload): ApiJson<SaveAiModelProfileInput>,
+) -> Result<Json<ItemResponse<AiModelProfileView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let profile = state
+        .ai_providers
+        .create_model_profile(
+            principal.user_id,
+            payload,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(profile, &metadata))
+}
+
+async fn get_model_profile(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(profile_id): ApiPath<Uuid>,
+) -> Result<Json<ItemResponse<AiModelProfileView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let profile = state
+        .ai_providers
+        .get_model_profile(principal.user_id, profile_id)
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(profile, &metadata))
+}
+
+async fn update_model_profile(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(profile_id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<SaveAiModelProfileInput>,
+) -> Result<Json<ItemResponse<AiModelProfileView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let profile = state
+        .ai_providers
+        .update_model_profile(
+            principal.user_id,
+            profile_id,
+            payload,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(profile, &metadata))
+}
+
+async fn validate_model_profile(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiJson(payload): ApiJson<ValidateAiModelProfileInput>,
+) -> Result<Json<ItemResponse<AiModelValidationView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let validation = state
+        .ai_providers
+        .validate_model_profile(principal.user_id, payload)
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(validation, &metadata))
+}
+
+async fn clear_model_profile_key(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(profile_id): ApiPath<Uuid>,
+) -> Result<Json<ItemResponse<AiModelProfileView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let profile = state
+        .ai_providers
+        .clear_model_profile_key(
+            principal.user_id,
+            profile_id,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(profile, &metadata))
+}
+
+async fn archive_model_profile(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(profile_id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<ArchiveAiModelProfileInput>,
+) -> Result<Json<ItemResponse<AiModelProfileView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let profile = state
+        .ai_providers
+        .archive_model_profile(
+            principal.user_id,
+            profile_id,
+            payload.expected_revision,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(profile, &metadata))
+}
+
+async fn get_model_defaults(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+) -> Result<Json<ItemResponse<AiModelDefaultsView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let defaults = state
+        .ai_providers
+        .get_model_defaults(principal.user_id)
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(defaults, &metadata))
+}
+
+async fn save_model_defaults(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiJson(payload): ApiJson<SaveAiModelDefaultsInput>,
+) -> Result<Json<ItemResponse<AiModelDefaultsView>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let defaults = state
+        .ai_providers
+        .save_model_defaults(
+            principal.user_id,
+            payload,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| provider_settings_error(error, &metadata))?;
+    Ok(item(defaults, &metadata))
 }
 
 async fn get_settings(
@@ -912,6 +1097,15 @@ fn provider_settings_error(error: AiProviderStoreError, metadata: &RequestMetada
         AiProviderStoreError::InvalidSettings | AiProviderStoreError::InvalidCredential => {
             ApiError::validation(error.to_string())
         }
+        AiProviderStoreError::CredentialRequired => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "ai_model_api_key_required",
+            error.to_string(),
+        ),
+        AiProviderStoreError::ModelProfileNotFound => {
+            ApiError::not_found("AI model profile was not found")
+        }
+        AiProviderStoreError::RevisionConflict => ApiError::conflict(error.to_string()),
         AiProviderStoreError::LocalUrlForbidden | AiProviderStoreError::CloudUrlForbidden => {
             ApiError::new(
                 StatusCode::FORBIDDEN,
@@ -1082,11 +1276,15 @@ mod tests {
         WriteSource,
     };
     use muriarc_data::{AnimalImportPreviewResponse, DataFiles};
+    #[cfg(feature = "postgres")]
+    use muriarc_store_postgres::PostgresStore;
     use muriarc_store_sqlite::SqliteStore;
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use tower::ServiceExt;
 
+    #[cfg(feature = "postgres")]
+    use crate::{AiMasterKey, PostgresAiProviderStore};
     use crate::{
         AuthenticatedSession, DisabledAiProviderStore, ExternalTokenSummary, JobRepository,
         NewExternalToken, NewSession, SESSION_COOKIE_NAME, SessionBackend, SessionCookieConfig,
@@ -1434,6 +1632,160 @@ mod tests {
 
     async fn response_json(response: axum::response::Response) -> Value {
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap()
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn model_management_routes_use_authenticated_user_scoped_postgres_store() {
+        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            return;
+        };
+        assert!(
+            database_url.contains("muriarc_test"),
+            "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
+        );
+        let postgres = PostgresStore::connect(&database_url).await.unwrap();
+        postgres.migrate().await.unwrap();
+        let sqlite = Arc::new(SqliteStore::in_memory().await.unwrap());
+        sqlite.migrate().await.unwrap();
+        let now = Utc::now();
+        let bootstrap = AuditContext::system(WriteSource::Migration);
+        let lab = Lab::new(format!("AI model routes lab {}", Uuid::new_v4()), now).unwrap();
+        let user = User::new(
+            lab.id,
+            format!("ai-model-routes-{}@example.test", Uuid::new_v4()),
+            "AI model routes owner",
+            now,
+        )
+        .unwrap();
+        postgres.create_lab(&lab, &bootstrap).await.unwrap();
+        postgres.create_user(&user, &bootstrap).await.unwrap();
+        sqlite.create_lab(&lab, &bootstrap).await.unwrap();
+        sqlite.create_user(&user, &bootstrap).await.unwrap();
+
+        let principal = AuthPrincipal::human(
+            user.id,
+            user.display_name.clone(),
+            lab.id,
+            [LabRole::AnimalManager],
+        );
+        let authenticator =
+            StaticTokenAuthenticator::new([(BEARER_TOKEN.to_owned(), principal)]).unwrap();
+        let jobs = Arc::new(StoreJobRepository::new(sqlite.clone()));
+        let master_key =
+            AiMasterKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", 1).unwrap();
+        let providers = Arc::new(PostgresAiProviderStore::new(postgres, master_key));
+        let state =
+            AppState::new(sqlite.clone(), Arc::new(authenticator), jobs).with_ai(sqlite, providers);
+        let app = application_router(state, None);
+
+        let create = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/ai/models")
+            .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "name": "Route model",
+                    "protocol": "openai_chat_completions",
+                    "transport": "open_ai_compatible",
+                    "baseUrl": "https://api.deepseek.com",
+                    "modelId": "route-model/自由",
+                    "supportsVision": true,
+                    "contextWindowTokens": 131072,
+                    "maxInputTokens": 65536,
+                    "maxOutputTokens": 4096,
+                    "historyTokenBudget": 32768,
+                    "historyTurns": 20,
+                    "temperature": 0,
+                    "timeoutMs": 120000,
+                    "apiKey": "route-test-key"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let created = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = response_json(created).await;
+        assert_eq!(created["data"]["currentVersion"], 1);
+        assert_eq!(created["data"]["transport"], "open_ai_compatible");
+        assert_eq!(created["data"]["modelId"], "route-model/自由");
+        assert_eq!(created["data"]["hasKey"], true);
+        let profile_id = created["data"]["id"].as_str().unwrap();
+        let rotate_key = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/v1/ai/models/{profile_id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "name": "Route model",
+                    "protocol": "openai_chat_completions",
+                    "transport": "open_ai_compatible",
+                    "baseUrl": "https://api.deepseek.com",
+                    "modelId": "route-model/自由",
+                    "supportsVision": true,
+                    "contextWindowTokens": 131072,
+                    "maxInputTokens": 65536,
+                    "maxOutputTokens": 4096,
+                    "historyTokenBudget": 32768,
+                    "historyTurns": 20,
+                    "temperature": 0,
+                    "timeoutMs": 120000,
+                    "apiKey": "route-test-key-rotated",
+                    "expectedRevision": 1
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let key_rotated = app.clone().oneshot(rotate_key).await.unwrap();
+        assert_eq!(key_rotated.status(), StatusCode::OK);
+        let key_rotated = response_json(key_rotated).await;
+        assert_eq!(key_rotated["data"]["currentVersion"], 1);
+        assert_eq!(key_rotated["data"]["revision"], 1);
+        assert!(!key_rotated.to_string().contains("route-test-key-rotated"));
+
+        let list = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/ai/models")
+            .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+            .body(Body::empty())
+            .unwrap();
+        let listed = app.clone().oneshot(list).await.unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = response_json(listed).await;
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["data"][0]["name"], "Route model");
+        assert!(!listed.to_string().contains("route-test-key"));
+
+        let validate_without_key = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/ai/models/validate")
+            .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "protocol": "openai_chat_completions",
+                    "transport": "open_ai_compatible",
+                    "baseUrl": "https://api.deepseek.com",
+                    "modelId": "unsaved-cloud-model",
+                    "supportsVision": false,
+                    "contextWindowTokens": 131072,
+                    "maxInputTokens": 65536,
+                    "maxOutputTokens": 4096,
+                    "historyTokenBudget": 32768,
+                    "historyTurns": 20,
+                    "temperature": 0,
+                    "timeoutMs": 120000
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let missing_key = app.oneshot(validate_without_key).await.unwrap();
+        assert_eq!(missing_key.status(), StatusCode::OK);
+        let missing_key = response_json(missing_key).await;
+        assert_eq!(missing_key["data"]["ok"], false);
+        assert_eq!(missing_key["data"]["errorCode"], "missing_credential");
     }
 
     #[tokio::test]

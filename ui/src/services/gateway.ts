@@ -498,6 +498,76 @@ export type AiProviderProtocol =
   | 'openai_responses'
   | 'anthropic_messages'
 
+export type AiProviderTransport = 'open_ai_compatible' | 'local_http'
+
+export interface AiModelProfileView {
+  id: string
+  name: string
+  currentVersion: number
+  archivedAt?: string | null
+  revision: number
+  protocol: AiProviderProtocol
+  transport: AiProviderTransport
+  baseUrl: string
+  modelId: string
+  supportsVision: boolean
+  contextWindowTokens: number
+  maxInputTokens: number
+  maxOutputTokens: number
+  historyTokenBudget: number
+  historyTurns: number
+  temperature: number
+  timeoutMs: number
+  hasKey: boolean
+  isDefaultConversation: boolean
+  isDefaultVision: boolean
+  createdAt?: string
+  updatedAt?: string
+}
+
+export interface SaveAiModelProfileInput {
+  name: string
+  protocol: AiProviderProtocol
+  transport: AiProviderTransport
+  baseUrl: string
+  modelId: string
+  supportsVision: boolean
+  contextWindowTokens: number
+  maxInputTokens: number
+  maxOutputTokens: number
+  historyTokenBudget: number
+  historyTurns: number
+  temperature: number
+  timeoutMs: number
+  expectedRevision?: number
+  /** Omit to preserve the exact-version credential when its identity is unchanged. */
+  apiKey?: string
+}
+
+export interface ValidateAiModelProfileInput
+  extends Omit<SaveAiModelProfileInput, 'name' | 'expectedRevision'> {
+  profileId?: string
+  currentVersion?: number
+}
+
+export interface AiModelValidationResult {
+  ok: boolean
+  latencyMs: number
+  errorCode?: string
+}
+
+export interface AiModelDefaultsView {
+  defaultConversationProfileId?: string | null
+  defaultVisionProfileId?: string | null
+  revision: number
+}
+
+export interface SaveAiModelDefaultsInput {
+  defaultConversationProfileId: string | null
+  defaultVisionProfileId: string | null
+  expectedRevision: number
+}
+
 export interface SaveAiProviderEndpointInput {
   providerKind: AiProviderKind
   protocol: AiProviderProtocol
@@ -660,6 +730,15 @@ export interface MuriArcGateway {
   saveAiSettings?(input: SaveAiSettingsInput): Promise<AiSettings>
   clearAiApiKey?(): Promise<AiSettings>
   testAiSettings?(): Promise<{ ok: boolean; latencyMs: number; errorCode?: string }>
+  listAiModelProfiles?(): Promise<AiModelProfileView[]>
+  getAiModelProfile?(id: string): Promise<AiModelProfileView>
+  createAiModelProfile?(input: SaveAiModelProfileInput): Promise<AiModelProfileView>
+  updateAiModelProfile?(id: string, input: SaveAiModelProfileInput): Promise<AiModelProfileView>
+  validateAiModelProfile?(input: ValidateAiModelProfileInput): Promise<AiModelValidationResult>
+  clearAiModelProfileKey?(id: string): Promise<AiModelProfileView>
+  archiveAiModelProfile?(id: string, expectedRevision: number): Promise<AiModelProfileView>
+  getAiModelDefaults?(): Promise<AiModelDefaultsView>
+  saveAiModelDefaults?(input: SaveAiModelDefaultsInput): Promise<AiModelDefaultsView>
   getAiDiagnostics?(): Promise<AiDiagnostics>
   listAiProviderPresets?(): Promise<AiProviderPreset[]>
   getAiLabSettings?(): Promise<AiLabSettings>
@@ -1021,6 +1100,36 @@ export class LocalTauriGateway implements MuriArcGateway {
     return this.call<AiSettings>('save_ai_settings', { input })
   }
   clearAiApiKey() { return this.call<AiSettings>('clear_ai_api_key') }
+  listAiModelProfiles() {
+    return this.call<AiModelProfileView[]>('list_ai_model_profiles')
+  }
+  getAiModelProfile(id: string) {
+    return this.call<AiModelProfileView>('get_ai_model_profile', { id })
+  }
+  createAiModelProfile(input: SaveAiModelProfileInput) {
+    return this.call<AiModelProfileView>('create_ai_model_profile', { input })
+  }
+  updateAiModelProfile(id: string, input: SaveAiModelProfileInput) {
+    return this.call<AiModelProfileView>('update_ai_model_profile', { id, input })
+  }
+  validateAiModelProfile(input: ValidateAiModelProfileInput) {
+    return this.call<AiModelValidationResult>('validate_ai_model_profile', { input })
+  }
+  clearAiModelProfileKey(id: string) {
+    return this.call<AiModelProfileView>('clear_ai_model_profile_key', { id })
+  }
+  archiveAiModelProfile(id: string, expectedRevision: number) {
+    return this.call<AiModelProfileView>('archive_ai_model_profile', {
+      id,
+      expectedRevision,
+    })
+  }
+  getAiModelDefaults() {
+    return this.call<AiModelDefaultsView>('get_ai_model_defaults')
+  }
+  saveAiModelDefaults(input: SaveAiModelDefaultsInput) {
+    return this.call<AiModelDefaultsView>('save_ai_model_defaults', { input })
+  }
   async listAiProviderPresets() { return structuredClone(builtinAiProviderPresets) }
   async aiTurn(input: AiTurnInput) {
     return mapAiTurn(await this.call<RawAiTurnResponse>('ai_turn', { input }))
@@ -3031,6 +3140,72 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return response.data
   }
 
+  async listAiModelProfiles(): Promise<AiModelProfileView[]> {
+    return (await this.request<ApiCollection<AiModelProfileView>>('/ai/models')).data
+  }
+
+  async getAiModelProfile(id: string): Promise<AiModelProfileView> {
+    return (await this.request<ApiItem<AiModelProfileView>>(
+      `/ai/models/${encodeURIComponent(id)}`,
+    )).data
+  }
+
+  async createAiModelProfile(input: SaveAiModelProfileInput): Promise<AiModelProfileView> {
+    return (await this.request<ApiItem<AiModelProfileView>>('/ai/models', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })).data
+  }
+
+  async updateAiModelProfile(
+    id: string,
+    input: SaveAiModelProfileInput,
+  ): Promise<AiModelProfileView> {
+    return (await this.request<ApiItem<AiModelProfileView>>(
+      `/ai/models/${encodeURIComponent(id)}`,
+      { method: 'PUT', body: JSON.stringify(input) },
+    )).data
+  }
+
+  async validateAiModelProfile(
+    input: ValidateAiModelProfileInput,
+  ): Promise<AiModelValidationResult> {
+    return (await this.request<ApiItem<AiModelValidationResult>>('/ai/models/validate', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })).data
+  }
+
+  async clearAiModelProfileKey(id: string): Promise<AiModelProfileView> {
+    return (await this.request<ApiItem<AiModelProfileView>>(
+      `/ai/models/${encodeURIComponent(id)}/key`,
+      { method: 'DELETE' },
+    )).data
+  }
+
+  async archiveAiModelProfile(
+    id: string,
+    expectedRevision: number,
+  ): Promise<AiModelProfileView> {
+    return (await this.request<ApiItem<AiModelProfileView>>(
+      `/ai/models/${encodeURIComponent(id)}/archive`,
+      { method: 'POST', body: JSON.stringify({ expectedRevision }) },
+    )).data
+  }
+
+  async getAiModelDefaults(): Promise<AiModelDefaultsView> {
+    return (await this.request<ApiItem<AiModelDefaultsView>>('/ai/models/defaults')).data
+  }
+
+  async saveAiModelDefaults(
+    input: SaveAiModelDefaultsInput,
+  ): Promise<AiModelDefaultsView> {
+    return (await this.request<ApiItem<AiModelDefaultsView>>('/ai/models/defaults', {
+      method: 'PUT',
+      body: JSON.stringify(input),
+    })).data
+  }
+
   async aiTurn(input: AiTurnInput): Promise<AiTurnResponse> {
     const response = await this.request<ApiItem<RawAiTurnResponse>>('/ai/turns', {
       method: 'POST',
@@ -3872,6 +4047,55 @@ class DemoDomainStore {
     temperature: 0,
     timeoutMs: 120000,
     revision: 0,
+  }
+  aiModelProfiles: AiModelProfileView[] = [
+    {
+      id: '00000000-0000-4000-8000-000000000101',
+      name: 'DeepSeek 对话',
+      currentVersion: 1,
+      revision: 1,
+      protocol: 'openai_chat_completions',
+      transport: 'open_ai_compatible',
+      baseUrl: 'https://api.deepseek.com',
+      modelId: 'deepseek-chat',
+      supportsVision: false,
+      contextWindowTokens: 131072,
+      maxInputTokens: 65536,
+      maxOutputTokens: 4096,
+      historyTokenBudget: 32768,
+      historyTurns: 20,
+      temperature: 0,
+      timeoutMs: 120000,
+      hasKey: false,
+      isDefaultConversation: true,
+      isDefaultVision: false,
+    },
+    {
+      id: '00000000-0000-4000-8000-000000000102',
+      name: '本地视觉模型',
+      currentVersion: 1,
+      revision: 1,
+      protocol: 'openai_chat_completions',
+      transport: 'local_http',
+      baseUrl: 'http://127.0.0.1:11434/v1',
+      modelId: 'local-vision',
+      supportsVision: true,
+      contextWindowTokens: 32768,
+      maxInputTokens: 24576,
+      maxOutputTokens: 4096,
+      historyTokenBudget: 12288,
+      historyTurns: 12,
+      temperature: 0,
+      timeoutMs: 120000,
+      hasKey: false,
+      isDefaultConversation: false,
+      isDefaultVision: true,
+    },
+  ]
+  aiModelDefaults: AiModelDefaultsView = {
+    defaultConversationProfileId: '00000000-0000-4000-8000-000000000101',
+    defaultVisionProfileId: '00000000-0000-4000-8000-000000000102',
+    revision: 1,
   }
   aiProviderEndpoints: AiProviderEndpoint[] = builtinAiProviderPresets
     .filter((preset) => preset.recommendedBaseUrl)
@@ -4872,6 +5096,156 @@ export class DemoGateway implements MuriArcGateway {
     await pause(20)
     this.store.aiSettings.hasKey = false
     return clone(this.store.aiSettings)
+  }
+  async listAiModelProfiles() {
+    await pause(20)
+    return clone(this.store.aiModelProfiles.filter((profile) => !profile.archivedAt))
+  }
+  async getAiModelProfile(id: string) {
+    await pause(20)
+    const profile = this.store.aiModelProfiles.find((item) => item.id === id)
+    if (!profile) throw new Error('模型配置不存在')
+    return clone(profile)
+  }
+  async createAiModelProfile(input: SaveAiModelProfileInput) {
+    await pause(20)
+    if (input.transport === 'open_ai_compatible' && !input.apiKey?.trim()) {
+      throw new Error('云端模型首次保存必须填写 API Key')
+    }
+    const { apiKey, expectedRevision: _expectedRevision, ...configuration } = input
+    const profile: AiModelProfileView = {
+      id: crypto.randomUUID(),
+      ...clone(configuration),
+      currentVersion: 1,
+      revision: 1,
+      hasKey: Boolean(apiKey?.trim()),
+      isDefaultConversation: false,
+      isDefaultVision: false,
+    }
+    this.store.aiModelProfiles.push(profile)
+    return clone(profile)
+  }
+  async updateAiModelProfile(id: string, input: SaveAiModelProfileInput) {
+    await pause(20)
+    const index = this.store.aiModelProfiles.findIndex((item) => item.id === id)
+    const current = this.store.aiModelProfiles[index]
+    if (!current || current.archivedAt) throw new Error('模型配置不存在或已停用')
+    if (input.expectedRevision !== current.revision) throw new Error('模型配置已更新，请刷新后重试')
+    if (current.isDefaultVision && !input.supportsVision) {
+      throw new Error('请先取消默认视觉模型，再关闭视觉能力')
+    }
+    const identityChanged = current.protocol !== input.protocol
+      || current.transport !== input.transport
+      || current.baseUrl.replace(/\/$/, '') !== input.baseUrl.replace(/\/$/, '')
+    if (identityChanged && !input.apiKey?.trim()) {
+      throw new Error('协议、连接方式或 Base URL 变化后必须重新输入 API Key')
+    }
+    const { apiKey, expectedRevision: _expectedRevision, ...configuration } = input
+    const configurationChanged = current.name !== configuration.name
+      || current.protocol !== configuration.protocol
+      || current.transport !== configuration.transport
+      || current.baseUrl !== configuration.baseUrl
+      || current.modelId !== configuration.modelId
+      || current.supportsVision !== configuration.supportsVision
+      || current.contextWindowTokens !== configuration.contextWindowTokens
+      || current.maxInputTokens !== configuration.maxInputTokens
+      || current.maxOutputTokens !== configuration.maxOutputTokens
+      || current.historyTokenBudget !== configuration.historyTokenBudget
+      || current.historyTurns !== configuration.historyTurns
+      || current.temperature !== configuration.temperature
+      || current.timeoutMs !== configuration.timeoutMs
+    if (!configurationChanged) {
+      if (apiKey?.trim()) current.hasKey = true
+      return clone(current)
+    }
+    const updated: AiModelProfileView = {
+      ...current,
+      ...clone(configuration),
+      currentVersion: current.currentVersion + 1,
+      revision: current.revision + 1,
+      hasKey: apiKey?.trim() ? true : current.hasKey,
+    }
+    this.store.aiModelProfiles[index] = updated
+    return clone(updated)
+  }
+  async validateAiModelProfile(input: ValidateAiModelProfileInput) {
+    await pause(20)
+    if ((input.profileId === undefined) !== (input.currentVersion === undefined)) {
+      throw new Error('profileId 与 currentVersion 必须同时提供')
+    }
+    const stored = input.profileId
+      ? this.store.aiModelProfiles.find((item) =>
+        item.id === input.profileId && item.currentVersion === input.currentVersion)
+      : undefined
+    const canReuseKey = stored?.protocol === input.protocol
+      && stored.transport === input.transport
+      && stored.baseUrl.replace(/\/$/, '') === input.baseUrl.replace(/\/$/, '')
+      && stored.hasKey
+    if (input.transport === 'open_ai_compatible' && !input.apiKey?.trim() && !canReuseKey) {
+      return { ok: false, latencyMs: 20, errorCode: 'missing_credential' }
+    }
+    return { ok: true, latencyMs: 20 }
+  }
+  async clearAiModelProfileKey(id: string) {
+    await pause(20)
+    const profile = this.store.aiModelProfiles.find((item) => item.id === id)
+    if (!profile || profile.archivedAt) throw new Error('模型配置不存在或已停用')
+    profile.hasKey = false
+    return clone(profile)
+  }
+  async archiveAiModelProfile(id: string, expectedRevision: number) {
+    await pause(20)
+    const profile = this.store.aiModelProfiles.find((item) => item.id === id)
+    if (!profile || profile.archivedAt || profile.revision !== expectedRevision) {
+      throw new Error('模型配置已变化，请刷新后重试')
+    }
+    profile.archivedAt = new Date().toISOString()
+    profile.revision += 1
+    let defaultsChanged = false
+    if (this.store.aiModelDefaults.defaultConversationProfileId === id) {
+      this.store.aiModelDefaults.defaultConversationProfileId = undefined
+      defaultsChanged = true
+    }
+    if (this.store.aiModelDefaults.defaultVisionProfileId === id) {
+      this.store.aiModelDefaults.defaultVisionProfileId = undefined
+      defaultsChanged = true
+    }
+    if (defaultsChanged) {
+      this.store.aiModelDefaults.revision += 1
+    }
+    profile.isDefaultConversation = false
+    profile.isDefaultVision = false
+    return clone(profile)
+  }
+  async getAiModelDefaults() {
+    await pause(20)
+    return clone(this.store.aiModelDefaults)
+  }
+  async saveAiModelDefaults(input: SaveAiModelDefaultsInput) {
+    await pause(20)
+    if (input.expectedRevision !== this.store.aiModelDefaults.revision) {
+      throw new Error('默认模型已更新，请刷新后重试')
+    }
+    const conversation = input.defaultConversationProfileId
+      ? this.store.aiModelProfiles.find((profile) =>
+        profile.id === input.defaultConversationProfileId && !profile.archivedAt)
+      : undefined
+    const vision = input.defaultVisionProfileId
+      ? this.store.aiModelProfiles.find((profile) =>
+        profile.id === input.defaultVisionProfileId && !profile.archivedAt && profile.supportsVision)
+      : undefined
+    if (input.defaultConversationProfileId && !conversation) throw new Error('默认对话模型不可用')
+    if (input.defaultVisionProfileId && !vision) throw new Error('默认视觉模型不可用或不支持视觉')
+    this.store.aiModelDefaults = {
+      defaultConversationProfileId: conversation?.id,
+      defaultVisionProfileId: vision?.id,
+      revision: this.store.aiModelDefaults.revision + 1,
+    }
+    for (const profile of this.store.aiModelProfiles) {
+      profile.isDefaultConversation = profile.id === conversation?.id
+      profile.isDefaultVision = profile.id === vision?.id
+    }
+    return clone(this.store.aiModelDefaults)
   }
   async listAiProviderPresets() {
     await pause(20)

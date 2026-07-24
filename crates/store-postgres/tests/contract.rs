@@ -45,20 +45,27 @@ async fn assert_corrupted_second_evidence_rolls_back(
     .await
     .unwrap();
 
+    let request_id = format!("{provider}-atomicity");
+    let observation_id = draft.items[0].observation.id;
     let before_counts: (i64, i64, i64, i64) = (
-        sqlx::query_scalar("SELECT count(*) FROM observations")
+        sqlx::query_scalar("SELECT count(*) FROM observations WHERE id=$1")
+            .bind(observation_id)
             .fetch_one(store.pool())
             .await
             .unwrap(),
-        sqlx::query_scalar("SELECT count(*) FROM attachment_links")
+        sqlx::query_scalar("SELECT count(*) FROM attachment_links WHERE attachment_id IN ($1, $2)")
+            .bind(first.private_attachment_id)
+            .bind(second.private_attachment_id)
             .fetch_one(store.pool())
             .await
             .unwrap(),
-        sqlx::query_scalar("SELECT count(*) FROM audit_entries")
+        sqlx::query_scalar("SELECT count(*) FROM audit_entries WHERE request_id=$1")
+            .bind(&request_id)
             .fetch_one(store.pool())
             .await
             .unwrap(),
-        sqlx::query_scalar("SELECT count(*) FROM provenance")
+        sqlx::query_scalar("SELECT count(*) FROM provenance WHERE request_id=$1")
+            .bind(&request_id)
             .fetch_one(store.pool())
             .await
             .unwrap(),
@@ -80,7 +87,7 @@ async fn assert_corrupted_second_evidence_rolls_back(
     let audit = AuditContext {
         actor: Actor::human(draft.user_id, "Atomicity owner"),
         source: WriteSource::Web,
-        request_id: Some(format!("{provider}-atomicity")),
+        request_id: Some(request_id.clone()),
         reason: Some("second evidence corruption must roll back".to_owned()),
     };
     let result = if approval {
@@ -114,19 +121,24 @@ async fn assert_corrupted_second_evidence_rolls_back(
     assert!(matches!(result, Err(StoreError::Conflict(_))));
 
     let after_counts: (i64, i64, i64, i64) = (
-        sqlx::query_scalar("SELECT count(*) FROM observations")
+        sqlx::query_scalar("SELECT count(*) FROM observations WHERE id=$1")
+            .bind(observation_id)
             .fetch_one(store.pool())
             .await
             .unwrap(),
-        sqlx::query_scalar("SELECT count(*) FROM attachment_links")
+        sqlx::query_scalar("SELECT count(*) FROM attachment_links WHERE attachment_id IN ($1, $2)")
+            .bind(first.private_attachment_id)
+            .bind(second.private_attachment_id)
             .fetch_one(store.pool())
             .await
             .unwrap(),
-        sqlx::query_scalar("SELECT count(*) FROM audit_entries")
+        sqlx::query_scalar("SELECT count(*) FROM audit_entries WHERE request_id=$1")
+            .bind(&request_id)
             .fetch_one(store.pool())
             .await
             .unwrap(),
-        sqlx::query_scalar("SELECT count(*) FROM provenance")
+        sqlx::query_scalar("SELECT count(*) FROM provenance WHERE request_id=$1")
+            .bind(&request_id)
             .fetch_one(store.pool())
             .await
             .unwrap(),

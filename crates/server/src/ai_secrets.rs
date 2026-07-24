@@ -1,9 +1,13 @@
-use std::fmt;
+use std::{fmt, time::Instant};
 
 use async_trait::async_trait;
-use muriarc_ai::{AssistantRuntimeConfig, BuiltinProvider, ProviderKind};
+use chrono::{DateTime, Utc};
 #[cfg(feature = "postgres")]
-use muriarc_ai::{ProviderConfig, ProviderCredentials};
+use muriarc_ai::{
+    AiProvider, ChatMessage, CompletionRequest, ProviderConfig, ProviderCredentials, ProviderError,
+    TransportFailure,
+};
+use muriarc_ai::{AssistantRuntimeConfig, BuiltinProvider, ProviderKind};
 use muriarc_core::{
     AiAutonomyMode, AiModelProfileBinding, AiProviderProtocol, AiProviderTransport, AuditContext,
 };
@@ -294,6 +298,213 @@ pub struct SaveAiProviderEndpointInput {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelProfileView {
+    pub id: Uuid,
+    pub name: String,
+    pub current_version: i64,
+    pub protocol: AiProviderProtocol,
+    pub transport: AiProviderTransport,
+    pub base_url: String,
+    pub model_id: String,
+    pub supports_vision: bool,
+    pub context_window_tokens: u32,
+    pub max_input_tokens: u32,
+    pub max_output_tokens: u32,
+    pub history_token_budget: u32,
+    pub history_turns: u32,
+    pub temperature: f32,
+    pub timeout_ms: u64,
+    pub has_key: bool,
+    pub archived_at: Option<DateTime<Utc>>,
+    pub is_default_conversation: bool,
+    pub is_default_vision: bool,
+    pub revision: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveAiModelProfileInput {
+    pub name: String,
+    pub protocol: AiProviderProtocol,
+    pub transport: AiProviderTransport,
+    pub base_url: String,
+    pub model_id: String,
+    pub supports_vision: bool,
+    pub context_window_tokens: u32,
+    pub max_input_tokens: u32,
+    pub max_output_tokens: u32,
+    pub history_token_budget: u32,
+    pub history_turns: u32,
+    pub temperature: f32,
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
+}
+
+impl fmt::Debug for SaveAiModelProfileInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SaveAiModelProfileInput")
+            .field("name", &self.name)
+            .field("protocol", &self.protocol)
+            .field("transport", &self.transport)
+            .field("base_url", &"[REDACTED]")
+            .field("model_id", &"[REDACTED]")
+            .field("supports_vision", &self.supports_vision)
+            .field("context_window_tokens", &self.context_window_tokens)
+            .field("max_input_tokens", &self.max_input_tokens)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("history_token_budget", &self.history_token_budget)
+            .field("history_turns", &self.history_turns)
+            .field("temperature", &self.temperature)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("expected_revision", &self.expected_revision)
+            .finish()
+    }
+}
+
+impl SaveAiModelProfileInput {
+    fn runtime(&self) -> Result<AssistantRuntimeConfig, AiProviderStoreError> {
+        AssistantRuntimeConfig {
+            context_window_tokens: self.context_window_tokens,
+            max_input_tokens: self.max_input_tokens,
+            max_output_tokens: self.max_output_tokens,
+            history_token_budget: self.history_token_budget,
+            history_turns: self.history_turns,
+            temperature: self.temperature,
+            timeout_ms: self.timeout_ms,
+        }
+        .validate()
+        .map_err(|_| AiProviderStoreError::InvalidSettings)
+    }
+
+    fn trimmed_key(&self) -> Option<&str> {
+        self.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ValidateAiModelProfileInput {
+    pub protocol: AiProviderProtocol,
+    pub transport: AiProviderTransport,
+    pub base_url: String,
+    pub model_id: String,
+    pub supports_vision: bool,
+    pub context_window_tokens: u32,
+    pub max_input_tokens: u32,
+    pub max_output_tokens: u32,
+    pub history_token_budget: u32,
+    pub history_turns: u32,
+    pub temperature: f32,
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<Uuid>,
+    #[serde(default)]
+    pub current_version: Option<i64>,
+}
+
+impl fmt::Debug for ValidateAiModelProfileInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidateAiModelProfileInput")
+            .field("protocol", &self.protocol)
+            .field("transport", &self.transport)
+            .field("base_url", &"[REDACTED]")
+            .field("model_id", &"[REDACTED]")
+            .field("supports_vision", &self.supports_vision)
+            .field("context_window_tokens", &self.context_window_tokens)
+            .field("max_input_tokens", &self.max_input_tokens)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("history_token_budget", &self.history_token_budget)
+            .field("history_turns", &self.history_turns)
+            .field("temperature", &self.temperature)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("profile_id", &self.profile_id)
+            .field("current_version", &self.current_version)
+            .finish()
+    }
+}
+
+impl ValidateAiModelProfileInput {
+    fn profile_binding_hint(&self) -> Result<Option<(Uuid, i64)>, AiProviderStoreError> {
+        match (self.profile_id, self.current_version) {
+            (None, None) => Ok(None),
+            (Some(profile_id), Some(profile_version)) if profile_version > 0 => {
+                Ok(Some((profile_id, profile_version)))
+            }
+            _ => Err(AiProviderStoreError::InvalidSettings),
+        }
+    }
+
+    fn runtime(&self) -> Result<AssistantRuntimeConfig, AiProviderStoreError> {
+        AssistantRuntimeConfig {
+            context_window_tokens: self.context_window_tokens,
+            max_input_tokens: self.max_input_tokens,
+            max_output_tokens: self.max_output_tokens,
+            history_token_budget: self.history_token_budget,
+            history_turns: self.history_turns,
+            temperature: self.temperature,
+            timeout_ms: self.timeout_ms,
+        }
+        .validate()
+        .map_err(|_| AiProviderStoreError::InvalidSettings)
+    }
+
+    fn trimmed_key(&self) -> Option<&str> {
+        self.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArchiveAiModelProfileInput {
+    pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelDefaultsView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_conversation_profile_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_vision_profile_id: Option<Uuid>,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveAiModelDefaultsInput {
+    pub default_conversation_profile_id: Option<Uuid>,
+    pub default_vision_profile_id: Option<Uuid>,
+    pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelValidationView {
+    pub ok: bool,
+    pub latency_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<&'static str>,
+}
+
 #[derive(Debug, Error)]
 pub enum AiProviderStoreError {
     #[error("AI provider settings are invalid")]
@@ -322,6 +533,12 @@ pub enum AiProviderStoreError {
     Storage,
     #[error("AI provider settings are not configured")]
     NotConfigured,
+    #[error("AI model profile was not found")]
+    ModelProfileNotFound,
+    #[error("AI model profile changed concurrently")]
+    RevisionConflict,
+    #[error("a new API key is required for this AI model profile")]
+    CredentialRequired,
 }
 
 #[async_trait]
@@ -384,6 +601,57 @@ pub trait UserAiProviderStore: Send + Sync {
         endpoint_id: Uuid,
         audit: &AuditContext,
     ) -> Result<AiProviderEndpointView, AiProviderStoreError>;
+    async fn list_model_profiles(
+        &self,
+        user_id: Uuid,
+        include_archived: bool,
+    ) -> Result<Vec<AiModelProfileView>, AiProviderStoreError>;
+    async fn get_model_profile(
+        &self,
+        user_id: Uuid,
+        profile_id: Uuid,
+    ) -> Result<AiModelProfileView, AiProviderStoreError>;
+    async fn create_model_profile(
+        &self,
+        user_id: Uuid,
+        input: SaveAiModelProfileInput,
+        audit: &AuditContext,
+    ) -> Result<AiModelProfileView, AiProviderStoreError>;
+    async fn update_model_profile(
+        &self,
+        user_id: Uuid,
+        profile_id: Uuid,
+        input: SaveAiModelProfileInput,
+        audit: &AuditContext,
+    ) -> Result<AiModelProfileView, AiProviderStoreError>;
+    async fn validate_model_profile(
+        &self,
+        user_id: Uuid,
+        input: ValidateAiModelProfileInput,
+    ) -> Result<AiModelValidationView, AiProviderStoreError>;
+    async fn clear_model_profile_key(
+        &self,
+        user_id: Uuid,
+        profile_id: Uuid,
+        audit: &AuditContext,
+    ) -> Result<AiModelProfileView, AiProviderStoreError>;
+    async fn archive_model_profile(
+        &self,
+        user_id: Uuid,
+        profile_id: Uuid,
+        revision: i64,
+        audit: &AuditContext,
+    ) -> Result<AiModelProfileView, AiProviderStoreError>;
+    async fn get_model_defaults(
+        &self,
+        user_id: Uuid,
+    ) -> Result<AiModelDefaultsView, AiProviderStoreError>;
+    async fn save_model_defaults(
+        &self,
+        user_id: Uuid,
+        input: SaveAiModelDefaultsInput,
+        audit: &AuditContext,
+    ) -> Result<AiModelDefaultsView, AiProviderStoreError>;
 }
 
 #[derive(Debug, Default)]
@@ -489,6 +757,84 @@ impl UserAiProviderStore for DisabledAiProviderStore {
     ) -> Result<AiProviderEndpointView, AiProviderStoreError> {
         Err(AiProviderStoreError::NotConfigured)
     }
+
+    async fn list_model_profiles(
+        &self,
+        _user_id: Uuid,
+        _include_archived: bool,
+    ) -> Result<Vec<AiModelProfileView>, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+
+    async fn get_model_profile(
+        &self,
+        _user_id: Uuid,
+        _profile_id: Uuid,
+    ) -> Result<AiModelProfileView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+
+    async fn create_model_profile(
+        &self,
+        _user_id: Uuid,
+        _input: SaveAiModelProfileInput,
+        _audit: &AuditContext,
+    ) -> Result<AiModelProfileView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+
+    async fn update_model_profile(
+        &self,
+        _user_id: Uuid,
+        _profile_id: Uuid,
+        _input: SaveAiModelProfileInput,
+        _audit: &AuditContext,
+    ) -> Result<AiModelProfileView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+
+    async fn validate_model_profile(
+        &self,
+        _user_id: Uuid,
+        _input: ValidateAiModelProfileInput,
+    ) -> Result<AiModelValidationView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+
+    async fn clear_model_profile_key(
+        &self,
+        _user_id: Uuid,
+        _profile_id: Uuid,
+        _audit: &AuditContext,
+    ) -> Result<AiModelProfileView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+
+    async fn archive_model_profile(
+        &self,
+        _user_id: Uuid,
+        _profile_id: Uuid,
+        _revision: i64,
+        _audit: &AuditContext,
+    ) -> Result<AiModelProfileView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+
+    async fn get_model_defaults(
+        &self,
+        _user_id: Uuid,
+    ) -> Result<AiModelDefaultsView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+
+    async fn save_model_defaults(
+        &self,
+        _user_id: Uuid,
+        _input: SaveAiModelDefaultsInput,
+        _audit: &AuditContext,
+    ) -> Result<AiModelDefaultsView, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +899,211 @@ mod shared_tests {
         })
         .unwrap();
         assert_eq!(serialized["protocol"], "openai_responses");
+    }
+
+    #[test]
+    fn model_management_contract_uses_transport_expected_revision_and_redacts_secrets() {
+        let input: SaveAiModelProfileInput = serde_json::from_value(serde_json::json!({
+            "name": "自由模型",
+            "protocol": "openai_responses",
+            "transport": "open_ai_compatible",
+            "baseUrl": "https://provider.example.test/v1",
+            "modelId": "供应商/自由-model",
+            "supportsVision": true,
+            "contextWindowTokens": 131072,
+            "maxInputTokens": 65536,
+            "maxOutputTokens": 4096,
+            "historyTokenBudget": 32768,
+            "historyTurns": 20,
+            "temperature": 0.2,
+            "timeoutMs": 120000,
+            "apiKey": "must-not-leak",
+            "expectedRevision": 7
+        }))
+        .unwrap();
+        assert_eq!(input.protocol, AiProviderProtocol::OpenaiResponses);
+        assert_eq!(input.transport, AiProviderTransport::OpenAiCompatible);
+        assert_eq!(input.expected_revision, Some(7));
+        assert_eq!(input.model_id, "供应商/自由-model");
+        assert!(!format!("{input:?}").contains("must-not-leak"));
+
+        let validation: ValidateAiModelProfileInput = serde_json::from_value(serde_json::json!({
+            "protocol": "anthropic_messages",
+            "transport": "open_ai_compatible",
+            "baseUrl": "https://provider.example.test",
+            "modelId": "claude-compatible",
+            "supportsVision": false,
+            "contextWindowTokens": 131072,
+            "maxInputTokens": 65536,
+            "maxOutputTokens": 4096,
+            "historyTokenBudget": 32768,
+            "historyTurns": 20,
+            "temperature": 0,
+            "timeoutMs": 120000,
+            "apiKey": "",
+            "profileId": Uuid::nil(),
+            "currentVersion": 3
+        }))
+        .unwrap();
+        assert_eq!(validation.protocol, AiProviderProtocol::AnthropicMessages);
+        assert!(validation.trimmed_key().is_none());
+        assert!(!format!("{validation:?}").contains("provider.example"));
+
+        let serialized = serde_json::to_value(AiModelValidationView {
+            ok: true,
+            latency_ms: 12,
+            error_code: None,
+        })
+        .unwrap();
+        assert_eq!(serialized, serde_json::json!({"ok": true, "latencyMs": 12}));
+    }
+
+    #[test]
+    fn model_management_contract_requires_protocol_transport_and_all_configuration_fields() {
+        let save_input = serde_json::json!({
+            "name": "Required fields",
+            "protocol": "openai_chat_completions",
+            "transport": "local_http",
+            "baseUrl": "http://127.0.0.1:11434/v1",
+            "modelId": "free-form-model",
+            "supportsVision": false,
+            "contextWindowTokens": 131072,
+            "maxInputTokens": 65536,
+            "maxOutputTokens": 4096,
+            "historyTokenBudget": 32768,
+            "historyTurns": 20,
+            "temperature": 0.2,
+            "timeoutMs": 120000
+        });
+        let parsed: SaveAiModelProfileInput = serde_json::from_value(save_input.clone()).unwrap();
+        assert!(parsed.api_key.is_none());
+        assert!(parsed.expected_revision.is_none());
+        for field in [
+            "name",
+            "protocol",
+            "transport",
+            "baseUrl",
+            "modelId",
+            "supportsVision",
+            "contextWindowTokens",
+            "maxInputTokens",
+            "maxOutputTokens",
+            "historyTokenBudget",
+            "historyTurns",
+            "temperature",
+            "timeoutMs",
+        ] {
+            let mut missing = save_input.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<SaveAiModelProfileInput>(missing).is_err(),
+                "SaveAiModelProfileInput unexpectedly accepted missing {field}"
+            );
+        }
+
+        let validation_input = serde_json::json!({
+            "protocol": "openai_responses",
+            "transport": "local_http",
+            "baseUrl": "http://127.0.0.1:11434/v1",
+            "modelId": "free-form-model",
+            "supportsVision": false,
+            "contextWindowTokens": 131072,
+            "maxInputTokens": 65536,
+            "maxOutputTokens": 4096,
+            "historyTokenBudget": 32768,
+            "historyTurns": 20,
+            "temperature": 0.2,
+            "timeoutMs": 120000
+        });
+        serde_json::from_value::<ValidateAiModelProfileInput>(validation_input.clone()).unwrap();
+        for field in [
+            "protocol",
+            "transport",
+            "baseUrl",
+            "modelId",
+            "supportsVision",
+            "contextWindowTokens",
+            "maxInputTokens",
+            "maxOutputTokens",
+            "historyTokenBudget",
+            "historyTurns",
+            "temperature",
+            "timeoutMs",
+        ] {
+            let mut missing = validation_input.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<ValidateAiModelProfileInput>(missing).is_err(),
+                "ValidateAiModelProfileInput unexpectedly accepted missing {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_defaults_and_validation_binding_contracts_are_explicit() {
+        assert!(
+            serde_json::from_value::<SaveAiModelDefaultsInput>(serde_json::json!({
+                "defaultConversationProfileId": null,
+                "defaultVisionProfileId": null
+            }))
+            .is_err()
+        );
+        let defaults: SaveAiModelDefaultsInput = serde_json::from_value(serde_json::json!({
+            "defaultConversationProfileId": null,
+            "defaultVisionProfileId": null,
+            "expectedRevision": 0
+        }))
+        .unwrap();
+        assert_eq!(defaults.expected_revision, 0);
+        let empty_defaults = serde_json::to_value(AiModelDefaultsView {
+            default_conversation_profile_id: None,
+            default_vision_profile_id: None,
+            revision: 0,
+        })
+        .unwrap();
+        assert_eq!(empty_defaults, serde_json::json!({"revision": 0}));
+
+        let validation_input = serde_json::json!({
+            "protocol": "openai_chat_completions",
+            "transport": "open_ai_compatible",
+            "baseUrl": "https://provider.example.test/v1",
+            "modelId": "free-form-model",
+            "supportsVision": false,
+            "contextWindowTokens": 131072,
+            "maxInputTokens": 65536,
+            "maxOutputTokens": 4096,
+            "historyTokenBudget": 32768,
+            "historyTurns": 20,
+            "temperature": 0.2,
+            "timeoutMs": 120000,
+            "apiKey": "explicit-key"
+        });
+        let without_binding: ValidateAiModelProfileInput =
+            serde_json::from_value(validation_input.clone()).unwrap();
+        assert_eq!(without_binding.profile_binding_hint().unwrap(), None);
+
+        let mut paired = validation_input.clone();
+        paired["profileId"] = serde_json::json!(Uuid::nil());
+        paired["currentVersion"] = serde_json::json!(1);
+        let paired: ValidateAiModelProfileInput = serde_json::from_value(paired).unwrap();
+        assert_eq!(
+            paired.profile_binding_hint().unwrap(),
+            Some((Uuid::nil(), 1))
+        );
+
+        for (field, value) in [
+            ("profileId", serde_json::json!(Uuid::nil())),
+            ("currentVersion", serde_json::json!(1)),
+        ] {
+            let mut incomplete = validation_input.clone();
+            incomplete[field] = value;
+            let incomplete: ValidateAiModelProfileInput =
+                serde_json::from_value(incomplete).unwrap();
+            assert!(matches!(
+                incomplete.profile_binding_hint(),
+                Err(AiProviderStoreError::InvalidSettings)
+            ));
+        }
     }
 }
 
@@ -712,6 +1263,64 @@ mod postgres {
             BuiltinProvider::from_config(config.clone())
                 .map_err(|_| AiProviderStoreError::InvalidSettings)?;
             Ok(config)
+        }
+
+        fn model_config(
+            protocol: AiProviderProtocol,
+            transport: AiProviderTransport,
+            model_id: &str,
+            base_url: &str,
+            timeout_ms: u64,
+        ) -> Result<ProviderConfig, AiProviderStoreError> {
+            let model_id = model_id.trim();
+            let base_url = base_url.trim();
+            let mut config = match transport {
+                AiProviderTransport::OpenAiCompatible => {
+                    ProviderConfig::openai_compatible(SERVER_PROVIDER_ID, model_id, base_url)
+                }
+                AiProviderTransport::LocalHttp => {
+                    ProviderConfig::local_http(SERVER_PROVIDER_ID, model_id, base_url)
+                }
+            }
+            .with_protocol(protocol);
+            config.timeout_ms = timeout_ms;
+            BuiltinProvider::from_config(config.clone())
+                .map_err(|_| AiProviderStoreError::InvalidSettings)?;
+            Ok(config)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn validated_model_configuration(
+            name: &str,
+            protocol: AiProviderProtocol,
+            transport: AiProviderTransport,
+            base_url: &str,
+            model_id: &str,
+            supports_vision: bool,
+            runtime: AssistantRuntimeConfig,
+        ) -> Result<(String, ProviderConfig), AiProviderStoreError> {
+            let name = name.trim();
+            if name.is_empty() || name.chars().count() > 120 {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            let token_total =
+                u64::from(runtime.max_input_tokens) + u64::from(runtime.max_output_tokens);
+            if !(4_096..=2_000_000).contains(&runtime.context_window_tokens)
+                || !(1_024..=1_900_000).contains(&runtime.max_input_tokens)
+                || !(1..=131_072).contains(&runtime.max_output_tokens)
+                || runtime.history_token_budget > 1_000_000
+                || runtime.history_token_budget > runtime.max_input_tokens
+                || runtime.history_turns > 100
+                || token_total > u64::from(runtime.context_window_tokens)
+                || model_id.trim().is_empty()
+                || model_id.trim().chars().count() > 256
+            {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            let _ = supports_vision;
+            let config =
+                Self::model_config(protocol, transport, model_id, base_url, runtime.timeout_ms)?;
+            Ok((name.to_owned(), config))
         }
 
         fn validated_endpoint_label(label: &str) -> Result<String, AiProviderStoreError> {
@@ -919,6 +1528,248 @@ mod postgres {
                 "base_url_present": true,
                 "revision": view.revision,
             })
+        }
+
+        fn model_profile_view(
+            row: &sqlx::postgres::PgRow,
+        ) -> Result<AiModelProfileView, AiProviderStoreError> {
+            let protocol = Self::protocol_from_db(
+                row.try_get::<String, _>("protocol")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    .as_str(),
+            )?;
+            let transport = Self::transport_from_db(
+                row.try_get::<String, _>("transport")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    .as_str(),
+            )?;
+            Ok(AiModelProfileView {
+                id: row
+                    .try_get("id")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                name: row
+                    .try_get("name")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                current_version: row
+                    .try_get("current_version")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                protocol,
+                transport,
+                base_url: row
+                    .try_get("base_url")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                model_id: row
+                    .try_get("model_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                supports_vision: row
+                    .try_get("supports_vision")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                context_window_tokens: numeric_u32(row, "context_window_tokens")?,
+                max_input_tokens: numeric_u32(row, "max_input_tokens")?,
+                max_output_tokens: numeric_u32(row, "max_output_tokens")?,
+                history_token_budget: numeric_u32(row, "history_token_budget")?,
+                history_turns: numeric_u32(row, "history_turns")?,
+                temperature: row
+                    .try_get::<f64, _>("temperature")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    as f32,
+                timeout_ms: numeric_u64(row, "timeout_ms")?,
+                has_key: row
+                    .try_get("has_key")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                archived_at: row
+                    .try_get("archived_at")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                is_default_conversation: row
+                    .try_get("is_default_conversation")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                is_default_vision: row
+                    .try_get("is_default_vision")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                revision: row
+                    .try_get("revision")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                created_at: row
+                    .try_get("created_at")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                updated_at: row
+                    .try_get("updated_at")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            })
+        }
+
+        async fn model_profile_views(
+            &self,
+            user_id: Uuid,
+            include_archived: bool,
+        ) -> Result<Vec<AiModelProfileView>, AiProviderStoreError> {
+            let rows = sqlx::query(
+                "SELECT p.id, p.name, p.current_version, p.archived_at,
+                        p.revision, p.created_at, p.updated_at,
+                        v.protocol, v.transport, v.base_url, v.model_id,
+                        v.supports_vision, v.context_window_tokens,
+                        v.max_input_tokens, v.max_output_tokens,
+                        v.history_token_budget, v.history_turns,
+                        v.temperature, v.timeout_ms,
+                        EXISTS(
+                            SELECT 1 FROM ai_model_profile_secrets s
+                            WHERE s.profile_id = p.id
+                              AND s.profile_version = p.current_version
+                        ) AS has_key,
+                        COALESCE(
+                            d.default_conversation_profile_id = p.id, FALSE
+                        ) AS is_default_conversation,
+                        COALESCE(
+                            d.default_vision_profile_id = p.id, FALSE
+                        ) AS is_default_vision
+                 FROM ai_model_profiles p
+                 JOIN ai_model_profile_versions v
+                   ON v.profile_id = p.id AND v.version = p.current_version
+                 LEFT JOIN ai_user_model_defaults d
+                   ON d.user_id = p.user_id AND d.deleted_at IS NULL
+                 WHERE p.user_id = $1
+                   AND p.deleted_at IS NULL
+                   AND ($2 OR p.archived_at IS NULL)
+                 ORDER BY p.updated_at DESC, p.id",
+            )
+            .bind(user_id)
+            .bind(include_archived)
+            .fetch_all(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            rows.iter().map(Self::model_profile_view).collect()
+        }
+
+        async fn model_profile_view_by_id(
+            &self,
+            user_id: Uuid,
+            profile_id: Uuid,
+        ) -> Result<AiModelProfileView, AiProviderStoreError> {
+            let row = sqlx::query(
+                "SELECT p.id, p.name, p.current_version, p.archived_at,
+                        p.revision, p.created_at, p.updated_at,
+                        v.protocol, v.transport, v.base_url, v.model_id,
+                        v.supports_vision, v.context_window_tokens,
+                        v.max_input_tokens, v.max_output_tokens,
+                        v.history_token_budget, v.history_turns,
+                        v.temperature, v.timeout_ms,
+                        EXISTS(
+                            SELECT 1 FROM ai_model_profile_secrets s
+                            WHERE s.profile_id = p.id
+                              AND s.profile_version = p.current_version
+                        ) AS has_key,
+                        COALESCE(
+                            d.default_conversation_profile_id = p.id, FALSE
+                        ) AS is_default_conversation,
+                        COALESCE(
+                            d.default_vision_profile_id = p.id, FALSE
+                        ) AS is_default_vision
+                 FROM ai_model_profiles p
+                 JOIN ai_model_profile_versions v
+                   ON v.profile_id = p.id AND v.version = p.current_version
+                 LEFT JOIN ai_user_model_defaults d
+                   ON d.user_id = p.user_id AND d.deleted_at IS NULL
+                 WHERE p.id = $1 AND p.user_id = $2
+                   AND p.deleted_at IS NULL",
+            )
+            .bind(profile_id)
+            .bind(user_id)
+            .fetch_optional(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .ok_or(AiProviderStoreError::ModelProfileNotFound)?;
+            Self::model_profile_view(&row)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn insert_model_version(
+            transaction: &mut Transaction<'_, Postgres>,
+            profile_id: Uuid,
+            profile_version: i64,
+            protocol: AiProviderProtocol,
+            transport: AiProviderTransport,
+            config: &ProviderConfig,
+            supports_vision: bool,
+            runtime: AssistantRuntimeConfig,
+        ) -> Result<(), AiProviderStoreError> {
+            sqlx::query(
+                "INSERT INTO ai_model_profile_versions (
+                    profile_id, version, protocol, transport, base_url,
+                    normalized_base_url, model_id, supports_vision,
+                    context_window_tokens, max_input_tokens, max_output_tokens,
+                    history_token_budget, history_turns, temperature,
+                    timeout_ms, created_at
+                 ) VALUES (
+                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now()
+                 )",
+            )
+            .bind(profile_id)
+            .bind(profile_version)
+            .bind(Self::protocol_name(protocol))
+            .bind(Self::transport_name(transport))
+            .bind(&config.base_url)
+            .bind(normalized_url(&config.base_url))
+            .bind(&config.model)
+            .bind(supports_vision)
+            .bind(i64::from(runtime.context_window_tokens))
+            .bind(i64::from(runtime.max_input_tokens))
+            .bind(i64::from(runtime.max_output_tokens))
+            .bind(i64::from(runtime.history_token_budget))
+            .bind(
+                i32::try_from(runtime.history_turns)
+                    .map_err(|_| AiProviderStoreError::InvalidSettings)?,
+            )
+            .bind(f64::from(runtime.temperature))
+            .bind(
+                i64::try_from(runtime.timeout_ms)
+                    .map_err(|_| AiProviderStoreError::InvalidSettings)?,
+            )
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn save_model_version_secret(
+            &self,
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+            profile_id: Uuid,
+            profile_version: i64,
+            secret: &str,
+            audit: &AuditContext,
+            reason: &'static str,
+        ) -> Result<(), AiProviderStoreError> {
+            let (key_version, nonce, ciphertext) =
+                self.encrypt_profile_secret(user_id, profile_id, profile_version, secret)?;
+            sqlx::query(
+                "INSERT INTO ai_model_profile_secrets (
+                    profile_id, profile_version, key_version, nonce,
+                    ciphertext, created_at, updated_at
+                 ) VALUES ($1,$2,$3,$4,$5,now(),now())",
+            )
+            .bind(profile_id)
+            .bind(profile_version)
+            .bind(key_version)
+            .bind(nonce.to_vec())
+            .bind(ciphertext)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            write_human_profile_secret_audit(
+                transaction,
+                lab_id,
+                profile_id,
+                profile_version,
+                "create",
+                audit,
+                false,
+                true,
+                reason,
+            )
+            .await
         }
 
         async fn active_user_lab_from_pool(
@@ -2252,9 +3103,6 @@ mod postgres {
             base_url: String,
             timeout_ms: u64,
         ) -> Result<ProviderConfig, AiProviderStoreError> {
-            if protocol != AiProviderProtocol::OpenaiChatCompletions {
-                return Err(AiProviderStoreError::UnsupportedProtocol);
-            }
             let mut config = match transport {
                 AiProviderTransport::OpenAiCompatible => {
                     ProviderConfig::openai_compatible(SERVER_PROVIDER_ID, model, base_url)
@@ -2262,7 +3110,8 @@ mod postgres {
                 AiProviderTransport::LocalHttp => {
                     ProviderConfig::local_http(SERVER_PROVIDER_ID, model, base_url)
                 }
-            };
+            }
+            .with_protocol(protocol);
             config.timeout_ms = timeout_ms;
             Ok(config)
         }
@@ -2280,17 +3129,6 @@ mod postgres {
             if !self.lab_enabled(lab_id).await? {
                 return Err(AiProviderStoreError::LabDisabled);
             }
-            let enabled: bool =
-                sqlx::query_scalar("SELECT enabled FROM ai_provider_settings WHERE user_id = $1")
-                    .bind(user_id)
-                    .fetch_optional(self.postgres.pool())
-                    .await
-                    .map_err(|_| AiProviderStoreError::Storage)?
-                    .ok_or(AiProviderStoreError::MissingCredential)?;
-            if !enabled {
-                return Err(AiProviderStoreError::Disabled);
-            }
-
             let row = sqlx::query(
                 "SELECT v.protocol, v.transport, v.base_url,
                         v.normalized_base_url, v.model_id, v.supports_vision,
@@ -2322,9 +3160,6 @@ mod postgres {
                     .map_err(|_| AiProviderStoreError::Storage)?
                     .as_str(),
             )?;
-            if protocol != AiProviderProtocol::OpenaiChatCompletions {
-                return Err(AiProviderStoreError::UnsupportedProtocol);
-            }
             let transport = Self::transport_from_db(
                 row.try_get::<String, _>("transport")
                     .map_err(|_| AiProviderStoreError::Storage)?
@@ -3055,6 +3890,957 @@ mod postgres {
                 .map_err(|_| AiProviderStoreError::Storage)?;
             Ok(view)
         }
+
+        async fn list_model_profiles(
+            &self,
+            user_id: Uuid,
+            include_archived: bool,
+        ) -> Result<Vec<AiModelProfileView>, AiProviderStoreError> {
+            self.active_user_lab_from_pool(user_id).await?;
+            self.model_profile_views(user_id, include_archived).await
+        }
+
+        async fn get_model_profile(
+            &self,
+            user_id: Uuid,
+            profile_id: Uuid,
+        ) -> Result<AiModelProfileView, AiProviderStoreError> {
+            self.active_user_lab_from_pool(user_id).await?;
+            self.model_profile_view_by_id(user_id, profile_id).await
+        }
+
+        async fn create_model_profile(
+            &self,
+            user_id: Uuid,
+            input: SaveAiModelProfileInput,
+            audit: &AuditContext,
+        ) -> Result<AiModelProfileView, AiProviderStoreError> {
+            validate_settings_audit(user_id, audit)?;
+            if input.expected_revision.is_some() {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            let runtime = input.runtime()?;
+            let (name, config) = Self::validated_model_configuration(
+                &input.name,
+                input.protocol,
+                input.transport,
+                &input.base_url,
+                &input.model_id,
+                input.supports_vision,
+                runtime,
+            )?;
+            let api_key = input.trimmed_key();
+            if input.transport == AiProviderTransport::OpenAiCompatible && api_key.is_none() {
+                return Err(AiProviderStoreError::CredentialRequired);
+            }
+            if let Some(secret) = api_key {
+                ProviderCredentials::bearer(secret)
+                    .map_err(|_| AiProviderStoreError::InvalidCredential)?;
+            }
+
+            let profile_id = Uuid::new_v4();
+            let mut transaction = self
+                .postgres
+                .pool()
+                .begin()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let lab_id = Self::active_user_lab(&mut transaction, user_id).await?;
+            self.validate_endpoint_for_lab(lab_id, input.protocol, &config)
+                .await?;
+            sqlx::query(
+                "INSERT INTO ai_model_profiles (
+                    id, lab_id, user_id, name, current_version,
+                    created_at, updated_at, archived_at, deleted_at, revision
+                 ) VALUES ($1,$2,$3,$4,1,now(),now(),NULL,NULL,1)",
+            )
+            .bind(profile_id)
+            .bind(lab_id)
+            .bind(user_id)
+            .bind(&name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            Self::insert_model_version(
+                &mut transaction,
+                profile_id,
+                1,
+                input.protocol,
+                input.transport,
+                &config,
+                input.supports_vision,
+                runtime,
+            )
+            .await?;
+            if let Some(secret) = api_key {
+                self.save_model_version_secret(
+                    &mut transaction,
+                    user_id,
+                    lab_id,
+                    profile_id,
+                    1,
+                    secret,
+                    audit,
+                    "AI model profile credential created",
+                )
+                .await?;
+            }
+            write_model_profile_management_audit(
+                &mut transaction,
+                lab_id,
+                profile_id,
+                "create",
+                audit,
+                None,
+                model_profile_audit_state(
+                    &name,
+                    1,
+                    input.protocol,
+                    input.transport,
+                    input.supports_vision,
+                    api_key.is_some(),
+                    false,
+                    1,
+                ),
+                "AI model profile created",
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            self.model_profile_view_by_id(user_id, profile_id).await
+        }
+
+        async fn update_model_profile(
+            &self,
+            user_id: Uuid,
+            profile_id: Uuid,
+            input: SaveAiModelProfileInput,
+            audit: &AuditContext,
+        ) -> Result<AiModelProfileView, AiProviderStoreError> {
+            validate_settings_audit(user_id, audit)?;
+            let expected_revision = input
+                .expected_revision
+                .filter(|revision| *revision > 0)
+                .ok_or(AiProviderStoreError::InvalidSettings)?;
+            let runtime = input.runtime()?;
+            let (name, config) = Self::validated_model_configuration(
+                &input.name,
+                input.protocol,
+                input.transport,
+                &input.base_url,
+                &input.model_id,
+                input.supports_vision,
+                runtime,
+            )?;
+            if let Some(secret) = input.trimmed_key() {
+                ProviderCredentials::bearer(secret)
+                    .map_err(|_| AiProviderStoreError::InvalidCredential)?;
+            }
+
+            let mut transaction = self
+                .postgres
+                .pool()
+                .begin()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let lab_id = Self::active_user_lab(&mut transaction, user_id).await?;
+            self.validate_endpoint_for_lab(lab_id, input.protocol, &config)
+                .await?;
+            let current = sqlx::query(
+                "SELECT p.name, p.current_version, p.archived_at, p.revision,
+                        v.protocol, v.transport, v.base_url,
+                        v.normalized_base_url, v.model_id, v.supports_vision,
+                        v.context_window_tokens, v.max_input_tokens,
+                        v.max_output_tokens, v.history_token_budget,
+                        v.history_turns, v.temperature, v.timeout_ms,
+                        s.key_version, s.nonce, s.ciphertext
+                 FROM ai_model_profiles p
+                 JOIN ai_model_profile_versions v
+                   ON v.profile_id = p.id AND v.version = p.current_version
+                 LEFT JOIN ai_model_profile_secrets s
+                   ON s.profile_id = p.id AND s.profile_version = v.version
+                 WHERE p.id = $1 AND p.user_id = $2 AND p.lab_id = $3
+                   AND p.deleted_at IS NULL
+                 FOR UPDATE OF p",
+            )
+            .bind(profile_id)
+            .bind(user_id)
+            .bind(lab_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .ok_or(AiProviderStoreError::ModelProfileNotFound)?;
+            if current
+                .try_get::<Option<DateTime<Utc>>, _>("archived_at")
+                .map_err(|_| AiProviderStoreError::Storage)?
+                .is_some()
+            {
+                return Err(AiProviderStoreError::ModelProfileNotFound);
+            }
+            let current_revision: i64 = current
+                .try_get("revision")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            if current_revision != expected_revision {
+                return Err(AiProviderStoreError::RevisionConflict);
+            }
+            if !input.supports_vision {
+                let default_vision_profile_id: Option<Option<Uuid>> = sqlx::query_scalar(
+                    "SELECT default_vision_profile_id
+                     FROM ai_user_model_defaults
+                     WHERE user_id = $1 AND deleted_at IS NULL
+                     FOR SHARE",
+                )
+                .bind(user_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                if default_vision_profile_id.flatten() == Some(profile_id) {
+                    return Err(AiProviderStoreError::InvalidSettings);
+                }
+            }
+            let current_version: i64 = current
+                .try_get("current_version")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let current_name: String = current
+                .try_get("name")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let current_protocol: String = current
+                .try_get("protocol")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let current_transport: String = current
+                .try_get("transport")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let current_normalized_base_url: String = current
+                .try_get("normalized_base_url")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let current_supports_vision: bool = current
+                .try_get("supports_vision")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let identity_matches = current_protocol == Self::protocol_name(input.protocol)
+                && current_transport == Self::transport_name(input.transport)
+                && current_normalized_base_url == normalized_url(&config.base_url);
+            if !identity_matches && input.trimmed_key().is_none() {
+                return Err(AiProviderStoreError::CredentialRequired);
+            }
+
+            let key_version: Option<i32> = current
+                .try_get("key_version")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let nonce: Option<Vec<u8>> = current
+                .try_get("nonce")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let ciphertext: Option<Vec<u8>> = current
+                .try_get("ciphertext")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let configuration_unchanged = current_name == name
+                && identity_matches
+                && current
+                    .try_get::<String, _>("base_url")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    == config.base_url
+                && current
+                    .try_get::<String, _>("model_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    == config.model
+                && current_supports_vision == input.supports_vision
+                && numeric_u32(&current, "context_window_tokens")? == runtime.context_window_tokens
+                && numeric_u32(&current, "max_input_tokens")? == runtime.max_input_tokens
+                && numeric_u32(&current, "max_output_tokens")? == runtime.max_output_tokens
+                && numeric_u32(&current, "history_token_budget")? == runtime.history_token_budget
+                && numeric_u32(&current, "history_turns")? == runtime.history_turns
+                && current
+                    .try_get::<f64, _>("temperature")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    == f64::from(runtime.temperature)
+                && numeric_u64(&current, "timeout_ms")? == runtime.timeout_ms;
+            if configuration_unchanged {
+                if let Some(secret) = input.trimmed_key() {
+                    let existed = match (&key_version, &nonce, &ciphertext) {
+                        (Some(_), Some(_), Some(_)) => true,
+                        (None, None, None) => false,
+                        _ => return Err(AiProviderStoreError::Encryption),
+                    };
+                    let (next_key_version, next_nonce, next_ciphertext) =
+                        self.encrypt_profile_secret(user_id, profile_id, current_version, secret)?;
+                    sqlx::query(
+                        "INSERT INTO ai_model_profile_secrets (
+                            profile_id, profile_version, key_version, nonce,
+                            ciphertext, created_at, updated_at
+                         ) VALUES ($1,$2,$3,$4,$5,now(),now())
+                         ON CONFLICT (profile_id, profile_version) DO UPDATE
+                         SET key_version = EXCLUDED.key_version,
+                             nonce = EXCLUDED.nonce,
+                             ciphertext = EXCLUDED.ciphertext,
+                             updated_at = now()",
+                    )
+                    .bind(profile_id)
+                    .bind(current_version)
+                    .bind(next_key_version)
+                    .bind(next_nonce.to_vec())
+                    .bind(next_ciphertext)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                    write_human_profile_secret_audit(
+                        &mut transaction,
+                        lab_id,
+                        profile_id,
+                        current_version,
+                        if existed { "update" } else { "create" },
+                        audit,
+                        existed,
+                        true,
+                        "AI model profile credential rotated without changing configuration",
+                    )
+                    .await?;
+                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                return self.model_profile_view_by_id(user_id, profile_id).await;
+            }
+            let copied_secret = if input.trimmed_key().is_none() && identity_matches {
+                match (key_version, nonce, ciphertext) {
+                    (Some(key_version), Some(nonce), Some(ciphertext)) => {
+                        Some(self.decrypt_profile_secret(
+                            user_id,
+                            profile_id,
+                            current_version,
+                            key_version,
+                            &nonce,
+                            &ciphertext,
+                        )?)
+                    }
+                    (None, None, None) => None,
+                    _ => return Err(AiProviderStoreError::Encryption),
+                }
+            } else {
+                None
+            };
+            let next_version = current_version
+                .checked_add(1)
+                .ok_or(AiProviderStoreError::Storage)?;
+            Self::insert_model_version(
+                &mut transaction,
+                profile_id,
+                next_version,
+                input.protocol,
+                input.transport,
+                &config,
+                input.supports_vision,
+                runtime,
+            )
+            .await?;
+            let secret = input
+                .trimmed_key()
+                .or_else(|| copied_secret.as_ref().map(|secret| secret.as_str()));
+            if let Some(secret) = secret {
+                self.save_model_version_secret(
+                    &mut transaction,
+                    user_id,
+                    lab_id,
+                    profile_id,
+                    next_version,
+                    secret,
+                    audit,
+                    "AI model profile credential bound to a new immutable version",
+                )
+                .await?;
+            }
+            let updated = sqlx::query(
+                "UPDATE ai_model_profiles
+                 SET name = $1, current_version = $2, updated_at = now(),
+                     revision = revision + 1
+                 WHERE id = $3 AND user_id = $4 AND revision = $5
+                   AND archived_at IS NULL AND deleted_at IS NULL",
+            )
+            .bind(&name)
+            .bind(next_version)
+            .bind(profile_id)
+            .bind(user_id)
+            .bind(expected_revision)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            if updated.rows_affected() != 1 {
+                return Err(AiProviderStoreError::RevisionConflict);
+            }
+            let before = model_profile_audit_state(
+                &current_name,
+                current_version,
+                Self::protocol_from_db(&current_protocol)?,
+                Self::transport_from_db(&current_transport)?,
+                current_supports_vision,
+                key_version.is_some(),
+                false,
+                current_revision,
+            );
+            let after = model_profile_audit_state(
+                &name,
+                next_version,
+                input.protocol,
+                input.transport,
+                input.supports_vision,
+                secret.is_some(),
+                false,
+                current_revision + 1,
+            );
+            write_model_profile_management_audit(
+                &mut transaction,
+                lab_id,
+                profile_id,
+                "update",
+                audit,
+                Some(before),
+                after,
+                "AI model profile immutable version appended",
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            self.model_profile_view_by_id(user_id, profile_id).await
+        }
+
+        async fn validate_model_profile(
+            &self,
+            user_id: Uuid,
+            input: ValidateAiModelProfileInput,
+        ) -> Result<AiModelValidationView, AiProviderStoreError> {
+            let profile_binding_hint = input.profile_binding_hint()?;
+            let runtime = input.runtime()?;
+            let (_, config) = Self::validated_model_configuration(
+                "Unsaved model validation",
+                input.protocol,
+                input.transport,
+                &input.base_url,
+                &input.model_id,
+                input.supports_vision,
+                runtime,
+            )?;
+            let lab_id = self.active_user_lab_from_pool(user_id).await?;
+            self.validate_endpoint_for_lab(lab_id, input.protocol, &config)
+                .await?;
+
+            let reusable_secret = match (input.trimmed_key(), profile_binding_hint) {
+                (None, Some((profile_id, profile_version))) => {
+                    let row = sqlx::query(
+                        "SELECT v.protocol, v.transport, v.normalized_base_url,
+                                s.key_version, s.nonce, s.ciphertext
+                         FROM ai_model_profiles p
+                         JOIN ai_model_profile_versions v
+                           ON v.profile_id = p.id
+                          AND v.version = p.current_version
+                          AND v.version = $3
+                         LEFT JOIN ai_model_profile_secrets s
+                           ON s.profile_id = p.id AND s.profile_version = v.version
+                         WHERE p.id = $1 AND p.user_id = $2
+                           AND p.archived_at IS NULL AND p.deleted_at IS NULL",
+                    )
+                    .bind(profile_id)
+                    .bind(user_id)
+                    .bind(profile_version)
+                    .fetch_optional(self.postgres.pool())
+                    .await
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                    match row {
+                        Some(row) => {
+                            let identity_matches = row
+                                .try_get::<String, _>("protocol")
+                                .map_err(|_| AiProviderStoreError::Storage)?
+                                == Self::protocol_name(input.protocol)
+                                && row
+                                    .try_get::<String, _>("transport")
+                                    .map_err(|_| AiProviderStoreError::Storage)?
+                                    == Self::transport_name(input.transport)
+                                && row
+                                    .try_get::<String, _>("normalized_base_url")
+                                    .map_err(|_| AiProviderStoreError::Storage)?
+                                    == normalized_url(&config.base_url);
+                            let key_version: Option<i32> = row
+                                .try_get("key_version")
+                                .map_err(|_| AiProviderStoreError::Storage)?;
+                            let nonce: Option<Vec<u8>> = row
+                                .try_get("nonce")
+                                .map_err(|_| AiProviderStoreError::Storage)?;
+                            let ciphertext: Option<Vec<u8>> = row
+                                .try_get("ciphertext")
+                                .map_err(|_| AiProviderStoreError::Storage)?;
+                            match (identity_matches, key_version, nonce, ciphertext) {
+                                (true, Some(key_version), Some(nonce), Some(ciphertext)) => {
+                                    Some(self.decrypt_profile_secret(
+                                        user_id,
+                                        profile_id,
+                                        profile_version,
+                                        key_version,
+                                        &nonce,
+                                        &ciphertext,
+                                    )?)
+                                }
+                                (true, None, None, None) | (false, _, _, _) => None,
+                                _ => return Err(AiProviderStoreError::Encryption),
+                            }
+                        }
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
+            let secret = input
+                .trimmed_key()
+                .or_else(|| reusable_secret.as_ref().map(SensitiveSecret::as_str));
+            if input.transport == AiProviderTransport::OpenAiCompatible && secret.is_none() {
+                return Ok(AiModelValidationView {
+                    ok: false,
+                    latency_ms: 0,
+                    error_code: Some("missing_credential"),
+                });
+            }
+            let credentials = match secret {
+                Some(secret) => ProviderCredentials::bearer(secret)
+                    .map_err(|_| AiProviderStoreError::InvalidCredential)?,
+                None => ProviderCredentials::none(),
+            };
+            let provider = BuiltinProvider::from_config(config)
+                .map_err(|_| AiProviderStoreError::InvalidSettings)?;
+            let mut request = CompletionRequest::new(vec![ChatMessage::user(
+                "Connection check. Reply with the single word OK.",
+            )]);
+            request.max_output_tokens = Some(256);
+            request.temperature = Some(0.0);
+            let started = Instant::now();
+            let result = provider.complete(request, credentials).await;
+            Ok(AiModelValidationView {
+                ok: result.is_ok(),
+                latency_ms: started.elapsed().as_millis(),
+                error_code: result.err().map(model_validation_error_code),
+            })
+        }
+
+        async fn clear_model_profile_key(
+            &self,
+            user_id: Uuid,
+            profile_id: Uuid,
+            audit: &AuditContext,
+        ) -> Result<AiModelProfileView, AiProviderStoreError> {
+            validate_settings_audit(user_id, audit)?;
+            let mut transaction = self
+                .postgres
+                .pool()
+                .begin()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let lab_id = Self::active_user_lab(&mut transaction, user_id).await?;
+            let owned: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM ai_model_profiles
+                 WHERE id = $1 AND user_id = $2 AND lab_id = $3
+                   AND deleted_at IS NULL
+                 FOR UPDATE",
+            )
+            .bind(profile_id)
+            .bind(user_id)
+            .bind(lab_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            if owned.is_none() {
+                return Err(AiProviderStoreError::ModelProfileNotFound);
+            }
+            let deleted_versions: Vec<i64> = sqlx::query_scalar(
+                "DELETE FROM ai_model_profile_secrets
+                 WHERE profile_id = $1
+                 RETURNING profile_version",
+            )
+            .bind(profile_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            for profile_version in deleted_versions {
+                write_human_profile_secret_audit(
+                    &mut transaction,
+                    lab_id,
+                    profile_id,
+                    profile_version,
+                    "delete",
+                    audit,
+                    true,
+                    false,
+                    "AI model profile credentials cleared for every immutable version",
+                )
+                .await?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            self.model_profile_view_by_id(user_id, profile_id).await
+        }
+
+        async fn archive_model_profile(
+            &self,
+            user_id: Uuid,
+            profile_id: Uuid,
+            revision: i64,
+            audit: &AuditContext,
+        ) -> Result<AiModelProfileView, AiProviderStoreError> {
+            validate_settings_audit(user_id, audit)?;
+            if revision <= 0 {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            let mut transaction = self
+                .postgres
+                .pool()
+                .begin()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let lab_id = Self::active_user_lab(&mut transaction, user_id).await?;
+            let current = sqlx::query(
+                "SELECT p.name, p.current_version, p.archived_at, p.revision,
+                        v.protocol, v.transport, v.supports_vision,
+                        EXISTS(
+                            SELECT 1 FROM ai_model_profile_secrets s
+                            WHERE s.profile_id = p.id
+                              AND s.profile_version = p.current_version
+                        ) AS has_key
+                 FROM ai_model_profiles p
+                 JOIN ai_model_profile_versions v
+                   ON v.profile_id = p.id AND v.version = p.current_version
+                 WHERE p.id = $1 AND p.user_id = $2 AND p.lab_id = $3
+                   AND p.deleted_at IS NULL
+                 FOR UPDATE OF p",
+            )
+            .bind(profile_id)
+            .bind(user_id)
+            .bind(lab_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .ok_or(AiProviderStoreError::ModelProfileNotFound)?;
+            let current_revision: i64 = current
+                .try_get("revision")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            if current_revision != revision {
+                return Err(AiProviderStoreError::RevisionConflict);
+            }
+            if current
+                .try_get::<Option<DateTime<Utc>>, _>("archived_at")
+                .map_err(|_| AiProviderStoreError::Storage)?
+                .is_some()
+            {
+                return Err(AiProviderStoreError::RevisionConflict);
+            }
+            let updated = sqlx::query(
+                "UPDATE ai_model_profiles
+                 SET archived_at = now(), updated_at = now(),
+                     revision = revision + 1
+                 WHERE id = $1 AND user_id = $2 AND revision = $3
+                   AND archived_at IS NULL AND deleted_at IS NULL",
+            )
+            .bind(profile_id)
+            .bind(user_id)
+            .bind(revision)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            if updated.rows_affected() != 1 {
+                return Err(AiProviderStoreError::RevisionConflict);
+            }
+            let defaults_before = sqlx::query(
+                "SELECT default_conversation_profile_id,
+                        default_vision_profile_id, revision
+                 FROM ai_user_model_defaults
+                 WHERE user_id = $1 AND deleted_at IS NULL
+                 FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            if let Some(defaults_before) = defaults_before {
+                let conversation: Option<Uuid> = defaults_before
+                    .try_get("default_conversation_profile_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                let vision: Option<Uuid> = defaults_before
+                    .try_get("default_vision_profile_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                if conversation == Some(profile_id) || vision == Some(profile_id) {
+                    let defaults_revision: i64 = defaults_before
+                        .try_get("revision")
+                        .map_err(|_| AiProviderStoreError::Storage)?;
+                    let next_conversation = (conversation != Some(profile_id))
+                        .then_some(conversation)
+                        .flatten();
+                    let next_vision = (vision != Some(profile_id)).then_some(vision).flatten();
+                    sqlx::query(
+                        "UPDATE ai_user_model_defaults
+                         SET default_conversation_profile_id = $1,
+                             default_vision_profile_id = $2,
+                             updated_at = now(), revision = revision + 1
+                         WHERE user_id = $3 AND revision = $4
+                           AND deleted_at IS NULL",
+                    )
+                    .bind(next_conversation)
+                    .bind(next_vision)
+                    .bind(user_id)
+                    .bind(defaults_revision)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                    write_model_defaults_management_audit(
+                        &mut transaction,
+                        lab_id,
+                        user_id,
+                        audit,
+                        Some(model_defaults_audit_state(
+                            conversation,
+                            vision,
+                            defaults_revision,
+                        )),
+                        model_defaults_audit_state(
+                            next_conversation,
+                            next_vision,
+                            defaults_revision + 1,
+                        ),
+                        "Archived AI model profile removed from user defaults",
+                    )
+                    .await?;
+                }
+            }
+            let name: String = current
+                .try_get("name")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let current_version: i64 = current
+                .try_get("current_version")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let protocol = Self::protocol_from_db(
+                current
+                    .try_get::<String, _>("protocol")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    .as_str(),
+            )?;
+            let transport = Self::transport_from_db(
+                current
+                    .try_get::<String, _>("transport")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    .as_str(),
+            )?;
+            let supports_vision: bool = current
+                .try_get("supports_vision")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let has_key: bool = current
+                .try_get("has_key")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            write_model_profile_management_audit(
+                &mut transaction,
+                lab_id,
+                profile_id,
+                "archive",
+                audit,
+                Some(model_profile_audit_state(
+                    &name,
+                    current_version,
+                    protocol,
+                    transport,
+                    supports_vision,
+                    has_key,
+                    false,
+                    revision,
+                )),
+                model_profile_audit_state(
+                    &name,
+                    current_version,
+                    protocol,
+                    transport,
+                    supports_vision,
+                    has_key,
+                    true,
+                    revision + 1,
+                ),
+                "AI model profile archived",
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            self.model_profile_view_by_id(user_id, profile_id).await
+        }
+
+        async fn get_model_defaults(
+            &self,
+            user_id: Uuid,
+        ) -> Result<AiModelDefaultsView, AiProviderStoreError> {
+            self.active_user_lab_from_pool(user_id).await?;
+            let row = sqlx::query(
+                "SELECT default_conversation_profile_id,
+                        default_vision_profile_id, revision
+                 FROM ai_user_model_defaults
+                 WHERE user_id = $1 AND deleted_at IS NULL",
+            )
+            .bind(user_id)
+            .fetch_optional(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            match row {
+                Some(row) => Ok(AiModelDefaultsView {
+                    default_conversation_profile_id: row
+                        .try_get("default_conversation_profile_id")
+                        .map_err(|_| AiProviderStoreError::Storage)?,
+                    default_vision_profile_id: row
+                        .try_get("default_vision_profile_id")
+                        .map_err(|_| AiProviderStoreError::Storage)?,
+                    revision: row
+                        .try_get("revision")
+                        .map_err(|_| AiProviderStoreError::Storage)?,
+                }),
+                None => Ok(AiModelDefaultsView {
+                    default_conversation_profile_id: None,
+                    default_vision_profile_id: None,
+                    revision: 0,
+                }),
+            }
+        }
+
+        async fn save_model_defaults(
+            &self,
+            user_id: Uuid,
+            input: SaveAiModelDefaultsInput,
+            audit: &AuditContext,
+        ) -> Result<AiModelDefaultsView, AiProviderStoreError> {
+            validate_settings_audit(user_id, audit)?;
+            let mut transaction = self
+                .postgres
+                .pool()
+                .begin()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let lab_id = Self::active_user_lab(&mut transaction, user_id).await?;
+            for (profile_id, requires_vision) in [
+                (input.default_conversation_profile_id, false),
+                (input.default_vision_profile_id, true),
+            ] {
+                let Some(profile_id) = profile_id else {
+                    continue;
+                };
+                let row = sqlx::query(
+                    "SELECT v.supports_vision
+                     FROM ai_model_profiles p
+                     JOIN ai_model_profile_versions v
+                       ON v.profile_id = p.id AND v.version = p.current_version
+                     WHERE p.id = $1 AND p.user_id = $2 AND p.lab_id = $3
+                       AND p.archived_at IS NULL AND p.deleted_at IS NULL
+                     FOR SHARE OF p",
+                )
+                .bind(profile_id)
+                .bind(user_id)
+                .bind(lab_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?
+                .ok_or(AiProviderStoreError::ModelProfileNotFound)?;
+                let supports_vision: bool = row
+                    .try_get("supports_vision")
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                if requires_vision && !supports_vision {
+                    return Err(AiProviderStoreError::InvalidSettings);
+                }
+            }
+            let current = sqlx::query(
+                "SELECT default_conversation_profile_id,
+                        default_vision_profile_id, deleted_at, revision
+                 FROM ai_user_model_defaults
+                 WHERE user_id = $1
+                 FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            let current_deleted = current
+                .as_ref()
+                .map(|row| {
+                    row.try_get::<Option<DateTime<Utc>>, _>("deleted_at")
+                        .map_err(|_| AiProviderStoreError::Storage)
+                })
+                .transpose()?
+                .flatten()
+                .is_some();
+            let before = current
+                .as_ref()
+                .filter(|_| !current_deleted)
+                .map(|row| {
+                    Ok::<_, AiProviderStoreError>(model_defaults_audit_state(
+                        row.try_get("default_conversation_profile_id")
+                            .map_err(|_| AiProviderStoreError::Storage)?,
+                        row.try_get("default_vision_profile_id")
+                            .map_err(|_| AiProviderStoreError::Storage)?,
+                        row.try_get("revision")
+                            .map_err(|_| AiProviderStoreError::Storage)?,
+                    ))
+                })
+                .transpose()?;
+            let current_revision: Option<i64> = current
+                .as_ref()
+                .filter(|_| !current_deleted)
+                .map(|row| row.try_get::<i64, _>("revision"))
+                .transpose()
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            if input.expected_revision != current_revision.unwrap_or(0) {
+                return Err(AiProviderStoreError::RevisionConflict);
+            }
+            let row = sqlx::query(
+                "INSERT INTO ai_user_model_defaults (
+                    user_id, default_conversation_profile_id,
+                    default_vision_profile_id, created_at, updated_at,
+                    deleted_at, revision
+                 ) VALUES ($1,$2,$3,now(),now(),NULL,1)
+                 ON CONFLICT (user_id) DO UPDATE
+                 SET default_conversation_profile_id =
+                        EXCLUDED.default_conversation_profile_id,
+                     default_vision_profile_id =
+                        EXCLUDED.default_vision_profile_id,
+                     updated_at = now(), deleted_at = NULL,
+                     revision = ai_user_model_defaults.revision + 1
+                 RETURNING revision",
+            )
+            .bind(user_id)
+            .bind(input.default_conversation_profile_id)
+            .bind(input.default_vision_profile_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            let next_revision: i64 = row
+                .try_get("revision")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let after = model_defaults_audit_state(
+                input.default_conversation_profile_id,
+                input.default_vision_profile_id,
+                next_revision,
+            );
+            write_model_defaults_management_audit(
+                &mut transaction,
+                lab_id,
+                user_id,
+                audit,
+                before,
+                after,
+                "AI model defaults saved",
+            )
+            .await?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            Ok(AiModelDefaultsView {
+                default_conversation_profile_id: input.default_conversation_profile_id,
+                default_vision_profile_id: input.default_vision_profile_id,
+                revision: next_revision,
+            })
+        }
     }
 
     fn preset(
@@ -3412,6 +5198,148 @@ mod postgres {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn model_profile_audit_state(
+        name: &str,
+        current_version: i64,
+        protocol: AiProviderProtocol,
+        transport: AiProviderTransport,
+        supports_vision: bool,
+        credential_present: bool,
+        archived: bool,
+        revision: i64,
+    ) -> Value {
+        json!({
+            "name": name,
+            "current_version": current_version,
+            "protocol": PostgresAiProviderStore::protocol_name(protocol),
+            "transport": PostgresAiProviderStore::transport_name(transport),
+            "base_url_present": true,
+            "model_id_present": true,
+            "supports_vision": supports_vision,
+            "credential_present": credential_present,
+            "secret_material_redacted": true,
+            "archived": archived,
+            "revision": revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_model_profile_management_audit(
+        transaction: &mut Transaction<'_, Postgres>,
+        lab_id: Uuid,
+        profile_id: Uuid,
+        action: &'static str,
+        audit: &AuditContext,
+        before: Option<Value>,
+        after: Value,
+        reason: &'static str,
+    ) -> Result<(), AiProviderStoreError> {
+        let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
+        sqlx::query(
+            "INSERT INTO audit_entries (
+                id, lab_id, project_id, entity_type, entity_id, action,
+                actor_type, actor_user_id, actor_display_name, source,
+                request_id, reason, before_json, after_json, occurred_at
+             ) VALUES (
+                $1,$2,NULL,'ai_model_profile',$3,$4,'human',$5,$6,$7,$8,$9,$10,$11,now()
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(lab_id)
+        .bind(profile_id)
+        .bind(action)
+        .bind(actor_user_id)
+        .bind(&audit.actor.display_name)
+        .bind(write_source_name(audit.source))
+        .bind(&audit.request_id)
+        .bind(reason)
+        .bind(before)
+        .bind(after)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| AiProviderStoreError::Storage)?;
+        Ok(())
+    }
+
+    fn model_defaults_audit_state(
+        conversation_profile_id: Option<Uuid>,
+        vision_profile_id: Option<Uuid>,
+        revision: i64,
+    ) -> Value {
+        json!({
+            "default_conversation_profile_id": conversation_profile_id,
+            "default_vision_profile_id": vision_profile_id,
+            "revision": revision,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_model_defaults_management_audit(
+        transaction: &mut Transaction<'_, Postgres>,
+        lab_id: Uuid,
+        user_id: Uuid,
+        audit: &AuditContext,
+        before: Option<Value>,
+        after: Value,
+        reason: &'static str,
+    ) -> Result<(), AiProviderStoreError> {
+        let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
+        sqlx::query(
+            "INSERT INTO audit_entries (
+                id, lab_id, project_id, entity_type, entity_id, action,
+                actor_type, actor_user_id, actor_display_name, source,
+                request_id, reason, before_json, after_json, occurred_at
+             ) VALUES (
+                $1,$2,NULL,'ai_user_model_defaults',$3,$4,'human',$5,$6,$7,$8,$9,$10,$11,now()
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(lab_id)
+        .bind(user_id)
+        .bind(if before.is_some() { "update" } else { "create" })
+        .bind(actor_user_id)
+        .bind(&audit.actor.display_name)
+        .bind(write_source_name(audit.source))
+        .bind(&audit.request_id)
+        .bind(reason)
+        .bind(before)
+        .bind(after)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| AiProviderStoreError::Storage)?;
+        Ok(())
+    }
+
+    fn model_validation_error_code(error: ProviderError) -> &'static str {
+        match error {
+            ProviderError::InvalidConfig(_) | ProviderError::InvalidRequest(_) => {
+                "invalid_provider"
+            }
+            ProviderError::RequestTooLarge { .. } => "context_exceeded",
+            ProviderError::ResponseTooLarge { .. } => "response_too_large",
+            ProviderError::Transport {
+                kind: TransportFailure::Timeout,
+            } => "request_timeout",
+            ProviderError::Transport {
+                kind: TransportFailure::Connection,
+            } => "provider_unreachable",
+            ProviderError::Transport {
+                kind: TransportFailure::Request,
+            } => "provider_transport_error",
+            ProviderError::HttpStatus {
+                status: 401 | 403, ..
+            } => "api_key_rejected",
+            ProviderError::HttpStatus { status: 404, .. } => "model_not_found",
+            ProviderError::HttpStatus { .. } => "provider_http_error",
+            ProviderError::MalformedResponse | ProviderError::EmptyResponse => {
+                "response_format_incompatible"
+            }
+            ProviderError::OutputBudgetExhausted => "output_budget_exhausted",
+            ProviderError::MockExhausted | ProviderError::MockUnavailable => "provider_unavailable",
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn write_settings_audit(
         transaction: &mut Transaction<'_, Postgres>,
         lab_id: Uuid,
@@ -3642,6 +5570,670 @@ mod postgres {
                 request_id: Some(request_id.to_owned()),
                 reason: Some("test personal AI settings isolation".to_owned()),
             }
+        }
+
+        fn model_input(
+            name: &str,
+            base_url: &str,
+            model_id: &str,
+            api_key: Option<&str>,
+            expected_revision: Option<i64>,
+        ) -> SaveAiModelProfileInput {
+            SaveAiModelProfileInput {
+                name: name.to_owned(),
+                protocol: AiProviderProtocol::OpenaiChatCompletions,
+                transport: AiProviderTransport::OpenAiCompatible,
+                base_url: base_url.to_owned(),
+                model_id: model_id.to_owned(),
+                supports_vision: true,
+                context_window_tokens: default_context_window_tokens(),
+                max_input_tokens: default_max_input_tokens(),
+                max_output_tokens: default_max_output_tokens(),
+                history_token_budget: default_history_token_budget(),
+                history_turns: default_history_turns(),
+                temperature: default_temperature(),
+                timeout_ms: default_timeout_ms(),
+                api_key: api_key.map(str::to_owned),
+                expected_revision,
+            }
+        }
+
+        #[tokio::test]
+        async fn model_management_lifecycle_is_versioned_isolated_and_audited() {
+            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+                return;
+            };
+            assert!(
+                database_url.contains("muriarc_test"),
+                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
+            );
+            let postgres = PostgresStore::connect(&database_url).await.unwrap();
+            postgres.migrate().await.unwrap();
+            let now = Utc::now();
+            let bootstrap = AuditContext::system(WriteSource::Migration);
+            let lab = Lab::new(format!("AI model API lab {}", Uuid::new_v4()), now).unwrap();
+            postgres.create_lab(&lab, &bootstrap).await.unwrap();
+            let user = User::new(
+                lab.id,
+                format!("ai-model-api-{}@example.test", Uuid::new_v4()),
+                "AI model API owner",
+                now,
+            )
+            .unwrap();
+            postgres.create_user(&user, &bootstrap).await.unwrap();
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
+
+            let created = store
+                .create_model_profile(
+                    user.id,
+                    model_input(
+                        "Primary model",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "自由填写/模型-v1",
+                        Some("phase-two-profile-key"),
+                        None,
+                    ),
+                    &user_audit(&user, "model-create"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(created.current_version, 1);
+            assert!(created.has_key);
+            assert_eq!(created.model_id, "自由填写/模型-v1");
+            assert_eq!(
+                store
+                    .list_model_profiles(user.id, false)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|profile| profile.id == created.id)
+                    .count(),
+                1
+            );
+            let key_rotated = store
+                .update_model_profile(
+                    user.id,
+                    created.id,
+                    model_input(
+                        "Primary model",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "自由填写/模型-v1",
+                        Some("phase-two-profile-key-rotated"),
+                        Some(created.revision),
+                    ),
+                    &user_audit(&user, "model-key-only-rotation"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(key_rotated.current_version, created.current_version);
+            assert_eq!(key_rotated.revision, created.revision);
+            let version_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM ai_model_profile_versions WHERE profile_id = $1",
+            )
+            .bind(created.id)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(version_count, 1);
+            let rotated_secret = sqlx::query(
+                "SELECT key_version, nonce, ciphertext
+                 FROM ai_model_profile_secrets
+                 WHERE profile_id = $1 AND profile_version = $2",
+            )
+            .bind(created.id)
+            .bind(created.current_version)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                store
+                    .decrypt_profile_secret(
+                        user.id,
+                        created.id,
+                        created.current_version,
+                        rotated_secret.try_get("key_version").unwrap(),
+                        &rotated_secret.try_get::<Vec<u8>, _>("nonce").unwrap(),
+                        &rotated_secret.try_get::<Vec<u8>, _>("ciphertext").unwrap(),
+                    )
+                    .unwrap()
+                    .as_str(),
+                "phase-two-profile-key-rotated"
+            );
+
+            let requires_new_key = store
+                .update_model_profile(
+                    user.id,
+                    created.id,
+                    model_input(
+                        "Primary model",
+                        OFFICIAL_OPENAI_BASE_URL,
+                        "自由填写/模型-v2",
+                        None,
+                        Some(created.revision),
+                    ),
+                    &user_audit(&user, "model-provider-change-without-key"),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                requires_new_key,
+                AiProviderStoreError::CredentialRequired
+            ));
+
+            let updated = store
+                .update_model_profile(
+                    user.id,
+                    created.id,
+                    model_input(
+                        "Primary model renamed",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "自由填写/模型-v2",
+                        None,
+                        Some(created.revision),
+                    ),
+                    &user_audit(&user, "model-update"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated.current_version, 2);
+            assert_eq!(updated.revision, 2);
+            assert!(updated.has_key);
+            assert_eq!(updated.name, "Primary model renamed");
+            let stale = store
+                .update_model_profile(
+                    user.id,
+                    created.id,
+                    model_input(
+                        "Stale",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "stale",
+                        None,
+                        Some(created.revision),
+                    ),
+                    &user_audit(&user, "model-stale-update"),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(stale, AiProviderStoreError::RevisionConflict));
+
+            let defaults = store
+                .save_model_defaults(
+                    user.id,
+                    SaveAiModelDefaultsInput {
+                        default_conversation_profile_id: Some(created.id),
+                        default_vision_profile_id: Some(created.id),
+                        expected_revision: 0,
+                    },
+                    &user_audit(&user, "model-defaults"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(defaults.revision, 1);
+            let with_defaults = store.get_model_profile(user.id, created.id).await.unwrap();
+            assert!(with_defaults.is_default_conversation);
+            assert!(with_defaults.is_default_vision);
+            let mut would_disable_default_vision = model_input(
+                "Primary model renamed",
+                OFFICIAL_DEEPSEEK_BASE_URL,
+                "自由填写/模型-v3",
+                None,
+                Some(updated.revision),
+            );
+            would_disable_default_vision.supports_vision = false;
+            let disable_error = store
+                .update_model_profile(
+                    user.id,
+                    created.id,
+                    would_disable_default_vision,
+                    &user_audit(&user, "model-disable-default-vision"),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                disable_error,
+                AiProviderStoreError::InvalidSettings
+            ));
+            assert_eq!(
+                store
+                    .get_model_profile(user.id, created.id)
+                    .await
+                    .unwrap()
+                    .revision,
+                updated.revision
+            );
+            let legacy_config = ProviderConfig::openai_compatible(
+                "legacy-disabled-row",
+                "legacy-model",
+                OFFICIAL_DEEPSEEK_BASE_URL,
+            );
+            sqlx::query(
+                "INSERT INTO ai_provider_settings (
+                    user_id, enabled, provider_config,
+                    created_at, updated_at, revision
+                 ) VALUES ($1,FALSE,$2,now(),now(),1)",
+            )
+            .bind(user.id)
+            .bind(serde_json::to_value(legacy_config).unwrap())
+            .execute(postgres.pool())
+            .await
+            .unwrap();
+            let resolved_without_legacy_enable = store.resolve(user.id).await.unwrap();
+            assert_eq!(
+                resolved_without_legacy_enable.model_profile.profile_id,
+                created.id
+            );
+            assert_eq!(
+                resolved_without_legacy_enable.model_profile.profile_version,
+                updated.current_version
+            );
+            assert_eq!(
+                resolved_without_legacy_enable
+                    .api_key
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                "phase-two-profile-key-rotated"
+            );
+
+            let cleared = store
+                .clear_model_profile_key(user.id, created.id, &user_audit(&user, "model-clear-key"))
+                .await
+                .unwrap();
+            assert!(!cleared.has_key);
+            let remaining_secrets: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM ai_model_profile_secrets WHERE profile_id = $1",
+            )
+            .bind(created.id)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(remaining_secrets, 0);
+            let updated_without_credential = store
+                .update_model_profile(
+                    user.id,
+                    created.id,
+                    model_input(
+                        "Primary model without credential",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "自由填写/模型-v3",
+                        None,
+                        Some(cleared.revision),
+                    ),
+                    &user_audit(&user, "model-update-after-key-clear"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(updated_without_credential.current_version, 3);
+            assert_eq!(updated_without_credential.revision, 3);
+            assert!(!updated_without_credential.has_key);
+
+            let archived = store
+                .archive_model_profile(
+                    user.id,
+                    created.id,
+                    updated_without_credential.revision,
+                    &user_audit(&user, "model-archive"),
+                )
+                .await
+                .unwrap();
+            assert!(archived.archived_at.is_some());
+            assert!(!archived.is_default_conversation);
+            assert!(!archived.is_default_vision);
+            assert!(
+                store
+                    .list_model_profiles(user.id, false)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|profile| profile.id != created.id)
+            );
+            assert!(
+                store
+                    .list_model_profiles(user.id, true)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|profile| profile.id == created.id)
+            );
+            let defaults_after_archive = store.get_model_defaults(user.id).await.unwrap();
+            assert_eq!(defaults_after_archive.default_conversation_profile_id, None);
+            assert_eq!(defaults_after_archive.default_vision_profile_id, None);
+
+            let audit_contains_secret: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1 FROM audit_entries
+                    WHERE entity_id = $1
+                      AND (
+                        COALESCE(before_json::text, '') LIKE '%phase-two-profile-key%'
+                        OR COALESCE(after_json::text, '') LIKE '%phase-two-profile-key%'
+                        OR COALESCE(before_json::text, '') LIKE '%phase-two-profile-key-rotated%'
+                        OR COALESCE(after_json::text, '') LIKE '%phase-two-profile-key-rotated%'
+                      )
+                 )",
+            )
+            .bind(created.id)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert!(!audit_contains_secret);
+        }
+
+        #[tokio::test]
+        async fn unsaved_model_validation_uses_local_mock_without_persisting() {
+            use axum::{Json, Router, routing::post};
+
+            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+                return;
+            };
+            assert!(
+                database_url.contains("muriarc_test"),
+                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mock = Router::new()
+                .route(
+                    "/chat/completions",
+                    post(|| async {
+                        Json(json!({
+                            "id": "mock-validation",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "OK"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 8,
+                                "completion_tokens": 1,
+                                "total_tokens": 9
+                            }
+                        }))
+                    }),
+                )
+                .route(
+                    "/responses",
+                    post(|| async {
+                        Json(json!({
+                            "id": "mock-responses-validation",
+                            "model": "unsaved-local-model",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "id": "mock-message",
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": "OK",
+                                    "annotations": []
+                                }]
+                            }],
+                            "usage": {
+                                "input_tokens": 8,
+                                "output_tokens": 1,
+                                "total_tokens": 9
+                            }
+                        }))
+                    }),
+                )
+                .route(
+                    "/messages",
+                    post(|| async {
+                        Json(json!({
+                            "id": "mock-anthropic-validation",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "unsaved-local-model",
+                            "content": [{"type": "text", "text": "OK"}],
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 8, "output_tokens": 1}
+                        }))
+                    }),
+                );
+            let mock_task = tokio::spawn(async move {
+                axum::serve(listener, mock).await.unwrap();
+            });
+
+            let postgres = PostgresStore::connect(&database_url).await.unwrap();
+            postgres.migrate().await.unwrap();
+            let now = Utc::now();
+            let bootstrap = AuditContext::system(WriteSource::Migration);
+            let lab = Lab::new(format!("AI validation lab {}", Uuid::new_v4()), now).unwrap();
+            postgres.create_lab(&lab, &bootstrap).await.unwrap();
+            let user = User::new(
+                lab.id,
+                format!("ai-validation-{}@example.test", Uuid::new_v4()),
+                "AI validation owner",
+                now,
+            )
+            .unwrap();
+            postgres.create_user(&user, &bootstrap).await.unwrap();
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
+            let base_url = format!("http://{address}");
+            for protocol in [
+                AiProviderProtocol::OpenaiChatCompletions,
+                AiProviderProtocol::OpenaiResponses,
+                AiProviderProtocol::AnthropicMessages,
+            ] {
+                store
+                    .save_provider_endpoint(
+                        lab.id,
+                        None,
+                        SaveAiProviderEndpointInput {
+                            provider_kind: ProviderKind::LocalHttp,
+                            protocol,
+                            label: format!("Phase two {protocol:?} validation mock"),
+                            base_url: base_url.clone(),
+                            enabled: true,
+                        },
+                        &user_audit(&user, "validation-endpoint"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let reusable_profile = store
+                .create_model_profile(
+                    user.id,
+                    model_input(
+                        "Validation credential source",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "validation-source-model",
+                        Some("validation-source-key"),
+                        None,
+                    ),
+                    &user_audit(&user, "validation-source-profile"),
+                )
+                .await
+                .unwrap();
+            let profile_count_before: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM ai_model_profiles WHERE user_id = $1")
+                    .bind(user.id)
+                    .fetch_one(postgres.pool())
+                    .await
+                    .unwrap();
+            for protocol in [
+                AiProviderProtocol::OpenaiChatCompletions,
+                AiProviderProtocol::OpenaiResponses,
+                AiProviderProtocol::AnthropicMessages,
+            ] {
+                let result = store
+                    .validate_model_profile(
+                        user.id,
+                        ValidateAiModelProfileInput {
+                            protocol,
+                            transport: AiProviderTransport::LocalHttp,
+                            base_url: base_url.clone(),
+                            model_id: "unsaved-local-model".to_owned(),
+                            supports_vision: false,
+                            context_window_tokens: default_context_window_tokens(),
+                            max_input_tokens: default_max_input_tokens(),
+                            max_output_tokens: default_max_output_tokens(),
+                            history_token_budget: default_history_token_budget(),
+                            history_turns: default_history_turns(),
+                            temperature: default_temperature(),
+                            timeout_ms: default_timeout_ms(),
+                            api_key: None,
+                            profile_id: None,
+                            current_version: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.ok, "{protocol:?}: {:?}", result.error_code);
+            }
+            let missing_cloud_credential = store
+                .validate_model_profile(
+                    user.id,
+                    ValidateAiModelProfileInput {
+                        protocol: AiProviderProtocol::OpenaiChatCompletions,
+                        transport: AiProviderTransport::OpenAiCompatible,
+                        base_url: OFFICIAL_DEEPSEEK_BASE_URL.to_owned(),
+                        model_id: "unsaved-cloud-model".to_owned(),
+                        supports_vision: false,
+                        context_window_tokens: default_context_window_tokens(),
+                        max_input_tokens: default_max_input_tokens(),
+                        max_output_tokens: default_max_output_tokens(),
+                        history_token_budget: default_history_token_budget(),
+                        history_turns: default_history_turns(),
+                        temperature: default_temperature(),
+                        timeout_ms: default_timeout_ms(),
+                        api_key: None,
+                        profile_id: None,
+                        current_version: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!missing_cloud_credential.ok);
+            assert_eq!(
+                missing_cloud_credential.error_code,
+                Some("missing_credential")
+            );
+            assert_eq!(missing_cloud_credential.latency_ms, 0);
+
+            let stale_binding = store
+                .validate_model_profile(
+                    user.id,
+                    ValidateAiModelProfileInput {
+                        protocol: AiProviderProtocol::OpenaiChatCompletions,
+                        transport: AiProviderTransport::OpenAiCompatible,
+                        base_url: OFFICIAL_DEEPSEEK_BASE_URL.to_owned(),
+                        model_id: "validation-source-model".to_owned(),
+                        supports_vision: false,
+                        context_window_tokens: default_context_window_tokens(),
+                        max_input_tokens: default_max_input_tokens(),
+                        max_output_tokens: default_max_output_tokens(),
+                        history_token_budget: default_history_token_budget(),
+                        history_turns: default_history_turns(),
+                        temperature: default_temperature(),
+                        timeout_ms: default_timeout_ms(),
+                        api_key: None,
+                        profile_id: Some(reusable_profile.id),
+                        current_version: Some(reusable_profile.current_version + 1),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(stale_binding.error_code, Some("missing_credential"));
+            assert_eq!(stale_binding.latency_ms, 0);
+
+            let identity_mismatch = store
+                .validate_model_profile(
+                    user.id,
+                    ValidateAiModelProfileInput {
+                        protocol: AiProviderProtocol::OpenaiChatCompletions,
+                        transport: AiProviderTransport::OpenAiCompatible,
+                        base_url: OFFICIAL_OPENAI_BASE_URL.to_owned(),
+                        model_id: "validation-source-model".to_owned(),
+                        supports_vision: false,
+                        context_window_tokens: default_context_window_tokens(),
+                        max_input_tokens: default_max_input_tokens(),
+                        max_output_tokens: default_max_output_tokens(),
+                        history_token_budget: default_history_token_budget(),
+                        history_turns: default_history_turns(),
+                        temperature: default_temperature(),
+                        timeout_ms: default_timeout_ms(),
+                        api_key: None,
+                        profile_id: Some(reusable_profile.id),
+                        current_version: Some(reusable_profile.current_version),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(identity_mismatch.error_code, Some("missing_credential"));
+            assert_eq!(identity_mismatch.latency_ms, 0);
+
+            store
+                .archive_model_profile(
+                    user.id,
+                    reusable_profile.id,
+                    reusable_profile.revision,
+                    &user_audit(&user, "validation-source-archive"),
+                )
+                .await
+                .unwrap();
+            let archived_binding = store
+                .validate_model_profile(
+                    user.id,
+                    ValidateAiModelProfileInput {
+                        protocol: AiProviderProtocol::OpenaiChatCompletions,
+                        transport: AiProviderTransport::OpenAiCompatible,
+                        base_url: OFFICIAL_DEEPSEEK_BASE_URL.to_owned(),
+                        model_id: "validation-source-model".to_owned(),
+                        supports_vision: false,
+                        context_window_tokens: default_context_window_tokens(),
+                        max_input_tokens: default_max_input_tokens(),
+                        max_output_tokens: default_max_output_tokens(),
+                        history_token_budget: default_history_token_budget(),
+                        history_turns: default_history_turns(),
+                        temperature: default_temperature(),
+                        timeout_ms: default_timeout_ms(),
+                        api_key: None,
+                        profile_id: Some(reusable_profile.id),
+                        current_version: Some(reusable_profile.current_version),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(archived_binding.error_code, Some("missing_credential"));
+            assert_eq!(archived_binding.latency_ms, 0);
+
+            let archived_hint_does_not_block_local_validation = store
+                .validate_model_profile(
+                    user.id,
+                    ValidateAiModelProfileInput {
+                        protocol: AiProviderProtocol::OpenaiChatCompletions,
+                        transport: AiProviderTransport::LocalHttp,
+                        base_url: base_url.clone(),
+                        model_id: "unsaved-local-model".to_owned(),
+                        supports_vision: false,
+                        context_window_tokens: default_context_window_tokens(),
+                        max_input_tokens: default_max_input_tokens(),
+                        max_output_tokens: default_max_output_tokens(),
+                        history_token_budget: default_history_token_budget(),
+                        history_turns: default_history_turns(),
+                        temperature: default_temperature(),
+                        timeout_ms: default_timeout_ms(),
+                        api_key: None,
+                        profile_id: Some(reusable_profile.id),
+                        current_version: Some(reusable_profile.current_version),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                archived_hint_does_not_block_local_validation.ok,
+                "{:?}",
+                archived_hint_does_not_block_local_validation.error_code
+            );
+
+            let profile_count_after: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM ai_model_profiles WHERE user_id = $1")
+                    .bind(user.id)
+                    .fetch_one(postgres.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(profile_count_after, profile_count_before);
+            mock_task.abort();
         }
 
         async fn insert_test_profile_defaults(
@@ -4560,21 +7152,21 @@ mod postgres {
         }
 
         #[test]
-        fn phase_one_rejects_unimplemented_profile_protocols_before_provider_construction() {
+        fn every_profile_protocol_is_forwarded_to_provider_construction() {
             for protocol in [
+                AiProviderProtocol::OpenaiChatCompletions,
                 AiProviderProtocol::OpenaiResponses,
                 AiProviderProtocol::AnthropicMessages,
             ] {
-                assert!(matches!(
-                    PostgresAiProviderStore::profile_provider_config(
-                        protocol,
-                        AiProviderTransport::OpenAiCompatible,
-                        "test-model".to_owned(),
-                        OFFICIAL_OPENAI_BASE_URL.to_owned(),
-                        default_timeout_ms(),
-                    ),
-                    Err(AiProviderStoreError::UnsupportedProtocol)
-                ));
+                let config = PostgresAiProviderStore::profile_provider_config(
+                    protocol,
+                    AiProviderTransport::OpenAiCompatible,
+                    "test-model".to_owned(),
+                    OFFICIAL_OPENAI_BASE_URL.to_owned(),
+                    default_timeout_ms(),
+                )
+                .unwrap();
+                assert_eq!(config.protocol, protocol);
             }
         }
 

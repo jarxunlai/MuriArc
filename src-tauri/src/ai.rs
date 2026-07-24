@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use muriarc_ai::{
     AccessGrant, AiAutonomyUpdateRequest, AiAutonomyView, AiExecutionContext, AiWorkflowError,
@@ -8,8 +8,8 @@ use muriarc_ai::{
     WriteDraftSummary,
 };
 use muriarc_core::{
-    Actor, AiAutonomyMode, AiOperationStore, AuditContext, LOCAL_LAB_ID, LOCAL_USER_ID,
-    MuriArcStore, StoreError, WriteSource,
+    Actor, AiAutonomyMode, AiModelProfileBinding, AiModelProfileStore, AiOperationStore,
+    AuditContext, LOCAL_LAB_ID, LOCAL_USER_ID, MuriArcStore, StoreError, WriteSource,
 };
 use muriarc_store_sqlite::SqliteStore;
 use thiserror::Error;
@@ -31,7 +31,7 @@ pub(crate) struct DesktopAiState {
 impl DesktopAiState {
     pub(crate) async fn initialize(
         data: DesktopDataState,
-        app_data_dir: &Path,
+        settings: SettingsService,
     ) -> Result<Self, DesktopAiError> {
         let store = Arc::new(data.store_ref().clone());
         let domain_store: Arc<dyn MuriArcStore> = store.clone();
@@ -41,7 +41,7 @@ impl DesktopAiState {
             store,
             workflow: AiWorkflowService::new(domain_store, operation_store)
                 .with_data_tools(data_tools),
-            settings: SettingsService::for_app_data(app_data_dir),
+            settings,
         })
     }
 
@@ -50,25 +50,43 @@ impl DesktopAiState {
         request: AssistantTurnRequest,
     ) -> Result<AssistantTurnResponse, DesktopAiError> {
         let context = self.context().await?;
-        let model_profile = match request.conversation_id {
-            Some(conversation_id) => {
-                self.workflow
-                    .conversation_model_profile(&context, conversation_id)
-                    .await?
-            }
-            None => {
-                self.settings
-                    .materialize_model_profiles(
-                        self.store.as_ref(),
-                        &AuditContext::system(WriteSource::Migration),
-                    )
-                    .await?
-            }
+        let (model_profile, resolved) = {
+            let _profile_operation = self.settings.profile_coordinator().lock().await;
+            let model_profile = match request.conversation_id {
+                Some(conversation_id) => {
+                    self.workflow
+                        .conversation_model_profile(&context, conversation_id)
+                        .await?
+                }
+                None => {
+                    let defaults = self
+                        .store
+                        .get_ai_user_model_defaults(LOCAL_USER_ID)
+                        .await?
+                        .ok_or(SettingsError::DefaultModelNotConfigured)?;
+                    let profile_id = defaults
+                        .default_conversation_profile_id
+                        .ok_or(SettingsError::DefaultModelNotConfigured)?;
+                    let profile = self.store.get_ai_model_profile(profile_id).await?;
+                    if profile.lab_id != LOCAL_LAB_ID
+                        || profile.user_id != LOCAL_USER_ID
+                        || profile.archived_at.is_some()
+                        || profile.meta.deleted_at.is_some()
+                    {
+                        return Err(SettingsError::DefaultModelNotConfigured.into());
+                    }
+                    AiModelProfileBinding {
+                        profile_id,
+                        profile_version: profile.current_version,
+                    }
+                }
+            };
+            let resolved = self
+                .settings
+                .resolve_provider_for_profile(self.store.as_ref(), model_profile)
+                .await?;
+            (model_profile, resolved)
         };
-        let resolved = self
-            .settings
-            .resolve_provider_for_profile(self.store.as_ref(), model_profile)
-            .await?;
         self.workflow
             .run_turn_with_config(
                 resolved.provider,
@@ -295,20 +313,24 @@ impl DesktopAiError {
             | Self::InvalidApprovalStatement
             | Self::AutonomyDeclarationRequired => "validation",
             Self::Forbidden | Self::Workflow(AiWorkflowError::Forbidden) => "forbidden",
-            Self::Settings(SettingsError::Disabled | SettingsError::MissingCredential) => {
-                "ai_not_configured"
-            }
-            Self::Settings(SettingsError::UnsupportedProtocol) => {
-                "unsupported_ai_provider_protocol"
-            }
+            Self::Settings(
+                SettingsError::MissingCredential | SettingsError::DefaultModelNotConfigured,
+            ) => "ai_not_configured",
             Self::Settings(error) if error.is_validation() => "validation",
             Self::Workflow(AiWorkflowError::Assistant(_))
             | Self::Workflow(AiWorkflowError::DataTool(
                 muriarc_ai::ToolExecutionError::Unavailable,
             )) => "ai_unavailable",
-            Self::Store(StoreError::NotFound { .. }) => "not_found",
-            Self::Store(StoreError::Conflict(_)) => "conflict",
+            Self::Store(StoreError::NotFound { .. })
+            | Self::Settings(SettingsError::ModelProfileStore(StoreError::NotFound { .. })) => {
+                "not_found"
+            }
+            Self::Store(StoreError::Conflict(_))
+            | Self::Settings(SettingsError::ModelProfileStore(StoreError::Conflict(_))) => {
+                "conflict"
+            }
             Self::Store(StoreError::Validation(_))
+            | Self::Settings(SettingsError::ModelProfileStore(StoreError::Validation(_)))
             | Self::Workflow(AiWorkflowError::Config(_))
             | Self::Workflow(AiWorkflowError::Approval(_))
             | Self::Workflow(AiWorkflowError::InvalidStoredDraft)
@@ -321,6 +343,9 @@ impl DesktopAiError {
             ))
             | Self::Workflow(AiWorkflowError::Credential(_)) => "validation",
             Self::Store(StoreError::Database(_) | StoreError::Serialization(_))
+            | Self::Settings(SettingsError::ModelProfileStore(
+                StoreError::Database(_) | StoreError::Serialization(_),
+            ))
             | Self::Settings(_)
             | Self::Workflow(AiWorkflowError::Store(_))
             | Self::Workflow(AiWorkflowError::InvalidStoredConversation) => "storage_error",
@@ -373,8 +398,26 @@ mod tests {
             "storage_error"
         );
         assert_eq!(
-            DesktopAiError::Settings(SettingsError::UnsupportedProtocol).code(),
-            "unsupported_ai_provider_protocol"
+            DesktopAiError::Settings(SettingsError::ModelProfileStore(StoreError::NotFound {
+                entity: "ai_model_profile",
+                id: Uuid::nil(),
+            }))
+            .code(),
+            "not_found"
+        );
+        assert_eq!(
+            DesktopAiError::Settings(SettingsError::ModelProfileStore(StoreError::Conflict(
+                "stale model profile".to_owned(),
+            )))
+            .code(),
+            "conflict"
+        );
+        assert_eq!(
+            DesktopAiError::Settings(SettingsError::ModelProfileStore(StoreError::Validation(
+                "invalid model profile".to_owned(),
+            )))
+            .code(),
+            "validation"
         );
     }
 

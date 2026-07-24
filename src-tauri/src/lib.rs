@@ -6,6 +6,7 @@ mod ai_data_tools;
 mod animal_details;
 mod application;
 mod data;
+mod model_profiles;
 mod research_extensions;
 mod settings;
 
@@ -31,6 +32,10 @@ use data::{
     DesktopDataError, DesktopDataState, ImportReceiptView, PreviewDataImportInput,
     RemapDataImportInput, UploadAttachmentInput,
 };
+use model_profiles::{
+    AiModelDefaultsView, AiModelProfileView, AiModelValidationResult, SaveAiModelDefaultsInput,
+    SaveAiModelProfileInput, ValidateAiModelProfileInput,
+};
 use muriarc_ai::{
     AiAutonomyView, AssistantConversationDetail, AssistantConversationSummary,
     AssistantTurnRequest, AssistantTurnResponse, DraftDecisionResponse, DraftStatus,
@@ -46,7 +51,7 @@ use research_extensions::{
     RegisterAnimalDraftInput, RegisteredAnimalDraftView, RetireBreedingPairInput,
     ReviseObservationInput, VoidGenotypingRecordInput,
 };
-use settings::{AiSettingsView, SaveAiSettingsInput};
+use settings::{AiSettingsView, SaveAiSettingsInput, SettingsService};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -781,6 +786,96 @@ async fn clear_ai_api_key(state: tauri::State<'_, DesktopState>) -> CommandResul
 }
 
 #[tauri::command]
+async fn list_ai_model_profiles(
+    state: tauri::State<'_, DesktopState>,
+) -> CommandResult<Vec<AiModelProfileView>> {
+    state.list_ai_model_profiles().await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn get_ai_model_profile(
+    state: tauri::State<'_, DesktopState>,
+    id: uuid::Uuid,
+) -> CommandResult<AiModelProfileView> {
+    state.get_ai_model_profile(id).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn create_ai_model_profile(
+    state: tauri::State<'_, DesktopState>,
+    input: SaveAiModelProfileInput,
+) -> CommandResult<AiModelProfileView> {
+    state
+        .create_ai_model_profile(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn update_ai_model_profile(
+    state: tauri::State<'_, DesktopState>,
+    id: uuid::Uuid,
+    input: SaveAiModelProfileInput,
+) -> CommandResult<AiModelProfileView> {
+    state
+        .update_ai_model_profile(id, input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn validate_ai_model_profile(
+    state: tauri::State<'_, DesktopState>,
+    input: ValidateAiModelProfileInput,
+) -> CommandResult<AiModelValidationResult> {
+    state
+        .validate_ai_model_profile(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn clear_ai_model_profile_key(
+    state: tauri::State<'_, DesktopState>,
+    id: uuid::Uuid,
+) -> CommandResult<AiModelProfileView> {
+    state
+        .clear_ai_model_profile_key(id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn archive_ai_model_profile(
+    state: tauri::State<'_, DesktopState>,
+    id: uuid::Uuid,
+    expected_revision: i64,
+) -> CommandResult<AiModelProfileView> {
+    state
+        .archive_ai_model_profile(id, expected_revision)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn get_ai_model_defaults(
+    state: tauri::State<'_, DesktopState>,
+) -> CommandResult<AiModelDefaultsView> {
+    state.get_ai_model_defaults().await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn save_ai_model_defaults(
+    state: tauri::State<'_, DesktopState>,
+    input: SaveAiModelDefaultsInput,
+) -> CommandResult<AiModelDefaultsView> {
+    state
+        .save_ai_model_defaults(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 async fn ai_turn(
     state: tauri::State<'_, DesktopAiState>,
     input: AssistantTurnRequest,
@@ -982,14 +1077,18 @@ pub fn run() {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
             let database_path = app_data_dir.join("muriarc.sqlite3");
-            let state = tauri::async_runtime::block_on(DesktopState::initialize(&database_path))?;
+            let settings = SettingsService::for_app_data(&app_data_dir);
+            let state = tauri::async_runtime::block_on(DesktopState::initialize_with_settings(
+                &database_path,
+                settings.clone(),
+            ))?;
             let data_state = tauri::async_runtime::block_on(DesktopDataState::initialize(
                 &database_path,
                 &app_data_dir,
             ))?;
             let ai_state = tauri::async_runtime::block_on(DesktopAiState::initialize(
                 data_state.clone(),
-                &app_data_dir,
+                settings,
             ))?;
             app.manage(state);
             app.manage(data_state);
@@ -1072,6 +1171,15 @@ pub fn run() {
             get_ai_settings,
             save_ai_settings,
             clear_ai_api_key,
+            list_ai_model_profiles,
+            get_ai_model_profile,
+            create_ai_model_profile,
+            update_ai_model_profile,
+            validate_ai_model_profile,
+            clear_ai_model_profile_key,
+            archive_ai_model_profile,
+            get_ai_model_defaults,
+            save_ai_model_defaults,
             ai_turn,
             list_ai_conversations,
             get_ai_conversation,

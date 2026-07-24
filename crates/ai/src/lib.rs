@@ -36,11 +36,11 @@ pub use data_tools::{
 #[cfg(any(test, feature = "test-support"))]
 pub use provider::MockProvider;
 pub use provider::{
-    AiProvider, BuiltinProvider, ChatMessage, ChatRole, CompletionRequest, CompletionResponse,
-    CredentialError, LocalHttpProvider, MAX_VISION_IMAGE_BASE64_BYTES, MAX_VISION_IMAGES,
-    MAX_VISION_TOTAL_BASE64_BYTES, OpenAiCompatibleProvider, ProviderConfig, ProviderConfigError,
-    ProviderCredentials, ProviderError, ProviderKind, ProviderToolCall, TokenUsage, ToolDefinition,
-    TransportFailure, VisionImageInput,
+    AiProvider, AiProviderProtocol, BuiltinProvider, ChatMessage, ChatRole, CompletionRequest,
+    CompletionResponse, CredentialError, LocalHttpProvider, MAX_VISION_IMAGE_BASE64_BYTES,
+    MAX_VISION_IMAGES, MAX_VISION_TOTAL_BASE64_BYTES, OpenAiCompatibleProvider, ProviderConfig,
+    ProviderConfigError, ProviderCredentials, ProviderError, ProviderKind, ProviderToolCall,
+    TokenUsage, ToolDefinition, TransportFailure, VisionImageInput,
 };
 pub use query::{
     FilterClause, FilterOperator, PageSpec, QueryField, QueryRequest, QueryResource, QueryValue,

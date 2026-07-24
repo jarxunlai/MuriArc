@@ -509,21 +509,67 @@ async fn run_turn(
     principal: AuthPrincipal,
     authentication: AuthenticationMethod,
     metadata: RequestMetadata,
-    ApiJson(payload): ApiJson<AssistantTurnRequest>,
+    ApiJson(payload): ApiJson<AssistantTurnHttpRequest>,
 ) -> Result<Json<ItemResponse<AssistantTurnResponse>>, ApiError> {
+    if payload.conversation_id.is_none() {
+        ensure_human(&principal, &metadata)?;
+    }
     let workflow = workflow(&state, &metadata)?;
     let context =
         execution_context_with_autonomy(&state, &principal, authentication, &metadata).await?;
-    let existing_binding = workflow
-        .conversation_model_profile(&context, payload.conversation_id)
-        .await
-        .map_err(|error| workflow_error(error, &metadata))?;
-    ensure_conversation_model_available(&state, &principal, existing_binding, &metadata).await?;
-    let resolved = state
-        .ai_providers
-        .resolve_for_profile(principal.user_id, existing_binding)
-        .await
-        .map_err(|error| conversation_model_resolve_error(error, &metadata))?;
+    let (payload, resolved) = match payload.conversation_id {
+        Some(conversation_id) => {
+            let payload = payload.into_request(conversation_id);
+            let existing_binding = workflow
+                .conversation_model_profile(&context, payload.conversation_id)
+                .await
+                .map_err(|error| workflow_error(error, &metadata))?;
+            ensure_conversation_model_available(&state, &principal, existing_binding, &metadata)
+                .await?;
+            let resolved = state
+                .ai_providers
+                .resolve_for_profile(principal.user_id, existing_binding)
+                .await
+                .map_err(|error| conversation_model_resolve_error(error, &metadata))?;
+            (payload, resolved)
+        }
+        None => {
+            if !payload.source_refs.is_empty()
+                || !payload.image_ids.is_empty()
+                || payload.vision_model_profile_id.is_some()
+            {
+                return Err(ApiError::validation(
+                    "conversationId is required when sending AI sources or image evidence",
+                )
+                .with_request_id(metadata.request_id.clone()));
+            }
+            let resolved = state
+                .ai_providers
+                .resolve(principal.user_id)
+                .await
+                .map_err(|error| provider_resolve_error(error, &metadata))?;
+            let mut payload = payload.into_request(Uuid::new_v4());
+            workflow
+                .validate_turn_request_input(&context, resolved.model_profile, &payload)
+                .map_err(|error| workflow_error(error, &metadata))?;
+            let started = workflow
+                .start_conversation(
+                    &context,
+                    resolved.model_profile,
+                    AssistantConversationStartRequest {
+                        project_id: payload.project_id,
+                        title: None,
+                        requested_mode: AiAutonomyMode::Ask,
+                    },
+                    false,
+                    &principal.audit_context(&metadata),
+                )
+                .await
+                .map_err(|error| workflow_error(error, &metadata))?;
+            payload.conversation_id = started.conversation.id;
+            (payload, resolved)
+        }
+    };
     let ResolvedAiProvider {
         provider,
         api_key,
@@ -594,6 +640,42 @@ async fn run_turn(
         .await
         .map_err(|error| workflow_error(error, &metadata))?;
     Ok(item(response, &metadata))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AssistantTurnHttpRequest {
+    #[serde(default, deserialize_with = "deserialize_present_conversation_id")]
+    conversation_id: Option<Uuid>,
+    #[serde(default)]
+    project_id: Option<Uuid>,
+    message: String,
+    #[serde(default)]
+    source_refs: Vec<Uuid>,
+    #[serde(default)]
+    image_ids: Vec<Uuid>,
+    #[serde(default)]
+    vision_model_profile_id: Option<Uuid>,
+}
+
+fn deserialize_present_conversation_id<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Uuid::deserialize(deserializer).map(Some)
+}
+
+impl AssistantTurnHttpRequest {
+    fn into_request(self, conversation_id: Uuid) -> AssistantTurnRequest {
+        AssistantTurnRequest {
+            conversation_id,
+            project_id: self.project_id,
+            message: self.message,
+            source_refs: self.source_refs,
+            image_ids: self.image_ids,
+            vision_model_profile_id: self.vision_model_profile_id,
+        }
+    }
 }
 
 pub(super) async fn resolve_turn_vision_provider(
@@ -2503,6 +2585,7 @@ mod tests {
         max_mode: AiAutonomyMode,
         archived: AtomicBool,
         resolve_calls: AtomicUsize,
+        default_resolve_failure: AtomicUsize,
     }
 
     impl ConversationProviderStore {
@@ -2523,6 +2606,7 @@ mod tests {
                 max_mode,
                 archived: AtomicBool::new(false),
                 resolve_calls: AtomicUsize::new(0),
+                default_resolve_failure: AtomicUsize::new(0),
             }
         }
 
@@ -2592,6 +2676,15 @@ mod tests {
         fn profile(&self) -> AiModelProfileView {
             self.profile_for(self.profile_id)
                 .expect("conversation test profile must exist")
+        }
+
+        fn fail_default_resolution_with(&self, error: AiProviderStoreError) {
+            let code = match error {
+                AiProviderStoreError::LabDisabled => 1,
+                AiProviderStoreError::NotConfigured => 2,
+                other => panic!("unsupported default resolution test error: {other:?}"),
+            };
+            self.default_resolve_failure.store(code, Ordering::SeqCst);
         }
 
         fn resolved(
@@ -2664,6 +2757,11 @@ mod tests {
         }
 
         async fn resolve(&self, user_id: Uuid) -> Result<ResolvedAiProvider, AiProviderStoreError> {
+            match self.default_resolve_failure.load(Ordering::SeqCst) {
+                1 => return Err(AiProviderStoreError::LabDisabled),
+                2 => return Err(AiProviderStoreError::NotConfigured),
+                _ => {}
+            }
             let profile_id = self
                 .default_profile
                 .ok_or(AiProviderStoreError::ProviderNotSelected)?;
@@ -3934,6 +4032,384 @@ mod tests {
         );
         handle.join().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_text_turn_starts_an_audited_ask_conversation_with_the_exact_default_binding() {
+        let (base_url, captured, handle) = spawn_provider_sequence(vec![chat_response(
+            "legacy-text-final",
+            "conversation-test-model",
+            "Legacy text answer",
+        )]);
+        let fixture = ConversationFixture::with_vision_runtime(base_url, true).await;
+        let now = Utc::now();
+        let project = Project::new(fixture.principal.lab_id, "Legacy turn project", now).unwrap();
+        fixture
+            .store
+            .create_project(&project, &AuditContext::system(WriteSource::Migration))
+            .await
+            .unwrap();
+
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({
+                    "projectId": project.id,
+                    "message": "Use the backwards-compatible text path"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["data"]["content"], "Legacy text answer");
+        let conversation_id = response["data"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let conversation = fixture
+            .store
+            .get_ai_conversation(conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(conversation.project_id, Some(project.id));
+        assert_eq!(
+            conversation.model_profile,
+            Some(AiModelProfileBinding {
+                profile_id: fixture.profile_id,
+                profile_version: 1,
+            })
+        );
+        let autonomy = fixture
+            .store
+            .get_ai_autonomy_grant(conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(autonomy.mode, AiAutonomyMode::Ask);
+        assert_eq!(autonomy.project_id, Some(project.id));
+        assert_eq!(autonomy.user_id, fixture.principal.user_id);
+        let audit = fixture
+            .store
+            .list_audit_entries(&AuditFilter {
+                lab_id: fixture.principal.lab_id,
+                project_id: Some(project.id),
+                entity_id: Some(conversation_id),
+            })
+            .await
+            .unwrap();
+        assert!(audit.iter().any(|entry| {
+            entry.action == muriarc_core::AuditAction::Create
+                && entry.actor.actor_type == ActorType::Human
+                && entry.actor.user_id == Some(fixture.principal.user_id)
+                && entry.source == WriteSource::Web
+        }));
+        assert_eq!(fixture.providers.resolve_calls.load(Ordering::SeqCst), 1);
+
+        let requests = captured.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_text_turn_persists_ask_conversation_before_provider_failure() {
+        let (base_url, captured, handle) =
+            spawn_provider_sequence(vec!["not valid provider json".to_owned()]);
+        let fixture = ConversationFixture::with_vision_runtime(base_url, true).await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({"message": "Persist before calling the Provider"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let requests = captured.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+
+        let listed = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(Method::GET, "/api/v1/ai/conversations", None))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = response_json(listed).await;
+        assert_eq!(listed["count"], 1);
+        let conversation_id = listed["data"][0]["id"].as_str().unwrap().parse().unwrap();
+        let conversation = fixture
+            .store
+            .get_ai_conversation(conversation_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            conversation.model_profile,
+            Some(AiModelProfileBinding {
+                profile_id: fixture.profile_id,
+                profile_version: 1,
+            })
+        );
+        assert_eq!(
+            fixture
+                .store
+                .get_ai_autonomy_grant(conversation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .mode,
+            AiAutonomyMode::Ask
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_text_turn_rejects_external_bearer_before_resolution_or_write() {
+        let fixture = ConversationFixture::new(true, AiAutonomyMode::Full).await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ai/turns")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {EXTERNAL_BEARER_TOKEN}"),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"message": "External AI cannot create a conversation"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_json(response).await["error"]["code"], "forbidden");
+        assert_eq!(fixture.providers.resolve_calls.load(Ordering::SeqCst), 0);
+
+        let listed = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(Method::GET, "/api/v1/ai/conversations", None))
+            .await
+            .unwrap();
+        assert_eq!(response_json(listed).await["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_null_conversation_id_remains_invalid_json() {
+        let fixture = ConversationFixture::new(true, AiAutonomyMode::Full).await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({
+                    "conversationId": null,
+                    "message": "Null is not an omitted conversation ID"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_json"
+        );
+        assert_eq!(fixture.providers.resolve_calls.load(Ordering::SeqCst), 0);
+
+        let listed = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(Method::GET, "/api/v1/ai/conversations", None))
+            .await
+            .unwrap();
+        assert_eq!(response_json(listed).await["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_messages_are_validated_after_resolution_but_before_any_write_or_call() {
+        let (base_url, calls, handle) = spawn_no_call_probe();
+        let fixture = ConversationFixture::with_vision_runtime(base_url, true).await;
+        for message in [
+            " \n\t ".to_owned(),
+            "x".repeat(muriarc_ai::AssistantLimits::default().max_user_message_bytes + 1),
+        ] {
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(fixture.session_request(
+                    Method::POST,
+                    "/api/v1/ai/turns",
+                    Some(json!({"message": message})),
+                ))
+                .await
+                .unwrap();
+            assert!(!response.status().is_success());
+        }
+        handle.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.providers.resolve_calls.load(Ordering::SeqCst), 2);
+
+        let listed = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(Method::GET, "/api/v1/ai/conversations", None))
+            .await
+            .unwrap();
+        assert_eq!(response_json(listed).await["count"], 0);
+        let audits = fixture
+            .store
+            .list_audit_entries(&AuditFilter {
+                lab_id: fixture.principal.lab_id,
+                project_id: None,
+                entity_id: None,
+            })
+            .await
+            .unwrap();
+        assert!(audits.iter().all(|entry| {
+            !matches!(
+                entry.entity_type,
+                EntityType::AiConversation | EntityType::AiAutonomyGrant
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn explicit_unknown_conversation_is_never_replaced_by_a_default_conversation() {
+        let fixture = ConversationFixture::new(true, AiAutonomyMode::Full).await;
+        let unknown_id = Uuid::new_v4();
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({
+                    "conversationId": unknown_id,
+                    "message": "Do not create a replacement conversation"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_json(response).await["error"]["code"], "not_found");
+        assert_eq!(fixture.providers.resolve_calls.load(Ordering::SeqCst), 0);
+
+        let listed = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(Method::GET, "/api/v1/ai/conversations", None))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        assert_eq!(response_json(listed).await["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_turn_preserves_disabled_and_unconfigured_provider_errors() {
+        for (error, expected_code) in [
+            (AiProviderStoreError::LabDisabled, "ai_lab_disabled"),
+            (
+                AiProviderStoreError::NotConfigured,
+                "ai_runtime_not_configured",
+            ),
+        ] {
+            let fixture = ConversationFixture::new(true, AiAutonomyMode::Full).await;
+            fixture.providers.fail_default_resolution_with(error);
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(fixture.session_request(
+                    Method::POST,
+                    "/api/v1/ai/turns",
+                    Some(json!({"message": "Keep the legacy provider error semantics"})),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response_json(response).await["error"]["code"],
+                expected_code
+            );
+
+            let listed = fixture
+                .app
+                .clone()
+                .oneshot(fixture.session_request(Method::GET, "/api/v1/ai/conversations", None))
+                .await
+                .unwrap();
+            assert_eq!(response_json(listed).await["count"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_turn_rejects_bound_evidence_and_unknown_fields_before_resolution() {
+        let fixture = ConversationFixture::new(true, AiAutonomyMode::Full).await;
+        for payload in [
+            json!({
+                "message": "A source needs an explicit conversation",
+                "sourceRefs": [Uuid::new_v4()]
+            }),
+            json!({
+                "message": "An image needs an explicit conversation",
+                "imageIds": [Uuid::new_v4()]
+            }),
+            json!({
+                "message": "A vision route needs an explicit conversation",
+                "visionModelProfileId": Uuid::new_v4()
+            }),
+        ] {
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(fixture.session_request(Method::POST, "/api/v1/ai/turns", Some(payload)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(
+                response_json(response).await["error"]["code"],
+                "validation_error"
+            );
+        }
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({
+                    "message": "Unknown fields remain rejected",
+                    "modelProfileId": fixture.profile_id
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "invalid_json"
+        );
+        assert_eq!(fixture.providers.resolve_calls.load(Ordering::SeqCst), 0);
+
+        let listed = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(Method::GET, "/api/v1/ai/conversations", None))
+            .await
+            .unwrap();
+        assert_eq!(response_json(listed).await["count"], 0);
     }
 
     #[tokio::test]

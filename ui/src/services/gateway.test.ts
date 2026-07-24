@@ -289,10 +289,20 @@ describe('MuriArc gateway selection', () => {
     }
     const local = new LocalTauriGateway(invokeCommand)
 
-    const response = await local.aiTurn({ projectId: 'project-1', message: '查找 M-001' })
+    const response = await local.aiTurn({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+      message: '查找 M-001',
+    })
     await local.listAiDrafts('project-1', 'pending_approval')
 
-    expect(calls[0]).toEqual(['ai_turn', { input: { projectId: 'project-1', message: '查找 M-001' } }])
+    expect(calls[0]).toEqual(['ai_turn', {
+      input: {
+        conversationId: 'conversation-1',
+        projectId: 'project-1',
+        message: '查找 M-001',
+      },
+    }])
     expect(calls[1]).toEqual(['list_ai_drafts', { projectId: 'project-1', status: 'pending_approval' }])
     expect(response.citations[0]).toEqual(expect.objectContaining({
       entityType: 'animal', entityId: 'animal-1', revision: 3, route: '/animals?animal=animal-1',
@@ -468,7 +478,20 @@ describe('MuriArc gateway selection', () => {
         })
       }
       if (url.endsWith('/ai/conversations') && init?.method === 'POST') {
-        return new Response(JSON.stringify({ data: summary, request_id: 'req-create' }), {
+        return new Response(JSON.stringify({
+          data: {
+            conversation: summary,
+            autonomy: {
+              mode: 'ask',
+              effectiveMode: 'ask',
+              maxMode: 'full',
+              batchLimit: 1,
+              revision: 1,
+              requiresHumanApproval: [],
+            },
+          },
+          request_id: 'req-create',
+        }), {
           status: 201, headers: { 'Content-Type': 'application/json' },
         })
       }
@@ -487,9 +510,11 @@ describe('MuriArc gateway selection', () => {
     })
     await remote.login({ email: 'r@example.org', password: 'not-retained' })
 
-    await remote.createAiConversation({
+    await remote.startAiConversation({
       projectId: 'project-1',
       title: '新对话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
     })
     const conversations = await remote.queryAiConversations({
       projectId: 'project-1',
@@ -544,8 +569,10 @@ describe('MuriArc gateway selection', () => {
     const create = requests.find((request) =>
       request.url.endsWith('/ai/conversations') && request.init?.method === 'POST')!
     expect(JSON.parse(String(create.init?.body))).toEqual({
-      project_id: 'project-1',
+      projectId: 'project-1',
       title: '新对话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
     })
     expect(requests.some((request) => request.url.endsWith(
       '/ai/conversations?archive=active&limit=80&project_id=project-1&q=%E5%AE%9E%E9%AA%8C',
@@ -595,7 +622,19 @@ describe('MuriArc gateway selection', () => {
     const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
       calls.push([command, args])
       if (command === 'list_ai_conversations') return [summary] as T
-      if (command === 'create_ai_conversation') return summary as T
+      if (command === 'start_ai_conversation') {
+        return {
+          conversation: summary,
+          autonomy: {
+            mode: 'ask',
+            effectiveMode: 'ask',
+            maxMode: 'full',
+            batchLimit: 1,
+            revision: 1,
+            requiresHumanApproval: [],
+          },
+        } as T
+      }
       if (command === 'upload_ai_source') return source as T
       if (command === 'list_ai_sources') {
         return [
@@ -613,7 +652,12 @@ describe('MuriArc gateway selection', () => {
     }
     const local = new LocalTauriGateway(invokeCommand)
 
-    await local.createAiConversation({ projectId: 'project-1', title: '新对话' })
+    await local.startAiConversation({
+      projectId: 'project-1',
+      title: '新对话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
+    })
     await local.queryAiConversations({ titleQuery: '置顶', archive: 'all', limit: 40 })
     await local.updateAiConversation('conversation-1', {
       action: 'pin',
@@ -649,8 +693,13 @@ describe('MuriArc gateway selection', () => {
       revision: 2,
     }))
     expect(calls).toEqual([
-      ['create_ai_conversation', {
-        input: { projectId: 'project-1', title: '新对话' },
+      ['start_ai_conversation', {
+        input: {
+          projectId: 'project-1',
+          title: '新对话',
+          modelProfileId: 'profile-1',
+          requestedMode: 'ask',
+        },
       }],
       ['list_ai_conversations', {
         projectId: undefined, titleQuery: '置顶', archive: 'all', limit: 40,
@@ -978,7 +1027,11 @@ describe('MuriArc gateway selection', () => {
       maxOutputTokens: 4096, historyTokenBudget: 32768, historyTurns: 20,
       temperature: 0, timeoutMs: 120000, apiKey: 'write-only-key',
     })
-    const turn = await remote.aiTurn({ projectId: 'project-1', message: '总结进度' })
+    const turn = await remote.aiTurn({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+      message: '总结进度',
+    })
     await remote.listAiDrafts('project-1', 'pending_approval')
     await remote.decideAiDraft('draft-1', {
       expectedRevision: 2,
@@ -1063,7 +1116,10 @@ describe('MuriArc gateway selection', () => {
     await remote.login({ email: 'reader@example.org', password: 'not-retained' })
 
     try {
-      await remote.aiTurn({ message: '跨项目只读汇总' })
+      await remote.aiTurn({
+        conversationId: 'lab-conversation',
+        message: '跨项目只读汇总',
+      })
       await remote.listAiDrafts(undefined, 'pending_approval')
     } finally {
       currentProjectId.value = undefined
@@ -1071,6 +1127,7 @@ describe('MuriArc gateway selection', () => {
 
     const turn = requests.find((request) => request.url.endsWith('/ai/turns'))
     expect(JSON.parse(String(turn?.init?.body))).toEqual({
+      conversationId: 'lab-conversation',
       message: '跨项目只读汇总',
     })
     expect(requests.some((request) =>
@@ -1544,6 +1601,655 @@ describe('MuriArc gateway selection', () => {
   })
 })
 
+describe('multi-model gateway contracts', () => {
+  const modelInput = {
+    name: '自由模型',
+    protocol: 'openai_responses' as const,
+    transport: 'open_ai_compatible' as const,
+    baseUrl: 'https://provider.example/v1',
+    modelId: 'organization/model:latest',
+    supportsVision: true,
+    contextWindowTokens: 131072,
+    maxInputTokens: 65536,
+    maxOutputTokens: 4096,
+    historyTokenBudget: 32768,
+    historyTurns: 20,
+    temperature: 0,
+    timeoutMs: 120000,
+    apiKey: 'write-only-secret',
+  }
+  const validationInput = {
+    protocol: modelInput.protocol,
+    transport: modelInput.transport,
+    baseUrl: modelInput.baseUrl,
+    modelId: modelInput.modelId,
+    supportsVision: modelInput.supportsVision,
+    contextWindowTokens: modelInput.contextWindowTokens,
+    maxInputTokens: modelInput.maxInputTokens,
+    maxOutputTokens: modelInput.maxOutputTokens,
+    historyTokenBudget: modelInput.historyTokenBudget,
+    historyTurns: modelInput.historyTurns,
+    temperature: modelInput.temperature,
+    timeoutMs: modelInput.timeoutMs,
+    apiKey: modelInput.apiKey,
+  }
+
+  it('uses stable, semantic Tauri commands for every model operation', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      calls.push([command, args])
+      return (command === 'list_ai_model_profiles' ? [] : {}) as T
+    }
+    const local = new LocalTauriGateway(invokeCommand)
+
+    await local.listAiModelProfiles()
+    await local.getAiModelProfile('profile-1')
+    await local.createAiModelProfile(modelInput)
+    await local.updateAiModelProfile('profile-1', { ...modelInput, expectedRevision: 3 })
+    await local.validateAiModelProfile({
+      ...validationInput,
+      profileId: 'profile-1',
+      currentVersion: 2,
+    })
+    await local.clearAiModelProfileKey('profile-1')
+    await local.archiveAiModelProfile('profile-1', 4)
+    await local.getAiModelDefaults()
+    await local.saveAiModelDefaults({
+      defaultConversationProfileId: 'profile-1',
+      defaultVisionProfileId: null,
+      expectedRevision: 2,
+    })
+
+    expect(calls).toEqual([
+      ['list_ai_model_profiles', undefined],
+      ['get_ai_model_profile', { id: 'profile-1' }],
+      ['create_ai_model_profile', { input: modelInput }],
+      ['update_ai_model_profile', {
+        id: 'profile-1',
+        input: { ...modelInput, expectedRevision: 3 },
+      }],
+      ['validate_ai_model_profile', {
+        input: { ...validationInput, profileId: 'profile-1', currentVersion: 2 },
+      }],
+      ['clear_ai_model_profile_key', { id: 'profile-1' }],
+      ['archive_ai_model_profile', { id: 'profile-1', expectedRevision: 4 }],
+      ['get_ai_model_defaults', undefined],
+      ['save_ai_model_defaults', {
+        input: {
+          defaultConversationProfileId: 'profile-1',
+          defaultVisionProfileId: null,
+          expectedRevision: 2,
+        },
+      }],
+    ])
+  })
+
+  it('uses versioned Server model routes and keeps write operations CSRF protected', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const profile = {
+      id: 'profile-1',
+      ...modelInput,
+      apiKey: undefined,
+      currentVersion: 1,
+      revision: 1,
+      hasKey: true,
+      isDefaultConversation: false,
+      isDefaultVision: false,
+    }
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      if (url.endsWith('/auth/login')) {
+        return new Response(JSON.stringify({ data: {
+          user: {
+            id: 'user-1',
+            lab_id: 'lab-1',
+            display_name: '研究者',
+            lab_roles: [],
+            project_roles: [],
+            authentication: 'session',
+          },
+          csrf_token: 'csrf-models',
+          expires_at: '2026-07-23T10:00:00Z',
+        } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/ai/models/defaults')) {
+        return new Response(JSON.stringify({ data: {
+          defaultConversationProfileId: 'profile-1',
+          revision: 2,
+        } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/ai/models/validate')) {
+        return new Response(JSON.stringify({ data: { ok: true, latencyMs: 18 } }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/ai/models') && !init?.method) {
+        return new Response(JSON.stringify({ data: [profile], count: 1 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ data: profile }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchRequest,
+    })
+    await remote.login({ email: 'researcher@example.test', password: 'not-retained' })
+
+    await remote.listAiModelProfiles()
+    await remote.getAiModelProfile('profile-1')
+    await remote.createAiModelProfile(modelInput)
+    await remote.updateAiModelProfile('profile-1', { ...modelInput, expectedRevision: 1 })
+    await remote.validateAiModelProfile({
+      ...validationInput,
+      profileId: 'profile-1',
+      currentVersion: 1,
+    })
+    await remote.clearAiModelProfileKey('profile-1')
+    await remote.archiveAiModelProfile('profile-1', 2)
+    await remote.getAiModelDefaults()
+    await remote.saveAiModelDefaults({
+      defaultConversationProfileId: 'profile-1',
+      defaultVisionProfileId: null,
+      expectedRevision: 2,
+    })
+
+    expect(requests.map(({ url, init }) => [
+      url.replace('https://lab.example/api/v1', ''),
+      init?.method ?? 'GET',
+    ])).toEqual([
+      ['/auth/login', 'POST'],
+      ['/ai/models', 'GET'],
+      ['/ai/models/profile-1', 'GET'],
+      ['/ai/models', 'POST'],
+      ['/ai/models/profile-1', 'PUT'],
+      ['/ai/models/validate', 'POST'],
+      ['/ai/models/profile-1/key', 'DELETE'],
+      ['/ai/models/profile-1/archive', 'POST'],
+      ['/ai/models/defaults', 'GET'],
+      ['/ai/models/defaults', 'PUT'],
+    ])
+    const mutations = requests.slice(3)
+      .filter(({ init }) => (init?.method ?? 'GET') !== 'GET')
+    expect(mutations.every(({ init }) =>
+      new Headers(init?.headers).get('X-CSRF-Token') === 'csrf-models')).toBe(true)
+    const validationRequest = requests.find(({ url }) => url.endsWith('/ai/models/validate'))
+    expect(JSON.parse(String(validationRequest?.init?.body))).toEqual({
+      ...validationInput,
+      profileId: 'profile-1',
+      currentVersion: 1,
+    })
+    expect(JSON.parse(String(validationRequest?.init?.body))).not.toHaveProperty('name')
+    expect(JSON.parse(String(requests.at(-1)?.init?.body))).toEqual({
+      defaultConversationProfileId: 'profile-1',
+      defaultVisionProfileId: null,
+      expectedRevision: 2,
+    })
+  })
+
+  it('implements credential isolation, validation, defaults, and archive in demo mode', async () => {
+    const demo = new DemoGateway()
+    const before = await demo.listAiModelProfiles()
+
+    await expect(demo.createAiModelProfile({
+      ...modelInput,
+      apiKey: undefined,
+    })).rejects.toThrow('首次保存必须填写 API Key')
+
+    const created = await demo.createAiModelProfile(modelInput)
+    expect(created).toEqual(expect.objectContaining({
+      modelId: 'organization/model:latest',
+      hasKey: true,
+    }))
+    expect(created).not.toHaveProperty('apiKey')
+
+    const validation = await demo.validateAiModelProfile({
+      ...validationInput,
+      apiKey: undefined,
+      profileId: created.id,
+      currentVersion: created.currentVersion,
+    })
+    expect(validation.ok).toBe(true)
+    await expect(demo.validateAiModelProfile({
+      ...validationInput,
+      profileId: created.id,
+    })).rejects.toThrow('必须同时提供')
+
+    const rotated = await demo.updateAiModelProfile(created.id, {
+      ...modelInput,
+      apiKey: 'rotated-write-only-secret',
+      expectedRevision: created.revision,
+    })
+    expect(rotated.currentVersion).toBe(created.currentVersion)
+    expect(rotated.revision).toBe(created.revision)
+
+    const emptyKeyUpdate = await demo.updateAiModelProfile(created.id, {
+      ...modelInput,
+      name: '自由模型（重命名）',
+      apiKey: '',
+      expectedRevision: rotated.revision,
+    })
+    expect(emptyKeyUpdate.hasKey).toBe(true)
+
+    await expect(demo.updateAiModelProfile(created.id, {
+      ...modelInput,
+      protocol: 'anthropic_messages',
+      apiKey: undefined,
+      expectedRevision: emptyKeyUpdate.revision,
+    })).rejects.toThrow('必须重新输入 API Key')
+
+    const updated = await demo.updateAiModelProfile(created.id, {
+      ...modelInput,
+      protocol: 'anthropic_messages',
+      expectedRevision: emptyKeyUpdate.revision,
+    })
+    const defaults = await demo.getAiModelDefaults()
+    await demo.saveAiModelDefaults({
+      defaultConversationProfileId: updated.id,
+      defaultVisionProfileId: updated.id,
+      expectedRevision: defaults.revision,
+    })
+    await expect(demo.updateAiModelProfile(updated.id, {
+      ...modelInput,
+      protocol: 'anthropic_messages',
+      supportsVision: false,
+      expectedRevision: updated.revision,
+    })).rejects.toThrow('取消默认视觉模型')
+    await demo.archiveAiModelProfile(updated.id, updated.revision)
+
+    const after = await demo.listAiModelProfiles()
+    const clearedDefaults = await demo.getAiModelDefaults()
+    expect(after).toHaveLength(before.length)
+    expect(clearedDefaults.defaultConversationProfileId).toBeUndefined()
+    expect(clearedDefaults.defaultVisionProfileId).toBeUndefined()
+  })
+})
+
+describe('conversation start gateway contracts', () => {
+  const startedConversation = {
+    id: 'conversation-1',
+    projectId: 'project-1',
+    title: '新会话',
+    modelProfileId: 'profile-1',
+    modelProfileVersion: 2,
+    modelProfileName: '主对话模型',
+    modelId: 'model-primary',
+    readOnly: false,
+    createdAt: '2026-07-23T01:00:00Z',
+    updatedAt: '2026-07-23T01:00:00Z',
+    revision: 0,
+  }
+  const startedAutonomy = {
+    mode: 'full' as const,
+    effectiveMode: 'auto' as const,
+    maxMode: 'auto' as const,
+    batchLimit: 50,
+    revision: 1,
+    requiresHumanApproval: [],
+  }
+
+  it('declares Full natively and strips renderer-only authority from Tauri start/update payloads', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      calls.push([command, args])
+      if (command === 'start_ai_conversation') {
+        return {
+          conversation: startedConversation,
+          autonomy: startedAutonomy,
+        } as T
+      }
+      if (command === 'set_ai_autonomy') {
+        return { ...startedAutonomy, revision: 2 } as T
+      }
+      return undefined as T
+    }
+    const local = new LocalTauriGateway(invokeCommand)
+
+    const started = await local.startAiConversation({
+      projectId: 'project-1',
+      title: '受治理会话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
+      currentPassword: 'must-not-cross-local-ipc',
+      declared: true,
+      sessionId: 'renderer-forged-session',
+    } as Parameters<typeof local.startAiConversation>[0] & {
+      declared: boolean
+      sessionId: string
+    })
+    await local.setAiAutonomy('conversation-1', {
+      mode: 'full',
+      expectedRevision: 1,
+    })
+
+    expect(started.conversation).toEqual(expect.objectContaining({
+      id: 'conversation-1',
+      modelProfileId: 'profile-1',
+    }))
+    expect(calls).toEqual([
+      ['declare_ai_full_startup', undefined],
+      ['start_ai_conversation', {
+        input: {
+          projectId: 'project-1',
+          title: '受治理会话',
+          modelProfileId: 'profile-1',
+          requestedMode: 'full',
+        },
+      }],
+      ['declare_ai_full_startup', undefined],
+      ['set_ai_autonomy', {
+        conversationId: 'conversation-1',
+        input: {
+          mode: 'full',
+          expectedRevision: 1,
+        },
+      }],
+    ])
+    expect(JSON.stringify(calls)).not.toContain('must-not-cross-local-ipc')
+    expect(JSON.stringify(calls)).not.toContain('renderer-forged-session')
+    expect(JSON.stringify(calls)).not.toContain('declared')
+  })
+
+  it('does not start a Desktop conversation when the native startup declaration fails', async () => {
+    const calls: string[] = []
+    const local = new LocalTauriGateway(async <T>(command: string): Promise<T> => {
+      calls.push(command)
+      throw new Error('本次启动尚未声明 Full')
+    })
+
+    await expect(local.startAiConversation({
+      title: '声明失败会话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
+    })).rejects.toThrow('尚未声明')
+    expect(calls).toEqual(['declare_ai_full_startup'])
+  })
+
+  it('sends the current password only in a Server Full start and keeps both starts CSRF protected', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      if (url.endsWith('/auth/login')) {
+        return new Response(JSON.stringify({ data: {
+          user: {
+            id: 'user-1',
+            lab_id: 'lab-1',
+            display_name: '研究者',
+            lab_roles: [],
+            project_roles: [],
+            authentication: 'session',
+          },
+          csrf_token: 'csrf-start',
+          expires_at: '2026-07-23T10:00:00Z',
+        } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ data: {
+        conversation: startedConversation,
+        autonomy: startedAutonomy,
+      } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchRequest,
+    })
+    await remote.login({ email: 'researcher@example.test', password: 'not-retained' })
+
+    await remote.startAiConversation({
+      projectId: 'project-1',
+      title: 'Full 会话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
+      currentPassword: 'one-request-password',
+    })
+    await remote.startAiConversation({
+      projectId: 'project-1',
+      title: 'Ask 会话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
+      currentPassword: 'must-be-stripped-for-ask',
+    })
+
+    const starts = requests.filter(({ url }) => url.endsWith('/ai/conversations'))
+    expect(starts).toHaveLength(2)
+    expect(JSON.parse(String(starts[0].init?.body))).toEqual({
+      projectId: 'project-1',
+      title: 'Full 会话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
+      currentPassword: 'one-request-password',
+    })
+    expect(JSON.parse(String(starts[1].init?.body))).toEqual({
+      projectId: 'project-1',
+      title: 'Ask 会话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
+    })
+    expect(starts.every(({ init }) =>
+      new Headers(init?.headers).get('X-CSRF-Token') === 'csrf-start')).toBe(true)
+  })
+
+  it('includes archived profiles only when explicitly requested across adapters', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const local = new LocalTauriGateway(async <T>(
+      command: string,
+      args?: Record<string, unknown>,
+    ): Promise<T> => {
+      calls.push([command, args])
+      return [] as T
+    })
+    await local.listAiModelProfiles(true)
+    expect(calls).toEqual([['list_ai_model_profiles', { includeArchived: true }]])
+
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify({ data: [], count: 0 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchMock as unknown as typeof fetch,
+    })
+    await remote.listAiModelProfiles(true)
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'https://lab.example/api/v1/ai/models?includeArchived=true',
+    )
+  })
+
+  it('binds Demo conversations to a profile and makes archived history read-only', async () => {
+    const demo = new DemoGateway()
+    const profiles = await demo.listAiModelProfiles()
+    const profile = profiles[0]
+    const started = await demo.startAiConversation({
+      projectId: 'project-1',
+      title: '演示受治理会话',
+      modelProfileId: profile.id,
+      requestedMode: 'full',
+    })
+
+    expect(started.conversation).toEqual(expect.objectContaining({
+      modelProfileId: profile.id,
+      modelProfileVersion: profile.currentVersion,
+      readOnly: false,
+    }))
+    expect(started.autonomy).toEqual(expect.objectContaining({
+      mode: 'full',
+      effectiveMode: 'full',
+    }))
+
+    await demo.archiveAiModelProfile(profile.id, profile.revision)
+    const detail = await demo.getAiConversation(started.conversation.id)
+    expect(detail.conversation).toEqual(expect.objectContaining({
+      readOnly: true,
+      readOnlyReason: 'model_archived',
+    }))
+    expect((await demo.listAiModelProfiles(true)).some((item) =>
+      item.id === profile.id && item.archivedAt)).toBe(true)
+    await expect(demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '归档模型不能继续执行',
+    })).rejects.toThrow('只读')
+    await expect(demo.uploadAiSource({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      file: new File(['blocked'], 'blocked.md', { type: 'text/markdown' }),
+    })).rejects.toThrow('只读')
+  })
+
+  it('requires a governed writable Demo conversation and keeps its exact model snapshot', async () => {
+    const demo = new DemoGateway()
+    const profiles = await demo.listAiModelProfiles()
+    const conversationProfile = profiles.find((profile) => !profile.supportsVision)!
+    const visionProfile = profiles.find((profile) => profile.supportsVision)!
+    const started = await demo.startAiConversation({
+      projectId: 'project-1',
+      title: '新会话',
+      modelProfileId: conversationProfile.id,
+      requestedMode: 'ask',
+    })
+    const sourceFile = new File(['# governed'], 'governed.md', {
+      type: 'text/markdown',
+    })
+
+    await expect(demo.aiTurn({
+      conversationId: 'missing-conversation',
+      projectId: 'project-1',
+      message: '不得隐式创建',
+    })).rejects.toThrow('会话不存在')
+    await expect(demo.uploadAiSource({
+      conversationId: 'missing-conversation',
+      projectId: 'project-1',
+      file: sourceFile,
+    })).rejects.toThrow('会话不存在')
+
+    const source = await demo.uploadAiSource({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      file: sourceFile,
+    })
+    const imageBytes = new TextEncoder().encode('image')
+    const imageFile = {
+      name: 'evidence.png',
+      type: 'image/png',
+      size: imageBytes.byteLength,
+      arrayBuffer: async () => imageBytes.buffer,
+      slice: () => new Blob([imageBytes], { type: 'image/png' }),
+    } as unknown as File
+    const image = await demo.uploadPrivateImage(imageFile, started.conversation.id)
+    const updated = await demo.updateAiModelProfile(conversationProfile.id, {
+      name: `${conversationProfile.name}（新版本）`,
+      protocol: conversationProfile.protocol,
+      transport: conversationProfile.transport,
+      baseUrl: conversationProfile.baseUrl,
+      modelId: `${conversationProfile.modelId}-new`,
+      supportsVision: true,
+      contextWindowTokens: conversationProfile.contextWindowTokens,
+      maxInputTokens: conversationProfile.maxInputTokens,
+      maxOutputTokens: conversationProfile.maxOutputTokens,
+      historyTokenBudget: conversationProfile.historyTokenBudget,
+      historyTurns: conversationProfile.historyTurns,
+      temperature: conversationProfile.temperature,
+      timeoutMs: conversationProfile.timeoutMs,
+      expectedRevision: conversationProfile.revision,
+    })
+    expect(updated.currentVersion).toBe(conversationProfile.currentVersion + 1)
+
+    await expect(demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '文本来源不能静默携带视觉模型',
+      sourceRefs: [source.id],
+      visionModelProfileId: visionProfile.id,
+    })).rejects.toThrow('只能用于需要中转的图片证据')
+
+    const turn = await demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '读取受治理来源和图片',
+      sourceRefs: [source.id],
+      imageIds: [image.image.id],
+      visionModelProfileId: visionProfile.id,
+    })
+    expect(turn.content).toContain('视觉中转')
+    expect(turn.trace.stages).toEqual([
+      expect.objectContaining({
+        profileId: visionProfile.id,
+        profileVersion: visionProfile.currentVersion,
+        purpose: 'vision_observation',
+      }),
+      expect.objectContaining({
+        profileId: conversationProfile.id,
+        profileVersion: conversationProfile.currentVersion,
+        modelId: conversationProfile.modelId,
+        purpose: 'final_answer',
+      }),
+    ])
+
+    const imageSource = await demo.uploadAiSource({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      file: imageFile,
+    })
+    const sourceTurn = await demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '只读取图片来源',
+      sourceRefs: [imageSource.id],
+      visionModelProfileId: visionProfile.id,
+    })
+    expect(sourceTurn.content).toContain('视觉中转')
+    expect(sourceTurn.trace.stages).toEqual([
+      expect.objectContaining({
+        profileId: visionProfile.id,
+        purpose: 'vision_observation',
+      }),
+      expect.objectContaining({
+        profileId: conversationProfile.id,
+        profileVersion: conversationProfile.currentVersion,
+        purpose: 'final_answer',
+      }),
+    ])
+
+    const directStarted = await demo.startAiConversation({
+      projectId: 'project-1',
+      title: '直接视觉会话',
+      modelProfileId: visionProfile.id,
+      requestedMode: 'ask',
+    })
+    const directImage = await demo.uploadPrivateImage(imageFile, directStarted.conversation.id)
+    await expect(demo.aiTurn({
+      conversationId: directStarted.conversation.id,
+      projectId: 'project-1',
+      message: '直接视觉不能携带中转模型',
+      imageIds: [directImage.image.id],
+      visionModelProfileId: visionProfile.id,
+    })).rejects.toThrow('只能用于需要中转的图片证据')
+
+    const detail = await demo.getAiConversation(started.conversation.id)
+    await demo.updateAiConversation(started.conversation.id, {
+      action: 'archive',
+      expectedRevision: detail.conversation.revision,
+    })
+    await expect(demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '归档会话不能继续执行',
+    })).rejects.toThrow('已归档')
+    await expect(demo.uploadAiSource({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      file: sourceFile,
+    })).rejects.toThrow('已归档')
+  })
+})
+
 describe('browser demo gateway', () => {
   it('moves animals atomically and updates both projections', async () => {
     const gateway = new DemoGateway()
@@ -1693,5 +2399,75 @@ describe('browser demo gateway', () => {
     expect(second.observation.currentValueVersion).toBe(2)
     expect((await gateway.listObservationValues(first.observation.id)).map((value) => value.version))
       .toEqual([1, 2])
+  })
+
+  it('keeps demo extraction pending, releases every image on reject, and promotes on approval', async () => {
+    const gateway = new DemoGateway()
+    const experiment = (await gateway.listExperiments()).find((entry) => entry.id === 'exp-001')!
+    const event = await gateway.createExperimentEvent({
+      experimentId: experiment.id,
+      eventKey: 'vision_contract',
+      label: 'Vision contract',
+    })
+    const definition = await gateway.createObservationDefinition({
+      experimentId: experiment.id,
+      key: 'vision_contract_value',
+      label: '视觉候选',
+      valueType: 'number',
+      unit: 'g',
+      policy: 'versioned',
+    })
+    const profile = (await gateway.listAiModelProfiles()).find((entry) =>
+      entry.supportsVision && !entry.archivedAt)!
+    const imageBytes = new TextEncoder().encode('portable-image')
+    const imageFile = {
+      name: 'vision.png',
+      type: 'image/png',
+      size: imageBytes.byteLength,
+      arrayBuffer: async () => imageBytes.buffer,
+      slice: () => new Blob([imageBytes], { type: 'image/png' }),
+    } as unknown as File
+    const image = await gateway.uploadPrivateImage(imageFile)
+    const createInput = {
+      imageIds: [image.image.id],
+      projectId: experiment.projectId,
+      experimentId: experiment.id,
+      experimentEventId: event.id,
+      currentDataCell: {
+        definitionId: definition.id,
+        subjectType: 'experiment' as const,
+        subjectId: experiment.id,
+      },
+      visionModelProfileId: profile.id,
+    }
+
+    const pending = await gateway.createAiExtraction(createInput)
+    expect(pending.candidates[0].selected).toBe(false)
+    expect(pending.modelTrace?.purpose).toBe('vision')
+    expect((await gateway.listPrivateImages()).find((entry) =>
+      entry.image.id === image.image.id)?.image.status).toBe('pending_approval')
+
+    const rejected = await gateway.rejectAiExtraction(pending.id, {
+      expectedRevision: pending.revision,
+    })
+    expect(rejected.status).toBe('rejected')
+    expect((await gateway.listPrivateImages()).find((entry) =>
+      entry.image.id === image.image.id)?.image.status).toBe('active')
+
+    const second = await gateway.createAiExtraction(createInput)
+    const applied = await gateway.approveAiExtraction(second.id, {
+      expectedRevision: second.revision,
+      selections: [{
+        itemIndex: second.candidates[0].itemIndex,
+        value: { type: 'number', value: 12.5 },
+        notes: 'human checked',
+      }],
+    })
+    expect(applied.attachments).toHaveLength(1)
+    expect(applied.links).toHaveLength(1)
+    expect(applied.draft.candidates[0].selected).toBe(true)
+    expect((await gateway.listPrivateImages()).find((entry) =>
+      entry.image.id === image.image.id)?.image.status).toBe('archived')
+    await expect(gateway.readPrivateImage(image.image.id)).resolves.toBeInstanceOf(Blob)
   })
 })

@@ -438,6 +438,18 @@ async fn source_context(
             return Err(ApiError::conflict("AI conversation is archived")
                 .with_request_id(metadata.request_id.clone()));
         }
+        if require_writable {
+            if conversation.legacy_read_only {
+                return Err(ApiError::conflict("legacy AI conversation is read-only")
+                    .with_request_id(metadata.request_id.clone()));
+            }
+            let binding = conversation.model_profile.ok_or_else(|| {
+                ApiError::conflict("legacy AI conversation is read-only")
+                    .with_request_id(metadata.request_id.clone())
+            })?;
+            super::ai_api::ensure_conversation_model_available(state, principal, binding, metadata)
+                .await?;
+        }
         conversation.project_id
     } else {
         None

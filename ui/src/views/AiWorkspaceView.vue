@@ -1,14 +1,21 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
+import { useMessage } from 'naive-ui'
 import { MessageSquarePlus } from '@lucide/vue'
 import PageHeader from '@/components/PageHeader.vue'
 import AiWorkspaceShell from '@/components/AiWorkspaceShell.vue'
 import { useAiAssistant } from '@/composables/useAiAssistant'
 
 const ai = useAiAssistant()
+const toast = useMessage()
 
-onMounted(() => {
+onMounted(async () => {
   ai.setContext('AI 工作台', '/ai')
+  try {
+    await ai.loadModels(true)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法读取 AI 模型配置')
+  }
 })
 </script>
 
@@ -20,7 +27,7 @@ onMounted(() => {
       :show-ask-ai="false"
     >
       <template #actions>
-        <n-button type="primary" secondary @click="ai.newConversation">
+        <n-button type="primary" secondary :disabled="ai.busy.value" @click="ai.newConversation">
           <template #icon><MessageSquarePlus :size="17" /></template>
           新会话
         </n-button>

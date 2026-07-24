@@ -61,6 +61,16 @@ function projectLabel(conversation: AiConversationSummary) {
     : '跨项目只读'
 }
 
+function modelLabel(conversation: AiConversationSummary) {
+  const identity = conversation.modelProfileName
+    ?? conversation.modelId
+    ?? (conversation.modelProfileId ? '模型版本不可用' : '旧会话模型未知')
+  const version = conversation.modelProfileVersion
+    ? ` · v${conversation.modelProfileVersion}`
+    : ''
+  return `${identity}${version}${conversation.readOnly ? ' · 只读' : ''}`
+}
+
 async function changeProject(value: string | null) {
   try {
     await ai.selectProject(value || undefined)
@@ -296,7 +306,7 @@ onBeforeUnmount(() => {
               <strong>{{ conversation.title }}</strong>
             </span>
             <span class="conversation-meta">
-              <small>{{ projectLabel(conversation) }}</small>
+              <small>{{ projectLabel(conversation) }} · {{ modelLabel(conversation) }}</small>
               <time :datetime="conversation.updatedAt">{{ formatConversationDate(conversation.updatedAt) }}</time>
             </span>
           </button>
@@ -436,7 +446,7 @@ onBeforeUnmount(() => {
                 <strong>{{ conversation.title }}</strong>
               </span>
               <span class="conversation-meta">
-                <small>{{ projectLabel(conversation) }}</small>
+                <small>{{ projectLabel(conversation) }} · {{ modelLabel(conversation) }}</small>
                 <time :datetime="conversation.updatedAt">{{ formatConversationDate(conversation.updatedAt) }}</time>
               </span>
             </button>

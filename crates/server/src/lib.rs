@@ -23,15 +23,17 @@ mod user_governance;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use ai_step_up::AiStepUpRateLimiter;
-use muriarc_core::{AiOperationStore, MuriArcStore};
+use muriarc_core::{AiModelProfileStore, AiOperationStore, MuriArcStore};
 use muriarc_data::DataFiles;
 use tokio::sync::RwLock;
 
 pub use ai_secrets::{
-    AiLabSettingsView, AiProviderDiagnosticsView, AiProviderEndpointView,
-    AiProviderModelPresetView, AiProviderPresetView, AiProviderSettingsView, AiProviderStoreError,
-    DisabledAiProviderStore, ResolvedAiProvider, SaveAiLabSettingsInput,
-    SaveAiProviderEndpointInput, SaveAiProviderSettingsInput, SensitiveSecret, UserAiProviderStore,
+    AiLabSettingsView, AiModelDefaultsView, AiModelProfileView, AiModelValidationView,
+    AiProviderDiagnosticsView, AiProviderEndpointView, AiProviderModelPresetView,
+    AiProviderPresetView, AiProviderSettingsView, AiProviderStoreError, ArchiveAiModelProfileInput,
+    DisabledAiProviderStore, ResolvedAiProvider, SaveAiLabSettingsInput, SaveAiModelDefaultsInput,
+    SaveAiModelProfileInput, SaveAiProviderEndpointInput, SaveAiProviderSettingsInput,
+    SensitiveSecret, UserAiProviderStore, ValidateAiModelProfileInput,
 };
 #[cfg(feature = "postgres")]
 pub use ai_secrets::{AiMasterKey, PostgresAiProviderStore};
@@ -82,6 +84,7 @@ pub struct AppState {
     pub session_cookie: SessionCookieConfig,
     pub jobs: Arc<dyn JobRepository>,
     pub ai_operations: Option<Arc<dyn AiOperationStore>>,
+    pub ai_model_profiles: Option<Arc<dyn AiModelProfileStore>>,
     pub ai_providers: Arc<dyn UserAiProviderStore>,
     pub(crate) ai_step_up: AiStepUpRateLimiter,
     pub data_files: Option<Arc<DataFiles>>,
@@ -105,6 +108,7 @@ impl AppState {
             session_cookie: SessionCookieConfig::default(),
             jobs,
             ai_operations: None,
+            ai_model_profiles: None,
             ai_providers: Arc::new(DisabledAiProviderStore),
             ai_step_up: AiStepUpRateLimiter::default(),
             data_files: None,
@@ -139,9 +143,11 @@ impl AppState {
     pub fn with_ai(
         mut self,
         operations: Arc<dyn AiOperationStore>,
+        model_profiles: Arc<dyn AiModelProfileStore>,
         providers: Arc<dyn UserAiProviderStore>,
     ) -> Self {
         self.ai_operations = Some(operations);
+        self.ai_model_profiles = Some(model_profiles);
         self.ai_providers = providers;
         self
     }

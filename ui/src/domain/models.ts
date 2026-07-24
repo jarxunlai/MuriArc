@@ -748,13 +748,43 @@ export interface AiAssistantTrace {
     trimmedHistoryTurns: number
     trimReasons: string[]
   }
+  stages?: AiModelStageTrace[]
+  imageEvidence?: AiImageEvidence[]
+}
+
+export interface AiModelStageTrace {
+  profileId: string
+  profileVersion: number
+  purpose: 'vision_and_final' | 'vision_observation' | 'final_answer'
+  modelId?: string
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  providerRequestId?: string
+}
+
+export interface AiImageEvidence {
+  imageId: string
+  sha256: string
+  displayOrder: number
 }
 
 export interface AiTurnInput {
-  conversationId?: string
+  conversationId: string
   projectId?: string
   message: string
   sourceRefs?: string[]
+  imageIds?: string[]
+  visionModelProfileId?: string
+}
+
+export interface StartAiConversationInput {
+  projectId?: string
+  title: string
+  modelProfileId?: string
+  requestedMode: AiAutonomyMode
+  /** Server sessions only. LocalTauriGateway strips this before invoking Rust. */
+  currentPassword?: string
 }
 
 export interface AiTurnResponse {
@@ -798,14 +828,15 @@ export interface AiConversationSummary {
   title: string
   pinnedAt?: string
   archivedAt?: string
+  modelProfileId?: string
+  modelProfileVersion?: number
+  modelProfileName?: string
+  modelId?: string
+  readOnly: boolean
+  readOnlyReason?: 'legacy_model_unknown' | 'model_archived' | 'model_unavailable'
   createdAt: string
   updatedAt: string
   revision: number
-}
-
-export interface AiConversationCreateInput {
-  projectId?: string
-  title: string
 }
 
 export type AiConversationArchiveFilter = 'active' | 'archived' | 'all'
@@ -888,6 +919,11 @@ export interface AiConversationSourceRef {
   sizeBytes: number
 }
 
+export interface StartAiConversationResponse {
+  conversation: AiConversationSummary
+  autonomy: AiAutonomyView
+}
+
 export interface AiConversationMessage {
   id: string
   sequence: number
@@ -922,6 +958,11 @@ export interface AiMessage {
   role: 'user' | 'assistant'
   content: string
   createdAt: string
+  images?: Array<{
+    id: string
+    fileName: string
+    previewHref: string
+  }>
   citations?: AiCitation[]
   toolRuns?: AiToolRun[]
   drafts?: AiWriteDraft[]

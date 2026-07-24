@@ -287,6 +287,8 @@ fn in_scope(entity_type: EntityType, scope: OperationScope) -> bool {
                 | EntityType::AiConversationMessage
                 | EntityType::AiConversationSource
                 | EntityType::AiProviderSettings
+                | EntityType::AiModelProfile
+                | EntityType::AiUserModelDefaults
                 | EntityType::AiPrivateImage
                 | EntityType::AiExtractionDraft
                 | EntityType::ToolRun
@@ -444,6 +446,8 @@ const fn entity_label(entity_type: EntityType) -> &'static str {
         EntityType::AiConversationSource => "AI 会话来源",
         EntityType::AiAutonomyGrant => "AI 会话授权",
         EntityType::AiProviderSettings => "AI Provider 设置",
+        EntityType::AiModelProfile => "AI 模型档案",
+        EntityType::AiUserModelDefaults => "AI 默认模型",
         EntityType::AiProviderEndpoint => "AI Provider 端点",
         EntityType::AiLabSettings => "实验室 AI 设置",
         EntityType::TechnicalLogPolicy => "技术日志策略",

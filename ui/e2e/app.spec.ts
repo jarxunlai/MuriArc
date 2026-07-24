@@ -1,4 +1,43 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
+
+const tinyPng = (name: string) => ({
+  name,
+  mimeType: 'image/png',
+  buffer: Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64',
+  ),
+})
+
+async function selectNaiveOption(page: Page, selector: string, option: string | RegExp) {
+  await page.locator(selector).click()
+  await page.locator('.n-base-select-option').filter({ hasText: option }).last().click()
+}
+
+async function expectDataEntryDialogFits(page: Page) {
+  for (const width of [375, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 960 })
+    await expect.poll(() => page.locator('.data-entry-dialog').evaluate((card) => {
+      const cardRect = card.getBoundingClientRect()
+      const content = card.querySelector<HTMLElement>('.n-card__content')
+      const footer = card.querySelector<HTMLElement>('.n-card__footer')
+      return {
+        cardContained: cardRect.left >= -1 && cardRect.right <= window.innerWidth + 1,
+        cardHasNoOverflow: card.scrollWidth <= card.clientWidth + 1,
+        contentHasNoOverflow: !content || content.scrollWidth <= content.clientWidth + 1,
+        footerHasNoOverflow: !footer || footer.scrollWidth <= footer.clientWidth + 1,
+        documentHasNoOverflow:
+          document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+      }
+    })).toEqual({
+      cardContained: true,
+      cardHasNoOverflow: true,
+      contentHasNoOverflow: true,
+      footerHasNoOverflow: true,
+      documentHasNoOverflow: true,
+    })
+  }
+}
 
 test('以笼位视图启动并使用适配设备的导航', async ({ page }, testInfo) => {
   await page.goto('/')
@@ -245,16 +284,23 @@ test('动物 Registry 导出和完整业务归档快照都会触发浏览器下�
 
 test('AI 工作页保留上下文、回答和数据引用', async ({ page }) => {
   await page.goto('/#/ai')
+  await expect(page.getByTestId('conversation-mode-status')).toContainText('请求 Full（待启用）')
+  await expect(page.getByTestId('conversation-mode-status')).toContainText('实际 尚未开始')
   const prompt = page.getByLabel('发送给 AI 的消息')
   await prompt.fill('总结进行中的实验')
   await prompt.press('Enter')
 
+  const fullDialog = page.getByRole('dialog')
+  await expect(fullDialog).toContainText('以 Full 请求开始新会话')
+  await fullDialog.getByRole('checkbox').check()
+  await fullDialog.getByRole('button', { name: '确认启用' }).click()
   await expect(page.locator('.message.user .bubble p')).toHaveText('总结进行中的实验')
   await expect(page.getByText(/浏览器演示不会读取正式数据库/)).toBeVisible()
   await expect(page.getByRole('link', { name: '动物 M-26006' })).toBeVisible()
   await expect(page.getByText(/已调用 1 个安全领域工具/)).toBeVisible()
+  await expect(page.getByTestId('conversation-mode-status')).toContainText('实际 Full')
 
-  await page.getByRole('button', { name: '新会话' }).click()
+  await page.getByRole('button', { name: '新会话', exact: true }).click()
   await expect(page.locator('.message.user')).toHaveCount(0)
   await expect(page.getByText(/选择科研项目后/)).toBeVisible()
 })
@@ -301,6 +347,169 @@ test('AI 浮动工作台可由键盘移动缩放并在目标视口内保持可�
       .toBe(true)
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
       .toBe(true)
+  }
+})
+
+test('聊天图片明确覆盖无默认、视觉中转与当前模型直接视觉', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', '单一浏览器覆盖模型配置与两条视觉路径')
+
+  await page.goto('/#/settings')
+  await page.getByRole('navigation', { name: '设置导航' })
+    .getByRole('button', { name: 'AI 与模型' })
+    .click()
+  await page.locator('.model-row').filter({ hasText: '本地视觉模型' }).click()
+  await page.getByRole('button', { name: '默认视觉模型' }).click()
+  await expect(page.getByText('默认视觉模型已更新', { exact: true })).toBeVisible()
+
+  await page.goto('/#/ai')
+  await expect(page.getByTestId('conversation-model-select')).toBeVisible()
+  await selectNaiveOption(page, '[data-testid="conversation-mode-select"]', 'Ask')
+  await page.getByLabel('选择最多八张聊天图片').setInputFiles(tinyPng('relay.png'))
+
+  await expect(page.getByRole('status')).toContainText('请明确选择一个可用的视觉模型')
+  await expect(page.getByTestId('ai-composer-send')).toBeDisabled()
+  await selectNaiveOption(
+    page,
+    '[aria-label="聊天图片视觉中转模型"]',
+    /本地视觉模型/,
+  )
+  await page.getByTestId('ai-composer-input').fill('请通过视觉中转读取这张图片')
+  await page.getByTestId('ai-composer-send').click()
+
+  await expect(page.locator('.message.assistant .bubble').last())
+    .toContainText('视觉中转路径读取 1 张演示图片')
+  const relayTrace = page.locator('.message.assistant .tool-trace').last()
+  await relayTrace.locator('summary').click()
+  await expect(relayTrace).toContainText('视觉观察')
+  await expect(relayTrace).toContainText('最终回答')
+
+  await page.getByRole('button', { name: '新会话', exact: true }).click()
+  await selectNaiveOption(
+    page,
+    '[data-testid="conversation-model-select"]',
+    /本地视觉模型/,
+  )
+  await selectNaiveOption(page, '[data-testid="conversation-mode-select"]', 'Ask')
+  await page.getByLabel('选择最多八张聊天图片').setInputFiles(tinyPng('direct.png'))
+  await expect(page.getByText('当前对话模型支持视觉，将直接读取图片并回答。')).toBeVisible()
+  await page.getByTestId('ai-composer-input').fill('请由当前模型直接读取这张图片')
+  await page.getByTestId('ai-composer-send').click()
+
+  await expect(page.locator('.message.assistant .bubble').last())
+    .toContainText('当前模型直接视觉路径读取 1 张演示图片')
+  const directTrace = page.locator('.message.assistant .tool-trace').last()
+  await directTrace.locator('summary').click()
+  await expect(directTrace).toContainText('直接视觉')
+})
+
+test('实验数据图片候选支持多图、恢复、拒绝与人工批准', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', '单一浏览器覆盖四个宽度与完整候选生命周期')
+  test.setTimeout(60_000)
+
+  await page.goto('/#/experiments')
+  const experiment = page.locator('.experiment-card').filter({ hasText: 'DEMO-2026-01' })
+  await experiment.getByRole('button', { name: '打开实验' }).click()
+
+  await page.getByRole('link', { name: '追溯' }).click()
+  await page.getByRole('button', { name: '记录实验事件' }).click()
+  let dialog = page.getByRole('dialog')
+  await dialog.getByPlaceholder('例如：设备异常、提前退出或阶段完成').fill('视觉采集节点')
+  await dialog.getByRole('button', { name: '保存事件' }).click()
+  await expect(page.getByText('实验事件已创建', { exact: true })).toBeVisible()
+
+  await page.getByRole('link', { name: '实验设计' }).click()
+  await page.getByRole('button', { name: '添加数据列' }).click()
+  dialog = page.getByRole('dialog')
+  await dialog.getByPlaceholder('body_weight').fill('vision_note')
+  await dialog.getByPlaceholder('体重').fill('视觉观察')
+  await dialog.getByRole('button', { name: '添加数据列' }).click()
+  await expect(page.getByText('观察定义已创建', { exact: true })).toBeVisible()
+
+  await page.getByRole('link', { name: '数据工作表' }).click()
+  await page.getByRole('button', { name: '录入实验级数据' }).click()
+  dialog = page.getByRole('dialog', { name: '录入实验数据' })
+  await page.getByText('图片识别候选', { exact: true }).click()
+
+  const fileInput = page.getByLabel('选择当前数据单元的图片')
+  await fileInput.setInputFiles([tinyPng('cell-a.png'), tinyPng('cell-b.png')])
+  await expect(page.getByAltText(/当前数据单元图片：/)).toHaveCount(2)
+  await page.getByRole('button', { name: '移除图片 cell-b.png' }).click()
+  await expect(page.getByAltText(/当前数据单元图片：/)).toHaveCount(1)
+  await fileInput.setInputFiles(tinyPng('cell-b.png'))
+  await expect(page.getByAltText(/当前数据单元图片：/)).toHaveCount(2)
+  await expectDataEntryDialogFits(page)
+
+  await page.getByRole('button', { name: '生成候选' }).click()
+  await expect(page.locator('.candidate-review')).toContainText('AI 候选（可编辑）')
+  await expect(page.locator('.candidate-review')).toContainText('2 张证据')
+  await expectDataEntryDialogFits(page)
+
+  await page.getByRole('button', { name: '取消', exact: true }).click()
+  await expect(dialog).not.toBeVisible()
+  await page.getByRole('button', { name: '录入实验级数据' }).click()
+  dialog = page.getByRole('dialog', { name: '录入实验数据' })
+  await expect(page.locator('.candidate-review')).toContainText('2 张证据')
+  await page.getByRole('button', { name: '放弃候选并释放图片' }).click()
+  await expect(page.getByText('已放弃候选并释放全部私人暂存图片', { exact: true }))
+    .toBeVisible()
+  await expect(page.locator('.candidate-review')).toHaveCount(0)
+
+  const secondFileInput = page.getByLabel('选择当前数据单元的图片')
+  await secondFileInput.setInputFiles([tinyPng('approved-a.png'), tinyPng('approved-b.png')])
+  await page.getByRole('button', { name: '生成候选' }).click()
+  await expect(page.locator('.candidate-review')).toContainText('2 张证据')
+  await page.getByRole('checkbox', {
+    name: '我已核对当前数据单元、候选值和全部图片证据，并批准写入正式数据',
+  }).check()
+  await page.getByRole('button', { name: '批准并正式写入' }).click()
+
+  await expect(dialog).not.toBeVisible()
+  await expect(page.getByText(
+    '已由人工批准并原子写入 Observation、附件、Audit 与 Provenance',
+    { exact: true },
+  )).toBeVisible()
+  await page.getByText('实验级记录', { exact: true }).click()
+  await expect(page.locator('.experiment-records')).toContainText('演示识别候选')
+})
+
+test('AI 模型与模式控制在 375 768 1024 1440 宽度无横向溢出', async ({ page }) => {
+  await page.goto('/#/ai')
+  await expect(page.getByTestId('conversation-model-select')).toBeVisible()
+
+  for (const width of [375, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 960 })
+    await expect(page.getByTestId('conversation-mode-select')).toBeVisible()
+    await expect(page.getByTestId('conversation-mode-status')).toBeVisible()
+
+    const layout = await page.locator('.ai-conversation').evaluate((root) => {
+      const rootRect = root.getBoundingClientRect()
+      const selectors = [
+        '.context-strip',
+        '.conversation-controls',
+        '.model-field',
+        '.mode-field',
+        '.mode-status',
+        '.input-wrap',
+      ]
+      const contained = selectors.every((selector) => {
+        const element = root.querySelector(selector)
+        if (!element) return false
+        const rect = element.getBoundingClientRect()
+        return rect.left >= rootRect.left - 1 && rect.right <= rootRect.right + 1
+      })
+      return {
+        contained,
+        rootHasNoOverflow: root.scrollWidth <= root.clientWidth + 1,
+        documentHasNoOverflow:
+          document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+      }
+    })
+
+    expect(layout).toEqual({
+      contained: true,
+      rootHasNoOverflow: true,
+      documentHasNoOverflow: true,
+    })
   }
 })
 

@@ -14,7 +14,12 @@ MuriArc 是面向个人研究者和共享实验室的实验动物研究管理平
 
 - **Desktop**：Tauri v2 + SQLite，面向个人用户；正式本地交付为 Windows Tauri WebView 安装包，不通过 VNC/noVNC 或浏览器远程桌面部署。每次启动显示无密码“进入本地空间”，它只确认实验室和操作者、不是安全锁，进入后可完全离线使用。
 - **Server**：Axum + PostgreSQL + 响应式 Web，面向一个实验室内的多用户、多项目协作。
-- **AI**：新环境默认启用运行时和 DeepSeek 个人预设，但未配置个人 API Key 时不会发出外部请求或产生费用；不安装 Ollama、不下载本地模型。每位用户独立选择 Provider、API 出口、模型、Key 和 Token 参数；AI 只通过受控领域工具和查询 DSL 访问数据，对话可在实验室上限内使用 Ask / Auto / Full 委托，所有写入仍先形成草稿并经过预览、审批或科研签署。
+- **AI**：每位用户可建立多个版本化模型档案，自由填写模型 ID，并分别使用 OpenAI Chat
+  Completions、OpenAI Responses 或 Anthropic Messages 协议；档案密钥独立保存，未配置密钥
+  时不会发出外部请求或产生费用。对话绑定不可变档案版本，可在实验室上限内使用 Ask /
+  Auto / Full 委托。视觉请求可由当前模型直接处理，或经用户明确选择的视觉模型生成受控观察
+  后转交对话模型；AI 只访问受控领域工具，实验数据图片只能生成私有候选草稿，正式写入仍需
+  人工编辑或批准。
 
 ## 工程结构
 
@@ -53,7 +58,11 @@ migrations/               数据库迁移
   可查看本项目动物所在笼位和实验，但不会看到同笼的其他项目动物或实验室总占用。
 - **双运行形态**：Desktop/Tauri/SQLite 与 Server/Axum/PostgreSQL 共享 Application、Domain、
   Store contract 和 Vue 页面。
-- **受控 AI**：DeepSeek、智谱 GLM、Moonshot/Kimi、OpenAI 与自定义 OpenAI-compatible 预设只提供非敏感目录；Provider、出口、模型、加密 Key 与上下文/输入/输出/历史/Temperature/超时参数按用户隔离。固定工具、最小权限、结构化引用和对话级 Ask / Auto / Full 授权继续约束调用；科研签署、动物转移/死亡、删除/批量导入、权限账号、技术日志清理与繁育事实始终由人工完成。
+- **受控 AI**：用户拥有多个模型档案，档案的协议、规范化 Base URL、自由模型 ID、能力与
+  参数形成不可变版本；默认对话/视觉模型必须显式设置，停用档案只保留历史读取能力。Server
+  加密密钥和 Desktop OS keyring 均按档案版本隔离。固定工具、最小权限、结构化 Trace 和
+  对话级 Ask / Auto / Full 授权继续约束调用；科研签署、图片证据批准、动物转移/死亡、
+  删除/批量导入、权限账号、技术日志清理与繁育事实始终由人工完成。
 - **分层操作记录**：成员日常只看聚合后的关键活动；正式 Audit/Provenance 永久保留，Server
   技术日志按数量与最短天数自动清理，只有 Environment Root 能预览、调整策略或手动清理。
 

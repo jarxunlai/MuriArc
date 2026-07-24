@@ -115,8 +115,10 @@ mod tests {
     use chrono::Duration;
     use muriarc_core::{
         ActorType, AiConversation, AiConversationSource, AiConversationSourceKind,
-        AiConversationSourceStatus, AiOperationStore, Attachment, AuditAction, AuditFilter, Lab,
-        MuriArcStore, Project, ProvenanceFilter, RecordMeta, User, WorkspaceStore,
+        AiConversationSourceStatus, AiModelProfile, AiModelProfileBinding, AiModelProfileStore,
+        AiModelProfileVersion, AiOperationStore, AiProviderProtocol, AiProviderTransport,
+        Attachment, AuditAction, AuditFilter, Lab, MuriArcStore, Project, ProvenanceFilter,
+        RecordMeta, User, WorkspaceStore,
     };
     use muriarc_store_sqlite::SqliteStore;
 
@@ -149,12 +151,48 @@ mod tests {
             store.create_user(&user, &migration).await.unwrap();
             let project = Project::new(lab.id, "Cleanup project", now).unwrap();
             store.create_project(&project, &migration).await.unwrap();
+            let model_profile = AiModelProfile {
+                id: Uuid::new_v4(),
+                lab_id: lab.id,
+                user_id: user.id,
+                name: "Cleanup fixture model".to_owned(),
+                current_version: 1,
+                archived_at: None,
+                meta: RecordMeta::new(now),
+            };
+            let model_version = AiModelProfileVersion {
+                profile_id: model_profile.id,
+                version: 1,
+                protocol: AiProviderProtocol::OpenaiChatCompletions,
+                transport: AiProviderTransport::OpenAiCompatible,
+                base_url: "https://provider.example.test/v1".to_owned(),
+                normalized_base_url: "https://provider.example.test/v1".to_owned(),
+                model_id: "cleanup-fixture-model".to_owned(),
+                supports_vision: false,
+                context_window_tokens: 16_384,
+                max_input_tokens: 8_192,
+                max_output_tokens: 2_048,
+                history_token_budget: 4_096,
+                history_turns: 20,
+                temperature: 0.0,
+                timeout_ms: 30_000,
+                created_at: now,
+            };
+            store
+                .create_ai_model_profile(&model_profile, &model_version, &migration)
+                .await
+                .unwrap();
             let lab_conversation = AiConversation {
                 id: Uuid::new_v4(),
                 lab_id: lab.id,
                 project_id: None,
                 user_id: user.id,
                 title: "Lab cleanup".to_owned(),
+                model_profile: Some(AiModelProfileBinding {
+                    profile_id: model_profile.id,
+                    profile_version: 1,
+                }),
+                legacy_read_only: false,
                 pinned_at: None,
                 archived_at: None,
                 meta: RecordMeta::new(now),

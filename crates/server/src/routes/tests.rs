@@ -5,10 +5,12 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http_body_util::BodyExt;
 use muriarc_ai::SOURCE_IMPORT_JOB_BINDING_KEY;
 use muriarc_core::{
     Actor, ActorType, AiConversation, AiConversationMessage, AiConversationMessageRole,
+    AiModelProfile, AiModelProfileBinding, AiModelProfileStore, AiModelProfileVersion,
     AiOperationStore, AiScope, Animal, AnimalEvent, AnimalEventKind, Approval, ApprovalDecision,
     Attachment, AuditContext, Cage, EntityType, Experiment, ExperimentTemplateVersion,
     FieldValueType, Job, JobKind, JobStatus, Lab, LabRole, Measurement, MeasurementFilter,
@@ -44,20 +46,29 @@ struct Fixture {
     lab_id: Uuid,
     user_id: Uuid,
     project_id: Uuid,
+    model_profile: AiModelProfileBinding,
     attachment_root: PathBuf,
     _data_dir: tempfile::TempDir,
 }
 
 impl Fixture {
     async fn new(ui_dir: Option<PathBuf>) -> Self {
-        Self::new_inner(ui_dir, false).await
+        Self::new_inner(ui_dir, false, false).await
     }
 
     async fn new_with_ai(ui_dir: Option<PathBuf>) -> Self {
-        Self::new_inner(ui_dir, true).await
+        Self::new_inner(ui_dir, true, true).await
     }
 
-    async fn new_inner(ui_dir: Option<PathBuf>, enable_ai: bool) -> Self {
+    async fn new_with_ai_operations(ui_dir: Option<PathBuf>, enable_ai_operations: bool) -> Self {
+        Self::new_inner(ui_dir, enable_ai_operations, false).await
+    }
+
+    async fn new_inner(
+        ui_dir: Option<PathBuf>,
+        enable_ai_operations: bool,
+        enable_full_ai: bool,
+    ) -> Self {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
         store.migrate().await.unwrap();
         let now = chrono::Utc::now();
@@ -79,6 +90,45 @@ impl Fixture {
             .create_user(&user, &AuditContext::system(WriteSource::Migration))
             .await
             .unwrap();
+        let profile = AiModelProfile {
+            id: Uuid::new_v4(),
+            lab_id: lab.id,
+            user_id,
+            name: "Route test model".to_owned(),
+            current_version: 1,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        let profile_version = AiModelProfileVersion {
+            profile_id: profile.id,
+            version: 1,
+            protocol: muriarc_core::AiProviderProtocol::OpenaiChatCompletions,
+            transport: muriarc_core::AiProviderTransport::LocalHttp,
+            base_url: "http://127.0.0.1:9".to_owned(),
+            normalized_base_url: "http://127.0.0.1:9".to_owned(),
+            model_id: "route-test-model".to_owned(),
+            supports_vision: false,
+            context_window_tokens: 32_768,
+            max_input_tokens: 16_384,
+            max_output_tokens: 2_048,
+            history_token_budget: 8_192,
+            history_turns: 20,
+            temperature: 0.0,
+            timeout_ms: 1_000,
+            created_at: now,
+        };
+        store
+            .create_ai_model_profile(
+                &profile,
+                &profile_version,
+                &AuditContext::system(WriteSource::Migration),
+            )
+            .await
+            .unwrap();
+        let model_profile = AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: profile_version.version,
+        };
         let human = AuthPrincipal::human(user_id, "Animal manager", lab.id, [LabRole::LabAdmin]);
         let external = human.clone().with_ai_scopes([AiScope::Read]);
         let project_user =
@@ -137,7 +187,7 @@ impl Fixture {
         let data_dir = tempfile::tempdir().unwrap();
         let attachment_root = data_dir.path().join("attachments");
         fs::create_dir_all(&attachment_root).unwrap();
-        let state = AppState::new(
+        let mut state = AppState::new(
             store.clone(),
             Arc::new(authenticator),
             Arc::new(StoreJobRepository::new(store.clone())),
@@ -146,9 +196,16 @@ impl Fixture {
             DataFiles::new(data_dir.path().join("data")),
             attachment_root.clone(),
         );
-        let state = if enable_ai {
-            state.with_ai(store.clone(), Arc::new(DisabledAiProviderStore))
+        let state = if enable_full_ai {
+            state.with_ai(
+                store.clone(),
+                store.clone(),
+                Arc::new(DisabledAiProviderStore),
+            )
         } else {
+            if enable_ai_operations {
+                state.ai_operations = Some(store.clone());
+            }
             state
         };
         Self {
@@ -157,6 +214,7 @@ impl Fixture {
             lab_id: lab.id,
             user_id,
             project_id: project.id,
+            model_profile,
             attachment_root,
             _data_dir: data_dir,
         }
@@ -171,6 +229,59 @@ impl Fixture {
             .body(Body::from(value.to_string()))
             .unwrap()
     }
+}
+
+#[tokio::test]
+async fn legacy_conversation_image_upload_is_rejected_before_polling_the_body() {
+    let fixture = Fixture::new_with_ai_operations(None, true).await;
+    let conversation_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    sqlx::query(
+        "INSERT INTO ai_conversations (
+            id, lab_id, project_id, user_id, title, model_profile_id,
+            model_profile_version, legacy_read_only, created_at, updated_at,
+            deleted_at, revision
+         ) VALUES (?, ?, NULL, ?, 'Legacy image conversation',
+            NULL, NULL, 1, ?, ?, NULL, 1)",
+    )
+    .bind(conversation_id.to_string())
+    .bind(fixture.lab_id.to_string())
+    .bind(fixture.user_id.to_string())
+    .bind(now)
+    .bind(now)
+    .execute(fixture.store.pool())
+    .await
+    .unwrap();
+
+    let body_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let body_probe = body_polled.clone();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        body_probe.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"\x89PNG\r\n\x1a\n"))
+    }));
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/ai/images/upload?file_name=legacy.png&media_type=image%2Fpng&conversation_id={conversation_id}"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(body)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(
+        !body_polled.load(std::sync::atomic::Ordering::SeqCst),
+        "legacy conversation rejection must happen before the upload body reaches object storage"
+    );
+    assert_eq!(fs::read_dir(&fixture.attachment_root).unwrap().count(), 0);
 }
 
 #[tokio::test]
@@ -2741,7 +2852,11 @@ async fn server_measurement_import_uses_experiment_project_and_creates_drafts() 
 #[tokio::test]
 async fn private_ai_images_are_owner_scoped_and_admin_bearer_requires_a_view_session() {
     let fixture = Fixture::new(None).await;
-    let content = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01";
+    let content = STANDARD
+        .decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        )
+        .unwrap();
     let upload = fixture
         .app
         .clone()
@@ -2751,7 +2866,7 @@ async fn private_ai_images_are_owner_scoped_and_admin_bearer_requires_a_view_ses
                 .uri("/api/v1/ai/images/upload?file_name=private.png&media_type=image%2Fpng")
                 .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
                 .header(header::CONTENT_TYPE, "image/png")
-                .body(Body::from(content.as_slice()))
+                .body(Body::from(content.clone()))
                 .unwrap(),
         )
         .await
@@ -2860,6 +2975,8 @@ async fn ai_sources_are_validated_owner_scoped_archived_and_soft_discarded() {
         project_id: None,
         user_id: fixture.user_id,
         title: "Lab conversation".to_owned(),
+        model_profile: Some(fixture.model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),
@@ -3282,6 +3399,8 @@ async fn public_audit_routes_hide_ai_source_storage_identity_and_legacy_sensitiv
         project_id: None,
         user_id: fixture.user_id,
         title: "Audit-safe source".to_owned(),
+        model_profile: Some(fixture.model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),

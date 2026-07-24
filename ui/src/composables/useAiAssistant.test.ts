@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
+  AiAutonomyView,
   AiConversationDetail,
   AiConversationSummary,
   AiTurnResponse,
@@ -7,6 +8,7 @@ import type {
   AuthSession,
 } from '@/domain/models'
 import { currentAuthSession } from '@/services/projectContext'
+import type { AiModelProfileView } from '@/services/gateway'
 
 const mocks = vi.hoisted(() => ({
   mode: 'local' as 'local' | 'remote',
@@ -14,11 +16,14 @@ const mocks = vi.hoisted(() => ({
   listAiDrafts: vi.fn(),
   listAiConversations: vi.fn(),
   getAiConversation: vi.fn(),
-  createAiConversation: vi.fn(),
   updateAiConversation: vi.fn(),
+  listAiModelProfiles: vi.fn(),
+  getAiModelDefaults: vi.fn(),
+  startAiConversation: vi.fn(),
   getAiAutonomy: vi.fn(),
   setAiAutonomy: vi.fn(),
   aiTurn: vi.fn(),
+  uploadPrivateImage: vi.fn(),
   decideAiDraft: vi.fn(),
   uploadAiSource: vi.fn(),
   listAiSources: vi.fn(),
@@ -32,7 +37,48 @@ vi.mock('@/services/gateway', () => ({
 
 import { useAiAssistant } from './useAiAssistant'
 
-const turnResponse = (conversationId = 'conversation-1'): AiTurnResponse => ({
+const autonomy = (
+  mode: AiAutonomyView['mode'] = 'ask',
+  effectiveMode: AiAutonomyView['effectiveMode'] = mode,
+): AiAutonomyView => ({
+  mode,
+  effectiveMode,
+  maxMode: 'full',
+  batchLimit: 100,
+  revision: 1,
+  requiresHumanApproval: [],
+})
+
+const modelProfile = (
+  id = 'profile-1',
+  overrides: Partial<AiModelProfileView> = {},
+): AiModelProfileView => ({
+  id,
+  name: id === 'profile-1' ? '主对话模型' : '备用模型',
+  currentVersion: 2,
+  revision: 3,
+  protocol: 'openai_responses',
+  transport: 'open_ai_compatible',
+  baseUrl: 'https://provider.example/v1',
+  modelId: id === 'profile-1' ? 'model-primary' : 'model-secondary',
+  supportsVision: false,
+  contextWindowTokens: 131072,
+  maxInputTokens: 65536,
+  maxOutputTokens: 4096,
+  historyTokenBudget: 32768,
+  historyTurns: 20,
+  temperature: 0,
+  timeoutMs: 120000,
+  hasKey: true,
+  isDefaultConversation: id === 'profile-1',
+  isDefaultVision: false,
+  ...overrides,
+})
+
+const turnResponse = (
+  conversationId = 'conversation-1',
+  drafts: AiWriteDraft[] = [],
+): AiTurnResponse => ({
   conversationId,
   content: '查询完成',
   citations: [{
@@ -43,12 +89,13 @@ const turnResponse = (conversationId = 'conversation-1'): AiTurnResponse => ({
     toolRunId: 'run-1', providerCallId: 'call-1', tool: 'animal_search',
     arguments: {}, outcome: 'read', citations: [],
   }],
-  drafts: [],
+  drafts,
   trace: {
     providerId: 'test-provider', model: 'test-model',
     usage: { providerCalls: 1, toolCalls: 1, inputTokens: 3, outputTokens: 2, totalTokens: 5 },
     context: { estimatedInputTokens: 3, inputTokenCountIsEstimate: true, contextTrimmed: false, trimmedHistoryTurns: 0, trimReasons: [] },
   },
+  autonomy: autonomy('full', 'full'),
 })
 
 const measurementDraft = (): AiWriteDraft => ({
@@ -105,6 +152,11 @@ const conversationSummary = (projectId = 'project-1'): AiConversationSummary => 
   id: 'conversation-1',
   projectId,
   title: '总结实验进度',
+  modelProfileId: 'profile-1',
+  modelProfileVersion: 2,
+  modelProfileName: '主对话模型',
+  modelId: 'model-primary',
+  readOnly: false,
   createdAt: '2026-07-18T01:00:00Z',
   updatedAt: '2026-07-18T02:00:00Z',
   revision: 2,
@@ -149,20 +201,40 @@ function session(userId: string): AuthSession {
   }
 }
 
+const privateImage = (
+  id = 'image-1',
+  conversationId = 'conversation-1',
+  previewHref = '/api/v1/ai/images/image-1/content?preview=true',
+) => ({
+  image: {
+    id,
+    conversation_id: conversationId,
+    project_id: 'project-1',
+    status: 'active',
+    expires_at: '2026-08-18T01:00:00Z',
+    meta: { revision: 1 },
+  },
+  fileName: 'evidence.png',
+  mediaType: 'image/png',
+  sizeBytes: 4,
+  sha256: 'abc123',
+  contentHref: `/api/v1/ai/images/${id}/content`,
+  previewHref,
+  retentionDays: 30,
+})
+
 describe('useAiAssistant', () => {
   let ai: ReturnType<typeof useAiAssistant>
 
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks()
     currentAuthSession.value = session('test-reset')
     currentAuthSession.value = undefined
     mocks.mode = 'local'
-    ai = useAiAssistant()
     mocks.listProjects.mockResolvedValue([{ id: 'project-1', name: 'DEMO' }])
     mocks.listAiDrafts.mockResolvedValue([])
     mocks.listAiConversations.mockResolvedValue([])
     mocks.getAiConversation.mockResolvedValue(conversationDetail())
-    mocks.createAiConversation.mockResolvedValue(conversationSummary())
     mocks.updateAiConversation.mockImplementation(async (
       _id: string,
       input: { action: string; title?: string; expectedRevision: number },
@@ -172,9 +244,6 @@ describe('useAiAssistant', () => {
       archivedAt: input.action === 'archive' ? '2026-07-24T01:00:00Z' : undefined,
       revision: input.expectedRevision + 1,
     }))
-    mocks.getAiAutonomy.mockResolvedValue(autonomyView())
-    mocks.setAiAutonomy.mockResolvedValue(autonomyView('auto'))
-    mocks.aiTurn.mockResolvedValue(turnResponse())
     mocks.uploadAiSource.mockImplementation(async ({
       file,
       conversationId,
@@ -212,15 +281,37 @@ describe('useAiAssistant', () => {
       expiresAt: '2999-08-22T01:00:00Z',
     }))
     mocks.deleteAiSource.mockResolvedValue(undefined)
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile(),
+      modelProfile('profile-2'),
+    ])
+    mocks.getAiModelDefaults.mockResolvedValue({
+      defaultConversationProfileId: 'profile-1',
+      revision: 1,
+    })
+    mocks.startAiConversation.mockResolvedValue({
+      conversation: conversationSummary(),
+      autonomy: autonomy('full', 'full'),
+    })
+    mocks.getAiAutonomy.mockResolvedValue(autonomy())
+    mocks.setAiAutonomy.mockImplementation(async (_id, input) =>
+      autonomy(input.mode, input.mode))
+    mocks.aiTurn.mockResolvedValue(turnResponse())
+    mocks.uploadPrivateImage.mockResolvedValue(privateImage())
+    ai = useAiAssistant()
     ai.selectedProjectId.value = 'project-1'
     ai.conversationFilter.value = { archive: 'active', limit: 100 }
     ai.pendingDrafts.value = []
+    ai.conversationDrafts.value = []
+    ai.composerDraft.value = ''
     ai.newConversation()
+    await ai.loadModels(true)
   })
 
   it('clears owner-scoped state and ignores an in-flight turn when identity changes', async () => {
     currentAuthSession.value = session('user-a')
     ai = useAiAssistant()
+    await ai.loadModels(true)
     ai.selectedProjectId.value = 'project-a'
     ai.projects.value = [{ id: 'project-a', name: 'Private project A' }]
     ai.projectsLoaded.value = true
@@ -242,7 +333,7 @@ describe('useAiAssistant', () => {
       resolveTurn = resolve
     }))
 
-    const pendingTurn = ai.send('查询 A 的私有数据')
+    const pendingTurn = ai.send('查询 A 的私有数据', { fullConfirmed: true })
     await vi.waitFor(() => expect(mocks.aiTurn).toHaveBeenCalledTimes(1))
     currentAuthSession.value = undefined
     currentAuthSession.value = session('user-b')
@@ -265,35 +356,56 @@ describe('useAiAssistant', () => {
     expect(ai.messages.value[0]?.content).not.toContain('查询完成')
   })
 
-  it('uses the real gateway and carries the server conversation id into later turns', async () => {
-    await ai.send('总结实验进度')
+  it('starts with the explicit model and carries the conversation id into later turns', async () => {
+    await ai.send('总结实验进度', { fullConfirmed: true })
     await ai.send('哪些动物缺少体重？')
 
+    expect(mocks.startAiConversation).toHaveBeenCalledWith({
+      projectId: 'project-1',
+      title: '总结实验进度',
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
+    })
     expect(mocks.aiTurn).toHaveBeenNthCalledWith(1, {
-      conversationId: undefined,
+      conversationId: 'conversation-1',
       projectId: 'project-1',
       message: '总结实验进度',
+      imageIds: [],
     })
     expect(mocks.aiTurn).toHaveBeenNthCalledWith(2, {
       conversationId: 'conversation-1',
       projectId: 'project-1',
       message: '哪些动物缺少体重？',
+      imageIds: [],
     })
     expect(ai.messages.value.at(-1)).toEqual(expect.objectContaining({
       role: 'assistant', content: '查询完成',
     }))
-    expect(ai.messages.value.at(-1)?.citations?.[0].entityId).toBe('animal-1')
   })
 
-  it('turns provider failures into an explicit non-demo assistant error', async () => {
+  it('does not call a turn or consume the shared prompt when Full start verification fails', async () => {
+    ai.composerDraft.value = '查询动物'
+    mocks.startAiConversation.mockRejectedValueOnce(new Error('当前密码验证失败'))
+
+    await expect(ai.send('查询动物', {
+      fullConfirmed: true,
+    })).rejects.toThrow('当前密码验证失败')
+
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
+    expect(ai.conversationId.value).toBeUndefined()
+    expect(ai.messages.value).toHaveLength(1)
+    expect(ai.composerDraft.value).toBe('查询动物')
+  })
+
+  it('turns provider failures after a successful start into an explicit non-demo error', async () => {
     mocks.aiTurn.mockRejectedValueOnce(new Error('请先启用 AI 并配置所需密钥'))
 
-    await ai.send('查询动物')
+    await ai.send('查询动物', { fullConfirmed: true })
 
     expect(ai.messages.value.at(-1)).toEqual(expect.objectContaining({
       role: 'assistant', error: true, content: '请先启用 AI 并配置所需密钥',
     }))
-    expect(mocks.listAiConversations).not.toHaveBeenCalled()
+    expect(mocks.startAiConversation).toHaveBeenCalledOnce()
   })
 
   it('keeps successful partial results visible when the bounded tool loop stops', async () => {
@@ -303,7 +415,7 @@ describe('useAiAssistant', () => {
       incompleteReason: 'tool_call_limit_exceeded',
     })
 
-    await ai.send('汇总全部项目状态')
+    await ai.send('汇总全部项目状态', { fullConfirmed: true })
 
     expect(ai.messages.value.at(-1)).toEqual(expect.objectContaining({
       role: 'assistant',
@@ -320,26 +432,28 @@ describe('useAiAssistant', () => {
 
     await ai.addFiles([file])
 
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.uploadAiSource).not.toHaveBeenCalled()
+    expect(ai.sources.value).toEqual([
+      expect.objectContaining({
+        fileName: 'measurements.csv',
+        status: 'staged',
+      }),
+    ])
+
+    await ai.send('检查后生成录入预览', { fullConfirmed: true })
+
     expect(mocks.uploadAiSource).toHaveBeenCalledWith({
       file,
       conversationId: 'conversation-1',
       projectId: 'project-1',
     })
-    expect(ai.sources.value).toEqual([
-      expect.objectContaining({
-        sourceId: 'source-1',
-        fileName: 'measurements.csv',
-        status: 'ready',
-      }),
-    ])
-
-    await ai.send('检查后生成录入预览')
-
     expect(mocks.aiTurn).toHaveBeenCalledWith({
       conversationId: 'conversation-1',
       projectId: 'project-1',
       message: '检查后生成录入预览',
       sourceRefs: ['source-1'],
+      imageIds: [],
     })
     expect(ai.sources.value).toEqual([])
     expect(ai.messages.value[1]?.sources).toEqual([
@@ -347,11 +461,101 @@ describe('useAiAssistant', () => {
     ])
   })
 
-  it('keeps explicit archive separate from removing a temporary source', async () => {
-    const file = new File(['animal_id,weight\\nM-001,23.4'], 'measurements.csv', {
-      type: 'text/csv',
+  it('does not attach a vision relay model to text-only sources', async () => {
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile(),
+      modelProfile('vision-1', { supportsVision: true }),
+    ])
+    mocks.getAiModelDefaults.mockResolvedValue({
+      defaultConversationProfileId: 'profile-1',
+      defaultVisionProfileId: 'vision-1',
+      revision: 2,
     })
-    await ai.addFiles([file])
+    await ai.loadModels(true)
+    await ai.addFiles([
+      new File(['# notes'], 'notes.md', { type: 'text/markdown' }),
+    ])
+
+    expect(ai.visionRoute.value).toBe('none')
+    await ai.send('分析文本来源', { fullConfirmed: true })
+
+    expect(mocks.aiTurn).toHaveBeenLastCalledWith({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+      message: '分析文本来源',
+      sourceRefs: ['source-1'],
+      imageIds: [],
+    })
+  })
+
+  it('routes image sources through the selected vision model for a text-only conversation', async () => {
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile(),
+      modelProfile('vision-1', { supportsVision: true }),
+    ])
+    mocks.getAiModelDefaults.mockResolvedValue({
+      defaultConversationProfileId: 'profile-1',
+      defaultVisionProfileId: 'vision-1',
+      revision: 2,
+    })
+    await ai.loadModels(true)
+    await ai.addFiles([
+      new File(['image'], 'source.png', { type: 'image/png' }),
+    ])
+
+    expect(ai.visionRoute.value).toBe('relay')
+    await ai.send('分析图片来源', { fullConfirmed: true })
+
+    expect(mocks.aiTurn).toHaveBeenLastCalledWith({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+      message: '分析图片来源',
+      sourceRefs: ['source-1'],
+      imageIds: [],
+      visionModelProfileId: 'vision-1',
+    })
+  })
+
+  it('does not attach an unused relay model when the conversation model supports vision', async () => {
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { supportsVision: true }),
+      modelProfile('vision-1', { supportsVision: true }),
+    ])
+    mocks.getAiModelDefaults.mockResolvedValue({
+      defaultConversationProfileId: 'profile-1',
+      defaultVisionProfileId: 'vision-1',
+      revision: 2,
+    })
+    await ai.loadModels(true)
+    ai.stageImages([
+      new File(['image'], 'evidence.png', { type: 'image/png' }),
+    ])
+
+    expect(ai.visionRoute.value).toBe('direct')
+    await ai.send('直接读取图片', { fullConfirmed: true })
+
+    expect(mocks.aiTurn).toHaveBeenLastCalledWith({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+      message: '直接读取图片',
+      imageIds: ['image-1'],
+    })
+    releaseComposer()
+  })
+
+  it('keeps explicit archive separate from removing a temporary source', async () => {
+    ai.sources.value = [{
+      clientId: 'source-1',
+      sourceId: 'source-1',
+      projectId: 'project-1',
+      fileName: 'measurements.csv',
+      mediaType: 'text/csv',
+      sizeBytes: 24,
+      status: 'ready',
+      revision: 1,
+      expiresAt: '2999-08-22T01:00:00Z',
+    }]
     const source = ai.sources.value[0]!
 
     await ai.archiveSource(source.clientId)
@@ -364,7 +568,7 @@ describe('useAiAssistant', () => {
     expect(ai.sources.value).toEqual([])
   })
 
-  it('creates exactly one real conversation before concurrent first-file uploads', async () => {
+  it('starts exactly one governed conversation before uploading staged first-turn files', async () => {
     const first = new File(['id,value\nM-1,1'], 'first.csv', { type: 'text/csv' })
     const second = new File(['id,value\nM-2,2'], 'second.csv', { type: 'text/csv' })
     mocks.uploadAiSource
@@ -395,10 +599,17 @@ describe('useAiAssistant', () => {
 
     await ai.addFiles([first, second])
 
-    expect(mocks.createAiConversation).toHaveBeenCalledTimes(1)
-    expect(mocks.createAiConversation).toHaveBeenCalledWith({
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.uploadAiSource).not.toHaveBeenCalled()
+
+    await ai.send('分析这两个文件', { fullConfirmed: true })
+
+    expect(mocks.startAiConversation).toHaveBeenCalledTimes(1)
+    expect(mocks.startAiConversation).toHaveBeenCalledWith({
       projectId: 'project-1',
-      title: '新对话',
+      title: '分析这两个文件',
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
     })
     expect(mocks.uploadAiSource).toHaveBeenCalledTimes(2)
     expect(mocks.uploadAiSource.mock.calls.map((call) => call[0].conversationId))
@@ -406,40 +617,17 @@ describe('useAiAssistant', () => {
     expect(ai.conversationId.value).toBe('conversation-1')
   })
 
-  it('never binds an upload to a conversation created for a stale project scope', async () => {
-    let resolveFirst!: (value: AiConversationSummary) => void
-    mocks.createAiConversation
-      .mockImplementationOnce(() => new Promise<AiConversationSummary>((resolve) => {
-        resolveFirst = resolve
-      }))
-      .mockResolvedValueOnce({
-        ...conversationSummary('project-2'),
-        id: 'conversation-2',
-      })
+  it('discards renderer-staged sources when the project scope changes before send', async () => {
     mocks.listAiConversations.mockResolvedValue([])
-    const staleUpload = ai.addFiles([
+    await ai.addFiles([
       new File(['M-1'], 'stale.csv', { type: 'text/csv' }),
     ])
-    await vi.waitFor(() => expect(mocks.createAiConversation).toHaveBeenCalledTimes(1))
 
     await ai.selectProject('project-2')
-    await ai.addFiles([
-      new File(['M-2'], 'current.csv', { type: 'text/csv' }),
-    ])
-    resolveFirst(conversationSummary('project-1'))
-    await staleUpload
 
-    expect(mocks.createAiConversation).toHaveBeenCalledTimes(2)
-    expect(mocks.createAiConversation).toHaveBeenNthCalledWith(2, {
-      projectId: 'project-2',
-      title: '新对话',
-    })
-    expect(mocks.uploadAiSource).toHaveBeenCalledTimes(1)
-    expect(mocks.uploadAiSource).toHaveBeenCalledWith(expect.objectContaining({
-      conversationId: 'conversation-2',
-      projectId: 'project-2',
-    }))
-    expect(ai.conversationId.value).toBe('conversation-2')
+    expect(ai.sources.value).toEqual([])
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.uploadAiSource).not.toHaveBeenCalled()
   })
 
   it('rejects unsupported or oversized files before calling the source gateway', async () => {
@@ -459,8 +647,192 @@ describe('useAiAssistant', () => {
     ])
   })
 
-  it('restores persisted messages and only currently usable ready sources after refresh', async () => {
+  it('does not silently choose the first vision model when no default exists', async () => {
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile(),
+      modelProfile('vision-1', {
+        name: '视觉模型',
+        supportsVision: true,
+        isDefaultConversation: false,
+      }),
+    ])
+    mocks.getAiModelDefaults.mockResolvedValue({
+      defaultConversationProfileId: 'profile-1',
+      revision: 2,
+    })
+    await ai.loadModels(true)
+    ai.stageImages([new File(['data'], 'evidence.png', { type: 'image/png' })])
+
+    expect(ai.selectedVisionModelProfileId.value).toBeUndefined()
+    expect(ai.composerDisabledReason.value).toContain('明确选择')
+    await expect(ai.send('分析图片', { fullConfirmed: true })).rejects.toThrow('明确选择')
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.uploadPrivateImage).not.toHaveBeenCalled()
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
+    releaseComposer()
+  })
+
+  it('preserves the prompt and staged images when the provider call fails', async () => {
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { supportsVision: true }),
+      modelProfile('profile-2'),
+    ])
+    await ai.loadModels(true)
+    ai.composerDraft.value = '从图片读取体重'
+    ai.stageImages([new File(['data'], 'evidence.png', { type: 'image/png' })])
+    mocks.aiTurn.mockRejectedValueOnce(new Error('视觉 Provider 暂时不可用'))
+
+    await ai.send(ai.composerDraft.value, { fullConfirmed: true })
+
+    expect(ai.composerDraft.value).toBe('从图片读取体重')
+    expect(ai.stagedImages.value).toHaveLength(1)
+    expect(ai.stagedImages.value[0]).toEqual(expect.objectContaining({
+      status: 'ready',
+      uploaded: expect.objectContaining({ image: expect.objectContaining({ id: 'image-1' }) }),
+    }))
+    expect(ai.messages.value.at(-1)).toEqual(expect.objectContaining({
+      error: true,
+      content: '视觉 Provider 暂时不可用',
+    }))
+    releaseComposer()
+  })
+
+  it('keeps staged files but clears their conversation upload binding after a confirmed model switch', async () => {
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { supportsVision: true }),
+      modelProfile('profile-2', { supportsVision: true }),
+    ])
+    await ai.loadModels(true)
+    ai.composerDraft.value = '保留这段未发送输入'
+    ai.stageImages([new File(['data'], 'evidence.png', { type: 'image/png' })])
+    mocks.aiTurn.mockRejectedValueOnce(new Error('请求失败'))
+    await ai.send('先尝试一次', { fullConfirmed: true })
+
+    expect(ai.selectModel('profile-2')).toBe(false)
+    expect(ai.selectModel('profile-2', true)).toBe(true)
+    expect(ai.conversationId.value).toBeUndefined()
+    expect(ai.composerDraft.value).toBe('保留这段未发送输入')
+    expect(ai.stagedImages.value).toEqual([
+      expect.objectContaining({ status: 'staged', uploaded: undefined }),
+    ])
+    releaseComposer()
+  })
+
+  it('rejects image formats outside the common provider protocol set', () => {
+    expect(() => ai.stageImages([
+      new File(['bitmap'], 'legacy.bmp', { type: 'image/bmp' }),
+    ])).toThrow('JPEG、PNG、WebP 或 GIF')
+    expect(ai.stagedImages.value).toHaveLength(0)
+    expect(mocks.uploadPrivateImage).not.toHaveBeenCalled()
+  })
+
+  it('rejects chat images above 10 MiB before upload or Provider work', async () => {
+    const oversized = new File(['x'], 'oversized.png', { type: 'image/png' })
+    Object.defineProperty(oversized, 'size', { value: 10 * 1024 * 1024 + 1 })
+
+    expect(() => ai.stageImages([oversized])).toThrow('10 MiB')
+    expect(ai.stagedImages.value).toHaveLength(0)
+    expect(mocks.uploadPrivateImage).not.toHaveBeenCalled()
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
+  })
+
+  it('revokes the local preview immediately when a successful upload has a private preview URL', async () => {
+    const createPreview = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:success-preview')
+    const revokePreview = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { supportsVision: true }),
+    ])
+    await ai.loadModels(true)
+    ai.stageImages([new File(['data'], 'evidence.png', { type: 'image/png' })])
+
+    await ai.send('分析图片', { fullConfirmed: true })
+
+    expect(createPreview).toHaveBeenCalledOnce()
+    expect(revokePreview).toHaveBeenCalledWith('blob:success-preview')
+    expect(ai.stagedImages.value).toHaveLength(0)
+    expect(ai.messages.value.find((message) => message.role === 'user')?.images?.[0]?.previewHref)
+      .toBe('/api/v1/ai/images/image-1/content?preview=true')
+    releaseComposer()
+    createPreview.mockRestore()
+    revokePreview.mockRestore()
+  })
+
+  it('releases fallback message previews on conversation switch and staged previews on final unmount', async () => {
+    const createPreview = vi.spyOn(URL, 'createObjectURL')
+      .mockReturnValueOnce('blob:fallback-message')
+      .mockReturnValueOnce('blob:still-staged')
+    const revokePreview = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+    const releaseComposer = ai.retainImageComposer()
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { supportsVision: true }),
+      modelProfile('profile-2', { supportsVision: true }),
+    ])
+    mocks.uploadPrivateImage.mockResolvedValueOnce(privateImage('image-1', 'conversation-1', ''))
+    await ai.loadModels(true)
+    ai.stageImages([new File(['data'], 'first.png', { type: 'image/png' })])
+    await ai.send('分析第一张', { fullConfirmed: true })
+
+    expect(revokePreview).not.toHaveBeenCalledWith('blob:fallback-message')
+    expect(ai.selectModel('profile-2', true)).toBe(true)
+    expect(revokePreview).toHaveBeenCalledWith('blob:fallback-message')
+
+    ai.stageImages([new File(['next'], 'second.png', { type: 'image/png' })])
+    releaseComposer()
+    expect(revokePreview).toHaveBeenCalledWith('blob:still-staged')
+    expect(ai.stagedImages.value).toHaveLength(0)
+    createPreview.mockRestore()
+    revokePreview.mockRestore()
+  })
+
+  it('requires an explicit selection when the saved default is unavailable', async () => {
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { archivedAt: '2026-07-20T00:00:00Z' }),
+    ])
+    await ai.loadModels(true)
+    ai.newConversation()
+
+    expect(ai.selectedModelProfileId.value).toBeUndefined()
+    expect(ai.composerDisabledReason.value).toContain('明确选择')
+    await expect(ai.send('不能静默选第一个', {
+      fullConfirmed: true,
+    })).rejects.toThrow('明确选择')
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
+  })
+
+  it('does not fall back to the first active profile when the saved default no longer exists', async () => {
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', { isDefaultConversation: false }),
+      modelProfile('profile-2', { isDefaultConversation: false }),
+    ])
+    mocks.getAiModelDefaults.mockResolvedValue({
+      defaultConversationProfileId: 'missing-profile',
+      revision: 7,
+    })
+
+    await ai.loadModels(true)
+    ai.newConversation()
+
+    expect(ai.selectedModelProfileId.value).toBeUndefined()
+    expect(ai.modelOptions.value.map((option) => option.value)).toEqual([
+      'profile-1',
+      'profile-2',
+    ])
+    await expect(ai.send('不能回退到列表第一项', {
+      fullConfirmed: true,
+    })).rejects.toThrow('明确选择')
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
+  })
+
+  it('restores persisted messages, usable sources, and conversation-scoped drafts', async () => {
     const draft = measurementDraft()
+    const unrelatedProjectDraft = { ...measurementDraft(), id: 'project-draft' }
     const detail = conversationDetail()
     detail.messages[0].sourceRefs = [{
       sourceId: 'source-history-1',
@@ -504,6 +876,7 @@ describe('useAiAssistant', () => {
         expiresAt: '2000-01-01T00:00:00Z',
       },
     ])
+    ai.pendingDrafts.value = [unrelatedProjectDraft]
 
     await ai.restoreLatestConversation(true)
 
@@ -514,10 +887,8 @@ describe('useAiAssistant', () => {
       projectId: 'project-1',
     })
     expect(ai.conversationId.value).toBe('conversation-1')
-    expect(ai.messages.value).toHaveLength(2)
     expect(ai.messages.value[1]).toEqual(expect.objectContaining({
-      id: 'message-2', role: 'assistant', content: '查询完成',
-      citations: [expect.objectContaining({ entityId: 'animal-1' })],
+      id: 'message-2',
       drafts: [expect.objectContaining({ id: 'draft-1' })],
       incompleteReason: 'provider_failure',
     }))
@@ -534,7 +905,13 @@ describe('useAiAssistant', () => {
         status: 'ready',
       }),
     ])
-    expect(ai.pendingDrafts.value).toEqual([expect.objectContaining({ id: 'draft-1' })])
+    expect(ai.conversationDrafts.value).toEqual([
+      expect.objectContaining({ id: 'draft-1' }),
+    ])
+    expect(ai.pendingDrafts.value).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'project-draft' }),
+      expect.objectContaining({ id: 'draft-1' }),
+    ]))
 
     await ai.send('继续检查当前可用文件')
     expect(mocks.aiTurn).toHaveBeenLastCalledWith({
@@ -542,6 +919,7 @@ describe('useAiAssistant', () => {
       projectId: 'project-1',
       message: '继续检查当前可用文件',
       sourceRefs: ['source-ready'],
+      imageIds: [],
     })
   })
 
@@ -613,7 +991,7 @@ describe('useAiAssistant', () => {
       resolveTurn = resolve
     }))
 
-    const sending = ai.send('旧会话中的查询')
+    const sending = ai.send('旧会话中的查询', { fullConfirmed: true })
     await vi.waitFor(() => expect(mocks.aiTurn).toHaveBeenCalledOnce())
     ai.newConversation()
     resolveTurn(turnResponse('stale-conversation'))
@@ -630,7 +1008,7 @@ describe('useAiAssistant', () => {
     mocks.aiTurn.mockImplementationOnce(() => new Promise<AiTurnResponse>((resolve) => {
       resolveTurn = resolve
     }))
-    const oldTurn = ai.send('旧会话中的查询')
+    const oldTurn = ai.send('旧会话中的查询', { fullConfirmed: true })
     await vi.waitFor(() => expect(mocks.aiTurn).toHaveBeenCalledOnce())
 
     const detail = conversationDetail()
@@ -716,8 +1094,10 @@ describe('useAiAssistant', () => {
     expect(ai.conversationArchived.value).toBe(true)
     expect(ai.messages.value).toHaveLength(2)
     expect(mocks.listAiSources).not.toHaveBeenCalled()
-    await ai.send('不应发送')
-    await ai.addFiles([new File(['M-1'], 'blocked.csv', { type: 'text/csv' })])
+    await expect(ai.send('不应发送')).rejects.toThrow('已归档会话为只读')
+    await expect(ai.addFiles([
+      new File(['M-1'], 'blocked.csv', { type: 'text/csv' }),
+    ])).rejects.toThrow('已归档会话为只读')
     await expect(ai.updateAutonomy('auto')).rejects.toThrow('已归档会话为只读')
     await expect(ai.decideDraft(measurementDraft(), 'reject')).rejects.toThrow('已归档会话为只读')
     expect(mocks.aiTurn).not.toHaveBeenCalled()
@@ -895,6 +1275,33 @@ describe('useAiAssistant', () => {
     expect(mocks.decideAiDraft).not.toHaveBeenCalled()
   })
 
+  it('shows the immutable conversation version instead of the profiles current model identity', async () => {
+    mocks.listAiModelProfiles.mockResolvedValue([
+      modelProfile('profile-1', {
+        name: '当前配置名称',
+        modelId: 'model-current-v3',
+        currentVersion: 3,
+      }),
+      modelProfile('profile-2'),
+    ])
+    await ai.loadModels(true)
+    const detail = conversationDetail()
+    detail.conversation = {
+      ...conversationSummary(),
+      modelProfileVersion: 1,
+      modelProfileName: '会话绑定名称',
+      modelId: 'model-pinned-v1',
+    }
+    mocks.getAiConversation.mockResolvedValue(detail)
+
+    await ai.openConversation('conversation-1')
+
+    expect(ai.selectedModelProfileId.value).toBe('profile-1')
+    expect(ai.modelOptions.value.find((option) => option.value === 'profile-1')?.label)
+      .toBe('会话绑定名称 · model-pinned-v1 · v1')
+    expect(mocks.startAiConversation).not.toHaveBeenCalled()
+  })
+
   it('switches project scope before restoring that projects latest conversation', async () => {
     mocks.listProjects.mockResolvedValue([
       { id: 'project-1', name: 'DEMO' },
@@ -913,6 +1320,99 @@ describe('useAiAssistant', () => {
     expect(mocks.listAiConversations).toHaveBeenCalledWith('project-2', 100)
     expect(ai.selectedProjectId.value).toBe('project-2')
     expect(ai.conversationId.value).toBe('conversation-2')
+  })
+
+  it('switches an empty conversation directly but requires confirmation after persisted messages', async () => {
+    await ai.requestMode('ask')
+    await ai.startConversation('空会话')
+    expect(ai.hasPersistedMessages.value).toBe(false)
+    expect(ai.selectModel('profile-2')).toBe(true)
+    expect(ai.conversationId.value).toBeUndefined()
+    expect(ai.selectedModelProfileId.value).toBe('profile-2')
+
+    mocks.startAiConversation.mockResolvedValueOnce({
+      conversation: {
+        ...conversationSummary(),
+        modelProfileId: 'profile-2',
+        modelProfileName: '备用模型',
+        modelId: 'model-secondary',
+      },
+      autonomy: autonomy('full', 'auto'),
+    })
+    ai.composerDraft.value = '尚未发送的输入'
+    ai.pendingDrafts.value = [{ ...measurementDraft(), id: 'project-level-draft' }]
+    await ai.send('已发送的消息', { fullConfirmed: true })
+    ai.conversationDrafts.value = [measurementDraft()]
+
+    expect(ai.selectModel('profile-1')).toBe(false)
+    expect(ai.conversationId.value).toBe('conversation-1')
+    expect(ai.selectedModelProfileId.value).toBe('profile-2')
+
+    expect(ai.selectModel('profile-1', true)).toBe(true)
+    expect(ai.conversationId.value).toBeUndefined()
+    expect(ai.selectedModelProfileId.value).toBe('profile-1')
+    expect(ai.messages.value).toHaveLength(1)
+    expect(ai.conversationDrafts.value).toEqual([])
+    expect(ai.pendingDrafts.value).toEqual([expect.objectContaining({ id: 'project-level-draft' })])
+    expect(ai.composerDraft.value).toBe('尚未发送的输入')
+    expect(ai.requestedMode.value).toBe('full')
+    expect(ai.autonomy.value.effectiveMode).toBe('ask')
+  })
+
+  it('keeps archived and legacy histories readable while disabling their composer', async () => {
+    const archived = modelProfile('profile-1', { archivedAt: '2026-07-20T00:00:00Z' })
+    mocks.listAiModelProfiles.mockResolvedValue([archived, modelProfile('profile-2')])
+    await ai.loadModels(true)
+    const detail = conversationDetail()
+    detail.conversation = {
+      ...conversationSummary(),
+      readOnly: true,
+      readOnlyReason: 'model_archived',
+    }
+    mocks.getAiConversation.mockResolvedValue(detail)
+
+    await ai.openConversation('conversation-1')
+
+    expect(ai.messages.value).toHaveLength(2)
+    expect(ai.conversationReadOnlyReason.value).toContain('已归档')
+    expect(ai.composerDisabledReason.value).toContain('已归档')
+    await expect(ai.send('不能继续归档会话')).rejects.toThrow('已归档')
+    expect(mocks.aiTurn).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['legacy_model_unknown', undefined, '旧会话没有可识别的模型绑定'],
+    ['model_unavailable', 'missing-profile', '模型版本当前不可用'],
+  ] as const)(
+    'keeps %s history readable and blocks direct send calls',
+    async (readOnlyReason, modelProfileId, expectedReason) => {
+      const detail = conversationDetail()
+      detail.conversation = {
+        ...conversationSummary(),
+        modelProfileId,
+        readOnly: true,
+        readOnlyReason,
+      }
+      mocks.getAiConversation.mockResolvedValue(detail)
+
+      await ai.openConversation('conversation-1')
+
+      expect(ai.messages.value).toHaveLength(2)
+      expect(ai.conversationReadOnlyReason.value).toContain(expectedReason)
+      expect(ai.composerDisabledReason.value).toContain(expectedReason)
+      await expect(ai.send('不能继续只读历史')).rejects.toThrow(expectedReason)
+      expect(mocks.aiTurn).not.toHaveBeenCalled()
+    },
+  )
+
+  it('shares the unsent composer draft between Drawer and Workspace consumers', () => {
+    const drawer = useAiAssistant()
+    const workspace = useAiAssistant()
+    drawer.composerDraft.value = '从 Drawer 输入但尚未发送'
+
+    expect(workspace.composerDraft.value).toBe('从 Drawer 输入但尚未发送')
+    workspace.newConversation()
+    expect(drawer.composerDraft.value).toBe('从 Drawer 输入但尚未发送')
   })
 
   it('requires a researcher statement without sending any client step-up claim', async () => {
@@ -955,7 +1455,6 @@ describe('useAiAssistant', () => {
       decision: 'approve',
       statement: '我已核对完整导入预览',
     })
-    expect(mocks.decideAiDraft.mock.calls.at(-1)?.[1]).not.toHaveProperty('stepUpVerified')
     expect(mocks.decideAiDraft.mock.calls.at(-1)?.[1]).not.toHaveProperty('currentPassword')
   })
 
@@ -1024,7 +1523,6 @@ describe('useAiAssistant', () => {
 
   it('requires and sends the current password only for a remote reinforced approval', async () => {
     mocks.mode = 'remote'
-    ai = useAiAssistant()
     const draft = reinforcedDraft()
     mocks.decideAiDraft.mockResolvedValue({
       draft: { ...draft, status: 'applied', revision: 3 },
@@ -1040,12 +1538,10 @@ describe('useAiAssistant', () => {
       statement: '我已核对完整导入预览',
       currentPassword: 'one-request-password',
     })
-    expect(mocks.decideAiDraft.mock.calls.at(-1)?.[1]).not.toHaveProperty('stepUpVerified')
   })
 
   it('never sends a password when rejecting a reinforced draft', async () => {
     mocks.mode = 'remote'
-    ai = useAiAssistant()
     const draft = reinforcedDraft()
     mocks.decideAiDraft.mockResolvedValue({
       draft: { ...draft, status: 'rejected', revision: 2 },

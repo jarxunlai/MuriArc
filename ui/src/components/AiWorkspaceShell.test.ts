@@ -37,6 +37,7 @@ const activeConversation = (): AiConversationSummary => ({
   id: 'conversation-active',
   projectId: 'project-1',
   title: '活动会话',
+  readOnly: false,
   createdAt: '2026-07-24T01:00:00Z',
   updatedAt: '2026-07-24T02:00:00Z',
   revision: 2,

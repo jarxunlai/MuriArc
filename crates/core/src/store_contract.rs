@@ -10,6 +10,54 @@ fn contract_now() -> chrono::DateTime<Utc> {
         .expect("the current UTC timestamp is representable")
 }
 
+async fn create_ai_contract_model_binding<S>(
+    store: &S,
+    lab_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    label: &str,
+    now: chrono::DateTime<Utc>,
+    audit: &AuditContext,
+) -> AiModelProfileBinding
+where
+    S: AiModelProfileStore + ?Sized,
+{
+    let profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id,
+        user_id,
+        name: format!("{label} model"),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let version = AiModelProfileVersion {
+        profile_id: profile.id,
+        version: 1,
+        protocol: AiProviderProtocol::OpenaiChatCompletions,
+        transport: AiProviderTransport::OpenAiCompatible,
+        base_url: "https://provider.example.test/v1".to_owned(),
+        normalized_base_url: "https://provider.example.test/v1".to_owned(),
+        model_id: format!("{label}-model"),
+        supports_vision: false,
+        context_window_tokens: 16_384,
+        max_input_tokens: 8_192,
+        max_output_tokens: 2_048,
+        history_token_budget: 4_096,
+        history_turns: 20,
+        temperature: 0.0,
+        timeout_ms: 30_000,
+        created_at: now,
+    };
+    store
+        .create_ai_model_profile(&profile, &version, audit)
+        .await
+        .unwrap();
+    AiModelProfileBinding {
+        profile_id: profile.id,
+        profile_version: version.version,
+    }
+}
+
 async fn create_ai_source_contract_fixture<S>(
     store: &S,
     conversation: &AiConversation,
@@ -22,6 +70,26 @@ async fn create_ai_source_contract_fixture<S>(
 where
     S: MuriArcStore + AiOperationStore + ?Sized,
 {
+    let (source, attachment) = ai_source_contract_records(
+        conversation,
+        status,
+        size_bytes,
+        last_activity_at,
+        expires_at,
+    );
+    store
+        .create_ai_conversation_source(&attachment, &source, audit)
+        .await?;
+    Ok((source, attachment))
+}
+
+fn ai_source_contract_records(
+    conversation: &AiConversation,
+    status: AiConversationSourceStatus,
+    size_bytes: i64,
+    last_activity_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+) -> (AiConversationSource, Attachment) {
     let source_id = uuid::Uuid::new_v4();
     let attachment = Attachment {
         id: uuid::Uuid::new_v4(),
@@ -53,17 +121,84 @@ where
             .then(|| "contract_failure".to_owned()),
         meta: RecordMeta::new(last_activity_at),
     };
-    store
-        .create_ai_conversation_source(&attachment, &source, audit)
-        .await?;
-    Ok((source, attachment))
+    (source, attachment)
+}
+
+fn private_ai_image_contract_records(
+    conversation: &AiConversation,
+    now: chrono::DateTime<Utc>,
+) -> (PrivateAiImage, Attachment) {
+    let image_id = uuid::Uuid::new_v4();
+    let attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: conversation.lab_id,
+        project_id: None,
+        entity_type: "ai_private_image".to_owned(),
+        entity_id: image_id,
+        file_name: format!("{image_id}.png"),
+        media_type: Some("image/png".to_owned()),
+        relative_path: format!("contract/{}", uuid::Uuid::new_v4()),
+        size_bytes: 24,
+        sha256: "b".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    let image = PrivateAiImage {
+        id: image_id,
+        lab_id: conversation.lab_id,
+        user_id: conversation.user_id,
+        conversation_id: Some(conversation.id),
+        attachment_id: attachment.id,
+        project_id: None,
+        status: PrivateImageStatus::Active,
+        last_activity_at: now,
+        expires_at: now + Duration::days(30),
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    (image, attachment)
+}
+
+async fn workspace_evidence_counts<S>(
+    store: &S,
+    lab_id: uuid::Uuid,
+    entity_ids: &[uuid::Uuid],
+) -> (usize, usize)
+where
+    S: MuriArcStore + ?Sized,
+{
+    let mut audits = 0;
+    let mut provenance = 0;
+    for entity_id in entity_ids {
+        audits += store
+            .list_audit_entries(&AuditFilter {
+                lab_id,
+                project_id: None,
+                entity_id: Some(*entity_id),
+            })
+            .await
+            .unwrap()
+            .len();
+        provenance += store
+            .list_provenance(&ProvenanceFilter {
+                lab_id,
+                project_id: None,
+                entity_type: None,
+                entity_id: Some(*entity_id),
+                source: None,
+            })
+            .await
+            .unwrap()
+            .len();
+    }
+    (audits, provenance)
 }
 
 /// Shared adapter contract for owner quotas and deterministic retention
 /// candidates. The target store must point at an isolated database.
 pub async fn run_ai_conversation_source_retention_contract<S>(store: &S)
 where
-    S: MuriArcStore + AiOperationStore + ?Sized,
+    S: MuriArcStore + AiModelProfileStore + AiOperationStore + ?Sized,
 {
     store.migrate().await.unwrap();
     let now = contract_now();
@@ -81,12 +216,23 @@ where
     )
     .unwrap();
     store.create_user(&count_user, &audit).await.unwrap();
+    let count_model_profile = create_ai_contract_model_binding(
+        store,
+        lab.id,
+        count_user.id,
+        "source-count-contract",
+        now,
+        &audit,
+    )
+    .await;
     let count_conversation = AiConversation {
         id: uuid::Uuid::new_v4(),
         lab_id: lab.id,
         project_id: Some(project.id),
         user_id: count_user.id,
         title: "Count quota".to_owned(),
+        model_profile: Some(count_model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),
@@ -220,12 +366,23 @@ where
     )
     .unwrap();
     store.create_user(&byte_user, &audit).await.unwrap();
+    let byte_model_profile = create_ai_contract_model_binding(
+        store,
+        lab.id,
+        byte_user.id,
+        "source-byte-contract",
+        now,
+        &audit,
+    )
+    .await;
     let byte_conversation = AiConversation {
         id: uuid::Uuid::new_v4(),
         lab_id: lab.id,
         project_id: Some(project.id),
         user_id: byte_user.id,
         title: "Byte quota".to_owned(),
+        model_profile: Some(byte_model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),
@@ -290,12 +447,23 @@ where
     )
     .unwrap();
     store.create_user(&retention_user, &audit).await.unwrap();
+    let retention_model_profile = create_ai_contract_model_binding(
+        store,
+        lab.id,
+        retention_user.id,
+        "source-retention-contract",
+        now,
+        &audit,
+    )
+    .await;
     let retention_conversation = AiConversation {
         id: uuid::Uuid::new_v4(),
         lab_id: lab.id,
         project_id: Some(project.id),
         user_id: retention_user.id,
         title: "Retention candidates".to_owned(),
+        model_profile: Some(retention_model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),
@@ -487,6 +655,235 @@ async fn assign_project_animal(
         .await
         .expect("project animal assignment succeeds");
     assignment
+}
+
+async fn create_phase4_contract_definition<S>(
+    store: &S,
+    lab_id: uuid::Uuid,
+    project_id: uuid::Uuid,
+    experiment_id: uuid::Uuid,
+    key: &str,
+    audit: &AuditContext,
+    now: chrono::DateTime<Utc>,
+) -> ObservationDefinition
+where
+    S: MuriArcStore + ?Sized,
+{
+    let mut definition = ObservationDefinition::new(
+        lab_id,
+        project_id,
+        experiment_id,
+        key,
+        key.replace('_', " "),
+        ObservationValueType::Number,
+        ObservationPolicy::Versioned,
+        now,
+    )
+    .unwrap();
+    definition.unit = Some("g".to_owned());
+    definition.validate().unwrap();
+    store
+        .create_observation_definition(&definition, audit)
+        .await
+        .unwrap();
+    definition
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_phase4_contract_draft<S>(
+    store: &S,
+    lab_id: uuid::Uuid,
+    project_id: uuid::Uuid,
+    experiment_id: uuid::Uuid,
+    event_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    definition: &ObservationDefinition,
+    profile: &AiModelProfile,
+    profile_version: &AiModelProfileVersion,
+    provider: &str,
+    image_count: usize,
+    audit: &AuditContext,
+    now: chrono::DateTime<Utc>,
+) -> (AiExtractionDraft, Vec<Attachment>, Vec<PrivateAiImage>)
+where
+    S: MuriArcStore + ?Sized,
+{
+    let observation = Observation::new(
+        lab_id,
+        project_id,
+        experiment_id,
+        event_id,
+        definition.id,
+        ObservationSubjectType::Experiment,
+        experiment_id,
+        now,
+    )
+    .unwrap();
+    let value = ObservationValueRecord::new(
+        observation.id,
+        1,
+        ObservationValueData::Number(1.0),
+        now,
+        now,
+    )
+    .unwrap();
+    let mut attachments = Vec::with_capacity(image_count);
+    let mut images = Vec::with_capacity(image_count);
+    let mut evidence = Vec::with_capacity(image_count);
+    for display_order in 0..image_count {
+        let image_id = uuid::Uuid::new_v4();
+        let original_sha256 = if display_order % 2 == 0 {
+            "3".repeat(64)
+        } else {
+            "4".repeat(64)
+        };
+        let sanitized_sha256 = if display_order % 2 == 0 {
+            "5".repeat(64)
+        } else {
+            "6".repeat(64)
+        };
+        let attachment = Attachment {
+            id: uuid::Uuid::new_v4(),
+            lab_id,
+            project_id: None,
+            entity_type: "ai_private_image".to_owned(),
+            entity_id: image_id,
+            file_name: format!("{provider}-{display_order}.png"),
+            media_type: Some("image/png".to_owned()),
+            relative_path: format!("ai-private/{}.png", uuid::Uuid::new_v4()),
+            size_bytes: 64,
+            sha256: original_sha256.clone(),
+            version: 1,
+            meta: RecordMeta::new(now),
+        };
+        let image = PrivateAiImage {
+            id: image_id,
+            lab_id,
+            user_id,
+            conversation_id: None,
+            attachment_id: attachment.id,
+            project_id: None,
+            status: PrivateImageStatus::Active,
+            last_activity_at: now,
+            expires_at: now + Duration::days(30),
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_private_ai_image(&attachment, &image, audit)
+            .await
+            .unwrap();
+        evidence.push(AiExtractionEvidence {
+            display_order: display_order as i32,
+            private_image_id: image.id,
+            private_attachment_id: attachment.id,
+            promoted_attachment_id: None,
+            original_sha256,
+            sanitized_sha256,
+            meta: RecordMeta::new(now),
+        });
+        attachments.push(attachment);
+        images.push(image);
+    }
+    let draft = AiExtractionDraft {
+        id: uuid::Uuid::new_v4(),
+        lab_id,
+        user_id,
+        project_id,
+        experiment_id,
+        experiment_event_id: event_id,
+        private_image_id: evidence[0].private_image_id,
+        attachment_id: evidence[0].private_attachment_id,
+        image_sha256: evidence[0].original_sha256.clone(),
+        provider: provider.to_owned(),
+        model: profile_version.model_id.clone(),
+        tool_run_id: None,
+        data_cell: Some(AiObservationDataCell {
+            definition_id: definition.id,
+            subject_type: ObservationSubjectType::Experiment,
+            subject_id: experiment_id,
+        }),
+        evidence,
+        model_trace: Some(AiExtractionModelTrace {
+            profile_id: profile.id,
+            profile_version: profile_version.version,
+            purpose: AiModelPurpose::Vision,
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            provider_request_id: Some(format!("{provider}-request")),
+            trace: serde_json::json!({"route": provider}),
+        }),
+        status: AiExtractionStatus::PendingApproval,
+        items: vec![AiExtractionItem {
+            observation,
+            value,
+            confidence: 0.8,
+            selected: false,
+            source_label: Some(provider.to_owned()),
+        }],
+        error_code: None,
+        meta: RecordMeta::new(now),
+    };
+    (draft, attachments, images)
+}
+
+fn initial_ask_grant(conversation: &AiConversation, now: chrono::DateTime<Utc>) -> AiAutonomyGrant {
+    AiAutonomyGrant {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: conversation.id,
+        lab_id: conversation.lab_id,
+        project_id: conversation.project_id,
+        user_id: conversation.user_id,
+        session_id: None,
+        mode: AiAutonomyMode::Ask,
+        allowed_categories: vec![AiActionCategory::Read],
+        batch_limit: AiAutonomyMode::Ask.batch_limit(),
+        step_up_verified_at: None,
+        last_used_at: now,
+        expires_at: None,
+        revoked_at: None,
+        meta: RecordMeta::new(now),
+    }
+}
+
+async fn assert_atomic_ai_start_absent<S>(
+    store: &S,
+    conversation: &AiConversation,
+    grant: &AiAutonomyGrant,
+    label: &str,
+) where
+    S: MuriArcStore + AiOperationStore + ?Sized,
+{
+    assert!(
+        matches!(
+            store.get_ai_conversation(conversation.id).await,
+            Err(StoreError::NotFound { .. })
+        ),
+        "{label}: a rejected atomic start must not leave a conversation"
+    );
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        None,
+        "{label}: a rejected atomic start must not leave an autonomy grant"
+    );
+    for (entity_id, project_id) in [
+        (conversation.id, conversation.project_id),
+        (grant.id, grant.project_id),
+    ] {
+        assert!(
+            store
+                .list_audit_entries(&AuditFilter {
+                    lab_id: conversation.lab_id,
+                    project_id,
+                    entity_id: Some(entity_id),
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "{label}: a rejected atomic start must not leave audit records"
+        );
+    }
 }
 
 /// Runs the behavior contract shared by every persistence adapter.
@@ -1507,7 +1904,7 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
 /// The target store may already be migrated, but must be connected to a test database.
 pub async fn run_research_extensions_contract<S>(store: &S)
 where
-    S: MuriArcStore + AiOperationStore,
+    S: MuriArcStore + AiModelProfileStore + AiOperationStore,
 {
     store.migrate().await.expect("migration succeeds");
     let now = contract_now();
@@ -1522,6 +1919,15 @@ where
     )
     .unwrap();
     store.create_user(&user, &setup_audit).await.unwrap();
+    let conversation_model_profile = create_ai_contract_model_binding(
+        store,
+        lab.id,
+        user.id,
+        "research-source-contract",
+        now,
+        &setup_audit,
+    )
+    .await;
     let human_audit = AuditContext {
         actor: Actor::human(user.id, user.display_name.clone()),
         source: WriteSource::Web,
@@ -2187,6 +2593,8 @@ where
         project_id: Some(project.id),
         user_id: user.id,
         title: "Project source contract".to_owned(),
+        model_profile: Some(conversation_model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),
@@ -2197,6 +2605,8 @@ where
         project_id: None,
         user_id: user.id,
         title: "Lab source contract".to_owned(),
+        model_profile: Some(conversation_model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),
@@ -2454,6 +2864,9 @@ where
         provider: "contract-provider".to_owned(),
         model: "contract-vision".to_owned(),
         tool_run_id: None,
+        data_cell: None,
+        evidence: Vec::new(),
+        model_trace: None,
         status: AiExtractionStatus::PendingApproval,
         items: vec![AiExtractionItem {
             observation: overwrite_observation.clone(),
@@ -2473,8 +2886,14 @@ where
         store
             .apply_ai_extraction_draft(
                 overwrite_draft.id,
-                overwrite_draft.meta.revision,
-                &[0],
+                &AiExtractionApprovalInput {
+                    expected_revision: overwrite_draft.meta.revision,
+                    selections: vec![AiExtractionApprovalSelection {
+                        item_index: 0,
+                        value: ObservationValueData::Number(99.0),
+                        notes: None,
+                    }],
+                },
                 &human_audit,
             )
             .await,
@@ -2492,6 +2911,25 @@ where
         store.get_observation(overwrite_observation.id).await,
         Err(StoreError::NotFound { .. })
     ));
+    let rejected_legacy = store
+        .reject_ai_extraction_draft(
+            overwrite_draft.id,
+            &AiExtractionRejectionInput {
+                expected_revision: overwrite_draft.meta.revision,
+            },
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected_legacy.status, AiExtractionStatus::Rejected);
+    assert_eq!(
+        store
+            .get_private_ai_image(private_image.id)
+            .await
+            .unwrap()
+            .status,
+        PrivateImageStatus::Active
+    );
 
     let completed_experiment =
         Experiment::new(lab.id, project.id, "Closed AI write contract", now).unwrap();
@@ -2606,6 +3044,9 @@ where
         provider: "contract-provider".to_owned(),
         model: "contract-vision".to_owned(),
         tool_run_id: None,
+        data_cell: None,
+        evidence: Vec::new(),
+        model_trace: None,
         status: AiExtractionStatus::PendingApproval,
         items: vec![AiExtractionItem {
             observation: closed_observation.clone(),
@@ -2625,8 +3066,14 @@ where
         store
             .apply_ai_extraction_draft(
                 closed_draft.id,
-                closed_draft.meta.revision,
-                &[0],
+                &AiExtractionApprovalInput {
+                    expected_revision: closed_draft.meta.revision,
+                    selections: vec![AiExtractionApprovalSelection {
+                        item_index: 0,
+                        value: ObservationValueData::Number(1.0),
+                        notes: None,
+                    }],
+                },
                 &human_audit,
             )
             .await,
@@ -2644,6 +3091,880 @@ where
         store.get_observation(closed_observation.id).await,
         Err(StoreError::NotFound { .. })
     ));
+
+    // Phase 4 extraction drafts are bound to one explicit data cell, exact
+    // vision profile version, and one-to-eight ordered image evidence records.
+    // Approval may edit only the candidate value/notes and promotes every
+    // private image together with the observation in one transaction.
+    let vision_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "Research extraction vision".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let vision_version = AiModelProfileVersion {
+        profile_id: vision_profile.id,
+        version: 1,
+        protocol: AiProviderProtocol::OpenaiResponses,
+        transport: AiProviderTransport::OpenAiCompatible,
+        base_url: "https://vision.contract.test/v1".to_owned(),
+        normalized_base_url: "https://vision.contract.test/v1".to_owned(),
+        model_id: "contract-vision-v1".to_owned(),
+        supports_vision: true,
+        context_window_tokens: 16_384,
+        max_input_tokens: 8_192,
+        max_output_tokens: 1_024,
+        history_token_budget: 4_096,
+        history_turns: 8,
+        temperature: 0.0,
+        timeout_ms: 30_000,
+        created_at: now,
+    };
+    store
+        .create_ai_model_profile(&vision_profile, &vision_version, &human_audit)
+        .await
+        .unwrap();
+
+    let extraction_observation = Observation::new(
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        definition.id,
+        ObservationSubjectType::Experiment,
+        experiment.id,
+        now,
+    )
+    .unwrap();
+    let extraction_value = ObservationValueRecord::new(
+        extraction_observation.id,
+        1,
+        ObservationValueData::Number(23.0),
+        now,
+        now,
+    )
+    .unwrap();
+    let mut evidence = Vec::new();
+    let mut extraction_images = Vec::new();
+    let mut extraction_attachments = Vec::new();
+    for (display_order, (original, sanitized)) in [
+        ("d".repeat(64), "e".repeat(64)),
+        ("f".repeat(64), "a".repeat(64)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_ne!(
+            original, sanitized,
+            "the test must cover original and sanitized hash divergence"
+        );
+        let private_image_id = uuid::Uuid::new_v4();
+        let attachment = Attachment {
+            id: uuid::Uuid::new_v4(),
+            lab_id: lab.id,
+            project_id: None,
+            entity_type: "ai_private_image".to_owned(),
+            entity_id: private_image_id,
+            file_name: format!("extraction-{display_order}.png"),
+            media_type: Some("image/png".to_owned()),
+            relative_path: format!("ai-private/{}.png", uuid::Uuid::new_v4()),
+            size_bytes: 64,
+            sha256: original.clone(),
+            version: 1,
+            meta: RecordMeta::new(now),
+        };
+        let image = PrivateAiImage {
+            id: private_image_id,
+            lab_id: lab.id,
+            user_id: user.id,
+            conversation_id: None,
+            attachment_id: attachment.id,
+            project_id: None,
+            status: PrivateImageStatus::Active,
+            last_activity_at: now,
+            expires_at: now + Duration::days(30),
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_private_ai_image(&attachment, &image, &human_audit)
+            .await
+            .unwrap();
+        evidence.push(AiExtractionEvidence {
+            display_order: display_order as i32,
+            private_image_id,
+            private_attachment_id: attachment.id,
+            promoted_attachment_id: None,
+            original_sha256: original,
+            sanitized_sha256: sanitized,
+            meta: RecordMeta::new(now),
+        });
+        extraction_images.push(image);
+        extraction_attachments.push(attachment);
+    }
+    let extraction_draft = AiExtractionDraft {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        project_id: project.id,
+        experiment_id: experiment.id,
+        experiment_event_id: event.id,
+        private_image_id: evidence[0].private_image_id,
+        attachment_id: evidence[0].private_attachment_id,
+        image_sha256: evidence[0].original_sha256.clone(),
+        provider: "contract-provider".to_owned(),
+        model: vision_version.model_id.clone(),
+        tool_run_id: None,
+        data_cell: Some(AiObservationDataCell {
+            definition_id: definition.id,
+            subject_type: ObservationSubjectType::Experiment,
+            subject_id: experiment.id,
+        }),
+        evidence: evidence.clone(),
+        model_trace: Some(AiExtractionModelTrace {
+            profile_id: vision_profile.id,
+            profile_version: vision_version.version,
+            purpose: AiModelPurpose::Vision,
+            input_tokens: 120,
+            output_tokens: 30,
+            total_tokens: 150,
+            provider_request_id: Some("vision-contract-request".to_owned()),
+            trace: serde_json::json!({"route": "direct_vision"}),
+        }),
+        status: AiExtractionStatus::PendingApproval,
+        items: vec![AiExtractionItem {
+            observation: extraction_observation.clone(),
+            value: extraction_value,
+            confidence: 0.91,
+            selected: false,
+            source_label: Some("experiment body weight".to_owned()),
+        }],
+        error_code: None,
+        meta: RecordMeta::new(now),
+    };
+    for invalid_source_label in [
+        " \t ".to_owned(),
+        "contains\u{0000}control".to_owned(),
+        "x".repeat(513),
+    ] {
+        let mut invalid_item = extraction_draft.items[0].clone();
+        invalid_item.source_label = Some(invalid_source_label);
+        assert!(
+            invalid_item.validate().is_err(),
+            "blank, oversized, and control-character source labels must be rejected"
+        );
+    }
+    store
+        .create_ai_extraction_draft(&extraction_draft, &human_audit)
+        .await
+        .unwrap();
+    let persisted_draft = store
+        .get_ai_extraction_draft(extraction_draft.id)
+        .await
+        .unwrap();
+    assert_eq!(persisted_draft.evidence, evidence);
+    assert_eq!(persisted_draft.model_trace, extraction_draft.model_trace);
+    for private_entity_id in std::iter::once(extraction_draft.id)
+        .chain(extraction_images.iter().map(|image| image.id))
+        .chain(
+            extraction_attachments
+                .iter()
+                .map(|attachment| attachment.id),
+        )
+    {
+        assert!(
+            store
+                .list_audit_entries(&AuditFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_id: Some(private_entity_id),
+                })
+                .await
+                .unwrap()
+                .iter()
+                .all(|entry| entry.project_id.is_none()),
+            "unapproved AI extraction audit records must remain private scoped"
+        );
+        assert!(
+            store
+                .list_provenance(&ProvenanceFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_type: None,
+                    entity_id: Some(private_entity_id),
+                    source: None,
+                })
+                .await
+                .unwrap()
+                .iter()
+                .all(|record| record.project_id.is_none()),
+            "unapproved AI extraction provenance must remain private scoped"
+        );
+    }
+
+    let ai_approval = AuditContext {
+        actor: Actor {
+            actor_type: ActorType::Ai,
+            user_id: Some(user.id),
+            display_name: "Untrusted model".to_owned(),
+        },
+        source: WriteSource::Ai,
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        reason: Some("models cannot approve research data".to_owned()),
+    };
+    let edited_approval = AiExtractionApprovalInput {
+        expected_revision: extraction_draft.meta.revision,
+        selections: vec![AiExtractionApprovalSelection {
+            item_index: 0,
+            value: ObservationValueData::Number(23.75),
+            notes: Some("researcher corrected decimal".to_owned()),
+        }],
+    };
+    let other_approver = User::new(
+        lab.id,
+        format!("{}@research-contract.test", uuid::Uuid::new_v4()),
+        "Other researcher",
+        now,
+    )
+    .unwrap();
+    store
+        .create_user(&other_approver, &setup_audit)
+        .await
+        .unwrap();
+    let other_human_audit = AuditContext {
+        actor: Actor::human(other_approver.id, other_approver.display_name.clone()),
+        source: WriteSource::Web,
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        reason: Some("cross-owner approval must fail".to_owned()),
+    };
+    assert!(matches!(
+        store
+            .apply_ai_extraction_draft(extraction_draft.id, &edited_approval, &other_human_audit,)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store.get_observation(extraction_observation.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    let cross_owner_rejected = store
+        .get_ai_extraction_draft(extraction_draft.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        cross_owner_rejected.status,
+        AiExtractionStatus::PendingApproval
+    );
+    assert!(
+        cross_owner_rejected
+            .evidence
+            .iter()
+            .all(|item| item.promoted_attachment_id.is_none())
+    );
+    for image in &extraction_images {
+        let private_image = store.get_private_ai_image(image.id).await.unwrap();
+        assert_eq!(private_image.project_id, None);
+        assert_eq!(private_image.status, PrivateImageStatus::PendingApproval);
+    }
+    assert!(matches!(
+        store
+            .apply_ai_extraction_draft(extraction_draft.id, &edited_approval, &ai_approval)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    for attachment in &extraction_attachments {
+        assert!(attachment.project_id.is_none());
+        assert!(
+            store
+                .list_project_attachments(lab.id, project.id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|record| record.id != attachment.id)
+        );
+    }
+
+    let applied = store
+        .apply_ai_extraction_draft(extraction_draft.id, &edited_approval, &human_audit)
+        .await
+        .unwrap();
+    assert_eq!(applied.observations.len(), 1);
+    assert_eq!(applied.observations[0].id, extraction_observation.id);
+    assert_eq!(applied.attachments.len(), 2);
+    assert_eq!(applied.links.len(), 2);
+    assert!(applied.attachments.iter().all(|attachment| {
+        attachment.project_id == Some(project.id)
+            && attachment.entity_type == "observation"
+            && attachment.entity_id == extraction_observation.id
+    }));
+    assert!(applied.links.iter().all(|link| {
+        link.target_type == AttachmentLinkTarget::DataCell
+            && link.target_id == extraction_observation.id
+    }));
+    assert!(
+        applied
+            .draft
+            .evidence
+            .iter()
+            .all(|item| item.promoted_attachment_id == Some(item.private_attachment_id))
+    );
+    let approved_value = store
+        .get_observation_value(applied.draft.items[0].value.id)
+        .await
+        .unwrap();
+    assert_eq!(approved_value.value, ObservationValueData::Number(23.75));
+    assert_eq!(
+        approved_value.notes.as_deref(),
+        Some("researcher corrected decimal")
+    );
+    for image in &extraction_images {
+        let promoted = store.get_private_ai_image(image.id).await.unwrap();
+        assert_eq!(promoted.project_id, Some(project.id));
+        assert_eq!(promoted.status, PrivateImageStatus::Archived);
+    }
+    for formal_entity_id in std::iter::once(extraction_observation.id)
+        .chain(std::iter::once(approved_value.id))
+        .chain(applied.attachments.iter().map(|attachment| attachment.id))
+    {
+        assert!(
+            store
+                .list_audit_entries(&AuditFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_id: Some(formal_entity_id),
+                })
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.project_id == Some(project.id)),
+            "approved formal records must gain project-scoped audit evidence"
+        );
+        assert!(
+            store
+                .list_provenance(&ProvenanceFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_type: None,
+                    entity_id: Some(formal_entity_id),
+                    source: None,
+                })
+                .await
+                .unwrap()
+                .iter()
+                .any(|record| record.project_id == Some(project.id)),
+            "approved formal records must gain project-scoped provenance"
+        );
+    }
+
+    // A concurrent write after draft creation must make approval fail without
+    // promoting the image, creating links, or resolving the draft.
+    let mut conflict_definition = ObservationDefinition::new(
+        lab.id,
+        project.id,
+        experiment.id,
+        "conflicting_ai_cell",
+        "Conflicting AI cell",
+        ObservationValueType::Number,
+        ObservationPolicy::Versioned,
+        now,
+    )
+    .unwrap();
+    conflict_definition.unit = Some("g".to_owned());
+    conflict_definition.validate().unwrap();
+    store
+        .create_observation_definition(&conflict_definition, &human_audit)
+        .await
+        .unwrap();
+    let conflict_image_id = uuid::Uuid::new_v4();
+    let conflict_attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: None,
+        entity_type: "ai_private_image".to_owned(),
+        entity_id: conflict_image_id,
+        file_name: "conflict.png".to_owned(),
+        media_type: Some("image/png".to_owned()),
+        relative_path: format!("ai-private/{}.png", uuid::Uuid::new_v4()),
+        size_bytes: 32,
+        sha256: "1".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    let conflict_image = PrivateAiImage {
+        id: conflict_image_id,
+        lab_id: lab.id,
+        user_id: user.id,
+        conversation_id: None,
+        attachment_id: conflict_attachment.id,
+        project_id: None,
+        status: PrivateImageStatus::Active,
+        last_activity_at: now,
+        expires_at: now + Duration::days(30),
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_private_ai_image(&conflict_attachment, &conflict_image, &human_audit)
+        .await
+        .unwrap();
+    let conflict_observation = Observation::new(
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        conflict_definition.id,
+        ObservationSubjectType::Experiment,
+        experiment.id,
+        now,
+    )
+    .unwrap();
+    let conflict_value = ObservationValueRecord::new(
+        conflict_observation.id,
+        1,
+        ObservationValueData::Number(1.0),
+        now,
+        now,
+    )
+    .unwrap();
+    let conflict_draft = AiExtractionDraft {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        project_id: project.id,
+        experiment_id: experiment.id,
+        experiment_event_id: event.id,
+        private_image_id: conflict_image.id,
+        attachment_id: conflict_attachment.id,
+        image_sha256: conflict_attachment.sha256.clone(),
+        provider: "contract-provider".to_owned(),
+        model: vision_version.model_id.clone(),
+        tool_run_id: None,
+        data_cell: Some(AiObservationDataCell {
+            definition_id: conflict_definition.id,
+            subject_type: ObservationSubjectType::Experiment,
+            subject_id: experiment.id,
+        }),
+        evidence: vec![AiExtractionEvidence {
+            display_order: 0,
+            private_image_id: conflict_image.id,
+            private_attachment_id: conflict_attachment.id,
+            promoted_attachment_id: None,
+            original_sha256: conflict_attachment.sha256.clone(),
+            sanitized_sha256: "2".repeat(64),
+            meta: RecordMeta::new(now),
+        }],
+        model_trace: Some(AiExtractionModelTrace {
+            profile_id: vision_profile.id,
+            profile_version: 1,
+            purpose: AiModelPurpose::Vision,
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            provider_request_id: None,
+            trace: serde_json::json!({"route": "direct_vision"}),
+        }),
+        status: AiExtractionStatus::PendingApproval,
+        items: vec![AiExtractionItem {
+            observation: conflict_observation.clone(),
+            value: conflict_value,
+            confidence: 0.8,
+            selected: false,
+            source_label: None,
+        }],
+        error_code: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_extraction_draft(&conflict_draft, &human_audit)
+        .await
+        .unwrap();
+    let mut competing_value = ObservationValueRecord::new(
+        conflict_observation.id,
+        1,
+        ObservationValueData::Number(2.0),
+        now,
+        now,
+    )
+    .unwrap();
+    competing_value.recorded_by = Some(user.id);
+    store
+        .create_observation(&conflict_observation, &competing_value, &human_audit)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .apply_ai_extraction_draft(
+                conflict_draft.id,
+                &AiExtractionApprovalInput {
+                    expected_revision: 1,
+                    selections: vec![AiExtractionApprovalSelection {
+                        item_index: 0,
+                        value: ObservationValueData::Number(3.0),
+                        notes: None,
+                    }],
+                },
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let rolled_back_draft = store
+        .get_ai_extraction_draft(conflict_draft.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        rolled_back_draft.status,
+        AiExtractionStatus::PendingApproval
+    );
+    assert_eq!(rolled_back_draft.evidence[0].promoted_attachment_id, None);
+    assert_eq!(
+        store
+            .get_private_ai_image(conflict_image.id)
+            .await
+            .unwrap()
+            .status,
+        PrivateImageStatus::PendingApproval
+    );
+    assert!(
+        store
+            .list_project_attachments(lab.id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|attachment| attachment.id != conflict_attachment.id)
+    );
+
+    // Rejecting a multi-image candidate is owner-scoped and restores every
+    // private image without publishing any project-scoped audit material.
+    let rejection_definition = create_phase4_contract_definition(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        "ai_rejection_restore",
+        &human_audit,
+        now,
+    )
+    .await;
+    let (rejection_draft, rejection_attachments, rejection_images) = prepare_phase4_contract_draft(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        user.id,
+        &rejection_definition,
+        &vision_profile,
+        &vision_version,
+        "contract-rejection-restore",
+        2,
+        &human_audit,
+        now,
+    )
+    .await;
+    store
+        .create_ai_extraction_draft(&rejection_draft, &human_audit)
+        .await
+        .unwrap();
+    let rejection = AiExtractionRejectionInput {
+        expected_revision: rejection_draft.meta.revision,
+    };
+    assert!(matches!(
+        store
+            .reject_ai_extraction_draft(rejection_draft.id, &rejection, &other_human_audit)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store
+            .reject_ai_extraction_draft(rejection_draft.id, &rejection, &ai_approval)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    for image in &rejection_images {
+        assert_eq!(
+            store.get_private_ai_image(image.id).await.unwrap().status,
+            PrivateImageStatus::PendingApproval
+        );
+    }
+    let rejected = store
+        .reject_ai_extraction_draft(rejection_draft.id, &rejection, &human_audit)
+        .await
+        .unwrap();
+    assert_eq!(rejected.status, AiExtractionStatus::Rejected);
+    assert_eq!(rejected.meta.revision, rejection_draft.meta.revision + 1);
+    assert!(rejected.evidence.iter().all(|evidence| {
+        evidence.promoted_attachment_id.is_none() && evidence.meta.revision == 1
+    }));
+    for image in &rejection_images {
+        let restored = store.get_private_ai_image(image.id).await.unwrap();
+        assert_eq!(restored.status, PrivateImageStatus::Active);
+        assert_eq!(restored.project_id, None);
+        assert!(restored.expires_at > now);
+    }
+    assert!(
+        store
+            .list_project_attachments(lab.id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|attachment| rejection_attachments
+                .iter()
+                .all(|private| private.id != attachment.id))
+    );
+    for private_entity_id in std::iter::once(rejected.id)
+        .chain(rejection_images.iter().map(|image| image.id))
+        .chain(rejection_attachments.iter().map(|attachment| attachment.id))
+    {
+        assert!(
+            store
+                .list_audit_entries(&AuditFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_id: Some(private_entity_id),
+                })
+                .await
+                .unwrap()
+                .iter()
+                .all(|entry| entry.project_id.is_none())
+        );
+        assert!(
+            store
+                .list_provenance(&ProvenanceFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_type: None,
+                    entity_id: Some(private_entity_id),
+                    source: None,
+                })
+                .await
+                .unwrap()
+                .iter()
+                .all(|record| record.project_id.is_none())
+        );
+    }
+    assert!(matches!(
+        store
+            .reject_ai_extraction_draft(
+                rejected.id,
+                &AiExtractionRejectionInput {
+                    expected_revision: rejected.meta.revision,
+                },
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    // One user can have only one unresolved candidate for an exact data cell.
+    // Rejecting the winner releases the partial unique constraint for recovery.
+    let uniqueness_definition = create_phase4_contract_definition(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        "ai_unresolved_uniqueness",
+        &human_audit,
+        now,
+    )
+    .await;
+    let (first_unresolved, _, first_unresolved_images) = prepare_phase4_contract_draft(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        user.id,
+        &uniqueness_definition,
+        &vision_profile,
+        &vision_version,
+        "contract-unresolved-first",
+        1,
+        &human_audit,
+        now,
+    )
+    .await;
+    let (duplicate_unresolved, _, duplicate_unresolved_images) = prepare_phase4_contract_draft(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        user.id,
+        &uniqueness_definition,
+        &vision_profile,
+        &vision_version,
+        "contract-unresolved-duplicate",
+        1,
+        &human_audit,
+        now,
+    )
+    .await;
+    let (first_create, duplicate_create) = tokio::join!(
+        store.create_ai_extraction_draft(&first_unresolved, &human_audit),
+        store.create_ai_extraction_draft(&duplicate_unresolved, &human_audit),
+    );
+    assert_ne!(
+        first_create.is_ok(),
+        duplicate_create.is_ok(),
+        "concurrent writes for one unresolved data cell must have exactly one winner"
+    );
+    let losing_create = if first_create.is_ok() {
+        &duplicate_create
+    } else {
+        &first_create
+    };
+    assert!(matches!(losing_create, Err(StoreError::Conflict(_))));
+    let (winner, winner_images, loser, loser_images) = if first_create.is_ok() {
+        (
+            &first_unresolved,
+            &first_unresolved_images,
+            &duplicate_unresolved,
+            &duplicate_unresolved_images,
+        )
+    } else {
+        (
+            &duplicate_unresolved,
+            &duplicate_unresolved_images,
+            &first_unresolved,
+            &first_unresolved_images,
+        )
+    };
+    assert_eq!(
+        store
+            .get_private_ai_image(winner_images[0].id)
+            .await
+            .unwrap()
+            .status,
+        PrivateImageStatus::PendingApproval
+    );
+    assert_eq!(
+        store
+            .get_private_ai_image(loser_images[0].id)
+            .await
+            .unwrap()
+            .status,
+        PrivateImageStatus::Active
+    );
+    let winner_rejected = store
+        .reject_ai_extraction_draft(
+            winner.id,
+            &AiExtractionRejectionInput {
+                expected_revision: winner.meta.revision,
+            },
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(winner_rejected.status, AiExtractionStatus::Rejected);
+    store
+        .create_ai_extraction_draft(loser, &human_audit)
+        .await
+        .unwrap();
+    let loser_rejected = store
+        .reject_ai_extraction_draft(
+            loser.id,
+            &AiExtractionRejectionInput {
+                expected_revision: loser.meta.revision,
+            },
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(loser_rejected.status, AiExtractionStatus::Rejected);
+
+    // A manual soft archive remains private-scoped and never promotes its
+    // attachment into the project library.
+    let archive_source = store
+        .get_private_ai_image(duplicate_unresolved_images[0].id)
+        .await
+        .unwrap();
+    let archived_private = store
+        .archive_private_ai_image(
+            archive_source.id,
+            project.id,
+            archive_source.meta.revision,
+            Utc::now(),
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_private.status, PrivateImageStatus::Archived);
+    assert!(
+        store
+            .list_project_attachments(lab.id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|attachment| attachment.id != archived_private.attachment_id)
+    );
+    assert!(
+        store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: None,
+                entity_id: Some(archived_private.id),
+            })
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| entry.project_id.is_none())
+    );
+    assert!(
+        store
+            .list_provenance(&ProvenanceFilter {
+                lab_id: lab.id,
+                project_id: None,
+                entity_type: Some(EntityType::AiPrivateImage),
+                entity_id: Some(archived_private.id),
+                source: None,
+            })
+            .await
+            .unwrap()
+            .iter()
+            .all(|record| record.project_id.is_none())
+    );
+
+    // Adapter-specific contract tests deliberately corrupt the second image in
+    // these drafts to verify that approval/rejection roll back the first image.
+    for (definition_key, provider) in [
+        ("ai_atomic_approval_fixture", "contract-atomic-approval"),
+        ("ai_atomic_rejection_fixture", "contract-atomic-rejection"),
+    ] {
+        let definition = create_phase4_contract_definition(
+            store,
+            lab.id,
+            project.id,
+            experiment.id,
+            definition_key,
+            &human_audit,
+            now,
+        )
+        .await;
+        let (draft, _, _) = prepare_phase4_contract_draft(
+            store,
+            lab.id,
+            project.id,
+            experiment.id,
+            event.id,
+            user.id,
+            &definition,
+            &vision_profile,
+            &vision_version,
+            provider,
+            2,
+            &human_audit,
+            now,
+        )
+        .await;
+        store
+            .create_ai_extraction_draft(&draft, &human_audit)
+            .await
+            .unwrap();
+    }
 
     let retired = store
         .retire_breeding_pair(pair.id, pair.meta.revision, next_time, &human_audit)
@@ -2687,11 +4008,360 @@ where
     }
 }
 
+/// Runs the versioned AI model profile behavior contract shared by SQLite and
+/// PostgreSQL adapters.
+pub async fn run_ai_model_profile_contract<S>(store: &S)
+where
+    S: MuriArcStore + AiModelProfileStore + ?Sized,
+{
+    store.migrate().await.expect("migration succeeds");
+    let now = contract_now();
+    let audit = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new(
+        format!("AI model profile contract {}", uuid::Uuid::new_v4()),
+        now,
+    )
+    .unwrap();
+    store.create_lab(&lab, &audit).await.unwrap();
+    let user = User::new(
+        lab.id,
+        format!("{}@example.test", uuid::Uuid::new_v4()),
+        "AI model profile owner",
+        now,
+    )
+    .unwrap();
+    let other_user = User::new(
+        lab.id,
+        format!("{}@example.test", uuid::Uuid::new_v4()),
+        "Other model profile owner",
+        now,
+    )
+    .unwrap();
+    let mut deleted_user = User::new(
+        lab.id,
+        format!("{}@example.test", uuid::Uuid::new_v4()),
+        "Deleted model profile owner",
+        now,
+    )
+    .unwrap();
+    deleted_user
+        .meta
+        .soft_delete(now + Duration::milliseconds(1));
+    store.create_user(&user, &audit).await.unwrap();
+    store.create_user(&other_user, &audit).await.unwrap();
+    store.create_user(&deleted_user, &audit).await.unwrap();
+
+    let mut profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "Primary conversation model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let first = AiModelProfileVersion {
+        profile_id: profile.id,
+        version: 1,
+        protocol: AiProviderProtocol::OpenaiChatCompletions,
+        transport: AiProviderTransport::OpenAiCompatible,
+        base_url: "https://provider.example.test/v1/".to_owned(),
+        normalized_base_url: "https://provider.example.test/v1".to_owned(),
+        model_id: "model-v1".to_owned(),
+        supports_vision: false,
+        context_window_tokens: 131_072,
+        max_input_tokens: 65_536,
+        max_output_tokens: 4_096,
+        history_token_budget: 32_768,
+        history_turns: 20,
+        temperature: 0.0,
+        timeout_ms: 120_000,
+        created_at: now,
+    };
+    let deleted_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: deleted_user.id,
+        name: "Deleted owner's model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let deleted_version = AiModelProfileVersion {
+        profile_id: deleted_profile.id,
+        ..first.clone()
+    };
+    assert!(matches!(
+        store
+            .create_ai_model_profile(&deleted_profile, &deleted_version, &audit)
+            .await,
+        Err(StoreError::NotFound { entity: "user", id }) if id == deleted_user.id
+    ));
+    store
+        .create_ai_model_profile(&profile, &first, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_ai_model_profile(profile.id).await.unwrap(),
+        profile
+    );
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(profile.id, 1)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        store
+            .list_ai_model_profiles(&AiModelProfileFilter {
+                lab_id: lab.id,
+                user_id: other_user.id,
+                include_archived: true,
+            })
+            .await
+            .unwrap(),
+        Vec::<AiModelProfile>::new()
+    );
+
+    let max_history_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: other_user.id,
+        name: "Maximum history budget".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let max_history_version = AiModelProfileVersion {
+        profile_id: max_history_profile.id,
+        context_window_tokens: 1_200_000,
+        max_input_tokens: 1_100_000,
+        history_token_budget: 1_000_000,
+        ..first.clone()
+    };
+    store
+        .create_ai_model_profile(&max_history_profile, &max_history_version, &audit)
+        .await
+        .expect("history token budget accepts the documented inclusive maximum");
+
+    let excessive_history_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: other_user.id,
+        name: "Excessive history budget".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let excessive_history_version = AiModelProfileVersion {
+        profile_id: excessive_history_profile.id,
+        context_window_tokens: 1_200_000,
+        max_input_tokens: 1_100_000,
+        history_token_budget: 1_000_001,
+        ..first.clone()
+    };
+    assert!(matches!(
+        store
+            .create_ai_model_profile(
+                &excessive_history_profile,
+                &excessive_history_version,
+                &audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+
+    let unicode_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: other_user.id,
+        name: "Unicode model identifier".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let unicode_version = AiModelProfileVersion {
+        profile_id: unicode_profile.id,
+        model_id: "模".repeat(256),
+        ..first.clone()
+    };
+    store
+        .create_ai_model_profile(&unicode_profile, &unicode_version, &audit)
+        .await
+        .expect("model identifier length is measured in characters");
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(unicode_profile.id, 1)
+            .await
+            .unwrap(),
+        unicode_version
+    );
+
+    profile.current_version = 2;
+    profile.meta.touch(now + Duration::milliseconds(1));
+    let second = AiModelProfileVersion {
+        profile_id: profile.id,
+        version: 2,
+        protocol: AiProviderProtocol::AnthropicMessages,
+        transport: AiProviderTransport::LocalHttp,
+        base_url: "https://provider.example.test".to_owned(),
+        normalized_base_url: "https://provider.example.test".to_owned(),
+        model_id: "model-v2".to_owned(),
+        supports_vision: true,
+        created_at: now + Duration::milliseconds(1),
+        ..first.clone()
+    };
+    store
+        .append_ai_model_profile_version(&profile, &second, 1, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(profile.id, 1)
+            .await
+            .unwrap(),
+        first,
+        "appending a version must not mutate version 1"
+    );
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(profile.id, 2)
+            .await
+            .unwrap(),
+        second
+    );
+    assert!(matches!(
+        store
+            .append_ai_model_profile_version(&profile, &second, 1, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let defaults = AiUserModelDefaults {
+        user_id: user.id,
+        default_conversation_profile_id: Some(profile.id),
+        default_vision_profile_id: Some(profile.id),
+        meta: RecordMeta::new(now),
+    };
+    store
+        .save_ai_user_model_defaults(&defaults, None, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_ai_user_model_defaults(user.id).await.unwrap(),
+        Some(defaults)
+    );
+
+    let mut disable_default_vision_profile = profile.clone();
+    disable_default_vision_profile.current_version = 3;
+    disable_default_vision_profile
+        .meta
+        .touch(now + Duration::milliseconds(2));
+    let disable_default_vision = AiModelProfileVersion {
+        version: 3,
+        supports_vision: false,
+        created_at: now + Duration::milliseconds(2),
+        ..second.clone()
+    };
+    assert!(matches!(
+        store
+            .append_ai_model_profile_version(
+                &disable_default_vision_profile,
+                &disable_default_vision,
+                2,
+                &audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert_eq!(
+        store.get_ai_model_profile(profile.id).await.unwrap(),
+        profile,
+        "a default vision profile must retain vision support"
+    );
+
+    profile.archived_at = Some(now + Duration::milliseconds(2));
+    profile.meta.touch(now + Duration::milliseconds(2));
+    store
+        .archive_ai_model_profile(&profile, 2, &audit)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .list_ai_model_profiles(&AiModelProfileFilter {
+                lab_id: lab.id,
+                user_id: user.id,
+                include_archived: false,
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .get_ai_model_profile_version(profile.id, 1)
+            .await
+            .unwrap(),
+        first,
+        "archiving a profile must preserve historical versions"
+    );
+    let archived_defaults = store
+        .get_ai_user_model_defaults(user.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(archived_defaults.default_conversation_profile_id, None);
+    assert_eq!(archived_defaults.default_vision_profile_id, None);
+    assert_eq!(archived_defaults.meta.revision, 2);
+
+    let third = AiModelProfileVersion {
+        version: 3,
+        model_id: "model-v3".to_owned(),
+        created_at: now + Duration::milliseconds(3),
+        ..second.clone()
+    };
+    let mut append_to_archived = profile.clone();
+    append_to_archived.current_version = 3;
+    append_to_archived
+        .meta
+        .touch(now + Duration::milliseconds(3));
+    assert!(matches!(
+        store
+            .append_ai_model_profile_version(&append_to_archived, &third, 3, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let mut revive_through_append = append_to_archived;
+    revive_through_append.archived_at = None;
+    assert!(matches!(
+        store
+            .append_ai_model_profile_version(&revive_through_append, &third, 3, &audit)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert_eq!(
+        store.get_ai_model_profile(profile.id).await.unwrap(),
+        profile,
+        "failed append and revive attempts must preserve the archived profile"
+    );
+    assert!(matches!(
+        store
+            .get_ai_model_profile_version(profile.id, 3)
+            .await,
+        Err(StoreError::NotFound {
+            entity: "ai_model_profile",
+            id
+        }) if id == profile.id
+    ));
+}
+
 /// Runs the AI conversation/message behavior contract shared by SQLite and
 /// PostgreSQL adapters. The store may contain unrelated fixtures.
 pub async fn run_ai_conversation_contract<S>(store: &S)
 where
-    S: MuriArcStore + AiOperationStore + ?Sized,
+    S: MuriArcStore + AiModelProfileStore + AiOperationStore + ?Sized,
 {
     store.migrate().await.expect("migration succeeds");
     let now = contract_now();
@@ -2716,6 +4386,116 @@ where
     store.create_user(&other_user, &bootstrap).await.unwrap();
     let project = Project::new(lab.id, "AI Contract Project", now).unwrap();
     store.create_project(&project, &bootstrap).await.unwrap();
+    let profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "AI conversation contract model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let profile_version = AiModelProfileVersion {
+        profile_id: profile.id,
+        version: 1,
+        protocol: AiProviderProtocol::OpenaiChatCompletions,
+        transport: AiProviderTransport::OpenAiCompatible,
+        base_url: "https://provider.example.test/v1".to_owned(),
+        normalized_base_url: "https://provider.example.test/v1".to_owned(),
+        model_id: "contract-model".to_owned(),
+        supports_vision: false,
+        context_window_tokens: 16_384,
+        max_input_tokens: 8_192,
+        max_output_tokens: 2_048,
+        history_token_budget: 4_096,
+        history_turns: 20,
+        temperature: 0.0,
+        timeout_ms: 30_000,
+        created_at: now,
+    };
+    store
+        .create_ai_model_profile(&profile, &profile_version, &bootstrap)
+        .await
+        .unwrap();
+    let other_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: other_user.id,
+        name: "Other AI conversation contract model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let other_profile_version = AiModelProfileVersion {
+        profile_id: other_profile.id,
+        ..profile_version.clone()
+    };
+    store
+        .create_ai_model_profile(&other_profile, &other_profile_version, &bootstrap)
+        .await
+        .unwrap();
+    let replacement_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "Replacement AI conversation contract model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let replacement_profile_version = AiModelProfileVersion {
+        profile_id: replacement_profile.id,
+        model_id: "replacement-contract-model".to_owned(),
+        ..profile_version.clone()
+    };
+    store
+        .create_ai_model_profile(
+            &replacement_profile,
+            &replacement_profile_version,
+            &bootstrap,
+        )
+        .await
+        .unwrap();
+    let mut archived_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "Archived AI conversation contract model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let archived_profile_version = AiModelProfileVersion {
+        profile_id: archived_profile.id,
+        model_id: "archived-contract-model".to_owned(),
+        ..profile_version.clone()
+    };
+    store
+        .create_ai_model_profile(&archived_profile, &archived_profile_version, &bootstrap)
+        .await
+        .unwrap();
+    archived_profile.archived_at = Some(now + Duration::milliseconds(1));
+    archived_profile.meta.touch(now + Duration::milliseconds(1));
+    store
+        .archive_ai_model_profile(&archived_profile, 1, &bootstrap)
+        .await
+        .unwrap();
+    let model_profile = AiModelProfileBinding {
+        profile_id: profile.id,
+        profile_version: 1,
+    };
+    let other_model_profile = AiModelProfileBinding {
+        profile_id: other_profile.id,
+        profile_version: 1,
+    };
+    let replacement_model_profile = AiModelProfileBinding {
+        profile_id: replacement_profile.id,
+        profile_version: 1,
+    };
+    let archived_model_profile = AiModelProfileBinding {
+        profile_id: archived_profile.id,
+        profile_version: 1,
+    };
     let audit = AuditContext {
         actor: Actor {
             actor_type: ActorType::Ai,
@@ -2733,6 +4513,8 @@ where
         project_id: Some(project.id),
         user_id: user.id,
         title: "Project conversation".to_owned(),
+        model_profile: Some(model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),
@@ -2743,6 +4525,8 @@ where
         project_id: None,
         user_id: user.id,
         title: "Lab conversation".to_owned(),
+        model_profile: Some(model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now - Duration::seconds(1)),
@@ -2753,10 +4537,22 @@ where
         project_id: Some(project.id),
         user_id: other_user.id,
         title: "Other user's conversation".to_owned(),
+        model_profile: Some(other_model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),
     };
+    let unbound = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        title: "Unbound writable conversation".to_owned(),
+        model_profile: None,
+        ..conversation.clone()
+    };
+    assert!(matches!(
+        store.create_ai_conversation(&unbound, &audit).await,
+        Err(StoreError::Validation(_))
+    ));
     for value in [&conversation, &lab_conversation, &hidden_conversation] {
         store.create_ai_conversation(value, &audit).await.unwrap();
     }
@@ -3008,6 +4804,332 @@ where
         1
     );
 
+    let atomic_conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        title: "Atomic project conversation".to_owned(),
+        model_profile: Some(model_profile),
+        legacy_read_only: false,
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let atomic_grant = initial_ask_grant(&atomic_conversation, now);
+    store
+        .create_ai_conversation_with_autonomy(&atomic_conversation, &atomic_grant, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_ai_conversation(atomic_conversation.id)
+            .await
+            .unwrap(),
+        atomic_conversation
+    );
+    assert_eq!(
+        store
+            .get_ai_autonomy_grant(atomic_conversation.id)
+            .await
+            .unwrap(),
+        Some(atomic_grant.clone())
+    );
+    let atomic_conversation_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_id: Some(atomic_conversation.id),
+        })
+        .await
+        .unwrap();
+    let atomic_grant_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_id: Some(atomic_grant.id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(atomic_conversation_audits.len(), 1);
+    assert_eq!(atomic_grant_audits.len(), 1);
+    for (entry, entity_type, expected_after) in [
+        (
+            &atomic_conversation_audits[0],
+            EntityType::AiConversation,
+            serde_json::to_value(&atomic_conversation).unwrap(),
+        ),
+        (
+            &atomic_grant_audits[0],
+            EntityType::AiAutonomyGrant,
+            serde_json::to_value(&atomic_grant).unwrap(),
+        ),
+    ] {
+        assert_eq!(entry.entity_type, entity_type);
+        assert_eq!(entry.action, AuditAction::Create);
+        assert_eq!(entry.actor.user_id, Some(user.id));
+        assert!(entry.before.is_none());
+        assert_eq!(entry.after, Some(expected_after));
+        let serialized = serde_json::to_string(&entry.after).unwrap();
+        assert!(
+            !["api_key", "credential", "ciphertext", "secret"]
+                .iter()
+                .any(|field| serialized.contains(field)),
+            "atomic AI start audits must remain redacted"
+        );
+    }
+
+    let mut rebound_conversation = atomic_conversation.clone();
+    rebound_conversation.model_profile = Some(replacement_model_profile);
+    assert!(
+        store
+            .create_ai_conversation_with_autonomy(&rebound_conversation, &atomic_grant, &audit,)
+            .await
+            .is_err(),
+        "an existing conversation cannot be recreated with another model binding"
+    );
+    assert_eq!(
+        store
+            .get_ai_conversation(atomic_conversation.id)
+            .await
+            .unwrap()
+            .model_profile,
+        Some(model_profile),
+        "a failed rebind attempt must preserve the immutable model binding"
+    );
+    assert_eq!(
+        store
+            .get_ai_autonomy_grant(atomic_conversation.id)
+            .await
+            .unwrap(),
+        Some(atomic_grant.clone()),
+        "a failed rebind attempt must preserve the initial autonomy grant"
+    );
+    assert_eq!(
+        store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_id: Some(atomic_conversation.id),
+            })
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a failed rebind attempt must not append an audit record"
+    );
+
+    let mut rejected_starts = Vec::new();
+
+    let mut unavailable_model_conversation = atomic_conversation.clone();
+    unavailable_model_conversation.id = uuid::Uuid::new_v4();
+    unavailable_model_conversation.title = "Missing model atomic start".to_owned();
+    unavailable_model_conversation.model_profile = Some(AiModelProfileBinding {
+        profile_id: uuid::Uuid::new_v4(),
+        profile_version: 1,
+    });
+    let unavailable_model_grant = initial_ask_grant(&unavailable_model_conversation, now);
+    rejected_starts.push((
+        "missing model",
+        unavailable_model_conversation,
+        unavailable_model_grant,
+        audit.clone(),
+    ));
+
+    let mut archived_model_conversation = atomic_conversation.clone();
+    archived_model_conversation.id = uuid::Uuid::new_v4();
+    archived_model_conversation.title = "Archived model atomic start".to_owned();
+    archived_model_conversation.model_profile = Some(archived_model_profile);
+    let archived_model_grant = initial_ask_grant(&archived_model_conversation, now);
+    rejected_starts.push((
+        "archived model",
+        archived_model_conversation,
+        archived_model_grant,
+        audit.clone(),
+    ));
+
+    let mut foreign_model_conversation = atomic_conversation.clone();
+    foreign_model_conversation.id = uuid::Uuid::new_v4();
+    foreign_model_conversation.title = "Foreign model atomic start".to_owned();
+    foreign_model_conversation.model_profile = Some(other_model_profile);
+    let foreign_model_grant = initial_ask_grant(&foreign_model_conversation, now);
+    rejected_starts.push((
+        "foreign model owner",
+        foreign_model_conversation,
+        foreign_model_grant,
+        audit.clone(),
+    ));
+
+    let mut missing_project_conversation = atomic_conversation.clone();
+    missing_project_conversation.id = uuid::Uuid::new_v4();
+    missing_project_conversation.title = "Missing project atomic start".to_owned();
+    missing_project_conversation.project_id = Some(uuid::Uuid::new_v4());
+    let missing_project_grant = initial_ask_grant(&missing_project_conversation, now);
+    rejected_starts.push((
+        "missing project",
+        missing_project_conversation,
+        missing_project_grant,
+        audit.clone(),
+    ));
+
+    let mut wrong_owner_conversation = atomic_conversation.clone();
+    wrong_owner_conversation.id = uuid::Uuid::new_v4();
+    wrong_owner_conversation.title = "Wrong grant owner atomic start".to_owned();
+    let mut wrong_owner_grant = initial_ask_grant(&wrong_owner_conversation, now);
+    wrong_owner_grant.user_id = other_user.id;
+    rejected_starts.push((
+        "grant owner mismatch",
+        wrong_owner_conversation,
+        wrong_owner_grant,
+        audit.clone(),
+    ));
+
+    let mut wrong_project_conversation = atomic_conversation.clone();
+    wrong_project_conversation.id = uuid::Uuid::new_v4();
+    wrong_project_conversation.title = "Wrong grant project atomic start".to_owned();
+    let mut wrong_project_grant = initial_ask_grant(&wrong_project_conversation, now);
+    wrong_project_grant.project_id = None;
+    rejected_starts.push((
+        "grant project mismatch",
+        wrong_project_conversation,
+        wrong_project_grant,
+        audit.clone(),
+    ));
+
+    let mut wrong_conversation = atomic_conversation.clone();
+    wrong_conversation.id = uuid::Uuid::new_v4();
+    wrong_conversation.title = "Wrong grant conversation atomic start".to_owned();
+    let mut wrong_conversation_grant = initial_ask_grant(&wrong_conversation, now);
+    wrong_conversation_grant.conversation_id = uuid::Uuid::new_v4();
+    rejected_starts.push((
+        "grant conversation mismatch",
+        wrong_conversation,
+        wrong_conversation_grant,
+        audit.clone(),
+    ));
+
+    let mut wrong_audit_conversation = atomic_conversation.clone();
+    wrong_audit_conversation.id = uuid::Uuid::new_v4();
+    wrong_audit_conversation.title = "Wrong audit actor atomic start".to_owned();
+    let wrong_audit_grant = initial_ask_grant(&wrong_audit_conversation, now);
+    let mut wrong_audit = audit.clone();
+    wrong_audit.actor.user_id = Some(other_user.id);
+    rejected_starts.push((
+        "audit actor mismatch",
+        wrong_audit_conversation,
+        wrong_audit_grant,
+        wrong_audit,
+    ));
+
+    let mut wrong_revision_conversation = atomic_conversation.clone();
+    wrong_revision_conversation.id = uuid::Uuid::new_v4();
+    wrong_revision_conversation.title = "Wrong initial revision atomic start".to_owned();
+    wrong_revision_conversation.meta.revision = 2;
+    let mut wrong_revision_grant = initial_ask_grant(&wrong_revision_conversation, now);
+    wrong_revision_grant.meta.revision = 2;
+    rejected_starts.push((
+        "initial revision mismatch",
+        wrong_revision_conversation,
+        wrong_revision_grant,
+        audit.clone(),
+    ));
+
+    let mut full_without_session_conversation = atomic_conversation.clone();
+    full_without_session_conversation.id = uuid::Uuid::new_v4();
+    full_without_session_conversation.title = "Full without session atomic start".to_owned();
+    let mut full_without_session_grant = initial_ask_grant(&full_without_session_conversation, now);
+    full_without_session_grant.mode = AiAutonomyMode::Full;
+    full_without_session_grant.batch_limit = AiAutonomyMode::Full.batch_limit();
+    full_without_session_grant.step_up_verified_at = Some(now);
+    full_without_session_grant.expires_at = Some(now + Duration::minutes(30));
+    rejected_starts.push((
+        "Full grant without session",
+        full_without_session_conversation,
+        full_without_session_grant,
+        audit.clone(),
+    ));
+
+    let mut ask_with_full_metadata_conversation = atomic_conversation.clone();
+    ask_with_full_metadata_conversation.id = uuid::Uuid::new_v4();
+    ask_with_full_metadata_conversation.title = "Ask with Full metadata atomic start".to_owned();
+    let mut ask_with_full_metadata_grant =
+        initial_ask_grant(&ask_with_full_metadata_conversation, now);
+    ask_with_full_metadata_grant.session_id = Some(uuid::Uuid::new_v4());
+    ask_with_full_metadata_grant.step_up_verified_at = Some(now);
+    ask_with_full_metadata_grant.expires_at = Some(now + Duration::minutes(30));
+    rejected_starts.push((
+        "Ask grant with Full metadata",
+        ask_with_full_metadata_conversation,
+        ask_with_full_metadata_grant,
+        audit.clone(),
+    ));
+
+    for (label, rejected_conversation, rejected_grant, rejected_audit) in rejected_starts {
+        assert!(
+            store
+                .create_ai_conversation_with_autonomy(
+                    &rejected_conversation,
+                    &rejected_grant,
+                    &rejected_audit,
+                )
+                .await
+                .is_err(),
+            "{label}: invalid atomic start must be rejected"
+        );
+        assert_atomic_ai_start_absent(store, &rejected_conversation, &rejected_grant, label).await;
+    }
+
+    let mut late_failure_conversation = atomic_conversation.clone();
+    late_failure_conversation.id = uuid::Uuid::new_v4();
+    late_failure_conversation.title = "Late failure atomic start".to_owned();
+    let mut duplicate_grant = initial_ask_grant(&late_failure_conversation, now);
+    duplicate_grant.id = atomic_grant.id;
+    assert!(
+        store
+            .create_ai_conversation_with_autonomy(
+                &late_failure_conversation,
+                &duplicate_grant,
+                &audit,
+            )
+            .await
+            .is_err(),
+        "a grant insert failure must reject the whole atomic start"
+    );
+    assert!(matches!(
+        store
+            .get_ai_conversation(late_failure_conversation.id)
+            .await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert_eq!(
+        store
+            .get_ai_autonomy_grant(late_failure_conversation.id)
+            .await
+            .unwrap(),
+        None,
+        "a failure after conversation insertion must roll the conversation back"
+    );
+    assert_eq!(
+        store
+            .get_ai_autonomy_grant(atomic_conversation.id)
+            .await
+            .unwrap(),
+        Some(atomic_grant.clone()),
+        "a duplicate grant failure must not mutate the existing grant"
+    );
+    assert!(
+        store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_id: Some(late_failure_conversation.id),
+            })
+            .await
+            .unwrap()
+            .is_empty(),
+        "a late transaction failure must roll back the conversation audit"
+    );
+
     let mut autonomy = AiAutonomyGrant {
         id: uuid::Uuid::new_v4(),
         conversation_id: conversation.id,
@@ -3028,6 +5150,19 @@ where
         revoked_at: None,
         meta: RecordMeta::new(now),
     };
+    let mut full_without_session = autonomy.clone();
+    full_without_session.session_id = None;
+    assert!(matches!(
+        store
+            .save_ai_autonomy_grant(&full_without_session, None, &audit)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        None,
+        "a Full grant without a session must not be persisted"
+    );
     store
         .save_ai_autonomy_grant(&autonomy, None, &audit)
         .await
@@ -3331,8 +5466,8 @@ where
         vec![
             user_message.clone(),
             assistant_message.clone(),
-            tool_user_message,
-            tool_assistant_message,
+            tool_user_message.clone(),
+            tool_assistant_message.clone(),
         ]
     );
     for (entity_id, entity_type) in [
@@ -3531,6 +5666,490 @@ where
             .unwrap()
             .is_empty()
     );
+
+    // Source/image writes must revalidate the conversation and its exact bound
+    // profile version inside the adapter transaction. Transport preflights are
+    // not a sufficient guard because the conversation or profile can be
+    // archived while an object is being inspected.
+    let archived_scope_conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        title: "Archived workspace write guard".to_owned(),
+        model_profile: Some(model_profile),
+        legacy_read_only: false,
+        pinned_at: None,
+        archived_at: None,
+        meta: RecordMeta::new(now + Duration::milliseconds(20)),
+    };
+    store
+        .create_ai_conversation(&archived_scope_conversation, &audit)
+        .await
+        .unwrap();
+    let (archived_transition_source, archived_transition_source_attachment) =
+        ai_source_contract_records(
+            &archived_scope_conversation,
+            AiConversationSourceStatus::Ready,
+            12,
+            now + Duration::milliseconds(20),
+            now + Duration::days(30),
+        );
+    store
+        .create_ai_conversation_source(
+            &archived_transition_source_attachment,
+            &archived_transition_source,
+            &audit,
+        )
+        .await
+        .unwrap();
+    let (archived_transition_image, archived_transition_image_attachment) =
+        private_ai_image_contract_records(
+            &archived_scope_conversation,
+            now + Duration::milliseconds(20),
+        );
+    store
+        .create_private_ai_image(
+            &archived_transition_image_attachment,
+            &archived_transition_image,
+            &audit,
+        )
+        .await
+        .unwrap();
+    let archived_transition_evidence = workspace_evidence_counts(
+        store,
+        lab.id,
+        &[
+            archived_transition_source.id,
+            archived_transition_source_attachment.id,
+            archived_transition_image.id,
+            archived_transition_image_attachment.id,
+        ],
+    )
+    .await;
+    let archived_scope_conversation = store
+        .update_ai_conversation(
+            &AiConversationUpdate {
+                id: archived_scope_conversation.id,
+                expected_revision: archived_scope_conversation.meta.revision,
+                change: AiConversationChange::Archive,
+                updated_at: now + Duration::milliseconds(21),
+            },
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .archive_ai_conversation_source(
+                archived_transition_source.id,
+                project.id,
+                archived_transition_source.meta.revision,
+                now + Duration::milliseconds(22),
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .archive_private_ai_image(
+                archived_transition_image.id,
+                project.id,
+                archived_transition_image.meta.revision,
+                now + Duration::milliseconds(22),
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        store
+            .get_ai_conversation_source(archived_transition_source.id)
+            .await
+            .unwrap(),
+        archived_transition_source
+    );
+    assert_eq!(
+        store
+            .get_private_ai_image(archived_transition_image.id)
+            .await
+            .unwrap(),
+        archived_transition_image
+    );
+    assert_eq!(
+        store
+            .get_attachment(archived_transition_source_attachment.id)
+            .await
+            .unwrap(),
+        archived_transition_source_attachment
+    );
+    assert_eq!(
+        store
+            .get_attachment(archived_transition_image_attachment.id)
+            .await
+            .unwrap(),
+        archived_transition_image_attachment
+    );
+    assert_eq!(
+        workspace_evidence_counts(
+            store,
+            lab.id,
+            &[
+                archived_transition_source.id,
+                archived_transition_source_attachment.id,
+                archived_transition_image.id,
+                archived_transition_image_attachment.id,
+            ],
+        )
+        .await,
+        archived_transition_evidence,
+        "archiving a conversation must block source/image promotion without audit or provenance"
+    );
+    let (archived_source, archived_source_attachment) = ai_source_contract_records(
+        &archived_scope_conversation,
+        AiConversationSourceStatus::Ready,
+        12,
+        now + Duration::milliseconds(22),
+        now + Duration::days(30),
+    );
+    assert!(matches!(
+        store
+            .create_ai_conversation_source(&archived_source_attachment, &archived_source, &audit,)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let (archived_image, archived_image_attachment) = private_ai_image_contract_records(
+        &archived_scope_conversation,
+        now + Duration::milliseconds(22),
+    );
+    assert!(matches!(
+        store
+            .create_private_ai_image(&archived_image_attachment, &archived_image, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store.get_ai_conversation_source(archived_source.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert!(matches!(
+        store.get_private_ai_image(archived_image.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    for attachment_id in [archived_source_attachment.id, archived_image_attachment.id] {
+        assert!(matches!(
+            store.get_attachment(attachment_id).await,
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+    assert_eq!(
+        workspace_evidence_counts(
+            store,
+            lab.id,
+            &[
+                archived_source.id,
+                archived_source_attachment.id,
+                archived_image.id,
+                archived_image_attachment.id,
+            ],
+        )
+        .await,
+        (0, 0),
+        "rejected writes to an archived conversation must leave no audit or provenance"
+    );
+
+    let (guarded_source, guarded_source_attachment) = ai_source_contract_records(
+        &conversation,
+        AiConversationSourceStatus::Ready,
+        12,
+        now + Duration::milliseconds(23),
+        now + Duration::days(30),
+    );
+    store
+        .create_ai_conversation_source(&guarded_source_attachment, &guarded_source, &audit)
+        .await
+        .unwrap();
+    let (guarded_image, guarded_image_attachment) =
+        private_ai_image_contract_records(&conversation, now + Duration::milliseconds(23));
+    store
+        .create_private_ai_image(&guarded_image_attachment, &guarded_image, &audit)
+        .await
+        .unwrap();
+    let guarded_source_evidence = workspace_evidence_counts(
+        store,
+        lab.id,
+        &[guarded_source.id, guarded_source_attachment.id],
+    )
+    .await;
+    let guarded_image_evidence = workspace_evidence_counts(
+        store,
+        lab.id,
+        &[guarded_image.id, guarded_image_attachment.id],
+    )
+    .await;
+
+    let mut unavailable_profile = profile.clone();
+    unavailable_profile.archived_at = Some(now + Duration::seconds(2));
+    unavailable_profile.meta.touch(now + Duration::seconds(2));
+    store
+        .archive_ai_model_profile(&unavailable_profile, 1, &bootstrap)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.get_ai_conversation(conversation.id).await.unwrap(),
+        before_rollback,
+        "archiving a bound model must preserve the historical conversation"
+    );
+    assert_eq!(
+        store
+            .list_ai_conversation_messages(conversation.id, 20)
+            .await
+            .unwrap(),
+        vec![
+            user_message.clone(),
+            assistant_message.clone(),
+            tool_user_message.clone(),
+            tool_assistant_message.clone(),
+        ],
+        "archiving a bound model must preserve historical messages"
+    );
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        Some(autonomy.clone()),
+        "archiving a bound model must preserve the historical autonomy projection"
+    );
+
+    assert!(matches!(
+        store
+            .archive_ai_conversation_source(
+                guarded_source.id,
+                project.id,
+                guarded_source.meta.revision,
+                now + Duration::seconds(3),
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .archive_private_ai_image(
+                guarded_image.id,
+                project.id,
+                guarded_image.meta.revision,
+                now + Duration::seconds(3),
+                &audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        store
+            .get_ai_conversation_source(guarded_source.id)
+            .await
+            .unwrap(),
+        guarded_source
+    );
+    assert_eq!(
+        store.get_private_ai_image(guarded_image.id).await.unwrap(),
+        guarded_image
+    );
+    assert_eq!(
+        store
+            .get_attachment(guarded_source_attachment.id)
+            .await
+            .unwrap(),
+        guarded_source_attachment
+    );
+    assert_eq!(
+        store
+            .get_attachment(guarded_image_attachment.id)
+            .await
+            .unwrap(),
+        guarded_image_attachment
+    );
+    assert_eq!(
+        workspace_evidence_counts(
+            store,
+            lab.id,
+            &[guarded_source.id, guarded_source_attachment.id],
+        )
+        .await,
+        guarded_source_evidence,
+        "a rejected source archive must not append audit or provenance"
+    );
+    assert_eq!(
+        workspace_evidence_counts(
+            store,
+            lab.id,
+            &[guarded_image.id, guarded_image_attachment.id],
+        )
+        .await,
+        guarded_image_evidence,
+        "a rejected private-image archive must not append audit or provenance"
+    );
+
+    let (blocked_source, blocked_source_attachment) = ai_source_contract_records(
+        &conversation,
+        AiConversationSourceStatus::Ready,
+        12,
+        now + Duration::seconds(3),
+        now + Duration::days(30),
+    );
+    assert!(matches!(
+        store
+            .create_ai_conversation_source(&blocked_source_attachment, &blocked_source, &audit,)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let (blocked_image, blocked_image_attachment) =
+        private_ai_image_contract_records(&conversation, now + Duration::seconds(3));
+    assert!(matches!(
+        store
+            .create_private_ai_image(&blocked_image_attachment, &blocked_image, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store.get_ai_conversation_source(blocked_source.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert!(matches!(
+        store.get_private_ai_image(blocked_image.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    for attachment_id in [blocked_source_attachment.id, blocked_image_attachment.id] {
+        assert!(matches!(
+            store.get_attachment(attachment_id).await,
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+    assert_eq!(
+        workspace_evidence_counts(
+            store,
+            lab.id,
+            &[
+                blocked_source.id,
+                blocked_source_attachment.id,
+                blocked_image.id,
+                blocked_image_attachment.id,
+            ],
+        )
+        .await,
+        (0, 0),
+        "rejected writes through an unavailable exact model binding must leave no audit or provenance"
+    );
+
+    // Retention/deletion is intentionally different from promotion: an owner
+    // must still be able to remove private material after a conversation or
+    // model becomes read-only.
+    let discarded_guarded_source = store
+        .discard_ai_conversation_source(
+            guarded_source.id,
+            guarded_source.meta.revision,
+            now + Duration::seconds(4),
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        discarded_guarded_source.status,
+        AiConversationSourceStatus::Expired
+    );
+    assert!(matches!(
+        store.get_ai_conversation_source(guarded_source.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert!(matches!(
+        store.get_attachment(guarded_source_attachment.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+
+    let blocked_user = AiConversationMessage::new(
+        conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        5,
+        AiConversationMessageRole::User,
+        "Must not reach an archived model",
+        None,
+        now + Duration::seconds(3),
+    )
+    .unwrap();
+    let blocked_assistant = AiConversationMessage::new(
+        conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        6,
+        AiConversationMessageRole::Assistant,
+        "Must not persist",
+        Some(serde_json::json!({"content": "Must not persist"})),
+        now + Duration::seconds(4),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .append_ai_turn_messages(&blocked_user, &blocked_assistant, 4, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let blocked_tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: Some(conversation.id),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "archived_model_draft".to_owned(),
+        input: serde_json::json!({"operation": "must_not_run"}),
+        output: None,
+        status: ToolRunStatus::Pending,
+        source: WriteSource::Ai,
+        started_at: None,
+        completed_at: None,
+        error: None,
+        meta: RecordMeta::new(now + Duration::seconds(3)),
+    };
+    assert!(matches!(
+        store.create_tool_run(&blocked_tool, &audit).await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store.get_tool_run(blocked_tool.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+
+    let mut blocked_autonomy = autonomy.clone();
+    blocked_autonomy.last_used_at = now + Duration::seconds(3);
+    blocked_autonomy.meta.touch(now + Duration::seconds(3));
+    assert!(matches!(
+        store
+            .save_ai_autonomy_grant(&blocked_autonomy, Some(autonomy.meta.revision), &audit,)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        Some(autonomy),
+        "blocked writes must leave historical autonomy state unchanged"
+    );
+    assert_eq!(
+        store
+            .list_ai_conversation_messages(conversation.id, 20)
+            .await
+            .unwrap(),
+        vec![
+            user_message,
+            assistant_message,
+            tool_user_message,
+            tool_assistant_message,
+        ],
+        "blocked writes must leave historical messages unchanged"
+    );
 }
 
 /// Shared provenance contract for an approved AI measurement draft. It is run
@@ -3697,6 +6316,7 @@ async fn create_ai_import_atomicity_fixture<S>(
     experiment: &Experiment,
     animal: &Animal,
     user: &User,
+    model_profile: AiModelProfileBinding,
     key_label: &str,
     preview_hash: String,
     now: chrono::DateTime<Utc>,
@@ -3751,6 +6371,8 @@ where
         project_id: Some(project.id),
         user_id: user.id,
         title: format!("AI import {key_label}"),
+        model_profile: Some(model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),
@@ -3902,7 +6524,7 @@ fn assert_ai_import_conflict(error: StoreError, expected_fragment: &str) {
 /// projection must either all commit or all roll back.
 pub async fn run_ai_import_commit_atomicity_contract<S>(store: &S)
 where
-    S: MuriArcStore + AiOperationStore,
+    S: MuriArcStore + AiModelProfileStore + AiOperationStore,
 {
     store.migrate().await.expect("migration succeeds");
     let now = contract_now();
@@ -3921,6 +6543,15 @@ where
     )
     .unwrap();
     store.create_user(&user, &bootstrap).await.unwrap();
+    let model_profile = create_ai_contract_model_binding(
+        store,
+        lab.id,
+        user.id,
+        "ai-import-contract",
+        now,
+        &bootstrap,
+    )
+    .await;
     let project = Project::new(lab.id, "AI Import Contract Project", now).unwrap();
     store.create_project(&project, &bootstrap).await.unwrap();
     let human_audit = AuditContext {
@@ -3992,6 +6623,7 @@ where
         &experiment,
         &animal,
         &user,
+        model_profile,
         "success",
         "b".repeat(64),
         now + Duration::seconds(1),
@@ -4113,6 +6745,7 @@ where
         &experiment,
         &animal,
         &user,
+        model_profile,
         "rejected",
         "c".repeat(64),
         now + Duration::seconds(3),
@@ -5349,7 +7982,7 @@ fn source_archive_options(
 /// conversation source during ordinary import confirmation.
 pub async fn run_import_source_archive_contract<S>(store: &S)
 where
-    S: MuriArcStore + AiOperationStore + ?Sized,
+    S: MuriArcStore + AiModelProfileStore + AiOperationStore + ?Sized,
 {
     store.migrate().await.expect("migration succeeds");
     let now = contract_now();
@@ -5368,6 +8001,15 @@ where
     )
     .unwrap();
     store.create_user(&user, &bootstrap).await.unwrap();
+    let model_profile = create_ai_contract_model_binding(
+        store,
+        lab.id,
+        user.id,
+        "source-import-contract",
+        now,
+        &bootstrap,
+    )
+    .await;
     let audit = AuditContext {
         actor: Actor::human(user.id, user.display_name.clone()),
         source: WriteSource::Web,
@@ -5380,6 +8022,8 @@ where
         project_id: None,
         user_id: user.id,
         title: "Source import contract".to_owned(),
+        model_profile: Some(model_profile),
+        legacy_read_only: false,
         pinned_at: None,
         archived_at: None,
         meta: RecordMeta::new(now),

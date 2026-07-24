@@ -1,6 +1,18 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { CalendarClock, CheckCircle2, Download, FlaskConical, Plus, Upload, UsersRound } from '@lucide/vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import {
+  CalendarClock,
+  CheckCircle2,
+  Download,
+  FlaskConical,
+  ImagePlus,
+  Plus,
+  ScanSearch,
+  ShieldCheck,
+  Trash2,
+  Upload,
+  UsersRound,
+} from '@lucide/vue'
 import { useMessage } from 'naive-ui'
 import type {
   Animal,
@@ -20,7 +32,14 @@ import type {
   ProjectSummary,
   TemplateFieldValueType,
 } from '@/domain/models'
-import { gateway, type AttachmentMetadata } from '@/services/gateway'
+import {
+  gateway,
+  type AiExtractionRecord,
+  type AiModelDefaultsView,
+  type AiModelProfileView,
+  type AttachmentMetadata,
+  type PrivateImageRecord,
+} from '@/services/gateway'
 import {
   canCreateProject,
   canPublishTemplate,
@@ -77,8 +96,29 @@ const showObservation = ref(false)
 const showObservationRevision = ref(false)
 const showObservationHistory = ref(false)
 const experimentFileInput = ref<HTMLInputElement | null>(null)
+const dataEntryFileInput = ref<HTMLInputElement | null>(null)
 const attachmentUploading = ref(false)
 const attachmentDownloadingId = ref<string | null>(null)
+interface DataEntryImage {
+  localId: string
+  file: File
+  previewUrl: string
+  status: 'staged' | 'uploading' | 'ready' | 'error'
+  uploaded?: PrivateImageRecord
+  error?: string
+}
+const MAX_PORTABLE_AI_IMAGE_BYTES = 10 * 1024 * 1024
+const dataEntryMode = ref<'manual' | 'ai'>('manual')
+const dataEntryImages = ref<DataEntryImage[]>([])
+const dataEntryImageError = ref('')
+const dataEntryAiBusy = ref(false)
+let dataEntryGeneration = 0
+const visionProfiles = ref<AiModelProfileView[]>([])
+const visionDefaults = ref<AiModelDefaultsView>({ revision: 0 })
+const selectedVisionProfileId = ref<string | null>(null)
+const extractionDraft = ref<AiExtractionRecord | null>(null)
+const aiCandidateNotes = ref('')
+const aiApprovalConfirmed = ref(false)
 const writeAllowed = computed(() => gateway.mode === 'local' || canWriteExperiment())
 const projectCreationAllowed = computed(() => gateway.mode === 'local' || canCreateProject())
 const templatePublishAllowed = computed(() => gateway.mode === 'local' || canPublishTemplate())
@@ -167,6 +207,21 @@ const observationDefinitionOptions = computed(() => observationDefinitions.value
 const selectedObservationDefinition = computed(() => observationDefinitions.value.find(
   (definition) => definition.id === newObservation.definitionId,
 ) ?? null)
+const visionProfileOptions = computed(() => visionProfiles.value.map((profile) => ({
+  label: `${profile.name} · ${profile.modelId} · v${profile.currentVersion}${profile.isDefaultVision ? '（默认）' : ''}`,
+  value: profile.id,
+})))
+const selectedVisionProfile = computed(() => visionProfiles.value.find((profile) =>
+  profile.id === selectedVisionProfileId.value) ?? null)
+const extractionCandidate = computed(() => extractionDraft.value?.candidates[0] ?? null)
+const extractionCellLocked = computed(() =>
+  dataEntryAiBusy.value || Boolean(extractionDraft.value))
+const currentDataCellReady = computed(() => Boolean(
+  selected.value
+  && newObservation.experimentEventId
+  && selectedObservationDefinition.value
+  && newObservation.subjectId,
+))
 const revisionDefinition = computed(() => observationDefinitions.value.find(
   (definition) => definition.id === revisionObservation.value?.definitionId,
 ) ?? null)
@@ -328,6 +383,334 @@ function cellDisplayValue(animalId: string, eventId: string, definitionId: strin
   return formatObservationValue(observation ? latestObservationValue(observation)?.value : undefined)
 }
 
+function revokeDataEntryPreview(previewUrl: string) {
+  if (previewUrl && typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(previewUrl)
+}
+
+function clearDataEntryImages() {
+  for (const image of dataEntryImages.value) revokeDataEntryPreview(image.previewUrl)
+  dataEntryImages.value = []
+}
+
+function resetDataEntryAiState() {
+  dataEntryGeneration += 1
+  clearDataEntryImages()
+  dataEntryMode.value = 'manual'
+  dataEntryImageError.value = ''
+  dataEntryAiBusy.value = false
+  extractionDraft.value = null
+  aiCandidateNotes.value = ''
+  aiApprovalConfirmed.value = false
+}
+
+class DataEntryOperationCancelled extends Error {}
+
+function isCurrentDataEntryGeneration(generation: number) {
+  return generation === dataEntryGeneration
+}
+
+function assertCurrentDataEntryGeneration(generation: number) {
+  if (!isCurrentDataEntryGeneration(generation) || !showObservation.value) {
+    throw new DataEntryOperationCancelled()
+  }
+}
+
+function beginReviewingExtraction(draft: AiExtractionRecord) {
+  extractionDraft.value = draft
+  resetObservationValue(draft.candidates[0].value)
+  aiCandidateNotes.value = draft.candidates[0].notes ?? ''
+  aiApprovalConfirmed.value = false
+  dataEntryMode.value = 'ai'
+}
+
+async function loadVisionProfiles(generation: number) {
+  if (!gateway.listAiModelProfiles || !gateway.getAiModelDefaults) {
+    if (!isCurrentDataEntryGeneration(generation)) return
+    visionProfiles.value = []
+    selectedVisionProfileId.value = null
+    return
+  }
+  const [profiles, defaults] = await Promise.all([
+    gateway.listAiModelProfiles(false),
+    gateway.getAiModelDefaults(),
+  ])
+  if (!isCurrentDataEntryGeneration(generation) || !showObservation.value) return
+  visionProfiles.value = profiles.filter((profile) =>
+    profile.supportsVision && !profile.archivedAt)
+  visionDefaults.value = defaults
+  const selectedAvailable = visionProfiles.value.some((profile) =>
+    profile.id === selectedVisionProfileId.value)
+  if (!selectedAvailable) {
+    const defaultId = defaults.defaultVisionProfileId ?? null
+    selectedVisionProfileId.value = visionProfiles.value.some((profile) =>
+      profile.id === defaultId)
+      ? defaultId
+      : null
+  }
+}
+
+async function restorePendingExtraction(generation: number) {
+  const experiment = selected.value
+  const definition = selectedObservationDefinition.value
+  if (!gateway.listAiExtractions || !experiment || !definition
+    || !newObservation.experimentEventId || !newObservation.subjectId) return
+  const drafts = await gateway.listAiExtractions(experiment.projectId)
+  if (!isCurrentDataEntryGeneration(generation) || !showObservation.value) return
+  const draft = drafts.find((entry) =>
+    entry.status === 'pending_approval'
+    && entry.projectId === experiment.projectId
+    && entry.experimentId === experiment.id
+    && entry.experimentEventId === newObservation.experimentEventId
+    && entry.currentDataCell?.definitionId === definition.id
+    && entry.currentDataCell.subjectType === newObservation.subjectType
+    && entry.currentDataCell.subjectId === newObservation.subjectId
+    && entry.candidates.length === 1)
+  if (draft) beginReviewingExtraction(draft)
+}
+
+function openDataEntryModal() {
+  resetDataEntryAiState()
+  showObservation.value = true
+  const generation = dataEntryGeneration
+  void Promise.all([
+    loadVisionProfiles(generation),
+    restorePendingExtraction(generation),
+  ]).catch((error) => {
+    if (!isCurrentDataEntryGeneration(generation) || !showObservation.value) return
+    dataEntryImageError.value = error instanceof Error
+      ? error.message
+      : '无法读取视觉模型'
+  })
+}
+
+function chooseDataEntryImages() {
+  dataEntryFileInput.value?.click()
+}
+
+function stageDataEntryImages(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  dataEntryImageError.value = ''
+  const available = 8 - dataEntryImages.value.length
+  if (available <= 0) {
+    dataEntryImageError.value = '当前数据单元最多使用 8 张图片'
+    return
+  }
+  if (files.length > available) {
+    dataEntryImageError.value = `当前数据单元最多使用 8 张图片，已保留前 ${available} 张`
+  }
+  const allowed = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+  for (const file of files.slice(0, available)) {
+    if (!allowed.has(file.type.toLowerCase())) {
+      dataEntryImageError.value = `${file.name} 不是支持的 JPEG、PNG、WebP 或 GIF`
+      continue
+    }
+    if (!file.size || file.size > MAX_PORTABLE_AI_IMAGE_BYTES) {
+      dataEntryImageError.value = `${file.name} 必须不超过 10 MiB`
+      continue
+    }
+    dataEntryImages.value.push({
+      localId: crypto.randomUUID(),
+      file,
+      previewUrl: typeof URL.createObjectURL === 'function' ? URL.createObjectURL(file) : '',
+      status: 'staged',
+    })
+  }
+}
+
+function removeDataEntryImage(localId: string) {
+  const image = dataEntryImages.value.find((entry) => entry.localId === localId)
+  if (!image) return
+  revokeDataEntryPreview(image.previewUrl)
+  dataEntryImages.value = dataEntryImages.value.filter((entry) => entry.localId !== localId)
+  if (!dataEntryImages.value.length) dataEntryImageError.value = ''
+}
+
+async function uploadDataEntryImages(generation: number) {
+  if (!gateway.uploadPrivateImage) throw new Error('当前运行模式不支持私人图片上传')
+  const uploaded: PrivateImageRecord[] = []
+  const stagedImages = [...dataEntryImages.value]
+  for (const image of stagedImages) {
+    assertCurrentDataEntryGeneration(generation)
+    if (image.uploaded) {
+      uploaded.push(image.uploaded)
+      continue
+    }
+    image.status = 'uploading'
+    image.error = undefined
+    try {
+      const uploadedImage = await gateway.uploadPrivateImage(image.file)
+      assertCurrentDataEntryGeneration(generation)
+      image.uploaded = uploadedImage
+      image.status = 'ready'
+      uploaded.push(uploadedImage)
+    } catch (error) {
+      if (error instanceof DataEntryOperationCancelled) throw error
+      image.status = 'error'
+      image.error = error instanceof Error ? error.message : '上传失败'
+      dataEntryImageError.value = `${image.file.name}：${image.error}`
+      throw error
+    }
+  }
+  return uploaded
+}
+
+async function generateExtractionCandidate() {
+  const definition = selectedObservationDefinition.value
+  if (!selected.value || !newObservation.experimentEventId || !definition
+    || !newObservation.subjectId) {
+    dataEntryImageError.value = '请先完整选择当前数据单元'
+    return
+  }
+  if (!dataEntryImages.value.length || dataEntryImages.value.length > 8) {
+    dataEntryImageError.value = '请选择 1–8 张当前数据单元的图片'
+    return
+  }
+  if (!selectedVisionProfile.value) {
+    dataEntryImageError.value = '请明确选择一个可用的视觉模型'
+    return
+  }
+  if (!gateway.createAiExtraction) {
+    dataEntryImageError.value = '当前运行模式不支持视觉数据提取'
+    return
+  }
+  const currentDataCell = {
+    definitionId: definition.id,
+    subjectType: newObservation.subjectType,
+    subjectId: newObservation.subjectId,
+  }
+  const extractionScope = {
+    projectId: selected.value.projectId,
+    experimentId: selected.value.id,
+    experimentEventId: newObservation.experimentEventId,
+    visionModelProfileId: selectedVisionProfile.value.id,
+  }
+  const generation = dataEntryGeneration + 1
+  dataEntryGeneration = generation
+  dataEntryAiBusy.value = true
+  dataEntryImageError.value = ''
+  try {
+    const uploaded = await uploadDataEntryImages(generation)
+    // Closing/resetting after uploads must not start an expensive Provider
+    // request that would leave a detached pending draft.
+    assertCurrentDataEntryGeneration(generation)
+    const draft = await gateway.createAiExtraction({
+      imageIds: uploaded.map((image) => image.image.id),
+      ...extractionScope,
+      currentDataCell,
+    })
+    assertCurrentDataEntryGeneration(generation)
+    if (!draft.currentDataCell
+      || draft.currentDataCell.definitionId !== currentDataCell.definitionId
+      || draft.currentDataCell.subjectType !== currentDataCell.subjectType
+      || draft.currentDataCell.subjectId !== currentDataCell.subjectId
+      || draft.candidates.length !== 1) {
+      throw new Error('AI 返回的候选没有严格绑定当前数据单元')
+    }
+    beginReviewingExtraction(draft)
+    message.success('已生成当前数据单元的候选，请编辑并人工批准')
+  } catch (error) {
+    if (error instanceof DataEntryOperationCancelled) return
+    if (!isCurrentDataEntryGeneration(generation)) return
+    dataEntryImageError.value = error instanceof Error ? error.message : '生成候选失败'
+  } finally {
+    if (isCurrentDataEntryGeneration(generation)) dataEntryAiBusy.value = false
+  }
+}
+
+async function rejectExtractionCandidate() {
+  const draft = extractionDraft.value
+  if (!draft || !gateway.rejectAiExtraction) {
+    dataEntryImageError.value = '当前运行模式不支持放弃 AI 候选'
+    return
+  }
+  const generation = dataEntryGeneration + 1
+  dataEntryGeneration = generation
+  dataEntryAiBusy.value = true
+  dataEntryImageError.value = ''
+  try {
+    const rejected = await gateway.rejectAiExtraction(draft.id, {
+      expectedRevision: draft.revision,
+    })
+    assertCurrentDataEntryGeneration(generation)
+    if (rejected.status !== 'rejected') {
+      throw new Error('AI 候选未被正确放弃')
+    }
+    extractionDraft.value = null
+    aiCandidateNotes.value = ''
+    aiApprovalConfirmed.value = false
+    for (const image of dataEntryImages.value) {
+      if (image.uploaded) image.status = 'ready'
+    }
+    message.success('已放弃候选并释放全部私人暂存图片')
+  } catch (error) {
+    if (error instanceof DataEntryOperationCancelled) return
+    if (!isCurrentDataEntryGeneration(generation)) return
+    dataEntryImageError.value = error instanceof Error ? error.message : '放弃候选失败'
+  } finally {
+    if (isCurrentDataEntryGeneration(generation)) dataEntryAiBusy.value = false
+  }
+}
+
+async function approveExtractionCandidate() {
+  const draft = extractionDraft.value
+  const definition = selectedObservationDefinition.value
+  if (!draft || !definition || !gateway.approveAiExtraction) return
+  if (!aiApprovalConfirmed.value) {
+    dataEntryImageError.value = '批准前请确认已核对当前数据单元、候选值和图片证据'
+    return
+  }
+  const generation = dataEntryGeneration + 1
+  dataEntryGeneration = generation
+  dataEntryAiBusy.value = true
+  dataEntryImageError.value = ''
+  try {
+    const applied = await gateway.approveAiExtraction(draft.id, {
+      expectedRevision: draft.revision,
+      selections: [{
+        itemIndex: draft.candidates[0].itemIndex,
+        value: buildObservationValue(definition),
+        notes: aiCandidateNotes.value.trim() || undefined,
+      }],
+    })
+    assertCurrentDataEntryGeneration(generation)
+    for (const observation of applied.observations) {
+      const index = observations.value.findIndex((entry) => entry.id === observation.id)
+      if (index >= 0) observations.value[index] = observation
+      else observations.value.push(observation)
+    }
+    let refreshFailed = false
+    try {
+      const loadedValues = await Promise.all(applied.observations.map(async (observation) => [
+        observation.id,
+        await gateway.listObservationValues(observation.id),
+      ] as const))
+      assertCurrentDataEntryGeneration(generation)
+      const next = new Map(observationValues.value)
+      for (const [observationId, values] of loadedValues) next.set(observationId, values)
+      observationValues.value = next
+    } catch (error) {
+      if (error instanceof DataEntryOperationCancelled) return
+      refreshFailed = true
+    }
+    // The atomic approval has already succeeded. Never leave a retryable
+    // "approval failed" state merely because the follow-up refresh failed.
+    dataEntryAiBusy.value = false
+    showObservation.value = false
+    message.success('已由人工批准并原子写入 Observation、附件、Audit 与 Provenance')
+    if (refreshFailed) {
+      message.warning('数据已正式写入，但最新观察值刷新失败；重新打开实验即可同步')
+    }
+  } catch (error) {
+    if (error instanceof DataEntryOperationCancelled) return
+    if (!isCurrentDataEntryGeneration(generation)) return
+    dataEntryImageError.value = error instanceof Error ? error.message : '批准候选失败'
+  } finally {
+    if (isCurrentDataEntryGeneration(generation)) dataEntryAiBusy.value = false
+  }
+}
+
 function editDataCell(
   participation: Participation,
   event: ExperimentEvent,
@@ -349,7 +732,7 @@ function editDataCell(
     contextJson: '{}',
   })
   resetObservationValue()
-  showObservation.value = true
+  openDataEntryModal()
 }
 
 async function loadRoute() {
@@ -749,7 +1132,7 @@ function openObservation() {
     contextJson: '{}',
   })
   resetObservationValue()
-  showObservation.value = true
+  openDataEntryModal()
 }
 
 function normalizeObservationSubject() {
@@ -882,6 +1265,17 @@ watch(() => newObservationDefinition.valueType, (value) => {
 })
 watch(() => newObservation.definitionId, () => resetObservationValue())
 watch(() => newObservation.subjectType, normalizeObservationSubject)
+watch(showObservation, (visible) => {
+  if (!visible && dataEntryAiBusy.value) {
+    showObservation.value = true
+    return
+  }
+  if (!visible) resetDataEntryAiState()
+})
+onUnmounted(() => {
+  dataEntryGeneration += 1
+  clearDataEntryImages()
+})
 onMounted(loadRoute)
 </script>
 
@@ -1095,9 +1489,285 @@ onMounted(loadRoute)
       <template #footer><div class="dialog-actions"><n-button @click="showObservationDefinition = false">取消</n-button><n-button type="primary" :loading="busy" @click="createObservationDefinition">添加数据列</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showObservation" preset="card" title="录入实验数据" class="dialog-card">
-      <n-form label-placement="top"><div class="form-grid"><n-form-item label="采集节点" required><n-select v-model:value="newObservation.experimentEventId" :options="experimentEventOptions" filterable /></n-form-item><n-form-item label="数据列" required><n-select v-model:value="newObservation.definitionId" :options="observationDefinitionOptions" filterable /></n-form-item></div><div class="form-grid"><n-form-item label="数据对象类型" required><n-select v-model:value="newObservation.subjectType" :options="[{label:'整个实验',value:'experiment'},{label:'动物',value:'animal'},{label:'样本',value:'sample'},{label:'研究产物',value:'artifact'}]" /></n-form-item><n-form-item label="数据对象" required><n-input v-if="newObservation.subjectType === 'experiment'" :value="selected?.name" disabled /><n-select v-else-if="newObservation.subjectType === 'animal'" v-model:value="newObservation.subjectId" :options="observationSubjectOptions" filterable /><n-input v-else v-model:value="newObservation.subjectId" placeholder="输入当前实验内对象的 UUID" /></n-form-item></div><template v-if="selectedObservationDefinition"><n-form-item v-if="selectedObservationDefinition.valueType === 'number'" :label="'数值（' + selectedObservationDefinition.unit + '）'" required><n-input-number v-model:value="observationValueForm.numberValue" /></n-form-item><n-form-item v-else-if="selectedObservationDefinition.valueType === 'text'" label="文本" required><n-input v-model:value="observationValueForm.textValue" type="textarea" /></n-form-item><n-form-item v-else-if="selectedObservationDefinition.valueType === 'boolean'" label="是/否"><n-switch v-model:value="observationValueForm.booleanValue" /></n-form-item><n-form-item v-else-if="selectedObservationDefinition.valueType === 'date'" label="日期" required><n-date-picker v-model:value="observationValueForm.dateValue" type="date" /></n-form-item><n-form-item v-else-if="selectedObservationDefinition.valueType === 'category'" label="分类" required><n-select v-model:value="observationValueForm.categoryValue" :options="selectedObservationDefinition.categories.map((value) => ({ label: value, value }))" /></n-form-item><n-form-item v-else label="结构化值" required><n-input v-model:value="observationValueForm.jsonValue" type="textarea" :rows="3" /></n-form-item></template><n-form-item label="实际记录时间"><n-date-picker v-model:value="newObservation.recordedAt" type="datetime" clearable /></n-form-item><n-form-item label="备注"><n-input v-model:value="newObservation.notes" type="textarea" /></n-form-item></n-form>
-      <template #footer><div class="dialog-actions"><n-button @click="showObservation = false">取消</n-button><n-button type="primary" :loading="busy" @click="createObservation">保存数据</n-button></div></template>
+    <n-modal
+      v-model:show="showObservation"
+      preset="card"
+      title="录入实验数据"
+      class="data-entry-dialog"
+      :closable="!dataEntryAiBusy"
+      :mask-closable="!dataEntryAiBusy"
+      :close-on-esc="!dataEntryAiBusy"
+    >
+      <n-alert type="info" :show-icon="false">
+        当前数据单元由采集节点、数据列与数据对象共同确定。AI 只能为这个单元生成候选，不能修改绑定，也不会直接写入正式数据。
+      </n-alert>
+      <n-form label-placement="top" class="data-cell-form">
+        <div class="form-grid">
+          <n-form-item label="采集节点" required>
+            <n-select
+              v-model:value="newObservation.experimentEventId"
+              :options="experimentEventOptions"
+              :disabled="extractionCellLocked"
+              filterable
+            />
+          </n-form-item>
+          <n-form-item label="数据列" required>
+            <n-select
+              v-model:value="newObservation.definitionId"
+              :options="observationDefinitionOptions"
+              :disabled="extractionCellLocked"
+              filterable
+            />
+          </n-form-item>
+        </div>
+        <div class="form-grid">
+          <n-form-item label="数据对象类型" required>
+            <n-select
+              v-model:value="newObservation.subjectType"
+              :disabled="extractionCellLocked"
+              :options="[
+                {label:'整个实验',value:'experiment'},
+                {label:'动物',value:'animal'},
+                {label:'样本',value:'sample'},
+                {label:'研究产物',value:'artifact'},
+              ]"
+            />
+          </n-form-item>
+          <n-form-item label="数据对象" required>
+            <n-input
+              v-if="newObservation.subjectType === 'experiment'"
+              :value="selected?.name"
+              disabled
+            />
+            <n-select
+              v-else-if="newObservation.subjectType === 'animal'"
+              v-model:value="newObservation.subjectId"
+              :options="observationSubjectOptions"
+              :disabled="extractionCellLocked"
+              filterable
+            />
+            <n-input
+              v-else
+              v-model:value="newObservation.subjectId"
+              :disabled="extractionCellLocked"
+              placeholder="输入当前实验内对象的 UUID"
+            />
+          </n-form-item>
+        </div>
+      </n-form>
+
+      <n-tabs v-model:value="dataEntryMode" type="segment" animated>
+        <n-tab-pane name="manual" tab="手工录入">
+          <n-form v-if="selectedObservationDefinition" label-placement="top">
+            <n-form-item
+              v-if="selectedObservationDefinition.valueType === 'number'"
+              :label="'数值（' + selectedObservationDefinition.unit + '）'"
+              required
+            ><n-input-number v-model:value="observationValueForm.numberValue" /></n-form-item>
+            <n-form-item
+              v-else-if="selectedObservationDefinition.valueType === 'text'"
+              label="文本"
+              required
+            ><n-input v-model:value="observationValueForm.textValue" type="textarea" /></n-form-item>
+            <n-form-item
+              v-else-if="selectedObservationDefinition.valueType === 'boolean'"
+              label="是/否"
+            ><n-switch v-model:value="observationValueForm.booleanValue" /></n-form-item>
+            <n-form-item
+              v-else-if="selectedObservationDefinition.valueType === 'date'"
+              label="日期"
+              required
+            ><n-date-picker v-model:value="observationValueForm.dateValue" type="date" /></n-form-item>
+            <n-form-item
+              v-else-if="selectedObservationDefinition.valueType === 'category'"
+              label="分类"
+              required
+            >
+              <n-select
+                v-model:value="observationValueForm.categoryValue"
+                :options="selectedObservationDefinition.categories.map((value) => ({ label: value, value }))"
+              />
+            </n-form-item>
+            <n-form-item v-else label="结构化值" required>
+              <n-input v-model:value="observationValueForm.jsonValue" type="textarea" :rows="3" />
+            </n-form-item>
+            <n-form-item label="实际记录时间">
+              <n-date-picker v-model:value="newObservation.recordedAt" type="datetime" clearable />
+            </n-form-item>
+            <n-form-item label="备注">
+              <n-input v-model:value="newObservation.notes" type="textarea" />
+            </n-form-item>
+          </n-form>
+        </n-tab-pane>
+
+        <n-tab-pane name="ai" tab="图片识别候选">
+          <div class="ai-entry-boundary">
+            <ShieldCheck :size="16" />
+            <span>图片先进入私人暂存区；生成结果只是候选，批准时才事务性创建正式 Observation、附件关系、Audit 与 Provenance。</span>
+          </div>
+          <input
+            ref="dataEntryFileInput"
+            class="visually-hidden"
+            type="file"
+            multiple
+            accept="image/jpeg,image/png,image/webp,image/gif"
+            aria-label="选择当前数据单元的图片"
+            @change="stageDataEntryImages"
+          >
+          <div class="ai-entry-toolbar">
+            <n-button
+              secondary
+              :disabled="extractionCellLocked || dataEntryImages.length >= 8"
+              @click="chooseDataEntryImages"
+            >
+              <template #icon><ImagePlus :size="16" /></template>
+              添加图片
+            </n-button>
+            <span>{{ dataEntryImages.length }}/8 张</span>
+          </div>
+          <div v-if="dataEntryImages.length" class="data-entry-images">
+            <article v-for="image in dataEntryImages" :key="image.localId">
+              <img :src="image.previewUrl" :alt="`当前数据单元图片：${image.file.name}`">
+              <div>
+                <strong>{{ image.file.name }}</strong>
+                <small v-if="image.status === 'uploading'">正在上传…</small>
+                <small v-else-if="image.status === 'ready'">已安全暂存</small>
+                <small v-else-if="image.status === 'error'" class="image-error">{{ image.error }}</small>
+                <small v-else>{{ (image.file.size / 1048576).toFixed(1) }} MiB</small>
+              </div>
+              <button
+                type="button"
+                :aria-label="`移除图片 ${image.file.name}`"
+                :disabled="extractionCellLocked"
+                @click="removeDataEntryImage(image.localId)"
+              ><Trash2 :size="15" /></button>
+            </article>
+          </div>
+          <n-empty v-else description="添加 1–8 张只属于当前数据单元的图片" />
+
+          <n-form label-placement="top" class="vision-model-field">
+            <n-form-item label="视觉模型" required>
+              <n-select
+                v-model:value="selectedVisionProfileId"
+                :options="visionProfileOptions"
+                :disabled="extractionCellLocked"
+                clearable
+                filterable
+                placeholder="没有可用默认值时必须明确选择"
+              />
+            </n-form-item>
+          </n-form>
+
+          <article v-if="extractionDraft && extractionCandidate" class="candidate-review">
+            <header>
+              <div>
+                <span><ScanSearch :size="16" />AI 候选（可编辑）</span>
+                <small>
+                  置信度 {{ Math.round(extractionCandidate.confidence * 100) }}%
+                  · v{{ extractionDraft.modelTrace?.profileVersion ?? '—' }}
+                  · {{ extractionDraft.evidence.length }} 张证据
+                </small>
+              </div>
+              <n-tag type="warning" size="small">尚未写入</n-tag>
+            </header>
+            <n-progress
+              type="line"
+              :percentage="Math.round(extractionCandidate.confidence * 100)"
+              :show-indicator="false"
+            />
+            <n-form v-if="selectedObservationDefinition" label-placement="top">
+              <n-form-item
+                v-if="selectedObservationDefinition.valueType === 'number'"
+                :label="'候选数值（' + selectedObservationDefinition.unit + '）'"
+                required
+              ><n-input-number v-model:value="observationValueForm.numberValue" /></n-form-item>
+              <n-form-item
+                v-else-if="selectedObservationDefinition.valueType === 'text'"
+                label="候选文本"
+                required
+              ><n-input v-model:value="observationValueForm.textValue" type="textarea" /></n-form-item>
+              <n-form-item
+                v-else-if="selectedObservationDefinition.valueType === 'boolean'"
+                label="候选是/否"
+              ><n-switch v-model:value="observationValueForm.booleanValue" /></n-form-item>
+              <n-form-item
+                v-else-if="selectedObservationDefinition.valueType === 'date'"
+                label="候选日期"
+                required
+              ><n-date-picker v-model:value="observationValueForm.dateValue" type="date" /></n-form-item>
+              <n-form-item
+                v-else-if="selectedObservationDefinition.valueType === 'category'"
+                label="候选分类"
+                required
+              >
+                <n-select
+                  v-model:value="observationValueForm.categoryValue"
+                  :options="selectedObservationDefinition.categories.map((value) => ({ label: value, value }))"
+                />
+              </n-form-item>
+              <n-form-item v-else label="候选结构化值" required>
+                <n-input v-model:value="observationValueForm.jsonValue" type="textarea" :rows="3" />
+              </n-form-item>
+              <n-form-item label="人工备注">
+                <n-input
+                  v-model:value="aiCandidateNotes"
+                  type="textarea"
+                  :rows="2"
+                  maxlength="1024"
+                  show-count
+                />
+              </n-form-item>
+            </n-form>
+            <n-checkbox v-model:checked="aiApprovalConfirmed">
+              我已核对当前数据单元、候选值和全部图片证据，并批准写入正式数据
+            </n-checkbox>
+          </article>
+
+          <p
+            v-if="dataEntryImageError"
+            class="data-entry-error"
+            role="alert"
+            aria-live="assertive"
+          >{{ dataEntryImageError }}</p>
+        </n-tab-pane>
+      </n-tabs>
+
+      <template #footer>
+        <div class="dialog-actions">
+          <n-button
+            :disabled="busy || dataEntryAiBusy"
+            @click="showObservation = false"
+          >取消</n-button>
+          <n-button
+            v-if="dataEntryMode === 'ai' && extractionDraft"
+            type="error"
+            secondary
+            :loading="dataEntryAiBusy"
+            @click="rejectExtractionCandidate"
+          >放弃候选并释放图片</n-button>
+          <n-button
+            v-if="dataEntryMode === 'manual'"
+            type="primary"
+            :loading="busy"
+            :disabled="!currentDataCellReady"
+            @click="createObservation"
+          >保存数据</n-button>
+          <n-button
+            v-else-if="!extractionDraft"
+            type="primary"
+            :loading="dataEntryAiBusy"
+            :disabled="!currentDataCellReady || !dataEntryImages.length || !selectedVisionProfile"
+            @click="generateExtractionCandidate"
+          >生成候选</n-button>
+          <n-button
+            v-else
+            type="primary"
+            :loading="dataEntryAiBusy"
+            :disabled="!aiApprovalConfirmed"
+            @click="approveExtractionCandidate"
+          >批准并正式写入</n-button>
+        </div>
+      </template>
     </n-modal>
 
     <n-modal v-model:show="showObservationRevision" preset="card" title="修订观察值" class="small-dialog">
@@ -1153,6 +1823,12 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .progress-panel p.completed { color: var(--muri-success); }
 .progress-panel button { justify-self: end; }
 .dialog-card { width: min(620px, calc(100vw - 28px)); }
+.data-entry-dialog { width: min(760px, calc(100vw - 28px)); }
+.data-cell-form { margin-top: 14px; }
+.ai-entry-boundary { display: flex; align-items: flex-start; gap: 7px; margin: 10px 0 12px; padding: 9px 11px; border: 1px solid #c8deef; border-radius: 8px; color: var(--muri-text-secondary); background: var(--muri-primary-soft); font-size: 11px; line-height: 1.55; }.ai-entry-boundary svg { flex: 0 0 auto; margin-top: 1px; color: var(--muri-primary); }
+.ai-entry-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 9px; }.ai-entry-toolbar > span { color: var(--muri-text-tertiary); font-size: 11px; }
+.data-entry-images { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }.data-entry-images article { display: grid; min-width: 0; grid-template-columns: 58px minmax(0, 1fr) 32px; align-items: center; gap: 8px; padding: 7px; border: 1px solid var(--muri-border); border-radius: 8px; background: var(--muri-surface-muted); }.data-entry-images img { width: 58px; height: 58px; border-radius: 6px; object-fit: cover; }.data-entry-images article > div { display: flex; min-width: 0; flex-direction: column; }.data-entry-images strong,.data-entry-images small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.data-entry-images strong { font-size: 11px; }.data-entry-images small { color: var(--muri-text-tertiary); font-size: 10px; }.data-entry-images small.image-error { color: var(--muri-danger); }.data-entry-images button { display: grid; width: 32px; height: 32px; padding: 0; place-items: center; border: 0; border-radius: 6px; color: var(--muri-text-tertiary); background: transparent; cursor: pointer; transition: color var(--muri-transition-fast), background var(--muri-transition-fast); }.data-entry-images button:hover { color: var(--muri-danger); background: #fff1f1; }.data-entry-images button:focus-visible { outline: 3px solid rgba(15, 95, 170, .22); outline-offset: 1px; }.data-entry-images button:disabled { cursor: wait; opacity: .55; }
+.vision-model-field { margin-top: 12px; }.candidate-review { display: grid; gap: 10px; margin-top: 4px; padding: 13px; border: 1px solid #e1cfaa; border-radius: 9px; background: #fffaf2; }.candidate-review header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }.candidate-review header > div { display: flex; min-width: 0; flex-direction: column; }.candidate-review header span { display: flex; align-items: center; gap: 6px; color: var(--muri-text); font-weight: 650; }.candidate-review header span svg { color: var(--muri-primary); }.candidate-review header small { color: var(--muri-text-tertiary); font-size: 10px; }.candidate-review :deep(.n-form-item:last-child) { margin-bottom: 0; }.data-entry-error { margin: 10px 0 0; color: var(--muri-danger); font-size: 11px; line-height: 1.5; }
 .small-dialog { width: min(480px, calc(100vw - 28px)); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .dialog-actions,.detail-actions { display: flex; justify-content: flex-end; gap: 9px; }
@@ -1166,7 +1842,7 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .observation-actions { display: flex; align-items: center; gap: 6px; }
 :deep(.n-list-item small) { display: block; color: var(--muri-text-tertiary); font-weight: 400; }
 @media (max-width: 900px) { .metrics { grid-template-columns: 1fr 1fr; }.experiment-card { grid-template-columns: 1fr; }.progress-panel { border-top: 1px solid var(--muri-border); border-left: 0; } }
-@media (max-width: 540px) { .metrics { grid-template-columns: 1fr 1fr; }.metrics > div { grid-template-columns: 24px 1fr; }.metrics strong { grid-column: 2; }.filter-row { overflow-x: auto; justify-content: flex-start; }.form-grid { grid-template-columns: 1fr; gap: 0; }.detail-actions { flex-wrap: wrap; }.detail-actions button { flex: 1; } }
+@media (max-width: 540px) { .metrics { grid-template-columns: 1fr 1fr; }.metrics > div { grid-template-columns: 24px 1fr; }.metrics strong { grid-column: 2; }.filter-row { overflow-x: auto; justify-content: flex-start; }.form-grid { grid-template-columns: 1fr; gap: 0; }.detail-actions { flex-wrap: wrap; }.detail-actions button { flex: 1; }.data-entry-images { grid-template-columns: minmax(0, 1fr); }.data-entry-dialog :deep(.n-card__content) { padding-inline: 14px; }.data-entry-dialog :deep(.n-tabs-tab) { min-width: 0; }.candidate-review { padding: 10px; } }
 
 .experiment-workspace { display: flex; flex-direction: column; gap: 16px; }
 .workspace-header { overflow: hidden; }

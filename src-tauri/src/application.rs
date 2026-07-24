@@ -52,15 +52,25 @@ pub(crate) enum DesktopError {
 impl DesktopError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::Store(StoreError::NotFound { .. }) => "not_found",
-            Self::Store(StoreError::Conflict(_)) => "conflict",
+            Self::Store(StoreError::NotFound { .. })
+            | Self::Settings(SettingsError::ModelProfileStore(StoreError::NotFound { .. })) => {
+                "not_found"
+            }
+            Self::Store(StoreError::Conflict(_))
+            | Self::Settings(SettingsError::ModelProfileStore(StoreError::Conflict(_))) => {
+                "conflict"
+            }
             Self::Store(StoreError::Validation(_))
+            | Self::Settings(SettingsError::ModelProfileStore(StoreError::Validation(_)))
             | Self::Domain(_)
             | Self::InvalidId { .. }
             | Self::InvalidDate { .. }
             | Self::TooLong { .. } => "validation",
             Self::Settings(error) if error.is_validation() => "validation",
             Self::Store(StoreError::Database(_) | StoreError::Serialization(_))
+            | Self::Settings(SettingsError::ModelProfileStore(
+                StoreError::Database(_) | StoreError::Serialization(_),
+            ))
             | Self::Settings(_) => "storage_error",
         }
     }
@@ -87,6 +97,7 @@ pub(crate) struct DesktopState {
 }
 
 impl DesktopState {
+    #[cfg(test)]
     pub(crate) async fn initialize(database_path: impl AsRef<Path>) -> Result<Self, DesktopError> {
         let app_data_dir = database_path
             .as_ref()
@@ -103,6 +114,11 @@ impl DesktopState {
         let store = SqliteStore::connect_path(database_path).await?;
         store.migrate().await?;
         bootstrap_local_identity(&store).await?;
+        let mut migration_audit = AuditContext::system(WriteSource::Migration);
+        migration_audit.reason = Some("materialize_desktop_ai_model_profiles".to_owned());
+        settings
+            .initialize_model_profiles(&store, &migration_audit)
+            .await?;
         Ok(Self {
             store,
             lab_id: LOCAL_LAB_ID,
@@ -113,6 +129,10 @@ impl DesktopState {
 
     pub(crate) fn domain_store(&self) -> &SqliteStore {
         &self.store
+    }
+
+    pub(crate) fn model_profile_settings(&self) -> &SettingsService {
+        &self.settings
     }
 
     pub(crate) const fn local_lab_id(&self) -> Uuid {
@@ -178,15 +198,25 @@ impl DesktopState {
         self.settings.get().map_err(Into::into)
     }
 
-    pub(crate) fn save_ai_settings(
+    pub(crate) async fn save_ai_settings(
         &self,
         input: SaveAiSettingsInput,
     ) -> Result<AiSettingsView, DesktopError> {
-        self.settings.save(input).map_err(Into::into)
+        let _model_profile_operation = self.settings.profile_coordinator().lock().await;
+        let audit = self.audit("update_ai_model_profile").await?;
+        self.settings
+            .save_and_materialize(&self.store, input, &audit)
+            .await
+            .map_err(Into::into)
     }
 
-    pub(crate) fn clear_ai_api_key(&self) -> Result<AiSettingsView, DesktopError> {
-        self.settings.clear_key().map_err(Into::into)
+    pub(crate) async fn clear_ai_api_key(&self) -> Result<AiSettingsView, DesktopError> {
+        let _model_profile_operation = self.settings.profile_coordinator().lock().await;
+        let audit = self.audit("revoke_ai_model_profile_credentials").await?;
+        self.settings
+            .clear_key_with_metadata(&self.store, &audit)
+            .await
+            .map_err(Into::into)
     }
 
     pub(crate) async fn list_cages(&self) -> Result<Vec<CageView>, DesktopError> {

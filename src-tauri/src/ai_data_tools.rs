@@ -1182,7 +1182,11 @@ fn map_data_error(error: DataError) -> ToolExecutionError {
 mod tests {
     use super::*;
     use muriarc_ai::DomainToolOutput;
-    use muriarc_core::{AiConversation, AiConversationSourceStatus, Project, StoreError};
+    use muriarc_core::{
+        AiConversation, AiConversationSourceStatus, AiModelProfile, AiModelProfileBinding,
+        AiModelProfileStore, AiModelProfileVersion, AiProviderProtocol, AiProviderTransport,
+        Project, StoreError,
+    };
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1193,6 +1197,47 @@ mod tests {
         application::DesktopState,
         data::{DesktopDataState, PreviewDataImportInput},
     };
+
+    async fn create_test_model_profile(
+        data: &DesktopDataState,
+        now: chrono::DateTime<Utc>,
+    ) -> AiModelProfileBinding {
+        let profile = AiModelProfile {
+            id: Uuid::new_v4(),
+            lab_id: LOCAL_LAB_ID,
+            user_id: LOCAL_USER_ID,
+            name: format!("AI data tool fixture {}", Uuid::new_v4()),
+            current_version: 1,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        let version = AiModelProfileVersion {
+            profile_id: profile.id,
+            version: 1,
+            protocol: AiProviderProtocol::OpenaiChatCompletions,
+            transport: AiProviderTransport::OpenAiCompatible,
+            base_url: "https://provider.example.test/v1".to_owned(),
+            normalized_base_url: "https://provider.example.test/v1".to_owned(),
+            model_id: "ai-data-tool-fixture".to_owned(),
+            supports_vision: false,
+            context_window_tokens: 16_384,
+            max_input_tokens: 8_192,
+            max_output_tokens: 2_048,
+            history_token_budget: 4_096,
+            history_turns: 20,
+            temperature: 0.0,
+            timeout_ms: 30_000,
+            created_at: now,
+        };
+        data.store_ref()
+            .create_ai_model_profile(&profile, &version, &human_audit("fixture_model_profile"))
+            .await
+            .unwrap();
+        AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: version.version,
+        }
+    }
 
     struct Fixture {
         _temp: TempDir,
@@ -1215,15 +1260,19 @@ mod tests {
                 .create_project(&project, &human_audit("fixture_project"))
                 .await
                 .unwrap();
+            let now = Utc::now();
+            let model_profile = create_test_model_profile(&data, now).await;
             let conversation = AiConversation {
                 id: Uuid::new_v4(),
                 lab_id: LOCAL_LAB_ID,
                 project_id: None,
                 user_id: LOCAL_USER_ID,
                 title: "Source import".to_owned(),
+                model_profile: Some(model_profile),
+                legacy_read_only: false,
                 pinned_at: None,
                 archived_at: None,
-                meta: RecordMeta::new(Utc::now()),
+                meta: RecordMeta::new(now),
             };
             data.store_ref()
                 .create_ai_conversation(&conversation, &human_audit("fixture_conversation"))

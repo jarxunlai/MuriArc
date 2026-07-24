@@ -29,6 +29,7 @@ muriarc-store-sqlite = { path = "../crates/store-sqlite" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2.7.2"
 tempfile = "3.23.0"
 thiserror.workspace = true
 uuid.workspace = true

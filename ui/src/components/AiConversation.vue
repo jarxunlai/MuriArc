@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed, nextTick, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, reactive, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import {
   AlertCircle,
+  AlertTriangle,
   Archive,
   ArchiveRestore,
   Bot,
@@ -13,9 +14,12 @@ import {
   File,
   FileSignature,
   Image,
+  ImagePlus,
+  Layers3,
   LoaderCircle,
   Paperclip,
   RefreshCw,
+  ScanSearch,
   ShieldCheck,
   Trash2,
   UserRound,
@@ -33,11 +37,12 @@ import AiMarkdown from './AiMarkdown.vue'
 const props = withDefaults(defineProps<{ compact?: boolean }>(), { compact: false })
 const ai = useAiAssistant()
 const toast = useMessage()
-const prompt = ref('')
 const scrollArea = ref<HTMLElement | null>(null)
 const fileInput = ref<HTMLInputElement | null>(null)
 const dragDepth = ref(0)
 const dragActive = computed(() => dragDepth.value > 0)
+const imageInput = ref<HTMLInputElement | null>(null)
+const releaseImageComposer = ai.retainImageComposer()
 const statements = reactive<Record<string, string>>({})
 const signed = reactive<Record<string, boolean>>({})
 const reinforcedConfirmed = reactive<Record<string, boolean>>({})
@@ -52,20 +57,29 @@ const releaseTarget = ref<{
   mediaType: string
   sizeBytes: number
 }>()
-const modeOptions = computed(() => {
-  const rank: Record<AiAutonomyMode, number> = { ask: 0, auto: 1, full: 2 }
-  const max = ai.autonomy.value.maxMode
-  return [
-    { label: 'Ask', value: 'ask' as const, disabled: rank.ask > rank[max] },
-    { label: 'Auto', value: 'auto' as const, disabled: rank.auto > rank[max] },
-    { label: 'Full', value: 'full' as const, disabled: rank.full > rank[max] },
-  ]
-})
+const autonomyModalPurpose = ref<'start' | 'update'>('update')
+const pendingSendValue = ref('')
+const modelSwitchModalOpen = ref(false)
+const pendingModelProfileId = ref('')
+const modeOptions = [
+  { label: 'Ask', value: 'ask' as const },
+  { label: 'Auto', value: 'auto' as const },
+  { label: 'Full', value: 'full' as const },
+]
 const autonomyDescription = computed(() => ({
   ask: '查询自动执行；创建导出等产物前需要你确认。',
   auto: `查询和普通产物可自动执行；普通批量上限 ${ai.autonomy.value.batchLimit} 条。`,
   full: `当前会话内扩大普通操作授权，批量上限 ${ai.autonomy.value.batchLimit} 条；30 分钟无活动自动降级。`,
-})[ai.autonomy.value.effectiveMode])
+})[ai.conversationId.value ? ai.autonomy.value.effectiveMode : ai.requestedMode.value])
+const modeLabels: Record<AiAutonomyMode, string> = {
+  ask: 'Ask',
+  auto: 'Auto',
+  full: 'Full',
+}
+const requestedModeLabel = computed(() =>
+  `${modeLabels[ai.requestedMode.value]}${ai.fullActivationRequired.value ? '（待启用）' : ''}`)
+const effectiveModeLabel = computed(() =>
+  ai.conversationId.value ? modeLabels[ai.autonomy.value.effectiveMode] : '尚未开始')
 const suggestions = computed(() => props.compact
   ? ['已授权范围内有哪些异常？', '哪些正式数据还没记录？']
   : ['总结进行中的实验', '找出待确认的基因型', '哪些动物缺少近期体重？'])
@@ -78,11 +92,18 @@ const visibleDrafts = computed(() => {
       if (draft.projectId === projectId) drafts.set(draft.id, draft)
     }
   }
+  for (const draft of ai.conversationDrafts.value) drafts.set(draft.id, draft)
   for (const draft of ai.pendingDrafts.value) {
     if (draft.projectId === projectId) drafts.set(draft.id, draft)
   }
   return [...drafts.values()]
 })
+const canSend = computed(() =>
+  Boolean(
+    ai.composerDraft.value.trim()
+    || ai.stagedImages.value.length
+    || ai.readySourceCount.value,
+  ))
 
 const requirementLabels: Record<AiWriteDraft['requirement'], string> = {
   preview_confirmation: '预览确认',
@@ -103,11 +124,63 @@ const acceptedSourceTypes = [
   '.png', '.jpg', '.jpeg', '.tif', '.tiff',
 ].join(',')
 
-async function send(value = prompt.value) {
-  if (ai.conversationArchived.value || ai.busy.value || ai.sourceUploading.value) return
-  if (!value.trim() && !ai.readySourceCount.value) return
-  prompt.value = ''
-  await ai.send(value)
+function openFullModal(purpose: 'start' | 'update', value = '') {
+  autonomyModalPurpose.value = purpose
+  pendingSendValue.value = value
+  autonomyPassword.value = ''
+  autonomyDeclared.value = false
+  autonomyModalOpen.value = true
+}
+
+function closeFullModal() {
+  autonomyModalOpen.value = false
+  autonomyPassword.value = ''
+  autonomyDeclared.value = false
+  pendingSendValue.value = ''
+}
+
+async function send(value = ai.composerDraft.value) {
+  const normalized = value.trim()
+  if ((!normalized && !ai.stagedImages.value.length && !ai.readySourceCount.value)
+    || ai.busy.value
+    || ai.sourceUploading.value) return
+  if (ai.composerDisabledReason.value) {
+    toast.error(ai.composerDisabledReason.value)
+    return
+  }
+  if (ai.fullActivationRequired.value) {
+    openFullModal('start', normalized)
+    return
+  }
+  try {
+    await ai.send(normalized)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法开始 AI 会话')
+  }
+}
+
+function openImagePicker() {
+  imageInput.value?.click()
+}
+
+function selectImages(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  if (!files.length) return
+  try {
+    ai.stageImages(files)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法暂存图片')
+  }
+}
+
+function selectVisionModel(profileId: string | null) {
+  try {
+    ai.selectVisionModel(profileId ?? undefined)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法选择视觉模型')
+  }
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -180,13 +253,17 @@ function issueLocation(
 }
 
 function openFilePicker() {
-  if (ai.conversationArchived.value) return
+  if (ai.conversationReadOnlyReason.value) return
   fileInput.value?.click()
 }
 
 async function addSelectedFiles(files: File[]) {
-  if (ai.conversationArchived.value || !files.length) return
-  await ai.addFiles(files)
+  if (ai.conversationReadOnlyReason.value || !files.length) return
+  try {
+    await ai.addFiles(files)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法暂存文件')
+  }
 }
 
 function onFileChange(event: Event) {
@@ -268,7 +345,7 @@ async function confirmMessageSourceRelease() {
 }
 
 function canApprove(draft: AiWriteDraft): boolean {
-  if (ai.conversationArchived.value
+  if (ai.conversationReadOnlyReason.value
     || !ai.selectedProjectId.value
     || draft.projectId !== ai.selectedProjectId.value) return false
   if (draft.status !== 'pending_approval') return false
@@ -314,16 +391,21 @@ async function decide(draft: AiWriteDraft, decision: 'approve' | 'reject') {
 }
 
 async function selectAutonomy(mode: AiAutonomyMode) {
-  if (ai.conversationArchived.value) return
-  if (mode === ai.autonomy.value.mode) return
+  if (ai.conversationReadOnlyReason.value) return
+  const current = ai.conversationId.value
+    ? ai.autonomy.value.mode
+    : ai.requestedMode.value
+  if (mode === current) return
+  if (!ai.conversationId.value) {
+    await ai.requestMode(mode)
+    return
+  }
   if (mode === 'full') {
-    autonomyPassword.value = ''
-    autonomyDeclared.value = false
-    autonomyModalOpen.value = true
+    openFullModal('update')
     return
   }
   try {
-    await ai.updateAutonomy(mode)
+    await ai.requestMode(mode)
     toast.success(`当前会话已切换到 ${mode === 'ask' ? 'Ask' : 'Auto'} 模式`)
   } catch (error) {
     toast.error(error instanceof Error ? error.message : '无法更新 AI 授权')
@@ -331,17 +413,55 @@ async function selectAutonomy(mode: AiAutonomyMode) {
 }
 
 async function applyFullAutonomy() {
-  if (ai.conversationArchived.value || !autonomyDeclared.value) return
+  if (ai.conversationReadOnlyReason.value || !autonomyDeclared.value) return
   try {
-    await ai.updateAutonomy('full', {
-      currentPassword: autonomyPassword.value || undefined,
-      declared: autonomyDeclared.value,
-    })
-    autonomyModalOpen.value = false
-    autonomyPassword.value = ''
-    toast.success('当前会话已启用 Full 模式，30 分钟无活动后自动降级')
+    if (autonomyModalPurpose.value === 'start') {
+      await ai.send(pendingSendValue.value, {
+        fullConfirmed: true,
+        currentPassword: autonomyPassword.value || undefined,
+      })
+      closeFullModal()
+      toast.success('新会话已按 Full 请求启动；实际模式以会话状态为准')
+    } else {
+      await ai.updateAutonomy('full', {
+        currentPassword: autonomyPassword.value || undefined,
+      })
+      closeFullModal()
+      toast.success('已请求 Full 模式；实际执行模式以会话状态为准')
+    }
   } catch (error) {
     toast.error(error instanceof Error ? error.message : '无法启用 Full 模式')
+  } finally {
+    autonomyPassword.value = ''
+  }
+}
+
+function selectModel(profileId: string) {
+  if (profileId === ai.selectedModelProfileId.value) return
+  if (ai.modelSwitchNeedsConfirmation(profileId)) {
+    pendingModelProfileId.value = profileId
+    modelSwitchModalOpen.value = true
+    return
+  }
+  try {
+    ai.selectModel(profileId)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法切换模型')
+  }
+}
+
+function cancelModelSwitch() {
+  pendingModelProfileId.value = ''
+  modelSwitchModalOpen.value = false
+}
+
+function confirmModelSwitch() {
+  try {
+    ai.selectModel(pendingModelProfileId.value, true)
+    cancelModelSwitch()
+    toast.success('已创建新的空会话，项目范围和未发送输入已保留')
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法切换模型')
   }
 }
 
@@ -363,37 +483,61 @@ watch(() => ai.messages.value.length, async () => {
 
 watch(ai.conversationArchived, (archived) => {
   if (!archived) return
-  prompt.value = ''
+  ai.composerDraft.value = ''
   dragDepth.value = 0
   autonomyModalOpen.value = false
   autonomyPassword.value = ''
   autonomyDeclared.value = false
 })
+onUnmounted(releaseImageComposer)
 </script>
 
 <template>
   <section class="ai-conversation" :class="{ compact, archived: ai.conversationArchived.value }">
     <div ref="scrollArea" class="message-list" aria-live="polite">
       <div class="context-strip">
-        <Database :size="14" />
-        <span title="仅表示打开或展示 AI 的界面位置，不改变数据授权范围">
-          打开入口：<strong>{{ ai.contextTitle.value }}</strong>
-        </span>
-        <span class="scope-divider">·</span>
-        <span>{{ ai.selectedProject.value?.name ?? '跨项目只读' }}</span>
-        <span class="scope-divider">·</span>
-        <n-select
-          class="autonomy-select"
-          size="tiny"
-          :value="ai.autonomy.value.mode"
-          :options="modeOptions"
-          :loading="ai.autonomyBusy.value"
-          :disabled="!ai.conversationId.value
-            || ai.conversationArchived.value
-            || ai.loadingConversation.value"
-          aria-label="AI 会话授权模式"
-          @update:value="selectAutonomy"
-        />
+        <div class="context-scope">
+          <Database :size="14" />
+          <span title="仅表示打开或展示 AI 的界面位置，不改变数据授权范围">
+            打开入口：<strong>{{ ai.contextTitle.value }}</strong>
+          </span>
+          <span class="scope-divider">·</span>
+          <span>{{ ai.selectedProject.value?.name ?? '跨项目只读' }}</span>
+        </div>
+        <div class="conversation-controls">
+          <label class="control-field model-field">
+            <span><Layers3 :size="13" />模型</span>
+            <n-select
+              data-testid="conversation-model-select"
+              size="small"
+              :value="ai.selectedModelProfileId.value ?? null"
+              :options="ai.modelOptions.value"
+              :loading="ai.loadingModels.value"
+              :disabled="ai.busy.value"
+              placeholder="明确选择模型"
+              aria-label="AI 对话模型"
+              @update:value="selectModel"
+            />
+          </label>
+          <label class="control-field mode-field">
+            <span><ShieldCheck :size="13" />请求模式</span>
+            <n-select
+              data-testid="conversation-mode-select"
+              size="small"
+              :value="ai.requestedMode.value"
+              :options="modeOptions"
+              :loading="ai.autonomyBusy.value"
+              :disabled="ai.busy.value || Boolean(ai.conversationReadOnlyReason.value)"
+              aria-label="AI 会话请求模式"
+              @update:value="selectAutonomy"
+            />
+          </label>
+          <div class="mode-status" data-testid="conversation-mode-status" aria-label="请求模式与实际模式">
+            <span>请求 <strong>{{ requestedModeLabel }}</strong></span>
+            <span class="mode-arrow" aria-hidden="true">→</span>
+            <span>实际 <strong>{{ effectiveModeLabel }}</strong></span>
+          </div>
+        </div>
       </div>
       <div
         v-if="ai.conversationArchived.value"
@@ -418,6 +562,18 @@ watch(ai.conversationArchived, (archived) => {
           <template #icon><ArchiveRestore :size="15" /></template>
           恢复会话
         </n-button>
+      </div>
+      <div
+        v-else-if="ai.conversationReadOnlyReason.value"
+        class="archive-readonly-banner"
+        role="status"
+        aria-label="历史会话只读"
+      >
+        <AlertTriangle :size="18" />
+        <div>
+          <strong>此历史会话只能查看</strong>
+          <span>{{ ai.conversationReadOnlyReason.value }}</span>
+        </div>
       </div>
       <article v-for="entry in ai.messages.value" :key="entry.id" class="message" :class="entry.role">
         <div class="avatar">
@@ -474,6 +630,14 @@ watch(ai.conversationArchived, (archived) => {
               </button>
             </span>
           </div>
+          <div v-if="entry.images?.length" class="message-images" aria-label="本轮图片证据">
+            <img
+              v-for="image in entry.images"
+              :key="image.id"
+              :src="image.previewHref"
+              :alt="`本轮图片：${image.fileName}`"
+            />
+          </div>
           <div v-if="entry.citations?.length" class="citations" aria-label="数据引用">
             <template v-for="citation in entry.citations" :key="`${citation.entityType}-${citation.entityId}`">
               <router-link v-if="citation.route" :to="citation.route">
@@ -493,6 +657,30 @@ watch(ai.conversationArchived, (archived) => {
             <div class="tool-list">
               <span v-for="run in entry.toolRuns" :key="run.toolRunId">
                 {{ run.tool }} · {{ run.outcome === 'read' ? '只读' : '写入草稿' }}
+              </span>
+            </div>
+          </details>
+          <details
+            v-if="entry.trace?.stages?.length || entry.trace?.imageEvidence?.length"
+            class="tool-trace"
+          >
+            <summary>
+              <ChevronDown :size="14" />
+              视觉与最终模型 Trace
+              <small>{{ entry.trace.imageEvidence?.length ?? 0 }} 张证据</small>
+            </summary>
+            <div class="tool-list">
+              <span v-for="stage in entry.trace.stages ?? []" :key="`${stage.profileId}-${stage.purpose}`">
+                {{ stage.purpose === 'vision_and_final'
+                  ? '直接视觉'
+                  : stage.purpose === 'vision_observation'
+                    ? '视觉观察'
+                    : '最终回答' }}
+                · v{{ stage.profileVersion }}
+                · {{ stage.totalTokens }} tokens
+              </span>
+              <span v-for="evidence in entry.trace.imageEvidence ?? []" :key="evidence.imageId">
+                图片 {{ evidence.displayOrder + 1 }} · SHA {{ evidence.sha256.slice(0, 12) }}
               </span>
             </div>
           </details>
@@ -735,8 +923,89 @@ watch(ai.conversationArchived, (archived) => {
         <strong>松开以暂存到当前会话</strong>
         <span>文件在发送前不会成为正式业务记录</span>
       </div>
+      <section
+        v-if="ai.stagedImages.value.length"
+        class="image-staging"
+        aria-label="待发送图片"
+      >
+        <div class="image-staging-heading">
+          <span><ImagePlus :size="15" />暂存图片 {{ ai.stagedImages.value.length }}/8</span>
+          <small>仅发送成功后清空</small>
+        </div>
+        <div class="staged-image-list">
+          <article v-for="image in ai.stagedImages.value" :key="image.localId">
+            <img :src="image.previewUrl" :alt="`待发送图片：${image.file.name}`" />
+            <div>
+              <strong>{{ image.file.name }}</strong>
+              <small v-if="image.status === 'uploading'">正在上传…</small>
+              <small v-else-if="image.status === 'ready'">已安全暂存</small>
+              <small v-else-if="image.status === 'error'" class="image-error">
+                {{ image.error }}
+              </small>
+              <small v-else>{{ (image.file.size / 1048576).toFixed(1) }} MiB</small>
+            </div>
+            <button
+              type="button"
+              :aria-label="`移除图片 ${image.file.name}`"
+              :disabled="ai.busy.value"
+              @click="ai.removeStagedImage(image.localId)"
+            >
+              <Trash2 :size="15" />
+            </button>
+          </article>
+        </div>
+        <div class="vision-route">
+          <template v-if="ai.visionRoute.value === 'direct'">
+            <ScanSearch :size="15" />
+            <span>
+              当前对话模型支持视觉，将直接读取图片并回答。
+            </span>
+          </template>
+          <template v-else>
+            <label for="chat-vision-model">
+              <ScanSearch :size="15" />
+              <span>视觉中转模型</span>
+            </label>
+            <n-select
+              id="chat-vision-model"
+              size="small"
+              :value="ai.selectedVisionModelProfileId.value ?? null"
+              :options="ai.visionModelOptions.value"
+              :disabled="ai.busy.value"
+              clearable
+              placeholder="必须明确选择"
+              aria-label="聊天图片视觉中转模型"
+              @update:value="selectVisionModel"
+            />
+            <small>视觉模型只生成受控观察，最终回答仍由当前对话模型完成。</small>
+          </template>
+        </div>
+      </section>
+      <p
+        v-if="ai.imageStageError.value"
+        class="image-stage-error"
+        role="alert"
+        aria-live="assertive"
+      >
+        {{ ai.imageStageError.value }}
+      </p>
       <div class="suggestions">
-        <button v-for="item in suggestions" :key="item" type="button" @click="send(item)">{{ item }}</button>
+        <button
+          v-for="item in suggestions"
+          :key="item"
+          type="button"
+          :disabled="ai.busy.value || Boolean(ai.composerDisabledReason.value)"
+          @click="send(item)"
+        >{{ item }}</button>
+      </div>
+      <div
+        v-if="ai.composerDisabledReason.value"
+        class="composer-blocked"
+        role="status"
+        data-testid="composer-disabled-reason"
+      >
+        <AlertTriangle :size="15" />
+        <span>{{ ai.composerDisabledReason.value }}</span>
       </div>
       <div v-if="ai.sources.value.length" class="source-list" aria-label="待发送文件" aria-live="polite">
         <article
@@ -749,7 +1018,7 @@ watch(ai.conversationArchived, (archived) => {
           <div>
             <strong :title="source.fileName">{{ source.fileName }}</strong>
             <span v-if="source.status === 'uploading'">正在安全上传 · {{ formatBytes(source.sizeBytes) }}</span>
-            <span v-else-if="source.status === 'staged'">服务端暂存处理中 · {{ formatBytes(source.sizeBytes) }}</span>
+            <span v-else-if="source.status === 'staged'">本地待发送 · {{ formatBytes(source.sizeBytes) }}</span>
             <span v-else-if="source.status === 'ready'">已就绪 · {{ formatBytes(source.sizeBytes) }}</span>
             <span v-else-if="source.status === 'archived'">已归档为项目附件</span>
             <span v-else-if="source.status === 'expired'" class="source-error">已过期，请重新上传</span>
@@ -757,7 +1026,7 @@ watch(ai.conversationArchived, (archived) => {
             <span v-else class="source-error">{{ source.error }}</span>
           </div>
           <LoaderCircle
-            v-if="source.status === 'uploading' || source.status === 'staged'"
+            v-if="source.status === 'uploading'"
             class="source-spinner"
             :size="16"
             aria-label="正在暂存"
@@ -814,19 +1083,43 @@ watch(ai.conversationArchived, (archived) => {
           :disabled="ai.busy.value"
           @click="openFilePicker"
         ><Paperclip :size="18" /></button>
+        <input
+          ref="imageInput"
+          class="visually-hidden"
+          type="file"
+          multiple
+          accept="image/jpeg,image/png,image/webp,image/gif"
+          aria-label="选择最多八张聊天图片"
+          @change="selectImages"
+        />
+        <n-button
+          quaternary
+          circle
+          :disabled="ai.busy.value || Boolean(ai.conversationReadOnlyReason.value)"
+          aria-label="添加聊天图片"
+          data-testid="ai-image-picker"
+          @click="openImagePicker"
+        >
+          <template #icon><ImagePlus :size="18" /></template>
+        </n-button>
         <textarea
-          v-model="prompt"
+          v-model="ai.composerDraft.value"
+          data-testid="ai-composer-input"
           rows="2"
           placeholder="询问动物、实验或数据，也可拖入文件…"
           aria-label="发送给 AI 的消息"
-          :disabled="ai.busy.value"
+          :disabled="ai.busy.value || Boolean(ai.composerDisabledReason.value)"
           @keydown="onKeydown"
         />
         <n-button
           type="primary"
           circle
-          :disabled="(!prompt.trim() && !ai.readySourceCount.value) || ai.busy.value || ai.sourceUploading.value"
+          :disabled="!canSend
+            || ai.busy.value
+            || ai.sourceUploading.value
+            || Boolean(ai.composerDisabledReason.value)"
           aria-label="发送"
+          data-testid="ai-composer-send"
           @click="send()"
         >
           <template #icon><CornerDownLeft :size="17" /></template>
@@ -880,13 +1173,23 @@ watch(ai.conversationArchived, (archived) => {
       </template>
     </n-modal>
 
-    <n-modal v-model:show="autonomyModalOpen" preset="card" title="启用当前会话的 Full 模式" class="autonomy-modal">
+    <n-modal
+      v-model:show="autonomyModalOpen"
+      preset="card"
+      :title="autonomyModalPurpose === 'start' ? '以 Full 请求开始新会话' : '请求当前会话的 Full 模式'"
+      class="autonomy-modal"
+      @after-leave="closeFullModal"
+    >
       <n-alert type="warning" :bordered="false">
         Full 不是新角色，也不会扩大你的项目权限。动物转移/死亡、删除与批量导入、科研签署、繁育事实、账号权限和日志清理仍无法自动执行。
       </n-alert>
       <div class="autonomy-boundary-list">
         <span>仅当前会话</span><span>30 分钟无活动降级</span><span>普通批量最多 100 条</span>
       </div>
+      <p v-if="!ai.reinforcedPasswordRequired.value" class="native-confirmation-note">
+        <ShieldCheck :size="14" />
+        桌面端还会在原生边界确认本次启动声明；取消或验证失败时不会调用模型。
+      </p>
       <n-input
         v-if="ai.reinforcedPasswordRequired.value"
         v-model:value="autonomyPassword"
@@ -894,20 +1197,51 @@ watch(ai.conversationArchived, (archived) => {
         show-password-on="click"
         autocomplete="current-password"
         maxlength="1024"
+        data-testid="full-start-password"
         placeholder="输入当前登录密码完成身份确认"
       />
-      <n-checkbox v-model:checked="autonomyDeclared">
+      <n-checkbox v-model:checked="autonomyDeclared" data-testid="full-start-declaration">
         我理解 Full 仅是当前会话的受限委托，不会绕过人工审批和签署
       </n-checkbox>
       <template #footer>
         <div class="modal-actions">
-          <n-button @click="autonomyModalOpen = false">取消</n-button>
+          <n-button
+            data-testid="cancel-full-start"
+            :disabled="ai.autonomyBusy.value || ai.startingConversation.value"
+            @click="closeFullModal"
+          >取消</n-button>
           <n-button
             type="primary"
-            :loading="ai.autonomyBusy.value"
+            :loading="ai.autonomyBusy.value || ai.startingConversation.value"
             :disabled="!autonomyDeclared || (ai.reinforcedPasswordRequired.value && !autonomyPassword)"
+            data-testid="confirm-full-start"
             @click="applyFullAutonomy"
           >确认启用</n-button>
+        </div>
+      </template>
+    </n-modal>
+
+    <n-modal
+      v-model:show="modelSwitchModalOpen"
+      preset="card"
+      title="使用所选模型开始新会话？"
+      class="autonomy-modal"
+      @after-leave="cancelModelSwitch"
+    >
+      <n-alert type="warning" :bordered="false">
+        当前会话已有持久消息，模型绑定不能修改。确认后会创建新的空会话。
+      </n-alert>
+      <ul class="switch-boundaries">
+        <li>保留当前科研项目范围</li>
+        <li>保留尚未发送的输入</li>
+        <li>不继承消息、工具结果、当前会话草稿或 Full 授权</li>
+      </ul>
+      <template #footer>
+        <div class="modal-actions">
+          <n-button data-testid="cancel-model-switch" @click="cancelModelSwitch">取消</n-button>
+          <n-button type="primary" data-testid="confirm-model-switch" @click="confirmModelSwitch">
+            开始新会话
+          </n-button>
         </div>
       </template>
     </n-modal>
@@ -925,6 +1259,15 @@ watch(ai.conversationArchived, (archived) => {
 .message-sources { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }.message-source-chip { display: inline-flex; max-width: 100%; align-items: center; gap: 6px; padding: 3px 4px 3px 8px; border: 1px solid #c8deef; border-radius: 7px; color: var(--muri-text-secondary); background: rgba(255,255,255,.78); font-size: 11px; overflow-wrap: anywhere; }.message-source-chip.released { border-color: var(--muri-border); background: var(--muri-surface-muted); }.message-source-metadata { display: inline-flex; min-width: 0; align-items: center; gap: 4px; }.message-source-release { display: inline-flex; min-height: 44px; align-items: center; gap: 4px; padding: 5px 8px; border: 0; border-radius: 5px; color: var(--muri-primary); background: transparent; cursor: pointer; font: inherit; white-space: nowrap; }.message-source-release:hover { background: var(--muri-primary-soft); }.message-source-release:disabled { color: var(--muri-text-tertiary); cursor: not-allowed; }.message-source-release:focus-visible { outline: 3px solid var(--muri-primary); outline-offset: 2px; }
 .incomplete-notice { margin-top: 10px; }
 .citations { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }.citations a, .citations > span { padding: 3px 8px; border-radius: 999px; color: var(--muri-primary); background: white; font-size: 12px; }.citations small { color: var(--muri-text-tertiary); font-size: 10px; }
+.context-strip { display: flex; width: min(100%, 760px); min-width: 0; margin: 0 auto 20px; padding: 10px; align-items: stretch; flex-direction: column; gap: 9px; border: 1px solid var(--muri-border); border-radius: 10px; color: var(--muri-text-secondary); background: var(--muri-surface-muted); font-size: 12px; }
+.context-scope { display: flex; min-width: 0; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px; }.context-scope > svg { flex: 0 0 auto; color: var(--muri-primary); }.scope-divider { color: var(--muri-border-strong); }
+.conversation-controls { display: grid; min-width: 0; grid-template-columns: minmax(180px, 1.5fr) minmax(112px, .65fr) auto; align-items: end; gap: 9px; }
+.control-field { display: grid; min-width: 0; gap: 4px; }.control-field > span { display: flex; align-items: center; gap: 4px; color: var(--muri-text-tertiary); font-size: 10px; font-weight: 600; }.control-field > span svg { color: var(--muri-primary); }.control-field :deep(.n-select) { min-width: 0; width: 100%; }.mode-status { display: flex; min-height: 34px; align-items: center; justify-content: center; flex-wrap: wrap; gap: 5px; padding: 5px 8px; border: 1px solid var(--muri-border); border-radius: 7px; background: white; color: var(--muri-text-secondary); font-size: 11px; }.mode-status strong { color: var(--muri-text); }.mode-arrow { color: var(--muri-primary); }
+.message { display: flex; align-items: flex-start; gap: 10px; max-width: 760px; margin: 0 auto 16px; }.message.user { flex-direction: row-reverse; }
+.avatar { display: grid; flex: 0 0 30px; width: 30px; height: 30px; place-items: center; border: 1px solid var(--muri-border); border-radius: 50%; color: var(--muri-primary); background: white; }.user .avatar { color: var(--muri-text-secondary); }
+.bubble { max-width: min(82%, 640px); padding: 10px 13px; border: 1px solid var(--muri-border); border-radius: 4px 12px 12px; background: var(--muri-surface-muted); line-height: 1.65; }.user .bubble { border-color: #c8deef; border-radius: 12px 4px 12px 12px; background: var(--muri-primary-soft); }.bubble.error { border-color: #efd0d0; color: var(--muri-danger); background: #fff7f7; }.bubble.pending { color: var(--muri-text-secondary); animation: soft-pulse 1.3s ease-in-out infinite; }.bubble p { margin: 0; white-space: pre-wrap; }
+.message-images { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 6px; margin-top: 9px; }.message-images img { width: 100%; height: 112px; border: 1px solid var(--muri-border); border-radius: 7px; object-fit: cover; }
+.citations { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }.citations a, .citations span { padding: 3px 8px; border-radius: 999px; color: var(--muri-primary); background: white; font-size: 12px; }
 .tool-trace { margin-top: 9px; border-top: 1px solid var(--muri-border); padding-top: 7px; }.tool-trace summary { display: flex; align-items: center; gap: 5px; color: var(--muri-text-tertiary); cursor: pointer; font-size: 11px; list-style: none; }.tool-trace summary small { margin-left: auto; }.tool-trace[open] summary svg { transform: rotate(180deg); }.tool-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }.tool-list span { padding: 3px 6px; border-radius: 4px; background: white; color: var(--muri-text-secondary); font-family: ui-monospace, monospace; font-size: 10px; }
 .draft-section { max-width: 760px; margin: 22px auto 0; }.draft-section-title { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; color: var(--muri-text); font-weight: 650; }.draft-section-title svg { color: var(--muri-primary); }
 .draft-card { margin-bottom: 10px; padding: 13px; border: 1px solid #c8deef; border-radius: 9px; background: #fbfdff; }.draft-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }.draft-card header > div { display: flex; flex-direction: column; }.draft-card header span { color: var(--muri-text-tertiary); font-size: 11px; }.diff-list { margin: 11px 0; border: 1px solid var(--muri-border); border-radius: 6px; overflow: hidden; }.diff-row { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(80px, 1fr) 18px minmax(80px, 1fr); gap: 6px; align-items: center; padding: 7px 9px; border-bottom: 1px solid var(--muri-border); font-size: 11px; }.diff-row:last-child { border-bottom: 0; }.diff-row code { overflow: hidden; color: var(--muri-text-secondary); text-overflow: ellipsis; }.diff-row .before { color: var(--muri-danger); text-decoration: line-through; }.diff-row .after { color: var(--muri-success); }.arrow { color: var(--muri-text-tertiary); text-align: center; }
@@ -935,11 +1278,24 @@ watch(ai.conversationArchived, (archived) => {
 .suggestions { display: flex; gap: 7px; max-width: 760px; margin: 0 auto 8px; overflow-x: auto; scrollbar-width: none; }.suggestions button { flex: 0 0 auto; padding: 5px 9px; border: 1px solid var(--muri-border); border-radius: 999px; color: var(--muri-text-secondary); background: white; cursor: pointer; transition: border-color var(--muri-transition-fast), color var(--muri-transition-fast); }.suggestions button:hover { border-color: var(--muri-primary); color: var(--muri-primary); }.suggestions button:focus-visible, .source-action:focus-visible, .attach-button:focus-visible { outline: 2px solid var(--muri-primary); outline-offset: 2px; }
 .source-list { display: flex; flex-wrap: wrap; gap: 7px; max-width: 760px; max-height: 126px; margin: 0 auto 8px; overflow-y: auto; }.source-card { display: grid; min-width: 190px; max-width: min(340px, 100%); flex: 1 1 220px; grid-template-columns: auto minmax(0, 1fr) repeat(3, auto); align-items: center; gap: 7px; padding: 7px 8px; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }.source-card > svg:first-child { color: var(--muri-primary); }.source-card > div { display: flex; min-width: 0; flex-direction: column; }.source-card strong { overflow: hidden; color: var(--muri-text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }.source-card span { color: var(--muri-text-tertiary); font-size: 10px; }.source-card.error, .source-card.failed, .source-card.expired { border-color: #efd0d0; background: #fff8f8; }.source-card .source-error { color: var(--muri-danger); overflow-wrap: anywhere; }.source-action { display: grid; width: 28px; height: 28px; padding: 0; place-items: center; border: 0; border-radius: 5px; color: var(--muri-text-secondary); background: transparent; cursor: pointer; }.source-action:hover { color: var(--muri-primary); background: white; }.source-action:disabled { cursor: wait; opacity: .55; }.source-spinner { color: var(--muri-primary); animation: source-spin .8s linear infinite; }
 .input-wrap { display: flex; align-items: flex-end; gap: 7px; max-width: 760px; margin: 0 auto; padding: 7px; border: 1px solid var(--muri-border-strong); border-radius: 10px; transition: border-color var(--muri-transition-fast), box-shadow var(--muri-transition-fast); }.input-wrap:focus-within { border-color: var(--muri-primary); box-shadow: 0 0 0 3px rgba(15, 95, 170, 0.1); }.input-wrap textarea { flex: 1; min-height: 42px; max-height: 130px; padding: 3px 5px; resize: none; border: 0; outline: 0; color: var(--muri-text); background: transparent; line-height: 1.5; }.attach-button { display: grid; width: 32px; height: 32px; flex: 0 0 32px; padding: 0; place-items: center; border: 0; border-radius: 6px; color: var(--muri-text-secondary); background: transparent; cursor: pointer; }.attach-button:hover { color: var(--muri-primary); background: var(--muri-primary-soft); }.attach-button:disabled { cursor: not-allowed; opacity: .5; }.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%); white-space: nowrap; }.safety-note { display: flex; align-items: center; justify-content: center; gap: 5px; margin-top: 7px; color: var(--muri-text-tertiary); font-size: 11px; }
+.composer { padding: 12px 18px 16px; border-top: 1px solid var(--muri-border); background: white; }.suggestions { display: flex; gap: 7px; max-width: 760px; margin: 0 auto 8px; overflow-x: auto; scrollbar-width: none; }.suggestions button { flex: 0 0 auto; padding: 5px 9px; border: 1px solid var(--muri-border); border-radius: 999px; color: var(--muri-text-secondary); background: white; cursor: pointer; transition: border-color var(--muri-transition-fast), color var(--muri-transition-fast); }.suggestions button:hover { border-color: var(--muri-primary); color: var(--muri-primary); }
+.image-staging { display: grid; max-width: 760px; gap: 8px; margin: 0 auto 10px; padding: 10px; border: 1px solid var(--muri-border); border-radius: 9px; background: var(--muri-surface-muted); }.image-staging-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muri-text-secondary); font-size: 11px; }.image-staging-heading > span { display: flex; align-items: center; gap: 5px; color: var(--muri-text); font-weight: 650; }.image-staging-heading svg { color: var(--muri-primary); }.image-staging-heading small { color: var(--muri-text-tertiary); }
+.staged-image-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 7px; }.staged-image-list article { display: grid; min-width: 0; grid-template-columns: 46px minmax(0, 1fr) 30px; align-items: center; gap: 7px; padding: 6px; border: 1px solid var(--muri-border); border-radius: 7px; background: white; }.staged-image-list img { width: 46px; height: 46px; border-radius: 5px; object-fit: cover; }.staged-image-list article > div { display: flex; min-width: 0; flex-direction: column; }.staged-image-list strong, .staged-image-list small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.staged-image-list strong { color: var(--muri-text); font-size: 11px; }.staged-image-list small { color: var(--muri-text-tertiary); font-size: 10px; }.staged-image-list small.image-error { color: var(--muri-danger); }.staged-image-list button { display: grid; width: 30px; height: 30px; padding: 0; place-items: center; border: 0; border-radius: 6px; color: var(--muri-text-tertiary); background: transparent; cursor: pointer; transition: color var(--muri-transition-fast), background var(--muri-transition-fast); }.staged-image-list button:hover { color: var(--muri-danger); background: #fff1f1; }.staged-image-list button:focus-visible { outline: 3px solid rgba(15, 95, 170, .22); outline-offset: 1px; }.staged-image-list button:disabled { cursor: wait; opacity: .55; }
+.vision-route { display: grid; grid-template-columns: auto minmax(160px, 260px) minmax(150px, 1fr); align-items: center; gap: 7px; color: var(--muri-text-secondary); font-size: 11px; }.vision-route > svg { color: var(--muri-primary); }.vision-route > label { display: flex; align-items: center; gap: 5px; color: var(--muri-text); font-weight: 600; }.vision-route > label svg { color: var(--muri-primary); }.vision-route > small { color: var(--muri-text-tertiary); line-height: 1.45; }.image-stage-error { max-width: 760px; margin: 0 auto 8px; color: var(--muri-danger); font-size: 11px; }
+.suggestions button:focus-visible { outline: 3px solid rgba(15, 95, 170, .2); outline-offset: 1px; }.suggestions button:disabled { color: var(--muri-text-tertiary); background: var(--muri-surface-muted); cursor: not-allowed; opacity: .7; }
+.composer-blocked { display: flex; max-width: 760px; min-width: 0; align-items: flex-start; gap: 6px; margin: 0 auto 8px; padding: 7px 9px; border: 1px solid #efd8b7; border-radius: 7px; color: #8a5515; background: #fffaf2; font-size: 11px; line-height: 1.45; }.composer-blocked svg { flex: 0 0 auto; margin-top: 1px; }
+.input-wrap { display: flex; align-items: flex-end; gap: 8px; max-width: 760px; margin: 0 auto; padding: 8px; border: 1px solid var(--muri-border-strong); border-radius: 10px; transition: border-color var(--muri-transition-fast), box-shadow var(--muri-transition-fast); }.input-wrap:focus-within { border-color: var(--muri-primary); box-shadow: 0 0 0 3px rgba(15, 95, 170, 0.1); }.input-wrap textarea { flex: 1; min-height: 42px; max-height: 130px; padding: 3px 5px; resize: none; border: 0; outline: 0; color: var(--muri-text); background: transparent; line-height: 1.5; }.safety-note { display: flex; align-items: center; justify-content: center; gap: 5px; margin-top: 7px; color: var(--muri-text-tertiary); font-size: 11px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .compact .message-list { padding: 16px 14px; }.compact .composer { padding: 10px 12px 12px; }.compact .suggestions { max-width: 100%; }
 .source-release-modal { width: min(520px, calc(100vw - 28px)); }.source-release-facts { display: grid; gap: 7px; margin: 13px 0 0; }.source-release-facts > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 7px 9px; border-radius: 6px; background: var(--muri-surface-muted); }.source-release-facts dt { color: var(--muri-text-tertiary); font-size: 11px; }.source-release-facts dd { margin: 0; overflow-wrap: anywhere; color: var(--muri-text); font-size: 11px; }
 .autonomy-modal { width: min(520px, calc(100vw - 28px)); }.autonomy-boundary-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }.autonomy-boundary-list span { padding: 4px 8px; border-radius: 999px; color: var(--muri-primary); background: var(--muri-primary-soft); font-size: 12px; }.autonomy-modal :deep(.n-checkbox) { margin-top: 14px; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.native-confirmation-note { display: flex; align-items: flex-start; gap: 6px; margin: 0 0 2px; color: var(--muri-text-secondary); font-size: 12px; line-height: 1.5; }.native-confirmation-note svg { flex: 0 0 auto; margin-top: 2px; color: var(--muri-primary); }
+.switch-boundaries { display: grid; gap: 7px; margin: 14px 0 0; padding-left: 22px; color: var(--muri-text-secondary); line-height: 1.55; }
 @keyframes soft-pulse { 50% { opacity: 0.55; } }
 @keyframes source-spin { to { transform: rotate(360deg); } }
 @media (max-width: 620px) { .context-strip { max-width: 100%; flex-wrap: wrap; justify-content: center; }.archive-readonly-banner { grid-template-columns: auto minmax(0, 1fr); }.archive-readonly-banner :deep(.n-button) { grid-column: 1 / -1; width: 100%; min-height: 44px; }.message-source-chip { width: 100%; justify-content: space-between; }.message-source-metadata { flex: 1; }.import-preview-heading { align-items: stretch; flex-direction: column; }.import-preview-facts { grid-template-columns: 1fr; }.diff-row { grid-template-columns: 1fr 18px 1fr; }.diff-row code { grid-column: 1 / -1; }.draft-card { padding: 11px; } }
 @media (prefers-reduced-motion: reduce) { .bubble.pending, .source-spinner { animation: none; }.tool-trace summary svg { transition: none; } }
+@media (max-width: 700px) { .conversation-controls { grid-template-columns: minmax(0, 1fr) minmax(104px, .48fr); }.mode-status { grid-column: 1 / -1; }.diff-row { grid-template-columns: 1fr 18px 1fr; }.diff-row code { grid-column: 1 / -1; }.draft-card { padding: 11px; }.vision-route { grid-template-columns: auto minmax(0, 1fr); }.vision-route > small { grid-column: 1 / -1; } }
+@media (max-width: 430px) { .message-list { padding: 14px 10px; }.context-strip { padding: 9px; }.conversation-controls { grid-template-columns: minmax(0, 1fr); }.mode-status { grid-column: auto; }.composer { padding-inline: 10px; }.safety-note { align-items: flex-start; text-align: center; }.bubble { max-width: calc(100% - 40px); overflow-wrap: anywhere; }.staged-image-list { grid-template-columns: minmax(0, 1fr); }.image-staging-heading { align-items: flex-start; flex-direction: column; }.message-images { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (prefers-reduced-motion: reduce) { .bubble.pending { animation: none; }.tool-trace summary svg { transition: none; } }
 </style>

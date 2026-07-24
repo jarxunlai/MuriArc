@@ -1,5 +1,6 @@
 use std::fmt;
 
+pub use muriarc_core::AiProviderProtocol;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -11,7 +12,7 @@ pub const MIN_MAX_RESPONSE_BYTES: usize = 1024;
 pub const MAX_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROVIDER_ID_BYTES: usize = 64;
-const MAX_MODEL_BYTES: usize = 256;
+const MAX_MODEL_CHARS: usize = 256;
 const MAX_BASE_URL_BYTES: usize = 2048;
 const MAX_API_KEY_BYTES: usize = 8192;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +27,8 @@ pub enum ProviderKind {
 pub struct ProviderConfig {
     pub provider_id: String,
     pub kind: ProviderKind,
+    #[serde(default)]
+    pub protocol: AiProviderProtocol,
     pub model: String,
     pub base_url: String,
     #[serde(default = "default_timeout_ms")]
@@ -48,9 +51,24 @@ impl ProviderConfig {
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
+        Self::openai_compatible_with_protocol(
+            provider_id,
+            AiProviderProtocol::OpenaiChatCompletions,
+            model,
+            base_url,
+        )
+    }
+
+    pub fn openai_compatible_with_protocol(
+        provider_id: impl Into<String>,
+        protocol: AiProviderProtocol,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
             provider_id: provider_id.into(),
             kind: ProviderKind::OpenAiCompatible,
+            protocol,
             model: model.into(),
             base_url: base_url.into(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
@@ -63,14 +81,35 @@ impl ProviderConfig {
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
+        Self::local_http_with_protocol(
+            provider_id,
+            AiProviderProtocol::OpenaiChatCompletions,
+            model,
+            base_url,
+        )
+    }
+
+    pub fn local_http_with_protocol(
+        provider_id: impl Into<String>,
+        protocol: AiProviderProtocol,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
             provider_id: provider_id.into(),
             kind: ProviderKind::LocalHttp,
+            protocol,
             model: model.into(),
             base_url: base_url.into(),
             timeout_ms: DEFAULT_TIMEOUT_MS,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
+    }
+
+    #[must_use]
+    pub fn with_protocol(mut self, protocol: AiProviderProtocol) -> Self {
+        self.protocol = protocol;
+        self
     }
 
     pub(super) fn validate(
@@ -89,7 +128,7 @@ impl ProviderConfig {
         {
             return Err(ProviderConfigError::InvalidProviderId);
         }
-        if self.model.trim().is_empty() || self.model.len() > MAX_MODEL_BYTES {
+        if self.model.trim().is_empty() || self.model.chars().count() > MAX_MODEL_CHARS {
             return Err(ProviderConfigError::InvalidModel);
         }
         if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&self.timeout_ms) {
@@ -123,14 +162,17 @@ impl ProviderConfig {
         }
 
         let path = base_url.path().trim_end_matches('/');
-        if !path.ends_with("/chat/completions") {
-            let endpoint_path = if path.is_empty() {
-                "/chat/completions".to_owned()
-            } else {
-                format!("{path}/chat/completions")
-            };
-            base_url.set_path(&endpoint_path);
-        }
+        let base_path = ["/chat/completions", "/responses", "/messages"]
+            .into_iter()
+            .find_map(|endpoint| path.strip_suffix(endpoint))
+            .unwrap_or(path)
+            .trim_end_matches('/');
+        let endpoint = match self.protocol {
+            AiProviderProtocol::OpenaiChatCompletions => "/chat/completions",
+            AiProviderProtocol::OpenaiResponses => "/responses",
+            AiProviderProtocol::AnthropicMessages => "/messages",
+        };
+        base_url.set_path(&format!("{base_path}{endpoint}"));
 
         Ok(ValidatedConfig { endpoint: base_url })
     }
@@ -151,7 +193,7 @@ pub enum ProviderConfigError {
     InvalidModel,
     #[error("base URL is invalid")]
     InvalidBaseUrl,
-    #[error("OpenAI-compatible cloud providers require HTTPS")]
+    #[error("cloud providers require HTTPS")]
     HttpsRequired,
     #[error("request timeout is outside the allowed range")]
     InvalidTimeout,

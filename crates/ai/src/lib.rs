@@ -16,6 +16,7 @@ pub mod scopes;
 pub mod source_context;
 pub mod store_executor;
 pub mod transport;
+pub mod vision;
 pub mod workflow;
 
 pub use approval::{
@@ -41,11 +42,11 @@ pub use data_tools::{
 #[cfg(any(test, feature = "test-support"))]
 pub use provider::MockProvider;
 pub use provider::{
-    AiProvider, BuiltinProvider, ChatMessage, ChatRole, CompletionRequest, CompletionResponse,
-    CredentialError, LocalHttpProvider, MAX_VISION_IMAGE_BASE64_BYTES, MAX_VISION_IMAGES,
-    MAX_VISION_TOTAL_BASE64_BYTES, OpenAiCompatibleProvider, ProviderConfig, ProviderConfigError,
-    ProviderCredentials, ProviderError, ProviderKind, ProviderToolCall, TokenUsage, ToolDefinition,
-    TransportFailure, VisionImageInput,
+    AiProvider, AiProviderProtocol, BuiltinProvider, ChatMessage, ChatRole, CompletionRequest,
+    CompletionResponse, CredentialError, LocalHttpProvider, MAX_VISION_IMAGE_BASE64_BYTES,
+    MAX_VISION_IMAGES, MAX_VISION_TOTAL_BASE64_BYTES, OpenAiCompatibleProvider, ProviderConfig,
+    ProviderConfigError, ProviderCredentials, ProviderError, ProviderKind, ProviderToolCall,
+    TokenUsage, ToolDefinition, TransportFailure, VisionImageInput,
 };
 pub use query::{
     FilterClause, FilterOperator, PageSpec, QueryField, QueryRequest, QueryResource, QueryValue,
@@ -59,10 +60,20 @@ pub use source_context::{
 };
 pub use store_executor::{StoreDomainToolExecutor, StoreToolAccessContext};
 pub use transport::{
-    AiAutonomyUpdateRequest, AiAutonomyView, AssistantConversationDetail,
-    AssistantConversationMessage, AssistantConversationSourceRef, AssistantConversationSummary,
-    AssistantTrace, AssistantTurnRequest, AssistantTurnResponse, DraftDecisionRequest,
-    WriteDraftSummary,
+    AiAutonomyUpdateRequest, AiAutonomyView, AiConversationReadOnlyReason,
+    AssistantConversationDetail, AssistantConversationMessage, AssistantConversationSourceRef,
+    AssistantConversationStartRequest, AssistantConversationStartResponse,
+    AssistantConversationSummary, AssistantImageEvidence, AssistantModelCallPurpose,
+    AssistantModelCallTrace, AssistantTrace, AssistantTurnRequest, AssistantTurnResponse,
+    DraftDecisionRequest, WriteDraftSummary,
+};
+pub use vision::{
+    DataCellVisionCandidate, DataCellVisionExtraction, DataCellVisionExtractionError,
+    DataCellVisionExtractionRequest, MAX_SANITIZED_VISION_INPUT_BYTES, SanitizedVisionInput,
+    VisionInputSanitizationError, extract_data_cell_vision, sanitize_vision_input,
 };
 
-pub use workflow::{AiExecutionContext, AiWorkflowError, AiWorkflowService, DraftDecisionResponse};
+pub use workflow::{
+    AiExecutionContext, AiWorkflowError, AiWorkflowService, AssistantTurnMedia,
+    AssistantVisionObservation, DraftDecisionResponse, PreparedAssistantImage,
+};

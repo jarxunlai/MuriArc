@@ -3,8 +3,8 @@ use std::path::Path;
 use chrono::{Duration, Utc};
 use muriarc_core::{
     Actor, AiConversationSource, AiConversationSourceFilter, AiConversationSourceKind,
-    AiConversationSourceStatus, AiOperationStore, Attachment, AuditContext, LOCAL_LAB_ID,
-    LOCAL_USER_ID, MuriArcStore, RecordMeta, StoreError, WorkspaceStore, WriteSource,
+    AiConversationSourceStatus, AiModelProfileStore, AiOperationStore, Attachment, AuditContext,
+    LOCAL_LAB_ID, LOCAL_USER_ID, MuriArcStore, RecordMeta, StoreError, WorkspaceStore, WriteSource,
 };
 use muriarc_data::{
     AttachmentContentKind, AttachmentInspection, DEFAULT_MAX_UPLOAD_BYTES,
@@ -283,8 +283,54 @@ impl DesktopDataState {
             if conversation.lab_id != LOCAL_LAB_ID || conversation.user_id != LOCAL_USER_ID {
                 return Err(DesktopDataError::ScopeMismatch);
             }
-            if require_writable && conversation.archived_at.is_some() {
-                return Err(StoreError::Conflict("AI conversation is archived".to_owned()).into());
+            if require_writable {
+                let Some(binding) = conversation.model_profile else {
+                    return Err(
+                        StoreError::Conflict("AI conversation is read-only".to_owned()).into(),
+                    );
+                };
+                if conversation.archived_at.is_some() || conversation.legacy_read_only {
+                    return Err(
+                        StoreError::Conflict("AI conversation is read-only".to_owned()).into(),
+                    );
+                }
+                let profile = match self
+                    .store_ref()
+                    .get_ai_model_profile(binding.profile_id)
+                    .await
+                {
+                    Ok(profile) => profile,
+                    Err(StoreError::NotFound { .. }) => {
+                        return Err(StoreError::Conflict(
+                            "AI conversation model is unavailable".to_owned(),
+                        )
+                        .into());
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                if profile.lab_id != conversation.lab_id
+                    || profile.user_id != conversation.user_id
+                    || profile.archived_at.is_some()
+                {
+                    return Err(StoreError::Conflict(
+                        "AI conversation model is unavailable".to_owned(),
+                    )
+                    .into());
+                }
+                match self
+                    .store_ref()
+                    .get_ai_model_profile_version(binding.profile_id, binding.profile_version)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(StoreError::NotFound { .. }) => {
+                        return Err(StoreError::Conflict(
+                            "AI conversation model version is unavailable".to_owned(),
+                        )
+                        .into());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             conversation.project_id
         } else {
@@ -530,8 +576,54 @@ fn ensure_local_source_lab(lab_id: Uuid) -> Result<(), DesktopDataError> {
 mod tests {
     use super::*;
     use crate::application::DesktopState;
-    use muriarc_core::{AiConversation, Project, ProvenanceFilter};
+    use muriarc_core::{
+        AiConversation, AiModelProfile, AiModelProfileBinding, AiModelProfileVersion,
+        AiProviderProtocol, AiProviderTransport, Project, ProvenanceFilter,
+    };
     use tempfile::tempdir;
+
+    async fn create_test_model_profile(
+        state: &DesktopDataState,
+        audit: &AuditContext,
+        now: chrono::DateTime<Utc>,
+    ) -> AiModelProfileBinding {
+        let profile = AiModelProfile {
+            id: Uuid::new_v4(),
+            lab_id: LOCAL_LAB_ID,
+            user_id: LOCAL_USER_ID,
+            name: format!("AI source fixture {}", Uuid::new_v4()),
+            current_version: 1,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        let version = AiModelProfileVersion {
+            profile_id: profile.id,
+            version: 1,
+            protocol: AiProviderProtocol::OpenaiChatCompletions,
+            transport: AiProviderTransport::OpenAiCompatible,
+            base_url: "https://provider.example.test/v1".to_owned(),
+            normalized_base_url: "https://provider.example.test/v1".to_owned(),
+            model_id: "ai-source-fixture".to_owned(),
+            supports_vision: false,
+            context_window_tokens: 16_384,
+            max_input_tokens: 8_192,
+            max_output_tokens: 2_048,
+            history_token_budget: 4_096,
+            history_turns: 20,
+            temperature: 0.0,
+            timeout_ms: 30_000,
+            created_at: now,
+        };
+        state
+            .store_ref()
+            .create_ai_model_profile(&profile, &version, audit)
+            .await
+            .unwrap();
+        AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: version.version,
+        }
+    }
 
     fn directory_contains_object(path: &Path) -> bool {
         std::fs::read_dir(path).unwrap().any(|entry| {
@@ -570,12 +662,15 @@ mod tests {
             .source_audit("opportunistic_cleanup_fixture")
             .await
             .unwrap();
+        let model_profile = create_test_model_profile(&state, &audit, now).await;
         let conversation = AiConversation {
             id: Uuid::new_v4(),
             lab_id: LOCAL_LAB_ID,
             project_id: None,
             user_id: LOCAL_USER_ID,
             title: "Expired source cleanup".to_owned(),
+            model_profile: Some(model_profile),
+            legacy_read_only: false,
             pinned_at: None,
             archived_at: None,
             meta: RecordMeta::new(now),
@@ -685,12 +780,15 @@ mod tests {
             .create_project(&project, &audit)
             .await
             .unwrap();
+        let model_profile = create_test_model_profile(&state, &audit, now).await;
         let project_conversation = AiConversation {
             id: Uuid::new_v4(),
             lab_id: LOCAL_LAB_ID,
             project_id: Some(project.id),
             user_id: LOCAL_USER_ID,
             title: "Project source conversation".to_owned(),
+            model_profile: Some(model_profile),
+            legacy_read_only: false,
             pinned_at: None,
             archived_at: None,
             meta: RecordMeta::new(now),
@@ -880,12 +978,15 @@ mod tests {
             .await
             .unwrap();
 
+        let model_profile = create_test_model_profile(&state, &audit, now).await;
         let project_conversation = AiConversation {
             id: Uuid::new_v4(),
             lab_id: LOCAL_LAB_ID,
             project_id: Some(project.id),
             user_id: LOCAL_USER_ID,
             title: "Project conversation".to_owned(),
+            model_profile: Some(model_profile),
+            legacy_read_only: false,
             pinned_at: None,
             archived_at: None,
             meta: RecordMeta::new(now),
@@ -954,6 +1055,33 @@ mod tests {
                 .await,
             Err(DesktopDataError::Store(StoreError::Conflict(_)))
         ));
+
+        let mut profile = state
+            .store_ref()
+            .get_ai_model_profile(model_profile.profile_id)
+            .await
+            .unwrap();
+        let expected_revision = profile.meta.revision;
+        let archived_at = Utc::now();
+        profile.archived_at = Some(archived_at);
+        profile.meta.touch(archived_at);
+        state
+            .store_ref()
+            .archive_ai_model_profile(&profile, expected_revision, &audit)
+            .await
+            .unwrap();
+        assert!(matches!(
+            state
+                .upload_ai_source(UploadAiSourceInput {
+                    file_name: "read-only-model.md".to_owned(),
+                    media_type: Some("text/markdown".to_owned()),
+                    conversation_id: lab_conversation.id.to_string(),
+                    project_id: None,
+                    bytes: b"must select a new model in a new conversation".to_vec(),
+                })
+                .await,
+            Err(DesktopDataError::Store(StoreError::Conflict(_)))
+        ));
     }
 
     #[tokio::test]
@@ -972,12 +1100,15 @@ mod tests {
             .len();
         let now = Utc::now();
         let audit = state.source_audit("rejected_source_fixture").await.unwrap();
+        let model_profile = create_test_model_profile(&state, &audit, now).await;
         let conversation = AiConversation {
             id: Uuid::new_v4(),
             lab_id: LOCAL_LAB_ID,
             project_id: None,
             user_id: LOCAL_USER_ID,
             title: "Rejected source conversation".to_owned(),
+            model_profile: Some(model_profile),
+            legacy_read_only: false,
             pinned_at: None,
             archived_at: None,
             meta: RecordMeta::new(now),

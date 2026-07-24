@@ -27,3 +27,4 @@ zip = { version = "2.4.2", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 muriarc-store-sqlite = { path = "../store-sqlite" }
 tempfile = "3.23.0"
+zip = { version = "2.4.2", default-features = false, features = ["deflate"] }

@@ -1,3 +1,4 @@
+mod ai_models;
 mod ai_operations;
 mod workspace;
 
@@ -8482,6 +8483,332 @@ mod tests {
 
     use super::*;
 
+    type LegacyProviderSecretBundle = (Option<i32>, Option<Vec<u8>>, Option<Vec<u8>>, i64);
+
+    struct Phase4SqlFixture {
+        lab_id: Uuid,
+        user_id: Uuid,
+        project_id: Uuid,
+        experiment_id: Uuid,
+        event_id: Uuid,
+        definition_id: Uuid,
+        image_id: Uuid,
+        attachment_id: Uuid,
+        profile_id: Uuid,
+        now: DateTime<Utc>,
+    }
+
+    async fn insert_phase4_draft(
+        pool: &PgPool,
+        fixture: &Phase4SqlFixture,
+        draft_id: Uuid,
+        include_cell: bool,
+        include_model_trace: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO ai_extraction_drafts(
+                id,lab_id,user_id,project_id,experiment_id,experiment_event_id,
+                private_image_id,attachment_id,image_sha256,provider,model,tool_run_id,
+                data_cell_definition_id,data_cell_subject_type,data_cell_subject_id,
+                model_profile_id,model_profile_version,model_purpose,
+                usage_input_tokens,usage_output_tokens,usage_total_tokens,
+                provider_request_id,trace_json,status,items_json,error_code,
+                created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                $16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30
+             )",
+        )
+        .bind(draft_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.user_id)
+        .bind(fixture.project_id)
+        .bind(fixture.experiment_id)
+        .bind(fixture.event_id)
+        .bind(fixture.image_id)
+        .bind(fixture.attachment_id)
+        .bind("a".repeat(64))
+        .bind("migration-provider")
+        .bind("migration-vision")
+        .bind(None::<Uuid>)
+        .bind(include_cell.then_some(fixture.definition_id))
+        .bind(include_cell.then_some("experiment"))
+        .bind(include_cell.then_some(fixture.experiment_id))
+        .bind(include_model_trace.then_some(fixture.profile_id))
+        .bind(include_model_trace.then_some(1_i64))
+        .bind(include_model_trace.then_some("vision"))
+        .bind(include_model_trace.then_some(10_i64))
+        .bind(include_model_trace.then_some(5_i64))
+        .bind(include_model_trace.then_some(15_i64))
+        .bind(None::<String>)
+        .bind(include_model_trace.then_some(serde_json::json!({
+            "route": "migration-test"
+        })))
+        .bind("pending_approval")
+        .bind(serde_json::json!([]))
+        .bind(None::<String>)
+        .bind(fixture.now)
+        .bind(fixture.now)
+        .bind(None::<DateTime<Utc>>)
+        .bind(1_i64)
+        .execute(pool)
+        .await
+        .map(|_| ())
+    }
+
+    async fn assert_phase4_migration_sql_constraints(pool: &PgPool) {
+        let fixture = Phase4SqlFixture {
+            lab_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            experiment_id: Uuid::new_v4(),
+            event_id: Uuid::new_v4(),
+            definition_id: Uuid::new_v4(),
+            image_id: Uuid::new_v4(),
+            attachment_id: Uuid::new_v4(),
+            profile_id: Uuid::new_v4(),
+            now: Utc::now(),
+        };
+        sqlx::query(
+            "INSERT INTO labs(id,name,created_at,updated_at,deleted_at,revision)
+             VALUES($1,'phase4 SQL constraints',$2,$2,NULL,1)",
+        )
+        .bind(fixture.lab_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO users(
+                id,lab_id,email,display_name,status,created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,'phase4 owner','active',$4,$4,NULL,1
+             )",
+        )
+        .bind(fixture.user_id)
+        .bind(fixture.lab_id)
+        .bind(format!("{}@phase4-migration.test", fixture.user_id))
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO projects(
+                id,lab_id,name,description,status,created_at,updated_at,deleted_at,revision
+             )VALUES($1,$2,'phase4 SQL constraints',NULL,'active',$3,$3,NULL,1)",
+        )
+        .bind(fixture.project_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO experiments(
+                id,lab_id,project_id,template_version_id,name,description,status,
+                starts_at,ends_at,created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,NULL,'phase4 SQL constraints',NULL,'draft',
+                NULL,NULL,$4,$4,NULL,1
+             )",
+        )
+        .bind(fixture.experiment_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.project_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO experiment_events(
+                id,lab_id,project_id,experiment_id,event_key,label,occurred_at,
+                details_json,created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,$4,'phase4_sql','Phase 4 SQL',$5,'{}'::jsonb,
+                $5,$5,NULL,1
+             )",
+        )
+        .bind(fixture.event_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.project_id)
+        .bind(fixture.experiment_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO observation_definitions(
+                id,lab_id,project_id,experiment_id,observation_key,label,value_type,
+                unit,categories_json,policy,created_at,updated_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,$4,'phase4_sql','Phase 4 SQL','number',NULL,
+                '[]'::jsonb,'versioned',$5,$5,NULL,1
+             )",
+        )
+        .bind(fixture.definition_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.project_id)
+        .bind(fixture.experiment_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO attachments(
+                id,lab_id,project_id,entity_type,entity_id,file_name,media_type,
+                relative_path,size_bytes,sha256,version,created_at,updated_at,
+                deleted_at,revision
+             )VALUES(
+                $1,$2,NULL,'ai_private_image',$3,'phase4.png','image/png',
+                'objects/phase4',64,$4,1,$5,$5,NULL,1
+             )",
+        )
+        .bind(fixture.attachment_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.image_id)
+        .bind("a".repeat(64))
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ai_private_images(
+                id,lab_id,user_id,conversation_id,attachment_id,project_id,status,
+                last_activity_at,expires_at,archived_at,created_at,updated_at,
+                deleted_at,revision
+             )VALUES(
+                $1,$2,$3,NULL,$4,NULL,'pending_approval',$5,
+                $5 + interval '30 days',NULL,$5,$5,NULL,1
+             )",
+        )
+        .bind(fixture.image_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.user_id)
+        .bind(fixture.attachment_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ai_model_profiles(
+                id,lab_id,user_id,name,current_version,created_at,updated_at,
+                archived_at,deleted_at,revision
+             )VALUES(
+                $1,$2,$3,'phase4 migration vision',1,$4,$4,NULL,NULL,1
+             )",
+        )
+        .bind(fixture.profile_id)
+        .bind(fixture.lab_id)
+        .bind(fixture.user_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ai_model_profile_versions(
+                profile_id,version,protocol,transport,base_url,normalized_base_url,
+                model_id,supports_vision,context_window_tokens,max_input_tokens,
+                max_output_tokens,history_token_budget,history_turns,temperature,
+                timeout_ms,created_at
+             )VALUES(
+                $1,1,'openai_responses','open_ai_compatible',
+                'https://vision.example.test/v1','https://vision.example.test/v1',
+                'migration-vision',TRUE,4096,2048,1024,1024,4,0,30000,$2
+             )",
+        )
+        .bind(fixture.profile_id)
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+
+        for (include_cell, include_model_trace) in [(true, false), (false, true)] {
+            assert!(
+                insert_phase4_draft(
+                    pool,
+                    &fixture,
+                    Uuid::new_v4(),
+                    include_cell,
+                    include_model_trace,
+                )
+                .await
+                .is_err(),
+                "data-cell and exact model trace bindings must be all-or-none"
+            );
+        }
+        let draft_id = Uuid::new_v4();
+        insert_phase4_draft(pool, &fixture, draft_id, true, true)
+            .await
+            .expect("a complete phase 4 binding must satisfy migration SQL");
+        sqlx::query(
+            "INSERT INTO ai_extraction_evidence(
+                draft_id,display_order,private_image_id,private_attachment_id,
+                promoted_attachment_id,original_sha256,sanitized_sha256,
+                created_at,updated_at,revision
+             )VALUES($1,0,$2,$3,NULL,$4,$5,$6,$6,1)",
+        )
+        .bind(draft_id)
+        .bind(fixture.image_id)
+        .bind(fixture.attachment_id)
+        .bind("a".repeat(64))
+        .bind("b".repeat(64))
+        .bind(fixture.now)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(
+                "UPDATE ai_extraction_evidence
+                 SET promoted_attachment_id=private_attachment_id,
+                     updated_at=$2
+                 WHERE draft_id=$1 AND display_order=0",
+            )
+            .bind(draft_id)
+            .bind(fixture.now + chrono::Duration::seconds(1))
+            .execute(pool)
+            .await
+            .is_err(),
+            "promotion must advance the evidence revision"
+        );
+        sqlx::query(
+            "UPDATE ai_extraction_evidence
+             SET promoted_attachment_id=private_attachment_id,
+                 updated_at=$2,revision=2
+             WHERE draft_id=$1 AND display_order=0",
+        )
+        .bind(draft_id)
+        .bind(fixture.now + chrono::Duration::seconds(1))
+        .execute(pool)
+        .await
+        .expect("the one-time evidence promotion transition must be allowed");
+        assert!(
+            sqlx::query(
+                "UPDATE ai_extraction_evidence
+                 SET updated_at=$2,revision=3
+                 WHERE draft_id=$1 AND display_order=0",
+            )
+            .bind(draft_id)
+            .bind(fixture.now + chrono::Duration::seconds(2))
+            .execute(pool)
+            .await
+            .is_err(),
+            "promoted evidence must reject even metadata-only updates"
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE ai_extraction_evidence
+                 SET promoted_attachment_id=NULL,updated_at=$2,revision=3
+                 WHERE draft_id=$1 AND display_order=0",
+            )
+            .bind(draft_id)
+            .bind(fixture.now + chrono::Duration::seconds(2))
+            .execute(pool)
+            .await
+            .is_err(),
+            "promoted evidence must never be cleared or rewritten"
+        );
+    }
+
     async fn create_migration_test_database(
         admin_pool: &PgPool,
         base_options: &PgConnectOptions,
@@ -8529,7 +8856,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_migrations_preserve_auth_and_ai_conversation_data() {
+    async fn migrations_support_fresh_and_incremental_databases() {
         let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
             eprintln!(
                 "skipping PostgreSQL migration contract: MURIARC_TEST_DATABASE_URL is not set"
@@ -8566,6 +8893,15 @@ mod tests {
         let expected_migration_count = i64::try_from(MIGRATOR.iter().count()).unwrap();
         let latest_migration_version = MIGRATOR.iter().map(|migration| migration.version).max();
         assert_eq!(
+            expected_migration_count, 31,
+            "the merged PostgreSQL migration set must contain versions 0001 through 0031"
+        );
+        assert_eq!(
+            latest_migration_version,
+            Some(31),
+            "the merged PostgreSQL migration set must end at 0031"
+        );
+        assert_eq!(
             fresh_versions,
             (expected_migration_count, latest_migration_version)
         );
@@ -8581,6 +8917,43 @@ mod tests {
                 .any(|column| column == "must_change_password")
         );
         assert!(fresh_columns.iter().any(|column| column == "revision"));
+        let ai_model_tables: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.tables
+             WHERE table_schema = current_schema()
+               AND table_name IN (
+                   'ai_model_profiles',
+                   'ai_model_profile_versions',
+                   'ai_model_profile_secrets',
+                   'ai_user_model_defaults'
+               )",
+        )
+        .fetch_one(&fresh_pool)
+        .await
+        .expect("fresh AI model profile tables must be readable");
+        assert_eq!(ai_model_tables, 4);
+        let conversation_columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'ai_conversations'
+               AND column_name IN (
+                   'model_profile_id',
+                   'model_profile_version',
+                   'legacy_read_only'
+               )
+             ORDER BY column_name",
+        )
+        .fetch_all(&fresh_pool)
+        .await
+        .expect("fresh AI conversation columns must be readable");
+        assert_eq!(
+            conversation_columns,
+            vec![
+                "legacy_read_only".to_owned(),
+                "model_profile_id".to_owned(),
+                "model_profile_version".to_owned(),
+            ]
+        );
+        assert_phase4_migration_sql_constraints(&fresh_pool).await;
         drop_migration_test_database(&admin_pool, &fresh_name, fresh_pool).await;
 
         let (incremental_name, incremental_pool) =
@@ -8686,6 +9059,1114 @@ mod tests {
         .unwrap();
         assert_eq!(current_migration_count, expected_current_migration_count);
         drop_migration_test_database(&admin_pool, &incremental_name, incremental_pool).await;
+
+        let (ai_incremental_name, ai_incremental_pool) =
+            create_migration_test_database(&admin_pool, &base_options, "ai_profiles").await;
+        let through_0024 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 24)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        through_0024
+            .run(&ai_incremental_pool)
+            .await
+            .expect("migration prefix through 0024 must succeed");
+
+        let ai_lab_id = Uuid::new_v4();
+        let vision_user_id = Uuid::new_v4();
+        let text_only_user_id = Uuid::new_v4();
+        let legacy_conversation_id = Uuid::new_v4();
+        let endpoint_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO labs (
+                id, name, created_at, updated_at, deleted_at, revision
+             ) VALUES ($1, 'AI profile migration lab', now(), now(), NULL, 1)",
+        )
+        .bind(ai_lab_id)
+        .execute(&ai_incremental_pool)
+        .await
+        .expect("AI migration lab fixture must be inserted");
+        for (user_id, email, name) in [
+            (
+                vision_user_id,
+                format!("vision-{vision_user_id}@example.test"),
+                "Vision migration user",
+            ),
+            (
+                text_only_user_id,
+                format!("text-{text_only_user_id}@example.test"),
+                "Text migration user",
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (
+                    id, lab_id, email, display_name, status, created_at,
+                    updated_at, deleted_at, revision
+                 ) VALUES ($1, $2, $3, $4, 'active', now(), now(), NULL, 1)",
+            )
+            .bind(user_id)
+            .bind(ai_lab_id)
+            .bind(email)
+            .bind(name)
+            .execute(&ai_incremental_pool)
+            .await
+            .expect("AI migration user fixture must be inserted");
+        }
+        sqlx::query(
+            "INSERT INTO ai_provider_settings (
+                user_id, enabled, provider_config, provider_preset_id,
+                secret_key_version, secret_nonce, secret_ciphertext,
+                supports_vision, vision_model, context_window_tokens,
+                max_input_tokens, max_output_tokens, history_token_budget,
+                history_turns, temperature, timeout_ms, created_at, updated_at,
+                revision
+             ) VALUES (
+                $1, TRUE, $2, 'custom-openai-compatible', 7, $3, $4, TRUE,
+                'legacy-vision', 131072, 65536, 4096, 32768, 20, 0.25,
+                90000, now(), now(), 4
+             )",
+        )
+        .bind(vision_user_id)
+        .bind(serde_json::json!({
+            "provider_id": "legacy-vision-provider",
+            "kind": "open_ai_compatible",
+            "model": "legacy-chat",
+            "base_url": "https://provider.example.test/v1/",
+            "timeout_ms": 90000,
+            "max_response_bytes": 2_097_152
+        }))
+        .bind(vec![7_u8; 12])
+        .bind(vec![8_u8; 32])
+        .execute(&ai_incremental_pool)
+        .await
+        .expect("legacy PostgreSQL vision settings must be inserted");
+        sqlx::query(
+            "INSERT INTO ai_provider_settings (
+                user_id, enabled, provider_config, provider_preset_id,
+                supports_vision, vision_model, context_window_tokens,
+                max_input_tokens, max_output_tokens, history_token_budget,
+                history_turns, temperature, timeout_ms, created_at, updated_at,
+                revision
+             ) VALUES (
+                $1, TRUE, $2, 'custom-openai-compatible', FALSE, NULL,
+                65536, 32768, 2048, 16384, 12, 0, 120000, now(), now(), 2
+             )",
+        )
+        .bind(text_only_user_id)
+        .bind(serde_json::json!({
+            "provider_id": "legacy-text-provider",
+            "kind": "local_http",
+            "model": "text-only",
+            "base_url": "https://text.example.test/api",
+            "timeout_ms": 120000,
+            "max_response_bytes": 2_097_152
+        }))
+        .execute(&ai_incremental_pool)
+        .await
+        .expect("legacy PostgreSQL text settings must be inserted");
+        sqlx::query(
+            "INSERT INTO ai_conversations (
+                id, lab_id, project_id, user_id, title, created_at, updated_at,
+                deleted_at, revision
+             ) VALUES (
+                $1, $2, NULL, $3, 'Legacy conversation', now(), now(), NULL, 1
+             )",
+        )
+        .bind(legacy_conversation_id)
+        .bind(ai_lab_id)
+        .bind(vision_user_id)
+        .execute(&ai_incremental_pool)
+        .await
+        .expect("legacy PostgreSQL conversation must be inserted");
+        sqlx::query(
+            "INSERT INTO ai_provider_endpoints (
+                id, lab_id, provider_kind, label, base_url,
+                normalized_base_url, enabled, builtin, created_by, updated_by,
+                created_at, updated_at, revision
+             ) VALUES (
+                $1, $2, 'local_http', 'Legacy endpoint',
+                'https://provider.example.test/v1/',
+                'https://provider.example.test/v1', TRUE, FALSE, $3, $3,
+                now(), now(), 3
+             )",
+        )
+        .bind(endpoint_id)
+        .bind(ai_lab_id)
+        .bind(vision_user_id)
+        .execute(&ai_incremental_pool)
+        .await
+        .expect("legacy PostgreSQL endpoint must be inserted");
+
+        MIGRATOR
+            .run(&ai_incremental_pool)
+            .await
+            .expect("0024 current-main checkpoint to merged migrations must succeed");
+        MIGRATOR
+            .run(&ai_incremental_pool)
+            .await
+            .expect("direct merged migration ledger replay must be idempotent");
+        let direct_upgrade_ledger: (i64, Option<i64>) =
+            sqlx::query_as("SELECT count(*), max(version) FROM _sqlx_migrations")
+                .fetch_one(&ai_incremental_pool)
+                .await
+                .expect("direct merged migration ledger must be readable");
+        assert_eq!(
+            direct_upgrade_ledger,
+            (31, Some(31)),
+            "the direct current-main to merged PostgreSQL upgrade must end at 0031"
+        );
+
+        let profile_count: i64 = sqlx::query_scalar("SELECT count(*) FROM ai_model_profiles")
+            .fetch_one(&ai_incremental_pool)
+            .await
+            .expect("migrated PostgreSQL profile count must be readable");
+        assert_eq!(profile_count, 3);
+        let text_profile: (Uuid, String, bool, i64, String) = sqlx::query_as(
+            "SELECT p.id, v.model_id, v.supports_vision, p.current_version,
+                v.normalized_base_url
+             FROM ai_model_profiles p
+             JOIN ai_model_profile_versions v
+               ON v.profile_id = p.id AND v.version = 1
+             WHERE p.user_id = $1 AND p.name = 'Migrated default model'",
+        )
+        .bind(vision_user_id)
+        .fetch_one(&ai_incremental_pool)
+        .await
+        .expect("migrated PostgreSQL text profile must be readable");
+        assert_eq!(text_profile.1, "legacy-chat");
+        assert!(!text_profile.2);
+        assert_eq!(text_profile.3, 1);
+        assert_eq!(
+            text_profile.4,
+            "https://provider.example.test/v1".to_owned()
+        );
+        let vision_profile: (Uuid, String, bool, String) = sqlx::query_as(
+            "SELECT p.id, v.model_id, v.supports_vision, v.protocol
+             FROM ai_model_profiles p
+             JOIN ai_model_profile_versions v
+               ON v.profile_id = p.id AND v.version = 1
+             WHERE p.user_id = $1 AND p.name = 'Migrated vision model'",
+        )
+        .bind(vision_user_id)
+        .fetch_one(&ai_incremental_pool)
+        .await
+        .expect("migrated PostgreSQL vision profile must be readable");
+        assert_eq!(vision_profile.1, "legacy-vision");
+        assert!(vision_profile.2);
+        assert_eq!(vision_profile.3, "openai_chat_completions");
+
+        let defaults: (Option<Uuid>, Option<Uuid>, i64) = sqlx::query_as(
+            "SELECT default_conversation_profile_id, default_vision_profile_id,
+                revision
+             FROM ai_user_model_defaults WHERE user_id = $1",
+        )
+        .bind(vision_user_id)
+        .fetch_one(&ai_incremental_pool)
+        .await
+        .expect("migrated PostgreSQL defaults must be readable");
+        assert_eq!(defaults, (Some(text_profile.0), Some(vision_profile.0), 1));
+        let legacy_secret_bundle: LegacyProviderSecretBundle = sqlx::query_as(
+            "SELECT secret_key_version, secret_nonce, secret_ciphertext,
+                    revision
+                 FROM ai_provider_settings WHERE user_id = $1",
+        )
+        .bind(vision_user_id)
+        .fetch_one(&ai_incremental_pool)
+        .await
+        .expect("legacy PostgreSQL credential bundle must remain readable");
+        assert_eq!(
+            legacy_secret_bundle,
+            (Some(7), Some(vec![7_u8; 12]), Some(vec![8_u8; 32]), 4,),
+            "forward migrations must preserve the legacy credential bundle and key version"
+        );
+        let text_only_profile_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM ai_model_profiles WHERE user_id = $1")
+                .bind(text_only_user_id)
+                .fetch_one(&ai_incremental_pool)
+                .await
+                .expect("text-only profile count must be readable");
+        assert_eq!(text_only_profile_count, 1);
+        let text_only_transport: String = sqlx::query_scalar(
+            "SELECT v.transport
+             FROM ai_model_profiles p
+             JOIN ai_model_profile_versions v
+               ON v.profile_id = p.id AND v.version = p.current_version
+             WHERE p.user_id = $1",
+        )
+        .bind(text_only_user_id)
+        .fetch_one(&ai_incremental_pool)
+        .await
+        .expect("legacy HTTPS LocalHttp transport must be preserved");
+        assert_eq!(text_only_transport, "local_http");
+        let text_only_vision_default: Option<Uuid> = sqlx::query_scalar(
+            "SELECT default_vision_profile_id
+             FROM ai_user_model_defaults WHERE user_id = $1",
+        )
+        .bind(text_only_user_id)
+        .fetch_one(&ai_incremental_pool)
+        .await
+        .expect("text-only vision default must be readable");
+        assert_eq!(text_only_vision_default, None);
+
+        let version_mutation = sqlx::query(
+            "UPDATE ai_model_profile_versions
+             SET model_id = 'silently-rewritten'
+             WHERE profile_id = $1 AND version = 1",
+        )
+        .bind(text_profile.0)
+        .execute(&ai_incremental_pool)
+        .await;
+        assert!(
+            version_mutation.is_err(),
+            "PostgreSQL model profile versions must be immutable"
+        );
+
+        let legacy_binding: (Option<Uuid>, Option<i64>, bool) = sqlx::query_as(
+            "SELECT model_profile_id, model_profile_version, legacy_read_only
+             FROM ai_conversations WHERE id = $1",
+        )
+        .bind(legacy_conversation_id)
+        .fetch_one(&ai_incremental_pool)
+        .await
+        .expect("legacy PostgreSQL conversation binding must be readable");
+        assert_eq!(legacy_binding, (None, None, true));
+        let new_conversation_id = Uuid::new_v4();
+        let unbound_writable = sqlx::query(
+            "INSERT INTO ai_conversations (
+                id, lab_id, project_id, user_id, title, created_at, updated_at,
+                deleted_at, revision
+             ) VALUES (
+                $1, $2, NULL, $3, 'New unbound conversation',
+                now(), now(), NULL, 1
+             )",
+        )
+        .bind(new_conversation_id)
+        .bind(ai_lab_id)
+        .bind(vision_user_id)
+        .execute(&ai_incremental_pool)
+        .await;
+        assert!(
+            unbound_writable.is_err(),
+            "new writable PostgreSQL conversations must bind an immutable model profile version"
+        );
+
+        let incomplete_binding = sqlx::query(
+            "INSERT INTO ai_conversations (
+                id, lab_id, project_id, user_id, title, model_profile_id,
+                created_at, updated_at, deleted_at, revision
+             ) VALUES (
+                $1, $2, NULL, $3, 'Incomplete binding', $4,
+                now(), now(), NULL, 1
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ai_lab_id)
+        .bind(vision_user_id)
+        .bind(text_profile.0)
+        .execute(&ai_incremental_pool)
+        .await;
+        assert!(
+            incomplete_binding.is_err(),
+            "a PostgreSQL profile id without a version must be rejected"
+        );
+        let unknown_binding = sqlx::query(
+            "INSERT INTO ai_conversations (
+                id, lab_id, project_id, user_id, title, model_profile_id,
+                model_profile_version, created_at, updated_at, deleted_at,
+                revision
+             ) VALUES (
+                $1, $2, NULL, $3, 'Unknown binding', $4, 1,
+                now(), now(), NULL, 1
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ai_lab_id)
+        .bind(vision_user_id)
+        .bind(Uuid::new_v4())
+        .execute(&ai_incremental_pool)
+        .await;
+        assert!(
+            unknown_binding.is_err(),
+            "a PostgreSQL conversation must reference an existing profile version"
+        );
+        let bound_conversation_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO ai_conversations (
+                id, lab_id, project_id, user_id, title, model_profile_id,
+                model_profile_version, created_at, updated_at, deleted_at,
+                revision
+             ) VALUES (
+                $1, $2, NULL, $3, 'Bound conversation', $4, 1,
+                now(), now(), NULL, 1
+             )",
+        )
+        .bind(bound_conversation_id)
+        .bind(ai_lab_id)
+        .bind(vision_user_id)
+        .bind(text_profile.0)
+        .execute(&ai_incremental_pool)
+        .await
+        .expect("complete PostgreSQL profile-version binding must be accepted");
+        let rebind = sqlx::query("UPDATE ai_conversations SET model_profile_id = $1 WHERE id = $2")
+            .bind(vision_profile.0)
+            .bind(bound_conversation_id)
+            .execute(&ai_incremental_pool)
+            .await;
+        assert!(
+            rebind.is_err(),
+            "PostgreSQL conversation model bindings must be immutable"
+        );
+
+        let protocol: String =
+            sqlx::query_scalar("SELECT protocol FROM ai_provider_endpoints WHERE id = $1")
+                .bind(endpoint_id)
+                .fetch_one(&ai_incremental_pool)
+                .await
+                .expect("migrated PostgreSQL endpoint protocol must be readable");
+        assert_eq!(protocol, "openai_chat_completions");
+        let enabled_index_definition: String = sqlx::query_scalar(
+            "SELECT indexdef
+             FROM pg_indexes
+             WHERE schemaname = current_schema()
+               AND tablename = 'ai_provider_endpoints'
+               AND indexname = 'idx_ai_provider_endpoints_enabled'",
+        )
+        .fetch_one(&ai_incremental_pool)
+        .await
+        .expect("migrated endpoint enabled index must be readable");
+        assert!(
+            enabled_index_definition.contains("(lab_id, protocol, enabled)"),
+            "endpoint enabled index must use protocol semantics: {enabled_index_definition}"
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE ai_provider_endpoints
+                 SET protocol = 'invalid_protocol' WHERE id = $1",
+            )
+            .bind(endpoint_id)
+            .execute(&ai_incremental_pool)
+            .await
+            .is_err(),
+            "PostgreSQL endpoint protocol must be schema constrained"
+        );
+        for protocol in ["openai_responses", "anthropic_messages"] {
+            sqlx::query(
+                "INSERT INTO ai_provider_endpoints (
+                    id, lab_id, provider_kind, protocol, label, base_url,
+                    normalized_base_url, enabled, builtin, created_by,
+                    updated_by, created_at, updated_at, revision
+                 ) VALUES (
+                    $1, $2, 'open_ai_compatible', $3, 'Protocol endpoint',
+                    'https://provider.example.test/v1/',
+                    'https://provider.example.test/v1', TRUE, FALSE, $4, $4,
+                    now(), now(), 1
+                 )",
+            )
+            .bind(Uuid::new_v4())
+            .bind(ai_lab_id)
+            .bind(protocol)
+            .bind(vision_user_id)
+            .execute(&ai_incremental_pool)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("distinct PostgreSQL protocol {protocol} must be accepted: {error}")
+            });
+        }
+        let duplicate_protocol = sqlx::query(
+            "INSERT INTO ai_provider_endpoints (
+                id, lab_id, provider_kind, protocol, label, base_url,
+                normalized_base_url, enabled, builtin, created_by, updated_by,
+                created_at, updated_at, revision
+             ) VALUES (
+                $1, $2, 'open_ai_compatible', 'openai_chat_completions',
+                'Duplicate endpoint', 'https://provider.example.test/v1/',
+                'https://provider.example.test/v1', TRUE, FALSE, $3, $3,
+                now(), now(), 1
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ai_lab_id)
+        .bind(vision_user_id)
+        .execute(&ai_incremental_pool)
+        .await;
+        assert!(
+            duplicate_protocol.is_err(),
+            "PostgreSQL lab, protocol, and normalized URL must be unique"
+        );
+
+        let active_name_conflict = sqlx::query(
+            "INSERT INTO ai_model_profiles (
+                id, lab_id, user_id, name, current_version, created_at,
+                updated_at, archived_at, deleted_at, revision
+             ) VALUES (
+                $1, $2, $3, 'Migrated default model', 1,
+                now(), now(), NULL, NULL, 1
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ai_lab_id)
+        .bind(text_only_user_id)
+        .execute(&ai_incremental_pool)
+        .await;
+        assert!(
+            active_name_conflict.is_err(),
+            "active PostgreSQL profile names must be unique per user"
+        );
+        let text_only_profile_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM ai_model_profiles
+             WHERE user_id = $1 AND name = 'Migrated default model'",
+        )
+        .bind(text_only_user_id)
+        .fetch_one(&ai_incremental_pool)
+        .await
+        .expect("text-only PostgreSQL profile id must be readable");
+        sqlx::query(
+            "UPDATE ai_model_profiles
+             SET archived_at = now(), updated_at = now()
+             WHERE id = $1",
+        )
+        .bind(text_only_profile_id)
+        .execute(&ai_incremental_pool)
+        .await
+        .expect("PostgreSQL profile must be archivable");
+        sqlx::query(
+            "INSERT INTO ai_model_profiles (
+                id, lab_id, user_id, name, current_version, created_at,
+                updated_at, archived_at, deleted_at, revision
+             ) VALUES (
+                $1, $2, $3, 'Migrated default model', 1,
+                now(), now(), NULL, NULL, 1
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(ai_lab_id)
+        .bind(text_only_user_id)
+        .execute(&ai_incremental_pool)
+        .await
+        .expect("an archived PostgreSQL profile name must be reusable");
+
+        let migration_0025_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 25")
+                .fetch_one(&ai_incremental_pool)
+                .await
+                .expect("0025 migration ledger entry must be readable");
+        assert_eq!(migration_0025_count, 1);
+        drop_migration_test_database(&admin_pool, &ai_incremental_name, ai_incremental_pool).await;
+
+        let (stack_incremental_name, stack_incremental_pool) =
+            create_migration_test_database(&admin_pool, &base_options, "ai_stack_incremental")
+                .await;
+        let through_0024 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 24)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        through_0024
+            .run(&stack_incremental_pool)
+            .await
+            .expect("pre-stack PostgreSQL migration prefix through 0024 must succeed");
+
+        let stack_lab_id = Uuid::new_v4();
+        let stack_user_id = Uuid::new_v4();
+        let stack_conversation_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO labs (
+                id, name, created_at, updated_at, deleted_at, revision
+             ) VALUES (
+                $1, 'AI stack migration lab', now(), now(), NULL, 1
+             )",
+        )
+        .bind(stack_lab_id)
+        .execute(&stack_incremental_pool)
+        .await
+        .expect("pre-stack migration lab fixture must be inserted");
+        sqlx::query(
+            "INSERT INTO users (
+                id, lab_id, email, display_name, status, created_at,
+                updated_at, deleted_at, revision
+             ) VALUES (
+                $1, $2, $3, 'AI stack migration user', 'active',
+                now(), now(), NULL, 1
+             )",
+        )
+        .bind(stack_user_id)
+        .bind(stack_lab_id)
+        .bind(format!("ai-stack-{stack_user_id}@example.test"))
+        .execute(&stack_incremental_pool)
+        .await
+        .expect("pre-stack migration user fixture must be inserted");
+        sqlx::query(
+            "INSERT INTO ai_conversations (
+                id, lab_id, project_id, user_id, title, created_at, updated_at,
+                deleted_at, revision
+             ) VALUES (
+                $1, $2, NULL, $3, 'Pre-stack conversation',
+                now(), now(), NULL, 1
+             )",
+        )
+        .bind(stack_conversation_id)
+        .bind(stack_lab_id)
+        .bind(stack_user_id)
+        .execute(&stack_incremental_pool)
+        .await
+        .expect("pre-stack conversation fixture must be inserted");
+
+        let through_0027 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 27)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        through_0027
+            .run(&stack_incremental_pool)
+            .await
+            .expect("PostgreSQL model-platform stack through 0027 must succeed");
+        let stack_checkpoint_ledger: (i64, Option<i64>) =
+            sqlx::query_as("SELECT count(*), max(version) FROM _sqlx_migrations")
+                .fetch_one(&stack_incremental_pool)
+                .await
+                .expect("PostgreSQL stack checkpoint ledger must be readable");
+        assert_eq!(
+            stack_checkpoint_ledger,
+            (27, Some(27)),
+            "the #12-#16 PostgreSQL stack must end at 0027"
+        );
+        let stack_checkpoint_conversation: (String, Option<Uuid>, Option<i64>, bool, i64) =
+            sqlx::query_as(
+                "SELECT title, model_profile_id, model_profile_version,
+                        legacy_read_only, revision
+                 FROM ai_conversations WHERE id = $1",
+            )
+            .bind(stack_conversation_id)
+            .fetch_one(&stack_incremental_pool)
+            .await
+            .expect("stack-checkpoint conversation must be readable");
+        assert_eq!(
+            stack_checkpoint_conversation,
+            ("Pre-stack conversation".to_owned(), None, None, true, 1,),
+            "the model-platform stack must preserve legacy history as read-only"
+        );
+
+        MIGRATOR
+            .run(&stack_incremental_pool)
+            .await
+            .expect("0027 stack checkpoint to merged PostgreSQL migrations must succeed");
+        MIGRATOR
+            .run(&stack_incremental_pool)
+            .await
+            .expect("merged PostgreSQL migration replay must be idempotent");
+        let merged_stack_ledger: (i64, Option<i64>) =
+            sqlx::query_as("SELECT count(*), max(version) FROM _sqlx_migrations")
+                .fetch_one(&stack_incremental_pool)
+                .await
+                .expect("merged PostgreSQL migration ledger must be readable");
+        assert_eq!(
+            merged_stack_ledger,
+            (31, Some(31)),
+            "the merged PostgreSQL migration set must end at 0031"
+        );
+        type MergedStackConversationRow = (
+            String,
+            Option<Uuid>,
+            Option<i64>,
+            bool,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            i64,
+        );
+        let merged_stack_conversation: MergedStackConversationRow = sqlx::query_as(
+            "SELECT title, model_profile_id, model_profile_version,
+                    legacy_read_only, pinned_at, archived_at, revision
+             FROM ai_conversations WHERE id = $1",
+        )
+        .bind(stack_conversation_id)
+        .fetch_one(&stack_incremental_pool)
+        .await
+        .expect("fully migrated stack conversation must be readable");
+        assert_eq!(
+            merged_stack_conversation,
+            (
+                "Pre-stack conversation".to_owned(),
+                None,
+                None,
+                true,
+                None,
+                None,
+                1,
+            ),
+            "conversation management must preserve the stack's model-binding semantics"
+        );
+        let merged_source_tables: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+             FROM information_schema.tables
+             WHERE table_schema = current_schema()
+               AND table_name IN (
+                   'ai_conversation_sources',
+                   'ai_conversation_source_object_deletions'
+               )",
+        )
+        .fetch_one(&stack_incremental_pool)
+        .await
+        .expect("merged AI source tables must be readable");
+        assert_eq!(merged_source_tables, 2);
+        drop_migration_test_database(&admin_pool, &stack_incremental_name, stack_incremental_pool)
+            .await;
+
+        let (compatibility_name, compatibility_pool) =
+            create_migration_test_database(&admin_pool, &base_options, "ai_compatibility").await;
+        let through_0026 = Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version <= 26)
+                    .cloned()
+                    .collect(),
+            ),
+            ..Migrator::DEFAULT
+        };
+        through_0026
+            .run(&compatibility_pool)
+            .await
+            .expect("migration prefix through 0026 must succeed");
+
+        let compatibility_lab_id = Uuid::new_v4();
+        let invalid_user_id = Uuid::new_v4();
+        let valid_user_id = Uuid::new_v4();
+        let cross_owner_user_id = Uuid::new_v4();
+        let archived_profile_id = Uuid::new_v4();
+        let non_vision_profile_id = Uuid::new_v4();
+        let valid_vision_profile_id = Uuid::new_v4();
+        let bound_conversation_id = Uuid::new_v4();
+        let legacy_conversation_id = Uuid::new_v4();
+        let compatibility_now =
+            chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+                .expect("compatibility fixture timestamp must be representable");
+
+        sqlx::query(
+            "INSERT INTO labs (
+                id, name, created_at, updated_at, deleted_at, revision
+             ) VALUES (
+                $1, 'AI compatibility repair lab', $2, $2, NULL, 1
+             )",
+        )
+        .bind(compatibility_lab_id)
+        .bind(compatibility_now)
+        .execute(&compatibility_pool)
+        .await
+        .expect("compatibility lab fixture must be inserted");
+        for (user_id, label) in [
+            (invalid_user_id, "invalid"),
+            (valid_user_id, "valid"),
+            (cross_owner_user_id, "cross-owner"),
+        ] {
+            sqlx::query(
+                "INSERT INTO users (
+                    id, lab_id, email, display_name, status, created_at,
+                    updated_at, deleted_at, revision
+                 ) VALUES (
+                    $1, $2, $3, 'Compatibility user', 'active',
+                    $4, $4, NULL, 1
+                 )",
+            )
+            .bind(user_id)
+            .bind(compatibility_lab_id)
+            .bind(format!("{label}-{user_id}@example.test"))
+            .bind(compatibility_now)
+            .execute(&compatibility_pool)
+            .await
+            .expect("compatibility user fixture must be inserted");
+        }
+
+        for (profile_id, user_id, name, supports_vision, archived_at) in [
+            (
+                archived_profile_id,
+                invalid_user_id,
+                "Archived conversation default",
+                false,
+                Some(compatibility_now),
+            ),
+            (
+                non_vision_profile_id,
+                invalid_user_id,
+                "Non-vision default",
+                false,
+                None,
+            ),
+            (
+                valid_vision_profile_id,
+                valid_user_id,
+                "Valid vision default",
+                true,
+                None,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO ai_model_profiles (
+                    id, lab_id, user_id, name, current_version, created_at,
+                    updated_at, archived_at, deleted_at, revision
+                 ) VALUES ($1, $2, $3, $4, 1, $5, $5, $6, NULL, 1)",
+            )
+            .bind(profile_id)
+            .bind(compatibility_lab_id)
+            .bind(user_id)
+            .bind(name)
+            .bind(compatibility_now)
+            .bind(archived_at)
+            .execute(&compatibility_pool)
+            .await
+            .expect("compatibility profile fixture must be inserted");
+            sqlx::query(
+                "INSERT INTO ai_model_profile_versions (
+                    profile_id, version, protocol, transport, base_url,
+                    normalized_base_url, model_id, supports_vision,
+                    context_window_tokens, max_input_tokens, max_output_tokens,
+                    history_token_budget, history_turns, temperature, timeout_ms,
+                    created_at
+                 ) VALUES (
+                    $1, 1, 'openai_chat_completions', 'open_ai_compatible',
+                    'https://provider.example.test/v1',
+                    'https://provider.example.test/v1', $2, $3,
+                    16384, 8192, 2048, 4096, 20, 0, 30000, $4
+                 )",
+            )
+            .bind(profile_id)
+            .bind(format!("model-{profile_id}"))
+            .bind(supports_vision)
+            .bind(compatibility_now)
+            .execute(&compatibility_pool)
+            .await
+            .expect("compatibility profile version fixture must be inserted");
+        }
+
+        for (user_id, conversation_profile, vision_profile, revision) in [
+            (
+                invalid_user_id,
+                archived_profile_id,
+                non_vision_profile_id,
+                4_i64,
+            ),
+            (
+                valid_user_id,
+                valid_vision_profile_id,
+                valid_vision_profile_id,
+                5_i64,
+            ),
+            (
+                cross_owner_user_id,
+                valid_vision_profile_id,
+                valid_vision_profile_id,
+                6_i64,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO ai_user_model_defaults (
+                    user_id, default_conversation_profile_id,
+                    default_vision_profile_id, created_at, updated_at,
+                    deleted_at, revision
+                 ) VALUES ($1, $2, $3, $4, $4, NULL, $5)",
+            )
+            .bind(user_id)
+            .bind(conversation_profile)
+            .bind(vision_profile)
+            .bind(compatibility_now)
+            .bind(revision)
+            .execute(&compatibility_pool)
+            .await
+            .expect("compatibility default fixture must be inserted");
+        }
+
+        sqlx::query(
+            "INSERT INTO ai_provider_settings (
+                user_id, enabled, provider_config, provider_preset_id,
+                secret_key_version, secret_nonce, secret_ciphertext,
+                supports_vision, vision_model, context_window_tokens,
+                max_input_tokens, max_output_tokens, history_token_budget,
+                history_turns, temperature, timeout_ms, created_at, updated_at,
+                revision
+             ) VALUES (
+                $1, TRUE, $2, 'custom-openai-compatible', 11, $3, $4,
+                FALSE, NULL, 16384, 8192, 2048, 4096, 20, 0, 30000,
+                $5, $5, 9
+             )",
+        )
+        .bind(invalid_user_id)
+        .bind(serde_json::json!({
+            "kind": "open_ai_compatible",
+            "model": "legacy-model",
+            "base_url": "https://provider.example.test/v1"
+        }))
+        .bind(vec![11_u8; 12])
+        .bind(vec![12_u8; 32])
+        .bind(compatibility_now)
+        .execute(&compatibility_pool)
+        .await
+        .expect("legacy credential fixture must be inserted");
+        sqlx::query(
+            "INSERT INTO ai_model_profile_secrets (
+                profile_id, profile_version, key_version, nonce, ciphertext,
+                created_at, updated_at
+             ) VALUES ($1, 1, 13, $2, $3, $4, $4)",
+        )
+        .bind(archived_profile_id)
+        .bind(vec![13_u8; 12])
+        .bind(vec![14_u8; 32])
+        .bind(compatibility_now)
+        .execute(&compatibility_pool)
+        .await
+        .expect("profile-version credential fixture must be inserted");
+        sqlx::query(
+            "INSERT INTO ai_conversations (
+                id, lab_id, project_id, user_id, title, model_profile_id,
+                model_profile_version, legacy_read_only, created_at, updated_at,
+                deleted_at, revision
+             ) VALUES (
+                $1, $2, NULL, $3, 'Archived model history', $4, 1, FALSE,
+                $5, $5, NULL, 1
+             )",
+        )
+        .bind(bound_conversation_id)
+        .bind(compatibility_lab_id)
+        .bind(invalid_user_id)
+        .bind(archived_profile_id)
+        .bind(compatibility_now)
+        .execute(&compatibility_pool)
+        .await
+        .expect("bound historical conversation fixture must be inserted");
+        sqlx::query(
+            "INSERT INTO ai_conversations (
+                id, lab_id, project_id, user_id, title, model_profile_id,
+                model_profile_version, legacy_read_only, created_at, updated_at,
+                deleted_at, revision
+             ) VALUES (
+                $1, $2, NULL, $3, 'Legacy read-only history',
+                NULL, NULL, TRUE, $4, $4, NULL, 1
+             )",
+        )
+        .bind(legacy_conversation_id)
+        .bind(compatibility_lab_id)
+        .bind(invalid_user_id)
+        .bind(compatibility_now)
+        .execute(&compatibility_pool)
+        .await
+        .expect("legacy read-only conversation fixture must be inserted");
+
+        MIGRATOR
+            .run(&compatibility_pool)
+            .await
+            .expect("0027 compatibility finalization must succeed");
+        MIGRATOR
+            .run(&compatibility_pool)
+            .await
+            .expect("0027 migration ledger replay must be idempotent");
+
+        let invalid_defaults: (Option<Uuid>, Option<Uuid>, i64) = sqlx::query_as(
+            "SELECT default_conversation_profile_id, default_vision_profile_id,
+                revision
+             FROM ai_user_model_defaults WHERE user_id = $1",
+        )
+        .bind(invalid_user_id)
+        .fetch_one(&compatibility_pool)
+        .await
+        .expect("repaired PostgreSQL defaults must be readable");
+        assert_eq!(invalid_defaults, (None, None, 5));
+        let valid_defaults: (
+            Option<Uuid>,
+            Option<Uuid>,
+            i64,
+            chrono::DateTime<chrono::Utc>,
+        ) = sqlx::query_as(
+            "SELECT default_conversation_profile_id, default_vision_profile_id,
+                revision, updated_at
+             FROM ai_user_model_defaults WHERE user_id = $1",
+        )
+        .bind(valid_user_id)
+        .fetch_one(&compatibility_pool)
+        .await
+        .expect("valid PostgreSQL defaults must be readable");
+        assert_eq!(
+            valid_defaults,
+            (
+                Some(valid_vision_profile_id),
+                Some(valid_vision_profile_id),
+                5,
+                compatibility_now,
+            ),
+            "valid PostgreSQL defaults must remain unchanged"
+        );
+        let cross_owner_defaults: (Option<Uuid>, Option<Uuid>, i64) = sqlx::query_as(
+            "SELECT default_conversation_profile_id, default_vision_profile_id,
+                revision
+             FROM ai_user_model_defaults WHERE user_id = $1",
+        )
+        .bind(cross_owner_user_id)
+        .fetch_one(&compatibility_pool)
+        .await
+        .expect("cross-owner PostgreSQL defaults must be readable");
+        assert_eq!(
+            cross_owner_defaults,
+            (None, None, 7),
+            "both invalid references must be repaired with one revision advance"
+        );
+
+        let retained_legacy_secret: LegacyProviderSecretBundle = sqlx::query_as(
+            "SELECT secret_key_version, secret_nonce, secret_ciphertext,
+                    revision
+                 FROM ai_provider_settings WHERE user_id = $1",
+        )
+        .bind(invalid_user_id)
+        .fetch_one(&compatibility_pool)
+        .await
+        .expect("legacy PostgreSQL credential row must remain readable");
+        assert_eq!(
+            retained_legacy_secret,
+            (Some(11), Some(vec![11_u8; 12]), Some(vec![12_u8; 32]), 9,)
+        );
+        let retained_profile_secret: (i64, i32, Vec<u8>, Vec<u8>) = sqlx::query_as(
+            "SELECT profile_version, key_version, nonce, ciphertext
+             FROM ai_model_profile_secrets WHERE profile_id = $1",
+        )
+        .bind(archived_profile_id)
+        .fetch_one(&compatibility_pool)
+        .await
+        .expect("profile-version PostgreSQL credential must remain readable");
+        assert_eq!(
+            retained_profile_secret,
+            (1, 13, vec![13_u8; 12], vec![14_u8; 32])
+        );
+        let retained_bindings: Vec<(Uuid, Option<Uuid>, Option<i64>, bool)> = sqlx::query_as(
+            "SELECT id, model_profile_id, model_profile_version, legacy_read_only
+             FROM ai_conversations
+             WHERE id = $1 OR id = $2
+             ORDER BY id",
+        )
+        .bind(bound_conversation_id)
+        .bind(legacy_conversation_id)
+        .fetch_all(&compatibility_pool)
+        .await
+        .expect("historical PostgreSQL bindings must remain readable");
+        let mut expected_bindings = vec![
+            (
+                bound_conversation_id,
+                Some(archived_profile_id),
+                Some(1),
+                false,
+            ),
+            (legacy_conversation_id, None, None, true),
+        ];
+        expected_bindings.sort_by_key(|binding| binding.0);
+        assert_eq!(retained_bindings, expected_bindings);
+        let retained_profiles: (i64, i64) = sqlx::query_as(
+            "SELECT
+                (SELECT count(*) FROM ai_model_profiles),
+                (SELECT count(*) FROM ai_model_profile_versions)",
+        )
+        .fetch_one(&compatibility_pool)
+        .await
+        .expect("PostgreSQL compatibility profile rows must remain readable");
+        assert_eq!(retained_profiles, (3, 3));
+        let migration_0027_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 27")
+                .fetch_one(&compatibility_pool)
+                .await
+                .expect("0027 migration ledger entry must be readable");
+        assert_eq!(migration_0027_count, 1);
+        drop_migration_test_database(&admin_pool, &compatibility_name, compatibility_pool).await;
+
+        let (collision_name, collision_pool) =
+            create_migration_test_database(&admin_pool, &base_options, "endpoint_collision").await;
+        through_0024
+            .run(&collision_pool)
+            .await
+            .expect("collision fixture migration prefix through 0024 must succeed");
+        let collision_lab_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO labs (
+                id, name, created_at, updated_at, deleted_at, revision
+             ) VALUES (
+                $1, 'AI endpoint collision migration lab',
+                now(), now(), NULL, 1
+             )",
+        )
+        .bind(collision_lab_id)
+        .execute(&collision_pool)
+        .await
+        .expect("endpoint collision lab fixture must be inserted");
+        for (provider_kind, label) in [
+            ("open_ai_compatible", "Legacy cloud transport"),
+            ("local_http", "Legacy local transport"),
+        ] {
+            sqlx::query(
+                "INSERT INTO ai_provider_endpoints (
+                    id, lab_id, provider_kind, label, base_url,
+                    normalized_base_url, enabled, builtin, created_at,
+                    updated_at, revision
+                 ) VALUES (
+                    $1, $2, $3, $4,
+                    'https://collision.example.test/v1/',
+                    'https://collision.example.test/v1',
+                    TRUE, FALSE, now(), now(), 1
+                 )",
+            )
+            .bind(Uuid::new_v4())
+            .bind(collision_lab_id)
+            .bind(provider_kind)
+            .bind(label)
+            .execute(&collision_pool)
+            .await
+            .expect("legacy endpoint collision fixture must remain legal through 0024");
+        }
+
+        let collision_error = MIGRATOR
+            .run(&collision_pool)
+            .await
+            .expect_err("0025 must reject ambiguous legacy endpoint protocol collisions")
+            .to_string();
+        assert!(
+            collision_error.contains("cannot migrate AI provider endpoints to protocol uniqueness"),
+            "migration failure must identify the endpoint collision: {collision_error}"
+        );
+        let retained_endpoint_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM ai_provider_endpoints WHERE lab_id = $1")
+                .bind(collision_lab_id)
+                .fetch_one(&collision_pool)
+                .await
+                .expect("legacy endpoints must remain readable after failed migration");
+        assert_eq!(retained_endpoint_count, 2);
+        let protocol_column_count: i64 = sqlx::query_scalar(
+            "SELECT count(*)
+             FROM information_schema.columns
+             WHERE table_schema = current_schema()
+               AND table_name = 'ai_provider_endpoints'
+               AND column_name = 'protocol'",
+        )
+        .fetch_one(&collision_pool)
+        .await
+        .expect("failed migration schema state must be readable");
+        assert_eq!(
+            protocol_column_count, 0,
+            "failed 0025 must roll back endpoint schema changes"
+        );
+        let failed_migration_ledger_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 25")
+                .fetch_one(&collision_pool)
+                .await
+                .expect("failed migration ledger must remain readable");
+        assert_eq!(failed_migration_ledger_count, 0);
+        drop_migration_test_database(&admin_pool, &collision_name, collision_pool).await;
         admin_pool.close().await;
     }
 }

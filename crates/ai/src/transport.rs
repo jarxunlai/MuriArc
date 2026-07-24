@@ -4,6 +4,7 @@ use uuid::Uuid;
 
 use muriarc_core::{
     AiAutonomyMode, AiConversation, AiConversationMessageRole, AiConversationSourceRef,
+    AiModelProfileBinding,
 };
 
 use crate::{
@@ -18,13 +19,40 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssistantTurnRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<Uuid>,
+    /// Governed transports require `start_conversation` before any model call
+    /// or source/image upload.
+    pub conversation_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
     pub message: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_refs: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model_profile_id: Option<Uuid>,
+}
+
+/// Starts an auditable empty conversation before the first Provider call.
+///
+/// The transport resolves `model_profile_id` to the profile's current
+/// immutable version. Passwords, Desktop startup declarations and native
+/// session identifiers deliberately live outside this shared payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssistantConversationStartRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub requested_mode: AiAutonomyMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssistantConversationStartResponse {
+    pub conversation: AssistantConversationSummary,
+    pub autonomy: AiAutonomyView,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,9 +130,28 @@ pub struct AssistantConversationSummary {
     pub pinned_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile_version: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_profile_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    pub read_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_reason: Option<AiConversationReadOnlyReason>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub revision: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiConversationReadOnlyReason {
+    LegacyModelUnknown,
+    ModelArchived,
+    ModelUnavailable,
 }
 
 impl From<AiConversation> for AssistantConversationSummary {
@@ -115,6 +162,14 @@ impl From<AiConversation> for AssistantConversationSummary {
             title: value.title,
             pinned_at: value.pinned_at,
             archived_at: value.archived_at,
+            model_profile_id: value.model_profile.map(|binding| binding.profile_id),
+            model_profile_version: value.model_profile.map(|binding| binding.profile_version),
+            model_profile_name: None,
+            model_id: None,
+            read_only: value.legacy_read_only,
+            read_only_reason: value
+                .legacy_read_only
+                .then_some(AiConversationReadOnlyReason::LegacyModelUnknown),
             created_at: value.meta.created_at,
             updated_at: value.meta.updated_at,
             revision: value.meta.revision,
@@ -177,6 +232,56 @@ pub struct AssistantTrace {
     pub model: String,
     pub usage: AssistantUsage,
     pub context: ContextManagementTrace,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_calls: Vec<AssistantModelCallTrace>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_evidence: Vec<AssistantImageEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantModelCallPurpose {
+    FinalAnswer,
+    VisionAndFinal,
+    VisionObservation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssistantModelCallTrace {
+    pub purpose: AssistantModelCallPurpose,
+    pub model_profile_id: Uuid,
+    pub model_profile_version: i64,
+    pub provider_id: String,
+    pub model: String,
+    pub usage: AssistantUsage,
+}
+
+impl AssistantModelCallTrace {
+    pub fn new(
+        purpose: AssistantModelCallPurpose,
+        binding: AiModelProfileBinding,
+        provider_id: impl Into<String>,
+        model: impl Into<String>,
+        usage: AssistantUsage,
+    ) -> Self {
+        Self {
+            purpose,
+            model_profile_id: binding.profile_id,
+            model_profile_version: binding.profile_version,
+            provider_id: provider_id.into(),
+            model: model.into(),
+            usage,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssistantImageEvidence {
+    pub image_id: Uuid,
+    /// SHA-256 of the verified, metadata-sanitized bytes sent to the Provider.
+    pub sanitized_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -223,7 +328,36 @@ impl AssistantTurnResponse {
         conversation_id: Uuid,
         response: AssistantResponse,
         autonomy: AiAutonomyView,
+        model_profile: AiModelProfileBinding,
+        purpose: AssistantModelCallPurpose,
+        mut prior_model_calls: Vec<AssistantModelCallTrace>,
+        image_evidence: Vec<AssistantImageEvidence>,
     ) -> Self {
+        let mut aggregate_usage = response.usage;
+        for call in &prior_model_calls {
+            aggregate_usage.provider_calls = aggregate_usage
+                .provider_calls
+                .saturating_add(call.usage.provider_calls);
+            aggregate_usage.tool_calls = aggregate_usage
+                .tool_calls
+                .saturating_add(call.usage.tool_calls);
+            aggregate_usage.input_tokens = aggregate_usage
+                .input_tokens
+                .saturating_add(call.usage.input_tokens);
+            aggregate_usage.output_tokens = aggregate_usage
+                .output_tokens
+                .saturating_add(call.usage.output_tokens);
+            aggregate_usage.total_tokens = aggregate_usage
+                .total_tokens
+                .saturating_add(call.usage.total_tokens);
+        }
+        prior_model_calls.push(AssistantModelCallTrace::new(
+            purpose,
+            model_profile,
+            response.provider_id.clone(),
+            response.model.clone(),
+            response.usage,
+        ));
         Self {
             conversation_id,
             content: response.content,
@@ -237,8 +371,10 @@ impl AssistantTurnResponse {
             trace: AssistantTrace {
                 provider_id: response.provider_id,
                 model: response.model,
-                usage: response.usage,
+                usage: aggregate_usage,
                 context: response.context,
+                model_calls: prior_model_calls,
+                image_evidence,
             },
             incomplete_reason: response.incomplete_reason,
             autonomy,
@@ -392,5 +528,30 @@ mod tests {
             "body_weight"
         );
         assert!(serialized["importPreview"].get("preview_rows").is_none());
+    }
+
+    #[test]
+    fn shared_conversation_start_rejects_transport_security_proofs() {
+        for forbidden in [
+            ("currentPassword", serde_json::json!("secret")),
+            ("declared", serde_json::json!(true)),
+            ("sessionId", serde_json::json!(Uuid::new_v4())),
+            ("stepUpVerified", serde_json::json!(true)),
+            ("modelProfileId", serde_json::json!(Uuid::new_v4())),
+        ] {
+            let mut value = serde_json::json!({
+                "projectId": null,
+                "requestedMode": "full",
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(forbidden.0.to_owned(), forbidden.1);
+            assert!(
+                serde_json::from_value::<AssistantConversationStartRequest>(value).is_err(),
+                "{} must remain transport-native",
+                forbidden.0
+            );
+        }
     }
 }

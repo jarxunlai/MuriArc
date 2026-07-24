@@ -10,7 +10,9 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Duration;
-use muriarc_core::{AiOperationStore, AiScope, LabRole, MuriArcStore, WriteSource};
+use muriarc_core::{
+    AiModelProfileStore, AiOperationStore, AiScope, LabRole, MuriArcStore, WriteSource,
+};
 use muriarc_data::{AttachmentFiles, DataFiles, cleanup_expired_ai_conversation_sources};
 use muriarc_server::{
     AiMasterKey, AppState, Authenticator, ChainedAuthenticator, EnvironmentRootConfig,
@@ -96,7 +98,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let attachment_root = PathBuf::from(required_env("MURIARC_ATTACHMENT_ROOT")?);
     tokio::fs::create_dir_all(&data_root).await?;
     tokio::fs::create_dir_all(&attachment_root).await?;
-    let state = configure_ai(state, store.clone(), &data_root)?;
+    let state = configure_ai(state, store.clone(), &data_root).await?;
     let state = state.with_data_storage(DataFiles::new(data_root), attachment_root.clone());
     let cleanup_store: Arc<dyn MuriArcStore> = store.clone();
     let _ai_source_cleanup = spawn_ai_source_cleanup(cleanup_store, server_lab_id, attachment_root);
@@ -152,7 +154,7 @@ fn spawn_ai_source_cleanup(
     })
 }
 
-fn configure_ai(
+async fn configure_ai(
     state: AppState,
     store: Arc<PostgresStore>,
     data_root: &Path,
@@ -172,12 +174,15 @@ fn configure_ai(
         store.as_ref().clone(),
         master_key,
     ));
-    let operations: Arc<dyn AiOperationStore> = store;
+    let migrated_profile_secrets = providers.migrate_legacy_profile_secrets().await?;
+    let operations: Arc<dyn AiOperationStore> = store.clone();
+    let model_profiles: Arc<dyn AiModelProfileStore> = store;
     tracing::info!(
         key_version,
-        "shared AI runtime is enabled with encrypted per-user credentials"
+        migrated_profile_secrets,
+        "shared AI runtime is enabled with profile-bound encrypted credentials"
     );
-    Ok(state.with_ai(operations, providers))
+    Ok(state.with_ai(operations, model_profiles, providers))
 }
 
 fn load_or_create_ai_master_key_file(path: &Path) -> Result<String, Box<dyn Error>> {

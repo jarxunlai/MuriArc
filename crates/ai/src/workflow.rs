@@ -426,10 +426,26 @@ impl AiWorkflowService {
         model_profile: AiModelProfileBinding,
         request: &AssistantTurnRequest,
     ) -> Result<(), AiWorkflowError> {
-        validate_turn_request_basics(context, model_profile, request)?;
+        self.validate_turn_request_input(context, model_profile, request)?;
         self.resolve_conversation(context, model_profile, request)
             .await?;
         Ok(())
+    }
+
+    /// Performs deterministic validation of transport-owned turn input only.
+    ///
+    /// This method never reads or writes a Store and never invokes a Provider.
+    /// A transport that must create a conversation before normal preflight may
+    /// use a fresh non-nil provisional `conversation_id`, then replace it with
+    /// the persisted ID and still call [`Self::preflight_turn_request`]. This
+    /// method does not authorize or prove the existence of a conversation.
+    pub fn validate_turn_request_input(
+        &self,
+        context: &AiExecutionContext,
+        model_profile: AiModelProfileBinding,
+        request: &AssistantTurnRequest,
+    ) -> Result<(), AiWorkflowError> {
+        validate_turn_request_basics(context, model_profile, request)
     }
 
     /// Resolves user-selected sources exactly once after the conversation and
@@ -442,7 +458,7 @@ impl AiWorkflowService {
         model_profile: AiModelProfileBinding,
         request: &AssistantTurnRequest,
     ) -> Result<AssistantSourceBundle, AiWorkflowError> {
-        validate_turn_request_basics(context, model_profile, request)?;
+        self.validate_turn_request_input(context, model_profile, request)?;
         let resolved = self
             .resolve_conversation(context, model_profile, request)
             .await?;
@@ -601,7 +617,7 @@ impl AiWorkflowService {
         media: AssistantTurnMedia,
         source_bundle: AssistantSourceBundle,
     ) -> Result<AssistantTurnResponse, AiWorkflowError> {
-        validate_turn_request_basics(context, model_profile, &request)?;
+        self.validate_turn_request_input(context, model_profile, &request)?;
         validate_resolved_sources(&request, &source_bundle)?;
         validate_turn_media(&request, &media, &source_bundle)?;
         let resolved = self

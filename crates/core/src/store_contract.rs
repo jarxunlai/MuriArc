@@ -4220,6 +4220,112 @@ where
         assert_eq!(entries[0].entity_type, EntityType::AiConversationMessage);
         assert_eq!(entries[0].actor.user_id, Some(user.id));
     }
+
+    let mut unavailable_profile = profile.clone();
+    unavailable_profile.archived_at = Some(now + Duration::seconds(2));
+    unavailable_profile.meta.touch(now + Duration::seconds(2));
+    store
+        .archive_ai_model_profile(&unavailable_profile, 1, &bootstrap)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.get_ai_conversation(conversation.id).await.unwrap(),
+        updated,
+        "archiving a bound model must preserve the historical conversation"
+    );
+    assert_eq!(
+        store
+            .list_ai_conversation_messages(conversation.id, 20)
+            .await
+            .unwrap(),
+        vec![user_message.clone(), assistant_message.clone()],
+        "archiving a bound model must preserve historical messages"
+    );
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        Some(autonomy.clone()),
+        "archiving a bound model must preserve the historical autonomy projection"
+    );
+
+    let blocked_user = AiConversationMessage::new(
+        conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        3,
+        AiConversationMessageRole::User,
+        "Must not reach an archived model",
+        None,
+        now + Duration::seconds(3),
+    )
+    .unwrap();
+    let blocked_assistant = AiConversationMessage::new(
+        conversation.id,
+        lab.id,
+        Some(project.id),
+        user.id,
+        4,
+        AiConversationMessageRole::Assistant,
+        "Must not persist",
+        Some(serde_json::json!({"content": "Must not persist"})),
+        now + Duration::seconds(4),
+    )
+    .unwrap();
+    assert!(matches!(
+        store
+            .append_ai_turn_messages(&blocked_user, &blocked_assistant, 2, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let blocked_tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: Some(conversation.id),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "archived_model_draft".to_owned(),
+        input: serde_json::json!({"operation": "must_not_run"}),
+        output: None,
+        status: ToolRunStatus::Pending,
+        source: WriteSource::Ai,
+        started_at: None,
+        completed_at: None,
+        error: None,
+        meta: RecordMeta::new(now + Duration::seconds(3)),
+    };
+    assert!(matches!(
+        store.create_tool_run(&blocked_tool, &audit).await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store.get_tool_run(blocked_tool.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+
+    let mut blocked_autonomy = autonomy.clone();
+    blocked_autonomy.last_used_at = now + Duration::seconds(3);
+    blocked_autonomy.meta.touch(now + Duration::seconds(3));
+    assert!(matches!(
+        store
+            .save_ai_autonomy_grant(&blocked_autonomy, Some(autonomy.meta.revision), &audit,)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        Some(autonomy),
+        "blocked writes must leave historical autonomy state unchanged"
+    );
+    assert_eq!(
+        store
+            .list_ai_conversation_messages(conversation.id, 20)
+            .await
+            .unwrap(),
+        vec![user_message, assistant_message],
+        "blocked writes must leave historical messages unchanged"
+    );
 }
 
 async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc>) {

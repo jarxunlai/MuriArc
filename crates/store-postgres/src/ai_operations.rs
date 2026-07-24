@@ -391,6 +391,47 @@ async fn conversation_in_tx(tx: &mut PgTransaction<'_>, id: Uuid) -> StoreResult
     conversation_from_row(&row)
 }
 
+async fn ensure_conversation_model_available(
+    tx: &mut PgTransaction<'_>,
+    conversation: &AiConversation,
+) -> StoreResult<()> {
+    if conversation.legacy_read_only {
+        return Err(StoreError::Conflict(
+            "legacy AI conversation is read-only".to_owned(),
+        ));
+    }
+    let Some(binding) = conversation.model_profile else {
+        return Err(StoreError::Conflict(
+            "AI conversation model profile is unavailable".to_owned(),
+        ));
+    };
+    let profile_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT p.id
+         FROM ai_model_profiles p
+         JOIN ai_model_profile_versions v
+           ON v.profile_id = p.id AND v.version = $1
+         WHERE p.id = $2
+           AND p.lab_id = $3
+           AND p.user_id = $4
+           AND p.archived_at IS NULL
+           AND p.deleted_at IS NULL
+         FOR SHARE OF p",
+    )
+    .bind(binding.profile_version)
+    .bind(binding.profile_id)
+    .bind(conversation.lab_id)
+    .bind(conversation.user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    if profile_id.is_none() {
+        return Err(StoreError::Conflict(
+            "AI conversation model profile is unavailable".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 async fn ensure_writable_tool_conversation(
     tx: &mut PgTransaction<'_>,
     tool_run: &ToolRun,
@@ -399,11 +440,7 @@ async fn ensure_writable_tool_conversation(
         return Ok(());
     };
     let conversation = conversation_in_tx(tx, conversation_id).await?;
-    if conversation.legacy_read_only {
-        return Err(StoreError::Conflict(
-            "legacy AI conversation is read-only".to_owned(),
-        ));
-    }
+    ensure_conversation_model_available(tx, &conversation).await?;
     if conversation.lab_id != tool_run.lab_id
         || conversation.user_id != tool_run.user_id
         || conversation.project_id != tool_run.project_id
@@ -629,11 +666,7 @@ impl AiOperationStore for PostgresStore {
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let before = conversation_in_tx(&mut tx, user_message.conversation_id).await?;
-        if before.legacy_read_only {
-            return Err(StoreError::Conflict(
-                "legacy AI conversation is read-only".to_owned(),
-            ));
-        }
+        ensure_conversation_model_available(&mut tx, &before).await?;
         if before.lab_id != user_message.lab_id
             || before.project_id != user_message.project_id
             || before.user_id != user_message.user_id
@@ -743,11 +776,7 @@ impl AiOperationStore for PostgresStore {
         }
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let conversation = conversation_in_tx(&mut tx, grant.conversation_id).await?;
-        if conversation.legacy_read_only {
-            return Err(StoreError::Conflict(
-                "legacy AI conversation is read-only".to_owned(),
-            ));
-        }
+        ensure_conversation_model_available(&mut tx, &conversation).await?;
         if conversation.lab_id != grant.lab_id
             || conversation.project_id != grant.project_id
             || conversation.user_id != grant.user_id

@@ -51,13 +51,46 @@ SQLite 与 PostgreSQL 按相同顺序应用以下共享业务迁移：
 首次改密生命周期。
 
 Desktop/SQLite 不创建 Credential、Session、token 或认证迁移；无密码“进入本地空间”只使用
-`sessionStorage` 记录当前 WebView 会话已确认，不能被解释为数据加密或安全锁。迁移门禁同时
-验证全新 PostgreSQL 数据库一次/重复应用 0001–0023，以及带旧 Credential 记录的
-0017→当前版本增量升级。AI Provider endpoint 在 PostgreSQL 使用 0019、SQLite 使用 0018；
-项目动物关系与对话级 AI 自主授权在 PostgreSQL 使用 0020/0021、SQLite 使用 0019/0020。
-Server-only 技术日志保留表使用 PostgreSQL 0022；Genetics v2 检测记录生命周期在 PostgreSQL
-使用 0023、SQLite 使用 0021。平台专属迁移造成编号偏移，但共享业务迁移仍保持相同的相对
-顺序与语义。
+`sessionStorage` 记录当前 WebView 会话已确认，不能被解释为数据加密或安全锁。AI Provider
+endpoint 在 PostgreSQL 使用 0019、SQLite 使用 0018；项目动物关系与对话级 AI 自主授权在
+PostgreSQL 使用 0020/0021、SQLite 使用 0019/0020。Server-only 技术日志保留表使用
+PostgreSQL 0022；Genetics v2 检测记录生命周期在 PostgreSQL 使用 0023、SQLite 使用 0021。
+平台专属迁移造成编号偏移，但共享业务迁移仍保持相同的相对顺序与语义。
+
+## Versioned AI model profile migrations
+
+多模型升级只新增迁移，不改写已发布 SQL：
+
+| 语义 | PostgreSQL | SQLite |
+| --- | --- | --- |
+| 旧用户 Provider 设置兼容层 | `0024_ai_user_provider_settings.sql` | `0022_ai_user_provider_settings.sql` |
+| 模型档案、不可变版本、默认引用与会话绑定 | `0025_ai_model_profiles.sql` | `0023_ai_model_profiles.sql` |
+| 视觉图片、提取候选与审批证据 | `0026_ai_vision_data_entry.sql` | `0024_ai_vision_data_entry.sql` |
+| 无效默认引用的纯向前兼容修复 | `0027_ai_provider_compatibility_finalize.sql` | `0025_ai_provider_compatibility_finalize.sql` |
+
+旧设置迁移按 owner 幂等投影为模型档案和版本，保留自由文本模型、视觉模型、参数、密钥版本与
+默认选择；不会根据模型名称重写能力或参数。新会话绑定精确的
+`model_profile_id + model_profile_version`。无法建立安全绑定的旧会话继续可读并标记为
+legacy read-only，不会伪造档案身份后继续调用 Provider。
+
+默认对话/视觉档案引用必须属于同一用户、未软删除且未归档；视觉默认还必须显式声明视觉能力。
+升级发现无效默认时使用后续纯向前修复迁移清空对应引用并推进 defaults revision，不删除档案、
+版本、凭据或会话。档案停用同样只阻止新调用与会话追加，历史记录和 Trace 保持可读。
+
+视觉数据迁移新增私有图片、候选草稿、图片关系与审批事务所需结构。它不扫描旧附件猜测证据
+用途，也不自动批准或创建 Observation；只有后续的人工作业能把候选提升为正式研究记录。
+
+## Upgrade and rollback policy
+
+- PostgreSQL 迁移门禁必须在一次性真实 PostgreSQL 17 上覆盖空库完整应用、重复应用，以及从
+  旧版本增量应用；SQLite 使用独立临时数据库执行相同 Store contract。未提供测试数据库而被
+  skip 不算通过。
+- 旧 Provider 表、旧设置行、旧配置文件、旧档案版本、旧密钥版本和 Desktop 旧 Keyring 项
+  本轮一律保留。兼容读取可以停止写入旧结构，但不得用删除来“完成迁移”。
+- 真实数据库完成升级后只允许追加新的修复迁移。禁止编辑或回滚已执行迁移、回退 schema
+  version，或从生产数据猜测重建凭据。
+- `MURIARC_AI_MASTER_KEY_VERSION` 只有在全部既有密文已用旧版本解密并重新加密后才能推进；
+  轮换失败必须阻断启动并保留原数据，不能清空密钥行或要求用户在无报告的情况下重输。
 
 ## Ordinary import/export boundary
 

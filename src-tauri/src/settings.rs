@@ -2465,6 +2465,98 @@ mod tests {
         assert_eq!(unrelated_profile.get_secret().unwrap(), None);
     }
 
+    #[tokio::test]
+    async fn legacy_v1_json_and_single_keyring_item_upgrade_to_versioned_profiles() {
+        let (temp, service, legacy_secrets, versioned_secrets) = service();
+        legacy_secrets
+            .set_secret("legacy-single-provider-secret")
+            .unwrap();
+        let store = local_profile_store(&temp.path().join("legacy-v1-upgrade.sqlite3")).await;
+        let audit = AuditContext::system(WriteSource::Migration);
+
+        let legacy_file = AiSettingsFile {
+            supports_vision: true,
+            vision_model: Some("legacy-vision-model".to_owned()),
+            ..AiSettingsFile::default()
+        };
+        let mut legacy_json = serde_json::to_value(legacy_file).unwrap();
+        let legacy_object = legacy_json.as_object_mut().unwrap();
+        legacy_object.insert("schema_version".to_owned(), serde_json::json!(1));
+        legacy_object.remove("provider_preset_id");
+        legacy_object.remove("conversation_profile_version");
+        legacy_object.remove("vision_profile_version");
+        fs::write(
+            temp.path().join("ai-provider.json"),
+            serde_json::to_vec_pretty(&legacy_json).unwrap(),
+        )
+        .unwrap();
+
+        let legacy_view = service.get().unwrap();
+        assert_eq!(legacy_view.provider_preset_id, "deepseek");
+        assert!(!legacy_view.has_key);
+
+        let binding = service
+            .materialize_model_profiles(&store, &audit)
+            .await
+            .unwrap();
+        assert_eq!(
+            binding,
+            AiModelProfileBinding {
+                profile_id: MIGRATED_LOCAL_PROFILE_ID,
+                profile_version: 1,
+            }
+        );
+        let defaults = store
+            .get_ai_user_model_defaults(LOCAL_USER_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            defaults.default_conversation_profile_id,
+            Some(MIGRATED_LOCAL_PROFILE_ID)
+        );
+        assert_eq!(
+            defaults.default_vision_profile_id,
+            Some(MIGRATED_LOCAL_VISION_PROFILE_ID)
+        );
+
+        for profile_id in [MIGRATED_LOCAL_PROFILE_ID, MIGRATED_LOCAL_VISION_PROFILE_ID] {
+            assert_eq!(
+                versioned_secrets
+                    .get_secret(profile_id, 1)
+                    .unwrap()
+                    .as_deref(),
+                Some("legacy-single-provider-secret")
+            );
+            let secret_ref = store
+                .get_ai_model_profile_secret_ref(profile_id, 1)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(secret_ref.credential_state, AiModelCredentialState::Present);
+            assert_eq!(
+                secret_ref.keyring_account,
+                KeyringSecretStore::for_profile_version(profile_id, 1).account()
+            );
+        }
+        assert_eq!(
+            legacy_secrets.get_secret().unwrap().as_deref(),
+            Some("legacy-single-provider-secret"),
+            "the compatibility copy must retain the old Keyring item"
+        );
+
+        let upgraded_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("ai-provider.json")).unwrap())
+                .unwrap();
+        assert_eq!(upgraded_json["schema_version"], SETTINGS_SCHEMA_VERSION);
+        assert_eq!(upgraded_json["provider_preset_id"], "deepseek");
+        assert_eq!(upgraded_json["conversation_profile_version"], 1);
+        assert_eq!(upgraded_json["vision_profile_version"], 1);
+        let serialized = serde_json::to_string(&upgraded_json).unwrap();
+        assert!(!serialized.contains("legacy-single-provider-secret"));
+        assert!(!serialized.to_ascii_lowercase().contains("api_key"));
+    }
+
     fn service() -> (
         tempfile::TempDir,
         SettingsService,

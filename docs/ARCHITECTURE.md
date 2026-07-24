@@ -62,15 +62,48 @@ Desktop 与 Server 共享核心领域模型、主要业务用例和同一套响�
 
 ## AI configuration and runtime boundaries
 
-AI 配置按两个层级持久化，预设目录不等于共享账号：
+AI 配置按实验室治理、用户模型档案、不可变档案版本和独立凭据四层持久化：
 
-- 实验室级仅保存 AI 总开关、最大自主模式、自定义 URL 审批策略，以及不含密钥的 Provider 出口/预设目录。Environment Root 与 LabAdmin 只能治理这一层，不能查看、替用户修改或调用用户凭据。
-- 用户级按认证 `user_id` 独立保存 `enabled`、Provider kind/preset、Base URL、文本/视觉模型、Token 预算、Temperature、超时与 revision。Server API 只返回 `hasKey`；Desktop 把 Key 放入 OS keyring，Server 使用部署 Master Key 以 AES-256-GCM 加密，并把 user ID 与 key version 绑定到 AAD。Provider 身份或出口切换会清除旧凭据绑定，模型和预算等非身份参数更新会保留同一 Provider 的 Key。
-- 新环境的 Server AI runtime、实验室开关和用户默认开关均为启用，默认个人预设为 DeepSeek；无个人 Key 的稳定状态是 `waiting_for_personal_api_key`，任何请求在网络调用前失败。Docker 只启动 MuriArc Server 与 PostgreSQL，不启动 Ollama、不下载模型。
+- 实验室级只保存 AI 总开关、最大自主模式和允许的 Provider 出口。出口以“协议 + 规范化
+  Base URL”登记；Environment Root 与 LabAdmin 不能读取、替换或调用用户凭据。
+- 用户可以创建任意数量的模型档案，自由填写模型 ID，并选择
+  `openai_chat_completions`、`openai_responses` 或 `anthropic_messages`。档案保存可变展示
+  状态；每次影响调用语义的修改创建不可变版本。协议适配器负责在 Base URL 上拼接标准端点，
+  页面和 Store 不按模型名推断或覆盖能力与参数。
+- 凭据与档案版本分离。Server 使用部署 Master Key 以 AES-256-GCM 加密，并把 user ID、
+  profile ID、profile version 与 Master Key version 绑定到 AAD；Desktop 为每个档案版本
+  使用独立 OS keyring 项。协议或 Base URL 变化时必须提供新 Key；其他编辑留空 Key 表示
+  保留现有绑定。API 只返回 `hasKey`。
+- 用户显式指定默认对话档案和至多一个默认视觉档案。默认引用无效、档案停用或缺少密钥时
+  都在 Provider 调用前失败，不会静默选择列表第一项。迁移生成的旧设置投影保留兼容读取，
+  不再可安全续写的旧会话标为只读。
 
-每次文本调用从用户设置构造 `AssistantRuntimeConfig`。`maxInputTokens + maxOutputTokens` 必须不超过 `contextWindowTokens`；`maxOutputTokens` 作为 OpenAI-compatible `max_tokens` 发给 Provider。调用前的输入 Token 是明确标注的保守估算，覆盖系统提示、历史、工具定义/结果与当前用户消息；超限时只从最旧的完整 user/assistant 历史轮次开始裁剪，当前 tool call/result 组保持配对，当前问题绝不静默截断。响应 Trace 分开记录估算输入、裁剪原因与 Provider 返回的真实 usage。
+对话创建时绑定 `model_profile_id + model_profile_version`，同一会话不可改变这组身份。空会话
+切换模型可原地生效；已有消息时切换会创建新会话，只保留项目范围和未发送输入，不复制消息、
+工具结果、草稿或 Full 授权。档案归档后历史仍可读，但追加消息、工具结果或授权一律拒绝。
 
-内置 Provider 预设为 DeepSeek、智谱 GLM、Moonshot/Kimi、OpenAI 和自定义 OpenAI-compatible。它们只提供显示名称、官方推荐出口、可选模型与文档链接；每位用户仍必须保存自己的 Key、模型和参数。Provider HTTP redirects 被禁用，自定义 OpenAI-compatible 云出口要求 HTTPS；实验室启用 URL 审批时还必须精确匹配官方出口或管理员登记的出口。
+每次文本调用从所绑定版本构造 `AssistantRuntimeConfig`。`maxInputTokens +
+maxOutputTokens` 必须不超过 `contextWindowTokens`。调用前的输入 Token 是明确标注的保守估算，
+覆盖系统提示、历史、工具定义/结果与当前用户消息；超限时只从最旧的完整
+user/assistant 历史轮次开始裁剪，tool call/result 组保持配对，当前问题绝不静默截断。响应
+Trace 分开记录估算输入、裁剪原因与 Provider 返回的真实 usage。
+
+Provider HTTP redirects 被禁用；云出口要求 HTTPS，只有 LabAdmin 精确登记的 HTTP 开发出口
+可使用明文协议。出口匹配始终同时比较协议和规范化地址。内置厂商信息只作为非敏感建议，
+不是模型 allowlist，也不提供共享账号。
+
+## Vision routing and image evidence
+
+- 当前对话模型声明视觉能力时直接接收图片；否则由默认或用户明确指定的视觉档案生成长度受限
+  的结构化文本观察，再交给最终对话模型。没有有效视觉默认时必须要求选择，不得暗选首个档案。
+- Trace 分别记录视觉阶段和最终阶段的档案 ID、不可变版本、用途、Token usage 与图片
+  SHA-256；中转文本采用受控 JSON envelope，不能把视觉模型输出当系统指令。
+- AI 图片只接受经过服务端重编码的 JPEG、PNG、WebP 或静态 GIF，执行大小、尺寸、像素和
+  帧预算，并移除元数据。未经批准的图片、提取候选、Audit 与 Provenance 保持私有且不进入
+  项目 snapshot。
+- “录入实验数据”允许多图生成当前数据单元的候选草稿。拒绝可以恢复编辑；只有具备权限的
+  人工批准才能在一个 Store 事务中创建 Observation、项目附件关系、领域关联、Audit 与
+  Provenance。模型和 transport 都不能直接写入正式实验数据。
 
 ## Operational records
 

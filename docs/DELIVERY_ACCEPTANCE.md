@@ -1,6 +1,9 @@
 # MuriArc 0.1.0 完整工作区、双运行形态与账号安全交付验收
 
-本文件覆盖既有六阶段工作区、Genetics v2、Breeding、Observation、双运行形态与 Server 账号安全的最终交付边界和逐步验收清单。默认验收服务地址为 `http://127.0.0.1:8787`；账号凭据使用单独的本地交付信息，不写入仓库。
+本文件覆盖既有六阶段工作区、Genetics v2、Breeding、Observation、双运行形态、Server
+账号安全，以及版本化多模型、对话切换、视觉路由和图片证据审批的最终交付边界与逐步验收
+清单。默认验收服务地址为 `http://127.0.0.1:8787`；账号凭据和模型 Key 使用单独的本地
+交付信息，不写入仓库。
 
 ## 1. Delivered scope
 
@@ -15,6 +18,12 @@
 - Desktop/Tauri/SQLite 与 Server/Axum/PostgreSQL 保持单代码库，共享 Domain、Application、Store contract 和主体 Vue UI；Desktop 正式本地交付为 Windows Tauri WebView 安装包，不以 VNC/noVNC 作为部署方式，不新增认证表，每个 WebView 会话只显示一次无密码欢迎页。
 - Server 启动从环境配置单事务同步唯一 Environment Root、LabAdmin membership 与 Argon2id Credential；冲突阻断启动，配置变化撤销 Root Session，Audit 不含密码/hash。
 - 新成员使用临时密码并强制首次改密；自助改密保留当前 Session、撤销其他 Session，管理员重置撤销目标全部 Session/external token，并受 Root/LabAdmin 层级约束。
+- 用户可创建多个版本化模型档案，自由填写模型 ID，并分别选择 OpenAI Chat Completions、
+  OpenAI Responses 或 Anthropic Messages；默认对话/视觉档案显式配置，凭据按档案版本隔离。
+- 会话绑定不可变档案版本，档案归档或旧会话无法安全绑定时保留历史读取但禁止继续发送；
+  Ask、Auto、Full 同时显示请求模式和实验室上限裁剪后的实际模式。
+- 图片可由对话模型直接处理或经明确视觉档案中转；实验数据多图识别只生成当前数据单元的
+  私有候选，人工批准后才原子创建 Observation、附件关系、Audit 与 Provenance。
 
 ## 2. REST surface
 
@@ -33,6 +42,9 @@
 | Observations | `GET/POST /observations`；`GET /observations/{id}`；`GET /observations/{id}/values`；`POST /observations/{id}/revisions` |
 | Enrollment snapshot | 既有 Participation DTO 新增 `genotypeSnapshot`；创建 Participation 时由 Store 原子填充 |
 | Data products | `POST /data/imports` 仅 Animal/Measurement；`POST /data/exports` 仅 Animal Registry；`POST /data/snapshots` 为 Lab 业务归档 |
+| AI model profiles | `GET/POST /ai/models`；`GET/PUT /ai/models/{id}`；`POST /ai/models/validate`；`DELETE /ai/models/{id}/key`；`POST /ai/models/{id}/archive`；`GET/PUT /ai/models/defaults` |
+| AI conversations | `GET/POST /ai/conversations`；`GET /ai/conversations/{id}`；`GET/PUT /ai/conversations/{id}/autonomy`；消息发送仍受绑定档案、项目和授权 preflight |
+| AI image evidence | 私有图片流式上传/读取；`GET/POST /ai/extractions`；`GET /ai/extractions/{id}`；`POST /ai/extractions/{id}/approve` 或 `/reject` |
 | Self-service account | `GET /auth/session`、`GET /auth/csrf`、`PATCH /auth/profile`、`POST /auth/password/change`、`POST /auth/logout` |
 | User governance | `GET/POST /admin/users`；`PATCH /admin/users/{id}/profile`；`POST /admin/users/{id}/password-reset` 及状态/权限操作 |
 
@@ -48,11 +60,57 @@ Tauri 的 `LocalTauriGateway` 和 Server 的 `RemoteHttpGateway` 暴露相同前
 | Snapshot | 业务 JSONL、附件、manifest、record count、大小、SHA-256 | restore/apply、自动合并、实时同步、账号/session/secret 备份 |
 | AI breeding | 基于可见数据进行分析、预测和建议 | 自动创建 MatingEvent、直接修改 Animal、绕过人工审批 |
 | AI mutation | 结构化 Measurement 只能形成待审批草稿 | raw SQL、任意 HTTP、Breeding/Animal mutation operation |
+| AI providers | 三种显式协议、自由模型 ID、版本化档案与本地 Mock 验证 | 静态模型 allowlist、按模型名覆盖参数、CI 调用真实厂商 |
+| AI vision | 当前模型直接视觉或经明确视觉档案生成受控观察 | 静默选择第一个视觉模型、把视觉输出当系统指令 |
+| Image data entry | 多图候选、编辑/拒绝/批准、事务性证据提升 | AI 直接正式写入、批准前进入项目 snapshot |
 
 普通 Export 是用户选择的数据产品，Snapshot 是业务归档边界；二者都不能替代 PostgreSQL/SQLite
 与附件目录的经演练部署备份。
 
 ## 4. Automated verification record
+
+### 2026-07-24 multi-model compatibility addendum
+
+阶段五候选源码在当前 feature worktree 内完成以下门禁；Cargo target 位于仓库外，Provider
+测试只使用 Mock/本机 upstream，未调用真实厂商：
+
+```text
+git diff --check + cargo fmt --all -- --check                   PASS
+Locked workspace metadata                                       PASS
+Tauri Linux image strict Clippy, all targets/features            PASS
+Rust workspace, all targets/features, disposable PostgreSQL 17   PASS
+Rust workspace planned command + doc tests, fresh PostgreSQL 17  PASS
+AI: 77 unit + 10 integration                                     PASS
+Desktop: 66 tests                                                PASS
+Server: 124 library + 2 binary                                   PASS
+PostgreSQL: 2 migration + 6 contract + 2 integration             PASS
+SQLite: 6 migration + 4 profile + 2 operation + 8 other tests    PASS
+UI Vitest: 20 files / 158 tests                                  PASS
+TypeScript vue-tsc                                               PASS
+Remote and Local Vite production builds                          PASS
+Playwright Desktop/Tablet/Mobile: 40 pass / 8 conditional skip   PASS
+Branding integrity                                               PASS
+pnpm high-severity audit against official registry               PASS
+```
+
+PostgreSQL 0027 与 SQLite 0025 的兼容迁移从前一版本 schema 增量应用并重放迁移账本：无效的
+归档、软删除、跨 owner、缺失版本或非视觉默认引用被清空，每个受影响 defaults 行 revision
+只推进一次；有效默认的 revision/时间戳不变。旧 `ai_provider_settings` 密钥版本与密文、
+档案/不可变版本、Server profile secret、Desktop keyring reference、legacy 会话和固定版本会话
+均保持可读。归档档案的历史仍可读取，但 SQLite/PostgreSQL 同一 Store contract 都在写前拒绝
+追加 turn、tool run 或 autonomy grant。
+
+Server 额外验证 Master Key v1 → v2 只有“旧 runtime 解密，再由新 runtime 显式重加密”路径
+成功；错误密钥、旧密文配新版本以及新密文配旧 runtime 都 fail closed。Desktop 验证 schema
+v1 JSON 和单一旧 Keyring 项幂等投影为文本/视觉档案版本，并保留旧文件/旧 Keyring 项。UI
+验证失效默认不会回退首个档案，`legacy_model_unknown`、`model_archived` 和
+`model_unavailable` 三类历史均可读但即使程序化调用 `send()` 也不会请求 Provider。
+
+8 个 Playwright skip 来自场景中明确的设备条件，不是浏览器、依赖或环境缺失。生产构建仍报告
+已知的主入口 chunk 大于 500 KiB 警告；它不影响本轮功能门禁，继续列在 Known limitations。
+Windows 安装包和原生运行时不能由 WSL/Linux 结果替代：阶段五提交后必须生成写明 40 位 commit
+的仓库外交接，Draft PR 的 Windows Tauri smoke 必须通过，安装/Keyring/升级/release bundle
+人工结果按 `docs/DESKTOP_DELIVERY.md` 记录，未执行项不得标记为 PASS。
 
 以下门禁在 2026-07-21 的交付工作树上实际执行：
 
@@ -171,21 +229,47 @@ external token 明文。验收停止时只执行 `docker compose down`，未使�
 3. “创建完整归档快照”触发下载，确认界面明确标注当前不可 `restore/apply`。
 4. 不删除现有数据库或 volume；部署恢复演练使用 `docs/DEPLOYMENT.md` 的数据库+附件流程。
 
-### G. AI and audit
+### G. AI models, conversations, vision and audit
 
-1. 在全新 Server 数据卷启动普通 Compose 部署；确认 diagnostics 为 `runtimeConfigured=true`、`labEnabled=true`、`userEnabled=true`、`providerPresetsAvailable=true`，无个人 Key 时状态为 `waiting_for_personal_api_key`。确认只存在 Server/PostgreSQL 容器，没有 Ollama 容器、模型下载或外部 AI 请求。
-2. 分别以 Root、Editor、Viewer 保存 DeepSeek/智谱 GLM/Moonshot-Kimi、不同模型和不同测试 Key；确认读取接口只返回 `hasKey`，Root 配置不出现在其他用户页面。Fake upstream 必须分别捕获预期 Authorization、model、`max_tokens` 与 Temperature。未配置 Key 的用户不能触发 upstream。
-3. 修改 Root 模型与 Token 参数，刷新设置页后再次调用；确认参数保持并实际进入 Provider 请求，Editor/Viewer 不变。切换 Provider 或 Base URL 且不输入新 Key 时，旧 Key 必须清除而不是复用。
-4. 验证 `maxInputTokens + maxOutputTokens <= contextWindowTokens`；超限 UI 禁止保存。构造历史与工具结果压力，确认只裁剪最旧完整历史、tool call/result 不拆分、当前问题不截断，Trace 区分估算输入、裁剪原因与 Provider 真实 usage。
-5. 让 AI 建议繁育方案；确认只返回分析/预测/建议，没有创建交配事件按钮或自动结果。尝试要求 AI 直接创建 `MatingEvent` 或更新 Animal，应因固定工具面而无法执行。
-6. 在审计/来源页面抽查 AI 设置修改及 Definition、检测、配对、窝次、Draft 注册、Observation 初值/修订，确认 actor、source、entity ID 与 revision 可追溯；任何日志、Audit、错误与前端状态都不得包含 API Key。
+1. 新建三个模型档案，协议分别为 `openai_chat_completions`、`openai_responses` 和
+   `anthropic_messages`，使用任意自由模型 ID。本机 Mock upstream 必须捕获各自标准端点、
+   鉴权 header、请求体和 usage；错误响应映射稳定，测试不得调用真实厂商。
+2. 对同一用户设置默认对话档案和至多一个默认视觉档案；删除、归档、跨 owner 或非视觉默认
+   引用后刷新，确认引用被 fail-closed 清除或拒绝且不会暗选首项。未保存表单可验证，验证不
+   落库也不是保存前置条件。
+3. 编辑名称、模型 ID 或 Token 参数且 Key 留空，确认现有绑定保留；修改协议或 Base URL 时
+   必须重新输入 Key。读取接口与页面只显示 `hasKey`，任何日志、Audit、错误、snapshot 和
+   前端状态都不得出现 Key。
+4. 创建空会话并切换模型，确认原会话绑定更新；发送消息后再切换，确认经提示创建新会话，
+   只保留项目范围和未发送输入，不继承消息、工具结果、草稿或 Full 授权。旧会话、归档档案
+   会话和 legacy read-only 会话保持可读但不能继续发送。
+5. 新会话首轮选择 Full：Server 必须用当前密码完成 session-bound step-up，Desktop 必须用
+   本次启动声明和独立 Session UUID；取消或验证失败时 Mock upstream 收到零请求。实验室上限
+   继续裁剪实际模式，界面同时展示请求模式与实际模式。
+6. 上传便携格式图片。当前档案支持视觉时直接处理；不支持时选择视觉档案中转。清除视觉默认
+   后必须显式选择，不能使用列表第一项。Trace 分别核对视觉/最终档案版本、用途、Token usage
+   与图片 SHA-256。
+7. 上传多张实验数据图片，检查预览和移除；AI 只生成当前数据单元候选。拒绝后可以恢复编辑；
+   批准前图片、草稿及相关 Audit/Provenance 不进入项目 snapshot，批准后 Observation、项目
+   附件关系、领域关联、Audit 与 Provenance 同时出现。制造第二张证据失败，确认整次回滚。
+8. 验证单图 10 MiB、尺寸、总像素、帧数和请求总预算；EXIF 等元数据必须被重编码移除。非
+   JPEG/PNG/WebP/静态 GIF、伪造 MIME 或解码炸弹必须在 Provider 调用前拒绝。
+9. 从旧用户设置和旧会话执行增量升级，确认旧模型/参数、凭据版本和历史不丢失；执行 Master
+   Key 轮换时确认旧密文先解密、全部重加密后才推进版本。轮换失败必须保留旧数据并阻断，不能
+   清空凭据要求用户无报告重输。
+10. 让 AI 建议繁育方案；确认只返回分析/预测/建议。尝试要求 AI 创建 `MatingEvent`、更新
+    Animal 或直接批准图片候选，应因固定工具面和人工审批边界而无法执行。
 
 ### H. Desktop Windows 本地交付
 
 1. 正式发布包必须来自 Tauri bundle；`pnpm run dev`、Vite preview、VNC/noVNC 和远程桌面会话不能替代 Desktop 安装包验收。
 2. 在干净 Windows 机器上安装后启动，确认 WebView2 runtime 策略有效：应用可正常显示或给出明确安装提示，不要求用户连接 noVNC。
-3. 保存 AI Provider 设置后确认 API key 不进入项目数据库、日志、审计、快照或前端状态；清除 key 后重启仍保持清除状态。
+3. 为多个档案保存独立 Key，确认 Key 不进入业务 snapshot、日志、审计或前端状态；重启后各
+   档案 Keyring 状态不串用，清除当前档案 Key 不影响其他档案。
 4. 卸载、重装或升级不得静默删除 application data；清除本地数据必须是用户通过 OS 或明确产品流程主动执行。
+5. 用固定 commit 从旧配置和旧 Keyring 状态升级，确认旧项保留；归档档案后历史会话可读但
+   不能继续发送。Debug `--no-bundle` 可保留控制台，正式 release bundle 启动不应伴随额外
+   PowerShell 窗口。
 
 ## 6. Known limitations
 

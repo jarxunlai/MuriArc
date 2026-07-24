@@ -1806,6 +1806,16 @@ mod tests {
         conversation_id: Uuid,
     }
 
+    impl LegacyConversationOperations {
+        fn legacy_view(&self, mut conversation: AiConversation) -> AiConversation {
+            if conversation.id == self.conversation_id {
+                conversation.model_profile = None;
+                conversation.legacy_read_only = true;
+            }
+            conversation
+        }
+    }
+
     #[async_trait]
     impl AiOperationStore for LegacyConversationOperations {
         async fn create_ai_conversation(
@@ -1828,12 +1838,10 @@ mod tests {
         }
 
         async fn get_ai_conversation(&self, id: Uuid) -> muriarc_core::StoreResult<AiConversation> {
-            let mut conversation = self.inner.get_ai_conversation(id).await?;
-            if id == self.conversation_id {
-                conversation.model_profile = None;
-                conversation.legacy_read_only = true;
-            }
-            Ok(conversation)
+            self.inner
+                .get_ai_conversation(id)
+                .await
+                .map(|conversation| self.legacy_view(conversation))
         }
 
         async fn list_ai_conversations(
@@ -1842,9 +1850,14 @@ mod tests {
             offset: u32,
             limit: u32,
         ) -> muriarc_core::StoreResult<Vec<AiConversation>> {
-            self.inner
+            let conversations = self
+                .inner
                 .list_ai_conversations(filter, offset, limit)
-                .await
+                .await?;
+            Ok(conversations
+                .into_iter()
+                .map(|conversation| self.legacy_view(conversation))
+                .collect())
         }
 
         async fn append_ai_turn_messages(
@@ -2246,6 +2259,117 @@ mod tests {
             Err(AiWorkflowError::ConversationModelArchived)
         ));
         assert!(probe.requests().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_conversation_keeps_history_readable_but_blocks_provider_continuation() {
+        let (store, workflow, context, project, binding, _) =
+            conversation_start_fixture(AiAutonomyMode::Full, true).await;
+        let historical = workflow
+            .run_turn(
+                MockProvider::new(
+                    "legacy-history",
+                    "legacy-history-model",
+                    [Ok(CompletionResponse {
+                        id: Some("legacy-history-response".to_owned()),
+                        model: Some("legacy-history-model".to_owned()),
+                        content: Some("Historical answer".to_owned()),
+                        tool_calls: Vec::new(),
+                        finish_reason: Some("stop".to_owned()),
+                        usage: None,
+                    })],
+                ),
+                None,
+                &context,
+                binding,
+                AssistantTurnRequest {
+                    conversation_id: None,
+                    project_id: Some(project.id),
+                    message: "Historical question".to_owned(),
+                    image_ids: Vec::new(),
+                    vision_model_profile_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let domain: Arc<dyn MuriArcStore> = store.clone();
+        let operations: Arc<dyn AiOperationStore> = Arc::new(LegacyConversationOperations {
+            inner: store.clone(),
+            conversation_id: historical.conversation_id,
+        });
+        let model_profiles: Arc<dyn AiModelProfileStore> = store.clone();
+        let legacy_workflow =
+            AiWorkflowService::new(domain, operations).with_model_profiles(model_profiles);
+
+        let detail = legacy_workflow
+            .get_conversation(&context, historical.conversation_id, 200)
+            .await
+            .unwrap();
+        assert!(detail.conversation.read_only);
+        assert_eq!(
+            detail.conversation.read_only_reason,
+            Some(AiConversationReadOnlyReason::LegacyModelUnknown)
+        );
+        assert_eq!(detail.messages.len(), 2);
+        assert_eq!(detail.messages[0].content, "Historical question");
+        assert_eq!(detail.messages[1].content, "Historical answer");
+
+        let summaries = legacy_workflow
+            .list_conversations(&context, Some(project.id), 20)
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].read_only);
+        assert_eq!(
+            summaries[0].read_only_reason,
+            Some(AiConversationReadOnlyReason::LegacyModelUnknown)
+        );
+
+        let blocked = MockProvider::new(
+            "legacy-blocked",
+            "legacy-blocked-model",
+            [Ok(CompletionResponse {
+                id: None,
+                model: None,
+                content: Some("must not run".to_owned()),
+                tool_calls: Vec::new(),
+                finish_reason: Some("stop".to_owned()),
+                usage: None,
+            })],
+        );
+        let probe = blocked.clone();
+        assert!(matches!(
+            legacy_workflow
+                .run_turn(
+                    blocked,
+                    None,
+                    &context,
+                    binding,
+                    AssistantTurnRequest {
+                        conversation_id: Some(historical.conversation_id),
+                        project_id: Some(project.id),
+                        message: "Do not continue this legacy conversation".to_owned(),
+                        image_ids: Vec::new(),
+                        vision_model_profile_id: None,
+                    },
+                )
+                .await,
+            Err(AiWorkflowError::LegacyConversationReadOnly)
+        ));
+        assert!(
+            probe.requests().unwrap().is_empty(),
+            "legacy conversations must fail before the Provider is called"
+        );
+        assert_eq!(
+            store
+                .list_ai_conversation_messages(historical.conversation_id, 200)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "a rejected continuation must not mutate readable legacy history"
+        );
     }
 
     #[tokio::test]

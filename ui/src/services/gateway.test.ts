@@ -1377,6 +1377,221 @@ describe('multi-model gateway contracts', () => {
   })
 })
 
+describe('conversation start gateway contracts', () => {
+  const startedConversation = {
+    id: 'conversation-1',
+    projectId: 'project-1',
+    title: '新会话',
+    modelProfileId: 'profile-1',
+    modelProfileVersion: 2,
+    modelProfileName: '主对话模型',
+    modelId: 'model-primary',
+    readOnly: false,
+    createdAt: '2026-07-23T01:00:00Z',
+    updatedAt: '2026-07-23T01:00:00Z',
+    revision: 0,
+  }
+  const startedAutonomy = {
+    mode: 'full' as const,
+    effectiveMode: 'auto' as const,
+    maxMode: 'auto' as const,
+    batchLimit: 50,
+    revision: 1,
+    requiresHumanApproval: [],
+  }
+
+  it('declares Full natively and strips renderer-only authority from Tauri start/update payloads', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      calls.push([command, args])
+      if (command === 'start_ai_conversation') {
+        return {
+          conversation: startedConversation,
+          autonomy: startedAutonomy,
+        } as T
+      }
+      if (command === 'set_ai_autonomy') {
+        return { ...startedAutonomy, revision: 2 } as T
+      }
+      return undefined as T
+    }
+    const local = new LocalTauriGateway(invokeCommand)
+
+    const started = await local.startAiConversation({
+      projectId: 'project-1',
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
+      currentPassword: 'must-not-cross-local-ipc',
+      declared: true,
+      sessionId: 'renderer-forged-session',
+    } as Parameters<typeof local.startAiConversation>[0] & {
+      declared: boolean
+      sessionId: string
+    })
+    await local.setAiAutonomy('conversation-1', {
+      mode: 'full',
+      expectedRevision: 1,
+    })
+
+    expect(started.conversation).toEqual(expect.objectContaining({
+      id: 'conversation-1',
+      modelProfileId: 'profile-1',
+    }))
+    expect(calls).toEqual([
+      ['declare_ai_full_startup', undefined],
+      ['start_ai_conversation', {
+        input: {
+          projectId: 'project-1',
+          modelProfileId: 'profile-1',
+          requestedMode: 'full',
+        },
+      }],
+      ['declare_ai_full_startup', undefined],
+      ['set_ai_autonomy', {
+        conversationId: 'conversation-1',
+        input: {
+          mode: 'full',
+          expectedRevision: 1,
+        },
+      }],
+    ])
+    expect(JSON.stringify(calls)).not.toContain('must-not-cross-local-ipc')
+    expect(JSON.stringify(calls)).not.toContain('renderer-forged-session')
+    expect(JSON.stringify(calls)).not.toContain('declared')
+  })
+
+  it('does not start a Desktop conversation when the native startup declaration fails', async () => {
+    const calls: string[] = []
+    const local = new LocalTauriGateway(async <T>(command: string): Promise<T> => {
+      calls.push(command)
+      throw new Error('本次启动尚未声明 Full')
+    })
+
+    await expect(local.startAiConversation({
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
+    })).rejects.toThrow('尚未声明')
+    expect(calls).toEqual(['declare_ai_full_startup'])
+  })
+
+  it('sends the current password only in a Server Full start and keeps both starts CSRF protected', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      if (url.endsWith('/auth/login')) {
+        return new Response(JSON.stringify({ data: {
+          user: {
+            id: 'user-1',
+            lab_id: 'lab-1',
+            display_name: '研究者',
+            lab_roles: [],
+            project_roles: [],
+            authentication: 'session',
+          },
+          csrf_token: 'csrf-start',
+          expires_at: '2026-07-23T10:00:00Z',
+        } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ data: {
+        conversation: startedConversation,
+        autonomy: startedAutonomy,
+      } }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchRequest,
+    })
+    await remote.login({ email: 'researcher@example.test', password: 'not-retained' })
+
+    await remote.startAiConversation({
+      projectId: 'project-1',
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
+      currentPassword: 'one-request-password',
+    })
+    await remote.startAiConversation({
+      projectId: 'project-1',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
+      currentPassword: 'must-be-stripped-for-ask',
+    })
+
+    const starts = requests.filter(({ url }) => url.endsWith('/ai/conversations'))
+    expect(starts).toHaveLength(2)
+    expect(JSON.parse(String(starts[0].init?.body))).toEqual({
+      projectId: 'project-1',
+      modelProfileId: 'profile-1',
+      requestedMode: 'full',
+      currentPassword: 'one-request-password',
+    })
+    expect(JSON.parse(String(starts[1].init?.body))).toEqual({
+      projectId: 'project-1',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
+    })
+    expect(starts.every(({ init }) =>
+      new Headers(init?.headers).get('X-CSRF-Token') === 'csrf-start')).toBe(true)
+  })
+
+  it('includes archived profiles only when explicitly requested across adapters', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const local = new LocalTauriGateway(async <T>(
+      command: string,
+      args?: Record<string, unknown>,
+    ): Promise<T> => {
+      calls.push([command, args])
+      return [] as T
+    })
+    await local.listAiModelProfiles(true)
+    expect(calls).toEqual([['list_ai_model_profiles', { includeArchived: true }]])
+
+    const fetchMock = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(JSON.stringify({ data: [], count: 0 }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchMock as unknown as typeof fetch,
+    })
+    await remote.listAiModelProfiles(true)
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'https://lab.example/api/v1/ai/models?include_archived=true',
+    )
+  })
+
+  it('binds Demo conversations to a profile and makes archived history read-only', async () => {
+    const demo = new DemoGateway()
+    const profiles = await demo.listAiModelProfiles()
+    const profile = profiles[0]
+    const started = await demo.startAiConversation({
+      projectId: 'project-1',
+      modelProfileId: profile.id,
+      requestedMode: 'full',
+    })
+
+    expect(started.conversation).toEqual(expect.objectContaining({
+      modelProfileId: profile.id,
+      modelProfileVersion: profile.currentVersion,
+      readOnly: false,
+    }))
+    expect(started.autonomy).toEqual(expect.objectContaining({
+      mode: 'full',
+      effectiveMode: 'full',
+    }))
+
+    await demo.archiveAiModelProfile(profile.id, profile.revision)
+    const detail = await demo.getAiConversation(started.conversation.id)
+    expect(detail.conversation).toEqual(expect.objectContaining({
+      readOnly: true,
+      readOnlyReason: 'model_archived',
+    }))
+    expect((await demo.listAiModelProfiles(true)).some((item) =>
+      item.id === profile.id && item.archivedAt)).toBe(true)
+  })
+})
+
 describe('browser demo gateway', () => {
   it('moves animals atomically and updates both projections', async () => {
     const gateway = new DemoGateway()

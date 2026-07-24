@@ -33,6 +33,64 @@ async fn assign_project_animal(
     assignment
 }
 
+fn initial_ask_grant(conversation: &AiConversation, now: chrono::DateTime<Utc>) -> AiAutonomyGrant {
+    AiAutonomyGrant {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: conversation.id,
+        lab_id: conversation.lab_id,
+        project_id: conversation.project_id,
+        user_id: conversation.user_id,
+        session_id: None,
+        mode: AiAutonomyMode::Ask,
+        allowed_categories: vec![AiActionCategory::Read],
+        batch_limit: AiAutonomyMode::Ask.batch_limit(),
+        step_up_verified_at: None,
+        last_used_at: now,
+        expires_at: None,
+        revoked_at: None,
+        meta: RecordMeta::new(now),
+    }
+}
+
+async fn assert_atomic_ai_start_absent<S>(
+    store: &S,
+    conversation: &AiConversation,
+    grant: &AiAutonomyGrant,
+    label: &str,
+) where
+    S: MuriArcStore + AiOperationStore + ?Sized,
+{
+    assert!(
+        matches!(
+            store.get_ai_conversation(conversation.id).await,
+            Err(StoreError::NotFound { .. })
+        ),
+        "{label}: a rejected atomic start must not leave a conversation"
+    );
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        None,
+        "{label}: a rejected atomic start must not leave an autonomy grant"
+    );
+    for (entity_id, project_id) in [
+        (conversation.id, conversation.project_id),
+        (grant.id, grant.project_id),
+    ] {
+        assert!(
+            store
+                .list_audit_entries(&AuditFilter {
+                    lab_id: conversation.lab_id,
+                    project_id,
+                    entity_id: Some(entity_id),
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "{label}: a rejected atomic start must not leave audit records"
+        );
+    }
+}
+
 /// Runs the behavior contract shared by every persistence adapter.
 /// The target store must already be connected to an isolated database.
 pub async fn run_store_contract(store: &dyn MuriArcStore) {
@@ -2414,12 +2472,66 @@ where
         .create_ai_model_profile(&other_profile, &other_profile_version, &bootstrap)
         .await
         .unwrap();
+    let replacement_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "Replacement AI conversation contract model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let replacement_profile_version = AiModelProfileVersion {
+        profile_id: replacement_profile.id,
+        model_id: "replacement-contract-model".to_owned(),
+        ..profile_version.clone()
+    };
+    store
+        .create_ai_model_profile(
+            &replacement_profile,
+            &replacement_profile_version,
+            &bootstrap,
+        )
+        .await
+        .unwrap();
+    let mut archived_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "Archived AI conversation contract model".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let archived_profile_version = AiModelProfileVersion {
+        profile_id: archived_profile.id,
+        model_id: "archived-contract-model".to_owned(),
+        ..profile_version.clone()
+    };
+    store
+        .create_ai_model_profile(&archived_profile, &archived_profile_version, &bootstrap)
+        .await
+        .unwrap();
+    archived_profile.archived_at = Some(now + Duration::milliseconds(1));
+    archived_profile.meta.touch(now + Duration::milliseconds(1));
+    store
+        .archive_ai_model_profile(&archived_profile, 1, &bootstrap)
+        .await
+        .unwrap();
     let model_profile = AiModelProfileBinding {
         profile_id: profile.id,
         profile_version: 1,
     };
     let other_model_profile = AiModelProfileBinding {
         profile_id: other_profile.id,
+        profile_version: 1,
+    };
+    let replacement_model_profile = AiModelProfileBinding {
+        profile_id: replacement_profile.id,
+        profile_version: 1,
+    };
+    let archived_model_profile = AiModelProfileBinding {
+        profile_id: archived_profile.id,
         profile_version: 1,
     };
     let audit = AuditContext {
@@ -2505,6 +2617,330 @@ where
         .unwrap();
     assert_eq!(project_only, vec![conversation.clone()]);
 
+    let atomic_conversation = AiConversation {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        title: "Atomic project conversation".to_owned(),
+        model_profile: Some(model_profile),
+        legacy_read_only: false,
+        meta: RecordMeta::new(now),
+    };
+    let atomic_grant = initial_ask_grant(&atomic_conversation, now);
+    store
+        .create_ai_conversation_with_autonomy(&atomic_conversation, &atomic_grant, &audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_ai_conversation(atomic_conversation.id)
+            .await
+            .unwrap(),
+        atomic_conversation
+    );
+    assert_eq!(
+        store
+            .get_ai_autonomy_grant(atomic_conversation.id)
+            .await
+            .unwrap(),
+        Some(atomic_grant.clone())
+    );
+    let atomic_conversation_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_id: Some(atomic_conversation.id),
+        })
+        .await
+        .unwrap();
+    let atomic_grant_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_id: Some(atomic_grant.id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(atomic_conversation_audits.len(), 1);
+    assert_eq!(atomic_grant_audits.len(), 1);
+    for (entry, entity_type, expected_after) in [
+        (
+            &atomic_conversation_audits[0],
+            EntityType::AiConversation,
+            serde_json::to_value(&atomic_conversation).unwrap(),
+        ),
+        (
+            &atomic_grant_audits[0],
+            EntityType::AiAutonomyGrant,
+            serde_json::to_value(&atomic_grant).unwrap(),
+        ),
+    ] {
+        assert_eq!(entry.entity_type, entity_type);
+        assert_eq!(entry.action, AuditAction::Create);
+        assert_eq!(entry.actor.user_id, Some(user.id));
+        assert!(entry.before.is_none());
+        assert_eq!(entry.after, Some(expected_after));
+        let serialized = serde_json::to_string(&entry.after).unwrap();
+        assert!(
+            !["api_key", "credential", "ciphertext", "secret"]
+                .iter()
+                .any(|field| serialized.contains(field)),
+            "atomic AI start audits must remain redacted"
+        );
+    }
+
+    let mut rebound_conversation = atomic_conversation.clone();
+    rebound_conversation.model_profile = Some(replacement_model_profile);
+    assert!(
+        store
+            .create_ai_conversation_with_autonomy(&rebound_conversation, &atomic_grant, &audit,)
+            .await
+            .is_err(),
+        "an existing conversation cannot be recreated with another model binding"
+    );
+    assert_eq!(
+        store
+            .get_ai_conversation(atomic_conversation.id)
+            .await
+            .unwrap()
+            .model_profile,
+        Some(model_profile),
+        "a failed rebind attempt must preserve the immutable model binding"
+    );
+    assert_eq!(
+        store
+            .get_ai_autonomy_grant(atomic_conversation.id)
+            .await
+            .unwrap(),
+        Some(atomic_grant.clone()),
+        "a failed rebind attempt must preserve the initial autonomy grant"
+    );
+    assert_eq!(
+        store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_id: Some(atomic_conversation.id),
+            })
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a failed rebind attempt must not append an audit record"
+    );
+
+    let mut rejected_starts = Vec::new();
+
+    let mut unavailable_model_conversation = atomic_conversation.clone();
+    unavailable_model_conversation.id = uuid::Uuid::new_v4();
+    unavailable_model_conversation.title = "Missing model atomic start".to_owned();
+    unavailable_model_conversation.model_profile = Some(AiModelProfileBinding {
+        profile_id: uuid::Uuid::new_v4(),
+        profile_version: 1,
+    });
+    let unavailable_model_grant = initial_ask_grant(&unavailable_model_conversation, now);
+    rejected_starts.push((
+        "missing model",
+        unavailable_model_conversation,
+        unavailable_model_grant,
+        audit.clone(),
+    ));
+
+    let mut archived_model_conversation = atomic_conversation.clone();
+    archived_model_conversation.id = uuid::Uuid::new_v4();
+    archived_model_conversation.title = "Archived model atomic start".to_owned();
+    archived_model_conversation.model_profile = Some(archived_model_profile);
+    let archived_model_grant = initial_ask_grant(&archived_model_conversation, now);
+    rejected_starts.push((
+        "archived model",
+        archived_model_conversation,
+        archived_model_grant,
+        audit.clone(),
+    ));
+
+    let mut foreign_model_conversation = atomic_conversation.clone();
+    foreign_model_conversation.id = uuid::Uuid::new_v4();
+    foreign_model_conversation.title = "Foreign model atomic start".to_owned();
+    foreign_model_conversation.model_profile = Some(other_model_profile);
+    let foreign_model_grant = initial_ask_grant(&foreign_model_conversation, now);
+    rejected_starts.push((
+        "foreign model owner",
+        foreign_model_conversation,
+        foreign_model_grant,
+        audit.clone(),
+    ));
+
+    let mut missing_project_conversation = atomic_conversation.clone();
+    missing_project_conversation.id = uuid::Uuid::new_v4();
+    missing_project_conversation.title = "Missing project atomic start".to_owned();
+    missing_project_conversation.project_id = Some(uuid::Uuid::new_v4());
+    let missing_project_grant = initial_ask_grant(&missing_project_conversation, now);
+    rejected_starts.push((
+        "missing project",
+        missing_project_conversation,
+        missing_project_grant,
+        audit.clone(),
+    ));
+
+    let mut wrong_owner_conversation = atomic_conversation.clone();
+    wrong_owner_conversation.id = uuid::Uuid::new_v4();
+    wrong_owner_conversation.title = "Wrong grant owner atomic start".to_owned();
+    let mut wrong_owner_grant = initial_ask_grant(&wrong_owner_conversation, now);
+    wrong_owner_grant.user_id = other_user.id;
+    rejected_starts.push((
+        "grant owner mismatch",
+        wrong_owner_conversation,
+        wrong_owner_grant,
+        audit.clone(),
+    ));
+
+    let mut wrong_project_conversation = atomic_conversation.clone();
+    wrong_project_conversation.id = uuid::Uuid::new_v4();
+    wrong_project_conversation.title = "Wrong grant project atomic start".to_owned();
+    let mut wrong_project_grant = initial_ask_grant(&wrong_project_conversation, now);
+    wrong_project_grant.project_id = None;
+    rejected_starts.push((
+        "grant project mismatch",
+        wrong_project_conversation,
+        wrong_project_grant,
+        audit.clone(),
+    ));
+
+    let mut wrong_conversation = atomic_conversation.clone();
+    wrong_conversation.id = uuid::Uuid::new_v4();
+    wrong_conversation.title = "Wrong grant conversation atomic start".to_owned();
+    let mut wrong_conversation_grant = initial_ask_grant(&wrong_conversation, now);
+    wrong_conversation_grant.conversation_id = uuid::Uuid::new_v4();
+    rejected_starts.push((
+        "grant conversation mismatch",
+        wrong_conversation,
+        wrong_conversation_grant,
+        audit.clone(),
+    ));
+
+    let mut wrong_audit_conversation = atomic_conversation.clone();
+    wrong_audit_conversation.id = uuid::Uuid::new_v4();
+    wrong_audit_conversation.title = "Wrong audit actor atomic start".to_owned();
+    let wrong_audit_grant = initial_ask_grant(&wrong_audit_conversation, now);
+    let mut wrong_audit = audit.clone();
+    wrong_audit.actor.user_id = Some(other_user.id);
+    rejected_starts.push((
+        "audit actor mismatch",
+        wrong_audit_conversation,
+        wrong_audit_grant,
+        wrong_audit,
+    ));
+
+    let mut wrong_revision_conversation = atomic_conversation.clone();
+    wrong_revision_conversation.id = uuid::Uuid::new_v4();
+    wrong_revision_conversation.title = "Wrong initial revision atomic start".to_owned();
+    wrong_revision_conversation.meta.revision = 2;
+    let mut wrong_revision_grant = initial_ask_grant(&wrong_revision_conversation, now);
+    wrong_revision_grant.meta.revision = 2;
+    rejected_starts.push((
+        "initial revision mismatch",
+        wrong_revision_conversation,
+        wrong_revision_grant,
+        audit.clone(),
+    ));
+
+    let mut full_without_session_conversation = atomic_conversation.clone();
+    full_without_session_conversation.id = uuid::Uuid::new_v4();
+    full_without_session_conversation.title = "Full without session atomic start".to_owned();
+    let mut full_without_session_grant = initial_ask_grant(&full_without_session_conversation, now);
+    full_without_session_grant.mode = AiAutonomyMode::Full;
+    full_without_session_grant.batch_limit = AiAutonomyMode::Full.batch_limit();
+    full_without_session_grant.step_up_verified_at = Some(now);
+    full_without_session_grant.expires_at = Some(now + Duration::minutes(30));
+    rejected_starts.push((
+        "Full grant without session",
+        full_without_session_conversation,
+        full_without_session_grant,
+        audit.clone(),
+    ));
+
+    let mut ask_with_full_metadata_conversation = atomic_conversation.clone();
+    ask_with_full_metadata_conversation.id = uuid::Uuid::new_v4();
+    ask_with_full_metadata_conversation.title = "Ask with Full metadata atomic start".to_owned();
+    let mut ask_with_full_metadata_grant =
+        initial_ask_grant(&ask_with_full_metadata_conversation, now);
+    ask_with_full_metadata_grant.session_id = Some(uuid::Uuid::new_v4());
+    ask_with_full_metadata_grant.step_up_verified_at = Some(now);
+    ask_with_full_metadata_grant.expires_at = Some(now + Duration::minutes(30));
+    rejected_starts.push((
+        "Ask grant with Full metadata",
+        ask_with_full_metadata_conversation,
+        ask_with_full_metadata_grant,
+        audit.clone(),
+    ));
+
+    for (label, rejected_conversation, rejected_grant, rejected_audit) in rejected_starts {
+        assert!(
+            store
+                .create_ai_conversation_with_autonomy(
+                    &rejected_conversation,
+                    &rejected_grant,
+                    &rejected_audit,
+                )
+                .await
+                .is_err(),
+            "{label}: invalid atomic start must be rejected"
+        );
+        assert_atomic_ai_start_absent(store, &rejected_conversation, &rejected_grant, label).await;
+    }
+
+    let mut late_failure_conversation = atomic_conversation.clone();
+    late_failure_conversation.id = uuid::Uuid::new_v4();
+    late_failure_conversation.title = "Late failure atomic start".to_owned();
+    let mut duplicate_grant = initial_ask_grant(&late_failure_conversation, now);
+    duplicate_grant.id = atomic_grant.id;
+    assert!(
+        store
+            .create_ai_conversation_with_autonomy(
+                &late_failure_conversation,
+                &duplicate_grant,
+                &audit,
+            )
+            .await
+            .is_err(),
+        "a grant insert failure must reject the whole atomic start"
+    );
+    assert!(matches!(
+        store
+            .get_ai_conversation(late_failure_conversation.id)
+            .await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert_eq!(
+        store
+            .get_ai_autonomy_grant(late_failure_conversation.id)
+            .await
+            .unwrap(),
+        None,
+        "a failure after conversation insertion must roll the conversation back"
+    );
+    assert_eq!(
+        store
+            .get_ai_autonomy_grant(atomic_conversation.id)
+            .await
+            .unwrap(),
+        Some(atomic_grant.clone()),
+        "a duplicate grant failure must not mutate the existing grant"
+    );
+    assert!(
+        store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_id: Some(late_failure_conversation.id),
+            })
+            .await
+            .unwrap()
+            .is_empty(),
+        "a late transaction failure must roll back the conversation audit"
+    );
+
     let mut autonomy = AiAutonomyGrant {
         id: uuid::Uuid::new_v4(),
         conversation_id: conversation.id,
@@ -2525,6 +2961,19 @@ where
         revoked_at: None,
         meta: RecordMeta::new(now),
     };
+    let mut full_without_session = autonomy.clone();
+    full_without_session.session_id = None;
+    assert!(matches!(
+        store
+            .save_ai_autonomy_grant(&full_without_session, None, &audit)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert_eq!(
+        store.get_ai_autonomy_grant(conversation.id).await.unwrap(),
+        None,
+        "a Full grant without a session must not be persisted"
+    );
     store
         .save_ai_autonomy_grant(&autonomy, None, &audit)
         .await

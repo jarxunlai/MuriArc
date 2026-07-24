@@ -245,18 +245,66 @@ test('动物 Registry 导出和完整业务归档快照都会触发浏览器下�
 
 test('AI 工作页保留上下文、回答和数据引用', async ({ page }) => {
   await page.goto('/#/ai')
+  await expect(page.getByTestId('conversation-mode-status')).toContainText('请求 Full（待启用）')
+  await expect(page.getByTestId('conversation-mode-status')).toContainText('实际 尚未开始')
   const prompt = page.getByPlaceholder('询问动物、实验或数据…')
   await prompt.fill('总结进行中的实验')
   await prompt.press('Enter')
 
+  const fullDialog = page.getByRole('dialog')
+  await expect(fullDialog).toContainText('以 Full 请求开始新会话')
+  await fullDialog.getByRole('checkbox').check()
+  await fullDialog.getByRole('button', { name: '确认启用' }).click()
   await expect(page.locator('.message.user .bubble p')).toHaveText('总结进行中的实验')
   await expect(page.getByText(/浏览器演示不会读取正式数据库/)).toBeVisible()
   await expect(page.getByRole('link', { name: '动物 M-26006' })).toBeVisible()
   await expect(page.getByText(/已调用 1 个安全领域工具/)).toBeVisible()
+  await expect(page.getByTestId('conversation-mode-status')).toContainText('实际 Full')
 
-  await page.getByRole('button', { name: '新会话' }).click()
+  await page.getByRole('button', { name: '新会话', exact: true }).click()
   await expect(page.locator('.message.user')).toHaveCount(0)
   await expect(page.getByText(/选择科研项目后/)).toBeVisible()
+})
+
+test('AI 模型与模式控制在 375 768 1024 1440 宽度无横向溢出', async ({ page }) => {
+  await page.goto('/#/ai')
+  await expect(page.getByTestId('conversation-model-select')).toBeVisible()
+
+  for (const width of [375, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 960 })
+    await expect(page.getByTestId('conversation-mode-select')).toBeVisible()
+    await expect(page.getByTestId('conversation-mode-status')).toBeVisible()
+
+    const layout = await page.locator('.ai-conversation').evaluate((root) => {
+      const rootRect = root.getBoundingClientRect()
+      const selectors = [
+        '.context-strip',
+        '.conversation-controls',
+        '.model-field',
+        '.mode-field',
+        '.mode-status',
+        '.input-wrap',
+      ]
+      const contained = selectors.every((selector) => {
+        const element = root.querySelector(selector)
+        if (!element) return false
+        const rect = element.getBoundingClientRect()
+        return rect.left >= rootRect.left - 1 && rect.right <= rootRect.right + 1
+      })
+      return {
+        contained,
+        rootHasNoOverflow: root.scrollWidth <= root.clientWidth + 1,
+        documentHasNoOverflow:
+          document.documentElement.scrollWidth <= document.documentElement.clientWidth + 1,
+      }
+    })
+
+    expect(layout).toEqual({
+      contained: true,
+      rootHasNoOverflow: true,
+      documentHasNoOverflow: true,
+    })
+  }
 })
 
 test('手机端使用选择动物再选择目标笼位的转笼流程', async ({ page }, testInfo) => {

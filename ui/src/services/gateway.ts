@@ -62,6 +62,8 @@ import type {
   RecordedObservation,
   RegisteredAnimalDraft,
   SaveAiSettingsInput,
+  StartAiConversationInput,
+  StartAiConversationResponse,
   TemplateFieldValueType,
   TimelineEvent,
   WorkspaceSettings,
@@ -730,7 +732,7 @@ export interface MuriArcGateway {
   saveAiSettings?(input: SaveAiSettingsInput): Promise<AiSettings>
   clearAiApiKey?(): Promise<AiSettings>
   testAiSettings?(): Promise<{ ok: boolean; latencyMs: number; errorCode?: string }>
-  listAiModelProfiles?(): Promise<AiModelProfileView[]>
+  listAiModelProfiles?(includeArchived?: boolean): Promise<AiModelProfileView[]>
   getAiModelProfile?(id: string): Promise<AiModelProfileView>
   createAiModelProfile?(input: SaveAiModelProfileInput): Promise<AiModelProfileView>
   updateAiModelProfile?(id: string, input: SaveAiModelProfileInput): Promise<AiModelProfileView>
@@ -758,6 +760,7 @@ export interface MuriArcGateway {
   listAiExtractions?(projectId?: string): Promise<AiExtractionRecord[]>
   createAiExtraction?(input: { private_image_id: string; project_id: string; experiment_id: string; experiment_event_id: string }): Promise<AiExtractionRecord>
   approveAiExtraction?(id: string, expectedRevision: number, selectedIndexes: number[]): Promise<AiExtractionRecord>
+  startAiConversation(input: StartAiConversationInput): Promise<StartAiConversationResponse>
   aiTurn(input: AiTurnInput): Promise<AiTurnResponse>
   listAiConversations(projectId?: string, limit?: number): Promise<AiConversationSummary[]>
   getAiConversation(conversationId: string, limit?: number): Promise<AiConversationDetail>
@@ -1100,8 +1103,11 @@ export class LocalTauriGateway implements MuriArcGateway {
     return this.call<AiSettings>('save_ai_settings', { input })
   }
   clearAiApiKey() { return this.call<AiSettings>('clear_ai_api_key') }
-  listAiModelProfiles() {
-    return this.call<AiModelProfileView[]>('list_ai_model_profiles')
+  listAiModelProfiles(includeArchived = false) {
+    return this.call<AiModelProfileView[]>(
+      'list_ai_model_profiles',
+      includeArchived ? { includeArchived: true } : undefined,
+    )
   }
   getAiModelProfile(id: string) {
     return this.call<AiModelProfileView>('get_ai_model_profile', { id })
@@ -1131,6 +1137,24 @@ export class LocalTauriGateway implements MuriArcGateway {
     return this.call<AiModelDefaultsView>('save_ai_model_defaults', { input })
   }
   async listAiProviderPresets() { return structuredClone(builtinAiProviderPresets) }
+  async startAiConversation(input: StartAiConversationInput) {
+    if (input.requestedMode === 'full') {
+      await this.call<void>('declare_ai_full_startup')
+    }
+    const localInput = {
+      ...(input.projectId ? { projectId: input.projectId } : {}),
+      ...(input.modelProfileId ? { modelProfileId: input.modelProfileId } : {}),
+      requestedMode: input.requestedMode,
+    }
+    const response = await this.call<{
+      conversation: RawAiConversationSummary
+      autonomy: AiAutonomyView
+    }>('start_ai_conversation', { input: localInput })
+    return {
+      conversation: mapAiConversationSummary(response.conversation),
+      autonomy: response.autonomy,
+    }
+  }
   async aiTurn(input: AiTurnInput) {
     return mapAiTurn(await this.call<RawAiTurnResponse>('ai_turn', { input }))
   }
@@ -1148,13 +1172,15 @@ export class LocalTauriGateway implements MuriArcGateway {
   getAiAutonomy(conversationId: string) {
     return this.call<AiAutonomyView>('get_ai_autonomy', { conversationId })
   }
-  setAiAutonomy(conversationId: string, input: AiAutonomyUpdateInput) {
+  async setAiAutonomy(conversationId: string, input: AiAutonomyUpdateInput) {
+    if (input.mode === 'full') {
+      await this.call<void>('declare_ai_full_startup')
+    }
     return this.call<AiAutonomyView>('set_ai_autonomy', {
       conversationId,
       input: {
         mode: input.mode,
         expectedRevision: input.expectedRevision,
-        declared: Boolean(input.declared),
       },
     })
   }
@@ -1708,7 +1734,10 @@ interface RawAiConversationSummary {
   title: string
   modelProfileId?: string | null
   modelProfileVersion?: number | null
+  modelProfileName?: string | null
+  modelId?: string | null
   readOnly?: boolean
+  readOnlyReason?: 'legacy_model_unknown' | 'model_archived' | 'model_unavailable' | null
   createdAt: string
   updatedAt: string
   revision: number
@@ -3140,8 +3169,9 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return response.data
   }
 
-  async listAiModelProfiles(): Promise<AiModelProfileView[]> {
-    return (await this.request<ApiCollection<AiModelProfileView>>('/ai/models')).data
+  async listAiModelProfiles(includeArchived = false): Promise<AiModelProfileView[]> {
+    const suffix = includeArchived ? '?include_archived=true' : ''
+    return (await this.request<ApiCollection<AiModelProfileView>>(`/ai/models${suffix}`)).data
   }
 
   async getAiModelProfile(id: string): Promise<AiModelProfileView> {
@@ -3204,6 +3234,29 @@ export class RemoteHttpGateway implements MuriArcGateway {
       method: 'PUT',
       body: JSON.stringify(input),
     })).data
+  }
+
+  async startAiConversation(
+    input: StartAiConversationInput,
+  ): Promise<StartAiConversationResponse> {
+    const response = await this.request<ApiItem<{
+      conversation: RawAiConversationSummary
+      autonomy: AiAutonomyView
+    }>>('/ai/conversations', {
+      method: 'POST',
+      body: JSON.stringify({
+        projectId: input.projectId ?? activeProjectId(),
+        modelProfileId: input.modelProfileId,
+        requestedMode: input.requestedMode,
+        ...(input.requestedMode === 'full' && input.currentPassword
+          ? { currentPassword: input.currentPassword }
+          : {}),
+      }),
+    })
+    return {
+      conversation: mapAiConversationSummary(response.data.conversation),
+      autonomy: response.data.autonomy,
+    }
   }
 
   async aiTurn(input: AiTurnInput): Promise<AiTurnResponse> {
@@ -3398,7 +3451,10 @@ function mapAiConversationSummary(raw: RawAiConversationSummary): AiConversation
     title: raw.title,
     modelProfileId: raw.modelProfileId ?? undefined,
     modelProfileVersion: raw.modelProfileVersion ?? undefined,
+    modelProfileName: raw.modelProfileName ?? undefined,
+    modelId: raw.modelId ?? undefined,
     readOnly: raw.readOnly ?? false,
+    readOnlyReason: raw.readOnlyReason ?? undefined,
     createdAt: raw.createdAt,
     updatedAt: raw.updatedAt,
     revision: raw.revision,
@@ -4260,6 +4316,7 @@ export class DemoGateway implements MuriArcGateway {
   readonly displayName = '浏览器演示数据'
   private readonly store = new DemoDomainStore()
   private readonly aiConversations = new Map<string, AiConversationDetail>()
+  private readonly aiConversationAutonomy = new Map<string, AiAutonomyView>()
 
   private setDemoArchive<T extends {
     id: string
@@ -5097,9 +5154,9 @@ export class DemoGateway implements MuriArcGateway {
     this.store.aiSettings.hasKey = false
     return clone(this.store.aiSettings)
   }
-  async listAiModelProfiles() {
+  async listAiModelProfiles(includeArchived = false) {
     await pause(20)
-    return clone(this.store.aiModelProfiles.filter((profile) => !profile.archivedAt))
+    return clone(this.store.aiModelProfiles.filter((profile) => includeArchived || !profile.archivedAt))
   }
   async getAiModelProfile(id: string) {
     await pause(20)
@@ -5215,6 +5272,13 @@ export class DemoGateway implements MuriArcGateway {
     }
     profile.isDefaultConversation = false
     profile.isDefaultVision = false
+    for (const detail of this.aiConversations.values()) {
+      if (detail.conversation.modelProfileId === id) {
+        detail.conversation.readOnly = true
+        detail.conversation.readOnlyReason = 'model_archived'
+        detail.conversation.revision += 1
+      }
+    }
     return clone(profile)
   }
   async getAiModelDefaults() {
@@ -5286,6 +5350,39 @@ export class DemoGateway implements MuriArcGateway {
     endpoint.revision += 1
     return clone(endpoint)
   }
+  async startAiConversation(
+    input: StartAiConversationInput,
+  ): Promise<StartAiConversationResponse> {
+    await pause(20)
+    const profileId = input.modelProfileId
+      ?? this.store.aiModelDefaults.defaultConversationProfileId
+    const profile = this.store.aiModelProfiles.find((item) =>
+      item.id === profileId && !item.archivedAt)
+    if (!profile) throw new Error('请选择一个可用的对话模型')
+    const now = new Date().toISOString()
+    const conversation: AiConversationSummary = {
+      id: crypto.randomUUID(),
+      projectId: input.projectId,
+      title: '新会话',
+      modelProfileId: profile.id,
+      modelProfileVersion: profile.currentVersion,
+      modelProfileName: profile.name,
+      modelId: profile.modelId,
+      readOnly: false,
+      createdAt: now,
+      updatedAt: now,
+      revision: 0,
+    }
+    const autonomy: AiAutonomyView = {
+      ...defaultAiAutonomy(),
+      mode: input.requestedMode,
+      effectiveMode: input.requestedMode,
+      revision: 1,
+    }
+    this.aiConversations.set(conversation.id, { conversation, messages: [] })
+    this.aiConversationAutonomy.set(conversation.id, autonomy)
+    return clone({ conversation, autonomy })
+  }
   async aiTurn(input: AiTurnInput): Promise<AiTurnResponse> {
     await pause(80)
     const conversationId = input.conversationId ?? crypto.randomUUID()
@@ -5316,6 +5413,7 @@ export class DemoGateway implements MuriArcGateway {
           trimReasons: [],
         },
       },
+      autonomy: clone(this.aiConversationAutonomy.get(conversationId) ?? defaultAiAutonomy()),
     }
     let detail = this.aiConversations.get(conversationId)
     if (!detail) {
@@ -5332,6 +5430,10 @@ export class DemoGateway implements MuriArcGateway {
         messages: [],
       }
       this.aiConversations.set(conversationId, detail)
+      this.aiConversationAutonomy.set(conversationId, defaultAiAutonomy())
+    }
+    if (!detail.messages.length && detail.conversation.title === '新会话') {
+      detail.conversation.title = input.message.trim().slice(0, 80) || '新会话'
     }
     detail.messages.push(
       {
@@ -5353,6 +5455,26 @@ export class DemoGateway implements MuriArcGateway {
     detail.conversation.updatedAt = now
     detail.conversation.revision += 1
     return clone(response)
+  }
+  async getAiAutonomy(conversationId: string) {
+    await pause(20)
+    const autonomy = this.aiConversationAutonomy.get(conversationId)
+    if (!autonomy) throw new Error('AI 会话不存在')
+    return clone(autonomy)
+  }
+  async setAiAutonomy(conversationId: string, input: AiAutonomyUpdateInput) {
+    await pause(20)
+    const current = this.aiConversationAutonomy.get(conversationId)
+    if (!current) throw new Error('AI 会话不存在')
+    if (current.revision !== input.expectedRevision) throw new Error('会话授权已变化，请刷新后重试')
+    const updated: AiAutonomyView = {
+      ...current,
+      mode: input.mode,
+      effectiveMode: input.mode,
+      revision: current.revision + 1,
+    }
+    this.aiConversationAutonomy.set(conversationId, updated)
+    return clone(updated)
   }
   async listAiConversations(projectId?: string, limit = 50) {
     await pause(20)

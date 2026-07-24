@@ -49,8 +49,9 @@ pub use query::{
 pub use scopes::{AccessGrant, ScopeSet, ToolAuthorizationError, ToolName, ToolScope};
 pub use store_executor::{StoreDomainToolExecutor, StoreToolAccessContext};
 pub use transport::{
-    AiAutonomyUpdateRequest, AiAutonomyView, AssistantConversationDetail,
-    AssistantConversationMessage, AssistantConversationSummary, AssistantTrace,
+    AiAutonomyUpdateRequest, AiAutonomyView, AiConversationReadOnlyReason,
+    AssistantConversationDetail, AssistantConversationMessage, AssistantConversationStartRequest,
+    AssistantConversationStartResponse, AssistantConversationSummary, AssistantTrace,
     AssistantTurnRequest, AssistantTurnResponse, DraftDecisionRequest, WriteDraftSummary,
 };
 

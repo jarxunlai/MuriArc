@@ -46,4 +46,5 @@ keyring = { version = "3.6.3", features = ["linux-native"] }
 
 [dev-dependencies]
 muriarc-snapshot = { path = "../crates/snapshot" }
+sqlx = { workspace = true, features = ["sqlite"] }
 tokio.workspace = true

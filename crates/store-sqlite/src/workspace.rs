@@ -276,6 +276,39 @@ impl WorkspaceStore for SqliteStore {
         if lab(&mut t, "users", i.user_id).await? != i.lab_id {
             return Err(StoreError::Validation("private owner crosses labs".into()));
         }
+        if let Some(conversation_id) = i.conversation_id {
+            let row = sqlx::query(
+                "SELECT lab_id,user_id,project_id,legacy_read_only
+                 FROM ai_conversations
+                 WHERE id=? AND deleted_at IS NULL",
+            )
+            .bind(conversation_id.to_string())
+            .fetch_optional(&mut *t)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "ai_conversation",
+                id: conversation_id,
+            })?;
+            let conversation_lab_id = uuid(row.try_get("lab_id").map_err(map_sqlx)?)?;
+            let conversation_user_id = uuid(row.try_get("user_id").map_err(map_sqlx)?)?;
+            let conversation_project_id =
+                optional_uuid(row.try_get("project_id").map_err(map_sqlx)?)?;
+            let legacy_read_only: bool = row.try_get("legacy_read_only").map_err(map_sqlx)?;
+            if (conversation_lab_id, conversation_user_id) != (i.lab_id, i.user_id) {
+                return Err(StoreError::Validation("conversation is not owned".into()));
+            }
+            if i.project_id.is_some() && i.project_id != conversation_project_id {
+                return Err(StoreError::Validation(
+                    "private image project does not match its conversation".into(),
+                ));
+            }
+            if legacy_read_only {
+                return Err(StoreError::Conflict(
+                    "legacy AI conversation is read-only".into(),
+                ));
+            }
+        }
         ia(&mut t, at).await?;
         sqlx::query("INSERT INTO ai_private_images(id,lab_id,user_id,conversation_id,attachment_id,project_id,status,last_activity_at,expires_at,archived_at,created_at,updated_at,deleted_at,revision)VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(i.id.to_string()).bind(i.lab_id.to_string()).bind(i.user_id.to_string()).bind(i.conversation_id.map(|v|v.to_string())).bind(i.attachment_id.to_string()).bind(i.project_id.map(|v|v.to_string())).bind(encode(&i.status)?).bind(i.last_activity_at).bind(i.expires_at).bind(i.archived_at).bind(i.meta.created_at).bind(i.meta.updated_at).bind(i.meta.deleted_at).bind(i.meta.revision).execute(&mut*t).await.map_err(map_sqlx)?;
         for (et, id, af) in [

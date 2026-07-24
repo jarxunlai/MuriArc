@@ -96,7 +96,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let attachment_root = PathBuf::from(required_env("MURIARC_ATTACHMENT_ROOT")?);
     tokio::fs::create_dir_all(&data_root).await?;
     tokio::fs::create_dir_all(&attachment_root).await?;
-    let state = configure_ai(state, store.clone(), &data_root)?;
+    let state = configure_ai(state, store.clone(), &data_root).await?;
     let state = state.with_data_storage(DataFiles::new(data_root), attachment_root);
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
     let ui_dir = env::var_os("MURIARC_UI_DIR").map(PathBuf::from);
@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn configure_ai(
+async fn configure_ai(
     state: AppState,
     store: Arc<PostgresStore>,
     data_root: &Path,
@@ -129,10 +129,12 @@ fn configure_ai(
         store.as_ref().clone(),
         master_key,
     ));
+    let migrated_profile_secrets = providers.migrate_legacy_profile_secrets().await?;
     let operations: Arc<dyn AiOperationStore> = store;
     tracing::info!(
         key_version,
-        "shared AI runtime is enabled with encrypted per-user credentials"
+        migrated_profile_secrets,
+        "shared AI runtime is enabled with profile-bound encrypted credentials"
     );
     Ok(state.with_ai(operations, providers))
 }

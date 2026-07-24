@@ -289,15 +289,40 @@ impl WorkspaceStore for PostgresStore {
             return Err(StoreError::Validation("private owner crosses labs".into()));
         }
         if let Some(c) = i.conversation_id {
-            let x: Option<(Uuid, Uuid)> = sqlx::query_as(
-                "SELECT lab_id,user_id FROM ai_conversations WHERE id=$1 AND deleted_at IS NULL",
+            let x: Option<(Uuid, Uuid, Option<Uuid>, bool)> = sqlx::query_as(
+                "SELECT lab_id,user_id,project_id,legacy_read_only
+                 FROM ai_conversations
+                 WHERE id=$1 AND deleted_at IS NULL
+                 FOR SHARE",
             )
             .bind(c)
             .fetch_optional(&mut *t)
             .await
             .map_err(map_sqlx)?;
-            if x != Some((i.lab_id, i.user_id)) {
+            let Some((
+                conversation_lab_id,
+                conversation_user_id,
+                conversation_project_id,
+                legacy_read_only,
+            )) = x
+            else {
+                return Err(StoreError::NotFound {
+                    entity: "ai_conversation",
+                    id: c,
+                });
+            };
+            if (conversation_lab_id, conversation_user_id) != (i.lab_id, i.user_id) {
                 return Err(StoreError::Validation("conversation is not owned".into()));
+            }
+            if i.project_id.is_some() && i.project_id != conversation_project_id {
+                return Err(StoreError::Validation(
+                    "private image project does not match its conversation".into(),
+                ));
+            }
+            if legacy_read_only {
+                return Err(StoreError::Conflict(
+                    "legacy AI conversation is read-only".into(),
+                ));
             }
         }
         ia(&mut t, at).await?;

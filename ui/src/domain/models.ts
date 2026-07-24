@@ -745,6 +745,9 @@ export interface AiConversationSummary {
   id: string
   projectId?: string
   title: string
+  modelProfileId?: string
+  modelProfileVersion?: number
+  readOnly: boolean
   createdAt: string
   updatedAt: string
   revision: number

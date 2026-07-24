@@ -768,16 +768,16 @@ fn get_ai_settings(state: tauri::State<'_, DesktopState>) -> CommandResult<AiSet
 }
 
 #[tauri::command]
-fn save_ai_settings(
+async fn save_ai_settings(
     state: tauri::State<'_, DesktopState>,
     input: SaveAiSettingsInput,
 ) -> CommandResult<AiSettingsView> {
-    state.save_ai_settings(input).map_err(Into::into)
+    state.save_ai_settings(input).await.map_err(Into::into)
 }
 
 #[tauri::command]
-fn clear_ai_api_key(state: tauri::State<'_, DesktopState>) -> CommandResult<AiSettingsView> {
-    state.clear_ai_api_key().map_err(Into::into)
+async fn clear_ai_api_key(state: tauri::State<'_, DesktopState>) -> CommandResult<AiSettingsView> {
+    state.clear_ai_api_key().await.map_err(Into::into)
 }
 
 #[tauri::command]

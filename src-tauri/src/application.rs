@@ -103,6 +103,11 @@ impl DesktopState {
         let store = SqliteStore::connect_path(database_path).await?;
         store.migrate().await?;
         bootstrap_local_identity(&store).await?;
+        let mut migration_audit = AuditContext::system(WriteSource::Migration);
+        migration_audit.reason = Some("materialize_desktop_ai_model_profiles".to_owned());
+        settings
+            .materialize_model_profiles(&store, &migration_audit)
+            .await?;
         Ok(Self {
             store,
             lab_id: LOCAL_LAB_ID,
@@ -178,15 +183,23 @@ impl DesktopState {
         self.settings.get().map_err(Into::into)
     }
 
-    pub(crate) fn save_ai_settings(
+    pub(crate) async fn save_ai_settings(
         &self,
         input: SaveAiSettingsInput,
     ) -> Result<AiSettingsView, DesktopError> {
-        self.settings.save(input).map_err(Into::into)
+        let audit = self.audit("update_ai_model_profile").await?;
+        self.settings
+            .save_and_materialize(&self.store, input, &audit)
+            .await
+            .map_err(Into::into)
     }
 
-    pub(crate) fn clear_ai_api_key(&self) -> Result<AiSettingsView, DesktopError> {
-        self.settings.clear_key().map_err(Into::into)
+    pub(crate) async fn clear_ai_api_key(&self) -> Result<AiSettingsView, DesktopError> {
+        let audit = self.audit("revoke_ai_model_profile_credentials").await?;
+        self.settings
+            .clear_key_with_metadata(&self.store, &audit)
+            .await
+            .map_err(Into::into)
     }
 
     pub(crate) async fn list_cages(&self) -> Result<Vec<CageView>, DesktopError> {

@@ -485,6 +485,7 @@ export interface TechnicalLogCleanupPreview {
 export interface AiProviderEndpoint {
   id: string
   providerKind: AiProviderKind
+  protocol: AiProviderProtocol
   label: string
   baseUrl: string
   enabled: boolean
@@ -492,8 +493,14 @@ export interface AiProviderEndpoint {
   revision: number
 }
 
+export type AiProviderProtocol =
+  | 'openai_chat_completions'
+  | 'openai_responses'
+  | 'anthropic_messages'
+
 export interface SaveAiProviderEndpointInput {
   providerKind: AiProviderKind
+  protocol: AiProviderProtocol
   label: string
   baseUrl: string
   enabled: boolean
@@ -1590,6 +1597,9 @@ interface RawAiConversationSummary {
   id: string
   projectId?: string | null
   title: string
+  modelProfileId?: string | null
+  modelProfileVersion?: number | null
+  readOnly?: boolean
   createdAt: string
   updatedAt: string
   revision: number
@@ -3211,6 +3221,9 @@ function mapAiConversationSummary(raw: RawAiConversationSummary): AiConversation
     id: raw.id,
     projectId: raw.projectId ?? undefined,
     title: raw.title,
+    modelProfileId: raw.modelProfileId ?? undefined,
+    modelProfileVersion: raw.modelProfileVersion ?? undefined,
+    readOnly: raw.readOnly ?? false,
     createdAt: raw.createdAt,
     updatedAt: raw.updatedAt,
     revision: raw.revision,
@@ -3865,6 +3878,7 @@ class DemoDomainStore {
     .map((preset, index) => ({
       id: `00000000-0000-0000-0000-${String(index + 1).padStart(12, '0')}`,
       providerKind: preset.providerKind,
+      protocol: 'openai_chat_completions',
       label: `${preset.displayName} API`,
       baseUrl: preset.recommendedBaseUrl,
       enabled: true,
@@ -4874,6 +4888,7 @@ export class DemoGateway implements MuriArcGateway {
     const endpoint: AiProviderEndpoint = existing ?? {
       id: crypto.randomUUID(),
       providerKind: input.providerKind,
+      protocol: input.protocol,
       label: input.label,
       baseUrl: input.baseUrl,
       enabled: input.enabled,
@@ -4881,6 +4896,7 @@ export class DemoGateway implements MuriArcGateway {
       revision: 0,
     }
     endpoint.providerKind = input.providerKind
+    endpoint.protocol = input.protocol
     endpoint.label = input.label
     endpoint.baseUrl = input.baseUrl
     endpoint.enabled = input.enabled
@@ -4934,6 +4950,7 @@ export class DemoGateway implements MuriArcGateway {
           id: conversationId,
           projectId: input.projectId,
           title: input.message.trim().slice(0, 80) || '新会话',
+          readOnly: false,
           createdAt: now,
           updatedAt: now,
           revision: 0,

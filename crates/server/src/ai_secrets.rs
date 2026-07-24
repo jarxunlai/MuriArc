@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use muriarc_ai::{AssistantRuntimeConfig, BuiltinProvider, ProviderKind};
 #[cfg(feature = "postgres")]
 use muriarc_ai::{ProviderConfig, ProviderCredentials};
-use muriarc_core::{AiAutonomyMode, AuditContext};
+use muriarc_core::{
+    AiAutonomyMode, AiModelProfileBinding, AiProviderProtocol, AiProviderTransport, AuditContext,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -180,6 +182,7 @@ pub struct ResolvedAiProvider {
     pub provider: BuiltinProvider,
     pub api_key: Option<SensitiveSecret>,
     pub runtime: AssistantRuntimeConfig,
+    pub model_profile: AiModelProfileBinding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -272,6 +275,7 @@ fn parse_autonomy_mode(value: &str) -> Result<AiAutonomyMode, AiProviderStoreErr
 pub struct AiProviderEndpointView {
     pub id: Uuid,
     pub provider_kind: ProviderKind,
+    pub protocol: AiProviderProtocol,
     pub label: String,
     pub base_url: String,
     pub enabled: bool,
@@ -283,6 +287,8 @@ pub struct AiProviderEndpointView {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SaveAiProviderEndpointInput {
     pub provider_kind: ProviderKind,
+    #[serde(default)]
+    pub protocol: AiProviderProtocol,
     pub label: String,
     pub base_url: String,
     pub enabled: bool,
@@ -306,6 +312,8 @@ pub enum AiProviderStoreError {
     ProviderNotSelected,
     #[error("AI provider credential is missing")]
     MissingCredential,
+    #[error("the selected AI model profile uses a provider protocol that is not supported yet")]
+    UnsupportedProtocol,
     #[error("AI secret master key configuration is invalid")]
     InvalidMasterKey,
     #[error("AI secret could not be encrypted or decrypted")]
@@ -331,6 +339,11 @@ pub trait UserAiProviderStore: Send + Sync {
         audit: &AuditContext,
     ) -> Result<AiProviderSettingsView, AiProviderStoreError>;
     async fn resolve(&self, user_id: Uuid) -> Result<ResolvedAiProvider, AiProviderStoreError>;
+    async fn resolve_for_profile(
+        &self,
+        user_id: Uuid,
+        binding: AiModelProfileBinding,
+    ) -> Result<ResolvedAiProvider, AiProviderStoreError>;
     async fn resolve_vision(
         &self,
         user_id: Uuid,
@@ -397,6 +410,13 @@ impl UserAiProviderStore for DisabledAiProviderStore {
         Err(AiProviderStoreError::NotConfigured)
     }
     async fn resolve(&self, _user_id: Uuid) -> Result<ResolvedAiProvider, AiProviderStoreError> {
+        Err(AiProviderStoreError::NotConfigured)
+    }
+    async fn resolve_for_profile(
+        &self,
+        _user_id: Uuid,
+        _binding: AiModelProfileBinding,
+    ) -> Result<ResolvedAiProvider, AiProviderStoreError> {
         Err(AiProviderStoreError::NotConfigured)
     }
     async fn resolve_vision(
@@ -499,6 +519,41 @@ mod shared_tests {
         assert!(!debug.contains("private-provider"));
         assert!(!debug.contains("private-api-key"));
     }
+
+    #[test]
+    fn endpoint_protocol_defaults_for_legacy_input_and_is_serialized_in_views() {
+        let legacy: SaveAiProviderEndpointInput = serde_json::from_value(serde_json::json!({
+            "providerKind": "open_ai_compatible",
+            "label": "Legacy endpoint",
+            "baseUrl": "https://provider.example.test/v1",
+            "enabled": true
+        }))
+        .unwrap();
+        assert_eq!(legacy.protocol, AiProviderProtocol::OpenaiChatCompletions);
+
+        let explicit: SaveAiProviderEndpointInput = serde_json::from_value(serde_json::json!({
+            "providerKind": "open_ai_compatible",
+            "protocol": "anthropic_messages",
+            "label": "Anthropic endpoint",
+            "baseUrl": "https://provider.example.test",
+            "enabled": true
+        }))
+        .unwrap();
+        assert_eq!(explicit.protocol, AiProviderProtocol::AnthropicMessages);
+
+        let serialized = serde_json::to_value(AiProviderEndpointView {
+            id: Uuid::nil(),
+            provider_kind: ProviderKind::OpenAiCompatible,
+            protocol: AiProviderProtocol::OpenaiResponses,
+            label: "Responses endpoint".to_owned(),
+            base_url: "https://provider.example.test/v1".to_owned(),
+            enabled: true,
+            builtin: false,
+            revision: 1,
+        })
+        .unwrap();
+        assert_eq!(serialized["protocol"], "openai_responses");
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -518,10 +573,40 @@ mod postgres {
 
     const NONCE_BYTES: usize = 12;
     const KEY_BYTES: usize = 32;
+    const PROFILE_SECRET_MIGRATION_LOCK: i64 = 0x4d55_5249_4152_4341;
     const OFFICIAL_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com";
     const OFFICIAL_GLM_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
     const OFFICIAL_KIMI_BASE_URL: &str = "https://api.moonshot.cn/v1";
     const OFFICIAL_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+    #[derive(Debug, Clone, Copy)]
+    enum SecretAadBinding {
+        LegacyUser {
+            user_id: Uuid,
+        },
+        ModelProfileVersion {
+            user_id: Uuid,
+            profile_id: Uuid,
+            profile_version: i64,
+        },
+    }
+
+    impl SecretAadBinding {
+        fn aad(self, master_key_version: i32) -> String {
+            match self {
+                Self::LegacyUser { user_id } => {
+                    format!("MuriArc/ai-provider-secret/v{master_key_version}/{user_id}")
+                }
+                Self::ModelProfileVersion {
+                    user_id,
+                    profile_id,
+                    profile_version,
+                } => format!(
+                    "MuriArc/ai-model-profile-secret/v{master_key_version}/{user_id}/{profile_id}/{profile_version}"
+                ),
+            }
+        }
+    }
 
     pub struct AiMasterKey {
         bytes: Zeroizing<Vec<u8>>,
@@ -652,6 +737,45 @@ mod postgres {
             }
         }
 
+        fn protocol_name(protocol: AiProviderProtocol) -> &'static str {
+            match protocol {
+                AiProviderProtocol::OpenaiChatCompletions => "openai_chat_completions",
+                AiProviderProtocol::OpenaiResponses => "openai_responses",
+                AiProviderProtocol::AnthropicMessages => "anthropic_messages",
+            }
+        }
+
+        fn protocol_from_db(value: &str) -> Result<AiProviderProtocol, AiProviderStoreError> {
+            match value {
+                "openai_chat_completions" => Ok(AiProviderProtocol::OpenaiChatCompletions),
+                "openai_responses" => Ok(AiProviderProtocol::OpenaiResponses),
+                "anthropic_messages" => Ok(AiProviderProtocol::AnthropicMessages),
+                _ => Err(AiProviderStoreError::Storage),
+            }
+        }
+
+        fn transport_name(transport: AiProviderTransport) -> &'static str {
+            match transport {
+                AiProviderTransport::OpenAiCompatible => "open_ai_compatible",
+                AiProviderTransport::LocalHttp => "local_http",
+            }
+        }
+
+        fn transport_from_provider_kind(kind: ProviderKind) -> AiProviderTransport {
+            match kind {
+                ProviderKind::OpenAiCompatible => AiProviderTransport::OpenAiCompatible,
+                ProviderKind::LocalHttp => AiProviderTransport::LocalHttp,
+            }
+        }
+
+        fn transport_from_db(value: &str) -> Result<AiProviderTransport, AiProviderStoreError> {
+            match value {
+                "open_ai_compatible" => Ok(AiProviderTransport::OpenAiCompatible),
+                "local_http" => Ok(AiProviderTransport::LocalHttp),
+                _ => Err(AiProviderStoreError::Storage),
+            }
+        }
+
         fn builtin_endpoint_id(index: u128) -> Uuid {
             Uuid::from_u128(index)
         }
@@ -667,6 +791,7 @@ mod postgres {
             .map(|(id, label, base_url)| AiProviderEndpointView {
                 id: Self::builtin_endpoint_id(id),
                 provider_kind: ProviderKind::OpenAiCompatible,
+                protocol: AiProviderProtocol::OpenaiChatCompletions,
                 label: label.to_owned(),
                 base_url: base_url.to_owned(),
                 enabled: true,
@@ -757,11 +882,15 @@ mod postgres {
             let kind: String = row
                 .try_get("provider_kind")
                 .map_err(|_| AiProviderStoreError::Storage)?;
+            let protocol: String = row
+                .try_get("protocol")
+                .map_err(|_| AiProviderStoreError::Storage)?;
             Ok(AiProviderEndpointView {
                 id: row
                     .try_get("id")
                     .map_err(|_| AiProviderStoreError::Storage)?,
                 provider_kind: Self::provider_kind_from_db(&kind)?,
+                protocol: Self::protocol_from_db(&protocol)?,
                 label: row
                     .try_get("label")
                     .map_err(|_| AiProviderStoreError::Storage)?,
@@ -783,6 +912,7 @@ mod postgres {
         fn endpoint_audit_state(view: &AiProviderEndpointView) -> Value {
             json!({
                 "provider_kind": Self::provider_kind_name(view.provider_kind),
+                "protocol": Self::protocol_name(view.protocol),
                 "label": view.label,
                 "enabled": view.enabled,
                 "builtin": view.builtin,
@@ -817,10 +947,12 @@ mod postgres {
         async fn validate_endpoint_for_lab(
             &self,
             lab_id: Uuid,
+            protocol: AiProviderProtocol,
             config: &ProviderConfig,
         ) -> Result<(), AiProviderStoreError> {
             let normalized = normalized_url(&config.base_url);
-            if config.kind == ProviderKind::OpenAiCompatible
+            if protocol == AiProviderProtocol::OpenaiChatCompletions
+                && config.kind == ProviderKind::OpenAiCompatible
                 && [
                     OFFICIAL_DEEPSEEK_BASE_URL,
                     OFFICIAL_GLM_BASE_URL,
@@ -844,10 +976,10 @@ mod postgres {
                 return Ok(());
             }
             let allowed: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM ai_provider_endpoints WHERE lab_id = $1 AND provider_kind = $2 AND normalized_base_url = $3 AND enabled = TRUE)",
+                "SELECT EXISTS(SELECT 1 FROM ai_provider_endpoints WHERE lab_id = $1 AND protocol = $2 AND normalized_base_url = $3 AND enabled = TRUE)",
             )
             .bind(lab_id)
-            .bind(Self::provider_kind_name(config.kind))
+            .bind(Self::protocol_name(protocol))
             .bind(&normalized)
             .fetch_one(self.postgres.pool())
             .await
@@ -875,9 +1007,9 @@ mod postgres {
             Ok((counts.0 as usize, counts.1 as usize + 4))
         }
 
-        fn encrypt(
+        fn encrypt_for_binding(
             &self,
-            user_id: Uuid,
+            binding: SecretAadBinding,
             secret: &str,
         ) -> Result<([u8; NONCE_BYTES], Vec<u8>), AiProviderStoreError> {
             ProviderCredentials::bearer(secret)
@@ -891,16 +1023,16 @@ mod postgres {
                 .key()?
                 .seal_in_place_append_tag(
                     Nonce::assume_unique_for_key(nonce),
-                    Aad::from(aad(user_id, self.master_key.version).as_bytes()),
+                    Aad::from(binding.aad(self.master_key.version).as_bytes()),
                     &mut ciphertext,
                 )
                 .map_err(|_| AiProviderStoreError::Encryption)?;
             Ok((nonce, ciphertext))
         }
 
-        fn decrypt(
+        fn decrypt_for_binding(
             &self,
-            user_id: Uuid,
+            binding: SecretAadBinding,
             key_version: i32,
             nonce: &[u8],
             ciphertext: &[u8],
@@ -917,7 +1049,7 @@ mod postgres {
                 .key()?
                 .open_in_place(
                     Nonce::assume_unique_for_key(nonce),
-                    Aad::from(aad(user_id, key_version).as_bytes()),
+                    Aad::from(binding.aad(key_version).as_bytes()),
                     &mut plaintext,
                 )
                 .map_err(|_| AiProviderStoreError::Encryption)?;
@@ -925,6 +1057,1113 @@ mod postgres {
                 String::from_utf8(opened.to_vec()).map_err(|_| AiProviderStoreError::Encryption)?;
             plaintext.fill(0);
             Ok(SensitiveSecret::new(secret))
+        }
+
+        fn encrypt(
+            &self,
+            user_id: Uuid,
+            secret: &str,
+        ) -> Result<([u8; NONCE_BYTES], Vec<u8>), AiProviderStoreError> {
+            self.encrypt_for_binding(SecretAadBinding::LegacyUser { user_id }, secret)
+        }
+
+        fn decrypt(
+            &self,
+            user_id: Uuid,
+            key_version: i32,
+            nonce: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<SensitiveSecret, AiProviderStoreError> {
+            self.decrypt_for_binding(
+                SecretAadBinding::LegacyUser { user_id },
+                key_version,
+                nonce,
+                ciphertext,
+            )
+        }
+
+        pub fn encrypt_profile_secret(
+            &self,
+            user_id: Uuid,
+            profile_id: Uuid,
+            profile_version: i64,
+            secret: &str,
+        ) -> Result<(i32, [u8; NONCE_BYTES], Vec<u8>), AiProviderStoreError> {
+            if profile_version <= 0 {
+                return Err(AiProviderStoreError::Encryption);
+            }
+            let (nonce, ciphertext) = self.encrypt_for_binding(
+                SecretAadBinding::ModelProfileVersion {
+                    user_id,
+                    profile_id,
+                    profile_version,
+                },
+                secret,
+            )?;
+            Ok((self.master_key.version, nonce, ciphertext))
+        }
+
+        pub fn decrypt_profile_secret(
+            &self,
+            user_id: Uuid,
+            profile_id: Uuid,
+            profile_version: i64,
+            key_version: i32,
+            nonce: &[u8],
+            ciphertext: &[u8],
+        ) -> Result<SensitiveSecret, AiProviderStoreError> {
+            if profile_version <= 0 {
+                return Err(AiProviderStoreError::Encryption);
+            }
+            self.decrypt_for_binding(
+                SecretAadBinding::ModelProfileVersion {
+                    user_id,
+                    profile_id,
+                    profile_version,
+                },
+                key_version,
+                nonce,
+                ciphertext,
+            )
+        }
+
+        /// Re-encrypts a legacy user-bound credential for one immutable model
+        /// profile version without exposing the plaintext to the caller.
+        ///
+        /// Persistence remains an explicit caller responsibility so a migration
+        /// can store the returned key version, nonce, and ciphertext atomically.
+        pub fn reencrypt_legacy_secret_for_profile(
+            &self,
+            user_id: Uuid,
+            profile_id: Uuid,
+            profile_version: i64,
+            legacy_key_version: i32,
+            legacy_nonce: &[u8],
+            legacy_ciphertext: &[u8],
+        ) -> Result<(i32, [u8; NONCE_BYTES], Vec<u8>), AiProviderStoreError> {
+            let secret =
+                self.decrypt(user_id, legacy_key_version, legacy_nonce, legacy_ciphertext)?;
+            self.encrypt_profile_secret(user_id, profile_id, profile_version, secret.as_str())
+        }
+
+        /// Copies legacy user-bound credentials into the immutable default model
+        /// profile versions using version-bound AAD.
+        ///
+        /// The old ciphertext is intentionally retained for forward-only
+        /// compatibility. A single transaction and advisory lock make the
+        /// migration safe to run at every server startup.
+        pub async fn migrate_legacy_profile_secrets(&self) -> Result<u64, AiProviderStoreError> {
+            let mut transaction = self
+                .postgres
+                .pool()
+                .begin()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(PROFILE_SECRET_MIGRATION_LOCK)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let rows = sqlx::query(
+                "SELECT s.user_id, u.lab_id, s.secret_key_version, s.secret_nonce,
+                        s.secret_ciphertext, d.default_conversation_profile_id,
+                        d.default_vision_profile_id
+                 FROM ai_provider_settings s
+                 JOIN users u
+                   ON u.id = s.user_id AND u.deleted_at IS NULL
+                 JOIN ai_user_model_defaults d
+                   ON d.user_id = s.user_id AND d.deleted_at IS NULL
+                 WHERE s.secret_key_version IS NOT NULL
+                    OR s.secret_nonce IS NOT NULL
+                    OR s.secret_ciphertext IS NOT NULL
+                 FOR UPDATE OF s, d",
+            )
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+
+            let mut migrated = 0_u64;
+            for row in rows {
+                let user_id: Uuid = row
+                    .try_get("user_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                let lab_id: Uuid = row
+                    .try_get("lab_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                let key_version: Option<i32> = row
+                    .try_get("secret_key_version")
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                let nonce: Option<Vec<u8>> = row
+                    .try_get("secret_nonce")
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                let ciphertext: Option<Vec<u8>> = row
+                    .try_get("secret_ciphertext")
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                let legacy_secret = match (key_version, nonce, ciphertext) {
+                    (Some(version), Some(nonce), Some(ciphertext)) => {
+                        self.decrypt(user_id, version, &nonce, &ciphertext)?
+                    }
+                    _ => return Err(AiProviderStoreError::Encryption),
+                };
+                let conversation_profile_id: Uuid = row
+                    .try_get::<Option<Uuid>, _>("default_conversation_profile_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    .ok_or(AiProviderStoreError::Storage)?;
+                let mut profile_ids = vec![conversation_profile_id];
+                if let Some(vision_profile_id) = row
+                    .try_get::<Option<Uuid>, _>("default_vision_profile_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    && vision_profile_id != conversation_profile_id
+                {
+                    profile_ids.push(vision_profile_id);
+                }
+
+                for profile_id in profile_ids {
+                    let profile_version = Self::active_profile_current_version(
+                        &mut transaction,
+                        profile_id,
+                        user_id,
+                        lab_id,
+                    )
+                    .await?;
+                    let existing = sqlx::query(
+                        "SELECT key_version, nonce, ciphertext
+                         FROM ai_model_profile_secrets
+                         WHERE profile_id = $1 AND profile_version = $2
+                         FOR UPDATE",
+                    )
+                    .bind(profile_id)
+                    .bind(profile_version)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                    if let Some(existing) = existing {
+                        let existing_version: i32 = existing
+                            .try_get("key_version")
+                            .map_err(|_| AiProviderStoreError::Storage)?;
+                        let existing_nonce: Vec<u8> = existing
+                            .try_get("nonce")
+                            .map_err(|_| AiProviderStoreError::Storage)?;
+                        let existing_ciphertext: Vec<u8> = existing
+                            .try_get("ciphertext")
+                            .map_err(|_| AiProviderStoreError::Storage)?;
+                        self.decrypt_profile_secret(
+                            user_id,
+                            profile_id,
+                            profile_version,
+                            existing_version,
+                            &existing_nonce,
+                            &existing_ciphertext,
+                        )?;
+                        continue;
+                    }
+
+                    let (profile_key_version, profile_nonce, profile_ciphertext) = self
+                        .encrypt_profile_secret(
+                            user_id,
+                            profile_id,
+                            profile_version,
+                            legacy_secret.as_str(),
+                        )?;
+                    sqlx::query(
+                        "INSERT INTO ai_model_profile_secrets (
+                            profile_id, profile_version, key_version, nonce,
+                            ciphertext, created_at, updated_at
+                         ) VALUES ($1, $2, $3, $4, $5, now(), now())",
+                    )
+                    .bind(profile_id)
+                    .bind(profile_version)
+                    .bind(profile_key_version)
+                    .bind(profile_nonce.to_vec())
+                    .bind(profile_ciphertext)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|_| AiProviderStoreError::Storage)?;
+                    write_profile_secret_audit(
+                        &mut transaction,
+                        lab_id,
+                        profile_id,
+                        profile_version,
+                        "create",
+                        "migration",
+                        None,
+                        "MuriArc AI secret migration",
+                        "migration",
+                        None,
+                        false,
+                        true,
+                        "Legacy AI credential migrated to profile-version-bound encryption",
+                    )
+                    .await?;
+                    migrated += 1;
+                }
+            }
+
+            transaction
+                .commit()
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            Ok(migrated)
+        }
+
+        async fn ensure_profile_owner(
+            transaction: &mut Transaction<'_, Postgres>,
+            profile_id: Uuid,
+            user_id: Uuid,
+            lab_id: Uuid,
+        ) -> Result<(), AiProviderStoreError> {
+            let owner: Option<(Uuid, Uuid)> = sqlx::query_as(
+                "SELECT user_id, lab_id
+                 FROM ai_model_profiles
+                 WHERE id = $1
+                   AND archived_at IS NULL
+                   AND deleted_at IS NULL
+                 FOR SHARE",
+            )
+            .bind(profile_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            if owner != Some((user_id, lab_id)) {
+                return Err(AiProviderStoreError::Storage);
+            }
+            Ok(())
+        }
+
+        async fn active_profile_current_version(
+            transaction: &mut Transaction<'_, Postgres>,
+            profile_id: Uuid,
+            user_id: Uuid,
+            lab_id: Uuid,
+        ) -> Result<i64, AiProviderStoreError> {
+            sqlx::query_scalar(
+                "SELECT current_version
+                 FROM ai_model_profiles
+                 WHERE id = $1 AND user_id = $2 AND lab_id = $3
+                   AND archived_at IS NULL AND deleted_at IS NULL
+                 FOR SHARE",
+            )
+            .bind(profile_id)
+            .bind(user_id)
+            .bind(lab_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .ok_or(AiProviderStoreError::Storage)
+        }
+
+        async fn default_profile_ids(
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+        ) -> Result<Vec<Uuid>, AiProviderStoreError> {
+            let defaults: Option<(Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+                "SELECT default_conversation_profile_id, default_vision_profile_id
+                 FROM ai_user_model_defaults
+                 WHERE user_id = $1 AND deleted_at IS NULL
+                 FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            let Some((conversation, vision)) = defaults else {
+                return Ok(Vec::new());
+            };
+            let mut profile_ids = Vec::with_capacity(2);
+            if let Some(profile_id) = conversation {
+                Self::ensure_profile_owner(transaction, profile_id, user_id, lab_id).await?;
+                profile_ids.push(profile_id);
+            }
+            if let Some(profile_id) = vision
+                && !profile_ids.contains(&profile_id)
+            {
+                Self::ensure_profile_owner(transaction, profile_id, user_id, lab_id).await?;
+                profile_ids.push(profile_id);
+            }
+            Ok(profile_ids)
+        }
+
+        async fn replace_default_profile_secrets(
+            &self,
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+            secret: &str,
+            audit: &AuditContext,
+        ) -> Result<(), AiProviderStoreError> {
+            for profile_id in Self::default_profile_ids(transaction, user_id, lab_id).await? {
+                let profile_version =
+                    Self::active_profile_current_version(transaction, profile_id, user_id, lab_id)
+                        .await?;
+                let existed: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM ai_model_profile_secrets
+                        WHERE profile_id = $1 AND profile_version = $2
+                     )",
+                )
+                .bind(profile_id)
+                .bind(profile_version)
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                let (key_version, nonce, ciphertext) =
+                    self.encrypt_profile_secret(user_id, profile_id, profile_version, secret)?;
+                sqlx::query(
+                    "INSERT INTO ai_model_profile_secrets (
+                        profile_id, profile_version, key_version, nonce,
+                        ciphertext, created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, $5, now(), now())
+                     ON CONFLICT (profile_id, profile_version) DO UPDATE
+                     SET key_version = EXCLUDED.key_version,
+                         nonce = EXCLUDED.nonce,
+                         ciphertext = EXCLUDED.ciphertext,
+                         updated_at = now()",
+                )
+                .bind(profile_id)
+                .bind(profile_version)
+                .bind(key_version)
+                .bind(nonce.to_vec())
+                .bind(ciphertext)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                write_human_profile_secret_audit(
+                    transaction,
+                    lab_id,
+                    profile_id,
+                    profile_version,
+                    if existed { "update" } else { "create" },
+                    audit,
+                    existed,
+                    true,
+                    "AI model profile credential replaced",
+                )
+                .await?;
+            }
+            Ok(())
+        }
+
+        async fn preserve_default_profile_secrets(
+            &self,
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+            legacy_secret: Option<&SensitiveSecret>,
+            audit: &AuditContext,
+        ) -> Result<(), AiProviderStoreError> {
+            let profile_ids = Self::default_profile_ids(transaction, user_id, lab_id).await?;
+            if profile_ids.is_empty() {
+                return Ok(());
+            }
+            for profile_id in profile_ids {
+                let profile_version =
+                    Self::active_profile_current_version(transaction, profile_id, user_id, lab_id)
+                        .await?;
+                let existing = sqlx::query(
+                    "SELECT key_version, nonce, ciphertext
+                     FROM ai_model_profile_secrets
+                     WHERE profile_id = $1 AND profile_version = $2
+                     FOR UPDATE",
+                )
+                .bind(profile_id)
+                .bind(profile_version)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                if let Some(existing) = existing {
+                    let key_version: i32 = existing
+                        .try_get("key_version")
+                        .map_err(|_| AiProviderStoreError::Storage)?;
+                    let nonce: Vec<u8> = existing
+                        .try_get("nonce")
+                        .map_err(|_| AiProviderStoreError::Storage)?;
+                    let ciphertext: Vec<u8> = existing
+                        .try_get("ciphertext")
+                        .map_err(|_| AiProviderStoreError::Storage)?;
+                    self.decrypt_profile_secret(
+                        user_id,
+                        profile_id,
+                        profile_version,
+                        key_version,
+                        &nonce,
+                        &ciphertext,
+                    )?;
+                    continue;
+                }
+                if legacy_secret.is_none() {
+                    continue;
+                }
+
+                let previous = sqlx::query(
+                    "SELECT profile_version, key_version, nonce, ciphertext
+                     FROM ai_model_profile_secrets
+                     WHERE profile_id = $1 AND profile_version < $2
+                     ORDER BY profile_version DESC
+                     LIMIT 1
+                     FOR UPDATE",
+                )
+                .bind(profile_id)
+                .bind(profile_version)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                let copied_secret = if let Some(previous) = previous {
+                    let previous_profile_version: i64 = previous
+                        .try_get("profile_version")
+                        .map_err(|_| AiProviderStoreError::Storage)?;
+                    let key_version: i32 = previous
+                        .try_get("key_version")
+                        .map_err(|_| AiProviderStoreError::Storage)?;
+                    let nonce: Vec<u8> = previous
+                        .try_get("nonce")
+                        .map_err(|_| AiProviderStoreError::Storage)?;
+                    let ciphertext: Vec<u8> = previous
+                        .try_get("ciphertext")
+                        .map_err(|_| AiProviderStoreError::Storage)?;
+                    Some(self.decrypt_profile_secret(
+                        user_id,
+                        profile_id,
+                        previous_profile_version,
+                        key_version,
+                        &nonce,
+                        &ciphertext,
+                    )?)
+                } else {
+                    None
+                };
+                let Some(secret) = copied_secret.as_ref().or(legacy_secret) else {
+                    continue;
+                };
+                let (key_version, nonce, ciphertext) = self.encrypt_profile_secret(
+                    user_id,
+                    profile_id,
+                    profile_version,
+                    secret.as_str(),
+                )?;
+                sqlx::query(
+                    "INSERT INTO ai_model_profile_secrets (
+                        profile_id, profile_version, key_version, nonce,
+                        ciphertext, created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, $5, now(), now())",
+                )
+                .bind(profile_id)
+                .bind(profile_version)
+                .bind(key_version)
+                .bind(nonce.to_vec())
+                .bind(ciphertext)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                write_human_profile_secret_audit(
+                    transaction,
+                    lab_id,
+                    profile_id,
+                    profile_version,
+                    "create",
+                    audit,
+                    false,
+                    true,
+                    "AI model profile credential synchronized",
+                )
+                .await?;
+            }
+            Ok(())
+        }
+
+        async fn clear_current_default_profile_secrets(
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+            audit: &AuditContext,
+            reason: &'static str,
+        ) -> Result<(), AiProviderStoreError> {
+            for profile_id in Self::default_profile_ids(transaction, user_id, lab_id).await? {
+                let profile_version =
+                    Self::active_profile_current_version(transaction, profile_id, user_id, lab_id)
+                        .await?;
+                let deleted = sqlx::query(
+                    "DELETE FROM ai_model_profile_secrets
+                     WHERE profile_id = $1 AND profile_version = $2
+                     RETURNING profile_version",
+                )
+                .bind(profile_id)
+                .bind(profile_version)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                if deleted.is_some() {
+                    write_human_profile_secret_audit(
+                        transaction,
+                        lab_id,
+                        profile_id,
+                        profile_version,
+                        "delete",
+                        audit,
+                        true,
+                        false,
+                        reason,
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        }
+
+        async fn compatibility_profile_ids(
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+        ) -> Result<Vec<Uuid>, AiProviderStoreError> {
+            let mut profile_ids = Self::default_profile_ids(transaction, user_id, lab_id).await?;
+            for vision in [false, true] {
+                let profile_id =
+                    Self::compatibility_profile_id(transaction, user_id, vision).await?;
+                let owned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM ai_model_profiles
+                        WHERE id = $1 AND user_id = $2 AND lab_id = $3
+                     )",
+                )
+                .bind(profile_id)
+                .bind(user_id)
+                .bind(lab_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                if owned && !profile_ids.contains(&profile_id) {
+                    profile_ids.push(profile_id);
+                }
+            }
+            Ok(profile_ids)
+        }
+
+        async fn clear_all_compatibility_profile_secrets(
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+            audit: &AuditContext,
+        ) -> Result<(), AiProviderStoreError> {
+            for profile_id in Self::compatibility_profile_ids(transaction, user_id, lab_id).await? {
+                let deleted_versions: Vec<i64> = sqlx::query_scalar(
+                    "DELETE FROM ai_model_profile_secrets
+                     WHERE profile_id = $1
+                     RETURNING profile_version",
+                )
+                .bind(profile_id)
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                for profile_version in deleted_versions {
+                    write_human_profile_secret_audit(
+                        transaction,
+                        lab_id,
+                        profile_id,
+                        profile_version,
+                        "delete",
+                        audit,
+                        true,
+                        false,
+                        "AI model profile credential cleared",
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn append_profile_version_if_changed(
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+            profile_id: Uuid,
+            config: &ProviderConfig,
+            model: &str,
+            supports_vision: bool,
+            runtime: AssistantRuntimeConfig,
+            audit: &AuditContext,
+        ) -> Result<(), AiProviderStoreError> {
+            let row = sqlx::query(
+                "SELECT p.current_version, p.revision, v.protocol,
+                        v.transport, v.base_url, v.normalized_base_url,
+                        v.model_id, v.supports_vision, v.context_window_tokens,
+                        v.max_input_tokens, v.max_output_tokens,
+                        v.history_token_budget, v.history_turns, v.temperature,
+                        v.timeout_ms
+                 FROM ai_model_profiles p
+                 JOIN ai_model_profile_versions v
+                   ON v.profile_id = p.id AND v.version = p.current_version
+                 WHERE p.id = $1
+                   AND p.user_id = $2
+                   AND p.lab_id = $3
+                   AND p.archived_at IS NULL
+                   AND p.deleted_at IS NULL
+                 FOR UPDATE OF p",
+            )
+            .bind(profile_id)
+            .bind(user_id)
+            .bind(lab_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .ok_or(AiProviderStoreError::ProviderNotSelected)?;
+            let current_version: i64 = row
+                .try_get("current_version")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let current_protocol: String = row
+                .try_get("protocol")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let normalized_base_url = normalized_url(&config.base_url);
+            let unchanged = current_protocol
+                == Self::protocol_name(AiProviderProtocol::OpenaiChatCompletions)
+                && row
+                    .try_get::<String, _>("transport")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    == Self::transport_name(Self::transport_from_provider_kind(config.kind))
+                && row
+                    .try_get::<String, _>("base_url")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    == config.base_url
+                && row
+                    .try_get::<String, _>("normalized_base_url")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    == normalized_base_url
+                && row
+                    .try_get::<String, _>("model_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    == model
+                && row
+                    .try_get::<bool, _>("supports_vision")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    == supports_vision
+                && numeric_u32(&row, "context_window_tokens")? == runtime.context_window_tokens
+                && numeric_u32(&row, "max_input_tokens")? == runtime.max_input_tokens
+                && numeric_u32(&row, "max_output_tokens")? == runtime.max_output_tokens
+                && numeric_u32(&row, "history_token_budget")? == runtime.history_token_budget
+                && numeric_u32(&row, "history_turns")? == runtime.history_turns
+                && row
+                    .try_get::<f64, _>("temperature")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    == f64::from(runtime.temperature)
+                && numeric_u64(&row, "timeout_ms")? == runtime.timeout_ms;
+            if unchanged {
+                return Ok(());
+            }
+
+            let next_version = current_version
+                .checked_add(1)
+                .ok_or(AiProviderStoreError::Storage)?;
+            sqlx::query(
+                "INSERT INTO ai_model_profile_versions (
+                    profile_id, version, protocol, transport, base_url,
+                    normalized_base_url, model_id, supports_vision,
+                    context_window_tokens,
+                    max_input_tokens, max_output_tokens, history_token_budget,
+                    history_turns, temperature, timeout_ms, created_at
+                 ) VALUES (
+                    $1, $2, 'openai_chat_completions', $3, $4, $5, $6, $7,
+                    $8, $9, $10, $11, $12, $13, $14, now()
+                 )",
+            )
+            .bind(profile_id)
+            .bind(next_version)
+            .bind(Self::transport_name(Self::transport_from_provider_kind(
+                config.kind,
+            )))
+            .bind(&config.base_url)
+            .bind(&normalized_base_url)
+            .bind(model)
+            .bind(supports_vision)
+            .bind(i64::from(runtime.context_window_tokens))
+            .bind(i64::from(runtime.max_input_tokens))
+            .bind(i64::from(runtime.max_output_tokens))
+            .bind(i64::from(runtime.history_token_budget))
+            .bind(
+                i32::try_from(runtime.history_turns)
+                    .map_err(|_| AiProviderStoreError::InvalidSettings)?,
+            )
+            .bind(f64::from(runtime.temperature))
+            .bind(
+                i64::try_from(runtime.timeout_ms)
+                    .map_err(|_| AiProviderStoreError::InvalidSettings)?,
+            )
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            let updated = sqlx::query(
+                "UPDATE ai_model_profiles
+                 SET current_version = $2, updated_at = now(), revision = revision + 1
+                 WHERE id = $1 AND current_version = $3",
+            )
+            .bind(profile_id)
+            .bind(next_version)
+            .bind(current_version)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            if updated.rows_affected() != 1 {
+                return Err(AiProviderStoreError::Storage);
+            }
+            write_profile_configuration_audit(
+                transaction,
+                lab_id,
+                profile_id,
+                current_version,
+                next_version,
+                supports_vision,
+                audit,
+            )
+            .await
+        }
+
+        async fn compatibility_profile_id(
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            vision: bool,
+        ) -> Result<Uuid, AiProviderStoreError> {
+            let namespace = if vision {
+                "muriarc-ai-vision-profile:"
+            } else {
+                "muriarc-ai-text-profile:"
+            };
+            sqlx::query_scalar(
+                "SELECT (
+                    substr(md5($1::text || $2::text), 1, 8) || '-' ||
+                    substr(md5($1::text || $2::text), 9, 4) || '-' ||
+                    substr(md5($1::text || $2::text), 13, 4) || '-' ||
+                    substr(md5($1::text || $2::text), 17, 4) || '-' ||
+                    substr(md5($1::text || $2::text), 21, 12)
+                 )::uuid",
+            )
+            .bind(namespace)
+            .bind(user_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)
+        }
+
+        async fn profile_is_active_for_user(
+            transaction: &mut Transaction<'_, Postgres>,
+            profile_id: Uuid,
+            user_id: Uuid,
+            lab_id: Uuid,
+        ) -> Result<bool, AiProviderStoreError> {
+            sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM ai_model_profiles
+                    WHERE id = $1 AND user_id = $2 AND lab_id = $3
+                      AND archived_at IS NULL AND deleted_at IS NULL
+                 )",
+            )
+            .bind(profile_id)
+            .bind(user_id)
+            .bind(lab_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn create_compatibility_profile_if_missing(
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+            profile_id: Uuid,
+            vision: bool,
+            config: &ProviderConfig,
+            model: &str,
+            runtime: AssistantRuntimeConfig,
+            audit: &AuditContext,
+        ) -> Result<(), AiProviderStoreError> {
+            let name = if vision {
+                "Migrated vision model"
+            } else {
+                "Migrated default model"
+            };
+            let inserted = sqlx::query(
+                "INSERT INTO ai_model_profiles (
+                    id, lab_id, user_id, name, current_version,
+                    created_at, updated_at, revision
+                 ) VALUES ($1, $2, $3, $4, 1, now(), now(), 1)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(profile_id)
+            .bind(lab_id)
+            .bind(user_id)
+            .bind(name)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            if inserted.rows_affected() == 1 {
+                sqlx::query(
+                    "INSERT INTO ai_model_profile_versions (
+                        profile_id, version, protocol, transport, base_url,
+                        normalized_base_url, model_id, supports_vision,
+                        context_window_tokens, max_input_tokens,
+                        max_output_tokens, history_token_budget, history_turns,
+                        temperature, timeout_ms, created_at
+                     ) VALUES (
+                        $1, 1, 'openai_chat_completions', $2, $3, $4, $5, $6,
+                        $7, $8, $9, $10, $11, $12, $13, now()
+                     )",
+                )
+                .bind(profile_id)
+                .bind(Self::transport_name(Self::transport_from_provider_kind(
+                    config.kind,
+                )))
+                .bind(&config.base_url)
+                .bind(normalized_url(&config.base_url))
+                .bind(model)
+                .bind(vision)
+                .bind(i64::from(runtime.context_window_tokens))
+                .bind(i64::from(runtime.max_input_tokens))
+                .bind(i64::from(runtime.max_output_tokens))
+                .bind(i64::from(runtime.history_token_budget))
+                .bind(
+                    i32::try_from(runtime.history_turns)
+                        .map_err(|_| AiProviderStoreError::InvalidSettings)?,
+                )
+                .bind(f64::from(runtime.temperature))
+                .bind(
+                    i64::try_from(runtime.timeout_ms)
+                        .map_err(|_| AiProviderStoreError::InvalidSettings)?,
+                )
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                write_profile_configuration_audit(
+                    transaction,
+                    lab_id,
+                    profile_id,
+                    0,
+                    1,
+                    vision,
+                    audit,
+                )
+                .await?;
+            }
+            if !Self::profile_is_active_for_user(transaction, profile_id, user_id, lab_id).await? {
+                return Err(AiProviderStoreError::ProviderNotSelected);
+            }
+            Ok(())
+        }
+
+        async fn materialize_and_append_default_profile_versions(
+            transaction: &mut Transaction<'_, Postgres>,
+            user_id: Uuid,
+            lab_id: Uuid,
+            config: &ProviderConfig,
+            runtime: AssistantRuntimeConfig,
+            vision_model: Option<&str>,
+            audit: &AuditContext,
+        ) -> Result<(), AiProviderStoreError> {
+            let supports_vision = vision_model.is_some();
+            let defaults = sqlx::query(
+                "SELECT default_conversation_profile_id,
+                        default_vision_profile_id, deleted_at
+                 FROM ai_user_model_defaults
+                 WHERE user_id = $1
+                 FOR UPDATE",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            let old_conversation_profile_id = defaults
+                .as_ref()
+                .and_then(|row| row.try_get("default_conversation_profile_id").ok())
+                .flatten();
+            let old_vision_profile_id = defaults
+                .as_ref()
+                .and_then(|row| row.try_get("default_vision_profile_id").ok())
+                .flatten();
+            let defaults_deleted = defaults
+                .as_ref()
+                .and_then(|row| {
+                    row.try_get::<Option<chrono::DateTime<Utc>>, _>("deleted_at")
+                        .ok()
+                })
+                .flatten()
+                .is_some();
+
+            let conversation_profile_id = match old_conversation_profile_id {
+                Some(profile_id)
+                    if Self::profile_is_active_for_user(
+                        transaction,
+                        profile_id,
+                        user_id,
+                        lab_id,
+                    )
+                    .await? =>
+                {
+                    profile_id
+                }
+                _ => {
+                    let profile_id =
+                        Self::compatibility_profile_id(transaction, user_id, false).await?;
+                    Self::create_compatibility_profile_if_missing(
+                        transaction,
+                        user_id,
+                        lab_id,
+                        profile_id,
+                        false,
+                        config,
+                        &config.model,
+                        runtime,
+                        audit,
+                    )
+                    .await?;
+                    profile_id
+                }
+            };
+
+            let mut vision_profile_id = supports_vision.then_some(old_vision_profile_id).flatten();
+            if supports_vision {
+                let current_is_active = match vision_profile_id {
+                    Some(profile_id) => {
+                        Self::profile_is_active_for_user(transaction, profile_id, user_id, lab_id)
+                            .await?
+                    }
+                    None => false,
+                };
+                if !current_is_active {
+                    let profile_id =
+                        Self::compatibility_profile_id(transaction, user_id, true).await?;
+                    Self::create_compatibility_profile_if_missing(
+                        transaction,
+                        user_id,
+                        lab_id,
+                        profile_id,
+                        true,
+                        config,
+                        vision_model.ok_or(AiProviderStoreError::InvalidSettings)?,
+                        runtime,
+                        audit,
+                    )
+                    .await?;
+                    vision_profile_id = Some(profile_id);
+                }
+            }
+
+            let defaults_changed = defaults.is_none()
+                || defaults_deleted
+                || old_conversation_profile_id != Some(conversation_profile_id)
+                || old_vision_profile_id != vision_profile_id;
+            if defaults_changed {
+                sqlx::query(
+                    "INSERT INTO ai_user_model_defaults (
+                        user_id, default_conversation_profile_id,
+                        default_vision_profile_id, created_at, updated_at,
+                        deleted_at, revision
+                     ) VALUES ($1, $2, $3, now(), now(), NULL, 1)
+                     ON CONFLICT (user_id) DO UPDATE
+                     SET default_conversation_profile_id =
+                            EXCLUDED.default_conversation_profile_id,
+                         default_vision_profile_id =
+                            EXCLUDED.default_vision_profile_id,
+                         updated_at = now(),
+                         deleted_at = NULL,
+                         revision = ai_user_model_defaults.revision + 1",
+                )
+                .bind(user_id)
+                .bind(conversation_profile_id)
+                .bind(vision_profile_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+                write_model_defaults_audit(
+                    transaction,
+                    lab_id,
+                    user_id,
+                    old_conversation_profile_id,
+                    old_vision_profile_id,
+                    conversation_profile_id,
+                    vision_profile_id,
+                    defaults.is_none(),
+                    audit,
+                )
+                .await?;
+            }
+
+            let shared_with_vision =
+                supports_vision && vision_profile_id == Some(conversation_profile_id);
+            if shared_with_vision && vision_model != Some(config.model.as_str()) {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            Self::append_profile_version_if_changed(
+                transaction,
+                user_id,
+                lab_id,
+                conversation_profile_id,
+                config,
+                &config.model,
+                shared_with_vision,
+                runtime,
+                audit,
+            )
+            .await?;
+            if supports_vision
+                && let (Some(vision_profile_id), Some(vision_model)) =
+                    (vision_profile_id, vision_model)
+                && vision_profile_id != conversation_profile_id
+            {
+                Self::append_profile_version_if_changed(
+                    transaction,
+                    user_id,
+                    lab_id,
+                    vision_profile_id,
+                    config,
+                    vision_model,
+                    true,
+                    runtime,
+                    audit,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+
+        async fn selected_profile_binding(
+            &self,
+            user_id: Uuid,
+            vision: bool,
+        ) -> Result<AiModelProfileBinding, AiProviderStoreError> {
+            let row = sqlx::query(
+                "SELECT p.id AS profile_id, p.current_version AS profile_version
+                 FROM ai_user_model_defaults d
+                 JOIN ai_model_profiles p
+                   ON p.id = CASE
+                       WHEN $2 THEN d.default_vision_profile_id
+                       ELSE d.default_conversation_profile_id
+                   END
+                  AND p.user_id = d.user_id
+                  AND p.archived_at IS NULL
+                  AND p.deleted_at IS NULL
+                 JOIN ai_model_profile_versions v
+                   ON v.profile_id = p.id AND v.version = p.current_version
+                  AND (NOT $2 OR v.supports_vision)
+                 WHERE d.user_id = $1 AND d.deleted_at IS NULL",
+            )
+            .bind(user_id)
+            .bind(vision)
+            .fetch_optional(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .ok_or(AiProviderStoreError::ProviderNotSelected)?;
+            let profile_id: Uuid = row
+                .try_get("profile_id")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let profile_version: i64 = row
+                .try_get("profile_version")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            Ok(AiModelProfileBinding {
+                profile_id,
+                profile_version,
+            })
         }
 
         async fn row(
@@ -954,7 +2193,10 @@ mod postgres {
             user_id: Uuid,
         ) -> Result<Uuid, AiProviderStoreError> {
             sqlx::query_scalar(
-                "SELECT lab_id FROM users WHERE id = $1 AND status = 'active' AND deleted_at IS NULL",
+                "SELECT lab_id
+                 FROM users
+                 WHERE id = $1 AND status = 'active' AND deleted_at IS NULL
+                 FOR UPDATE",
             )
             .bind(user_id)
             .fetch_optional(&mut **transaction)
@@ -1003,54 +2245,140 @@ mod postgres {
             })
         }
 
-        async fn resolve_row(
+        fn profile_provider_config(
+            protocol: AiProviderProtocol,
+            transport: AiProviderTransport,
+            model: String,
+            base_url: String,
+            timeout_ms: u64,
+        ) -> Result<ProviderConfig, AiProviderStoreError> {
+            if protocol != AiProviderProtocol::OpenaiChatCompletions {
+                return Err(AiProviderStoreError::UnsupportedProtocol);
+            }
+            let mut config = match transport {
+                AiProviderTransport::OpenAiCompatible => {
+                    ProviderConfig::openai_compatible(SERVER_PROVIDER_ID, model, base_url)
+                }
+                AiProviderTransport::LocalHttp => {
+                    ProviderConfig::local_http(SERVER_PROVIDER_ID, model, base_url)
+                }
+            };
+            config.timeout_ms = timeout_ms;
+            Ok(config)
+        }
+
+        async fn resolve_profile(
             &self,
             user_id: Uuid,
-            lab_id: Uuid,
-            row: &sqlx::postgres::PgRow,
-            vision: bool,
+            binding: AiModelProfileBinding,
+            requires_vision: bool,
         ) -> Result<ResolvedAiProvider, AiProviderStoreError> {
+            if binding.profile_id.is_nil() || binding.profile_version <= 0 {
+                return Err(AiProviderStoreError::InvalidSettings);
+            }
+            let lab_id = self.active_user_lab_from_pool(user_id).await?;
             if !self.lab_enabled(lab_id).await? {
                 return Err(AiProviderStoreError::LabDisabled);
             }
-            let enabled: bool = row
-                .try_get("enabled")
-                .map_err(|_| AiProviderStoreError::Storage)?;
+            let enabled: bool =
+                sqlx::query_scalar("SELECT enabled FROM ai_provider_settings WHERE user_id = $1")
+                    .bind(user_id)
+                    .fetch_optional(self.postgres.pool())
+                    .await
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    .ok_or(AiProviderStoreError::MissingCredential)?;
             if !enabled {
                 return Err(AiProviderStoreError::Disabled);
             }
-            let preset_id: String = row
-                .try_get("provider_preset_id")
-                .map_err(|_| AiProviderStoreError::Storage)?;
-            validate_preset_id(&preset_id)?;
-            let mut config = decode_config(row)?;
-            if vision {
-                let supports_vision: bool = row
-                    .try_get("supports_vision")
-                    .map_err(|_| AiProviderStoreError::Storage)?;
-                let vision_model: Option<String> = row
-                    .try_get("vision_model")
-                    .map_err(|_| AiProviderStoreError::Storage)?;
-                if !supports_vision {
-                    return Err(AiProviderStoreError::Disabled);
-                }
-                config.model = vision_model.ok_or(AiProviderStoreError::InvalidSettings)?;
+
+            let row = sqlx::query(
+                "SELECT v.protocol, v.transport, v.base_url,
+                        v.normalized_base_url, v.model_id, v.supports_vision,
+                        v.context_window_tokens, v.max_input_tokens,
+                        v.max_output_tokens, v.history_token_budget,
+                        v.history_turns, v.temperature, v.timeout_ms,
+                        s.key_version, s.nonce, s.ciphertext
+                 FROM ai_model_profiles p
+                 JOIN ai_model_profile_versions v
+                   ON v.profile_id = p.id AND v.version = $2
+                 LEFT JOIN ai_model_profile_secrets s
+                   ON s.profile_id = p.id AND s.profile_version = v.version
+                 WHERE p.id = $1
+                   AND p.user_id = $3
+                   AND p.lab_id = $4
+                   AND p.archived_at IS NULL
+                   AND p.deleted_at IS NULL",
+            )
+            .bind(binding.profile_id)
+            .bind(binding.profile_version)
+            .bind(user_id)
+            .bind(lab_id)
+            .fetch_optional(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            .ok_or(AiProviderStoreError::ProviderNotSelected)?;
+            let protocol = Self::protocol_from_db(
+                row.try_get::<String, _>("protocol")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    .as_str(),
+            )?;
+            if protocol != AiProviderProtocol::OpenaiChatCompletions {
+                return Err(AiProviderStoreError::UnsupportedProtocol);
             }
-            self.validate_endpoint_for_lab(lab_id, &config).await?;
+            let transport = Self::transport_from_db(
+                row.try_get::<String, _>("transport")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    .as_str(),
+            )?;
+            let supports_vision: bool = row
+                .try_get("supports_vision")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            if requires_vision && !supports_vision {
+                return Err(AiProviderStoreError::Disabled);
+            }
+            let runtime = runtime_from_row(&row)?;
+            let base_url: String = row
+                .try_get("base_url")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let normalized_base_url: String = row
+                .try_get("normalized_base_url")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            if normalized_base_url != normalized_url(&base_url) {
+                return Err(AiProviderStoreError::Storage);
+            }
+            let model: String = row
+                .try_get("model_id")
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            let config = Self::profile_provider_config(
+                protocol,
+                transport,
+                model,
+                base_url,
+                runtime.timeout_ms,
+            )?;
+            self.validate_endpoint_for_lab(lab_id, protocol, &config)
+                .await?;
             let provider = BuiltinProvider::from_config(config.clone())
                 .map_err(|_| AiProviderStoreError::InvalidSettings)?;
             let key_version: Option<i32> = row
-                .try_get("secret_key_version")
+                .try_get("key_version")
                 .map_err(|_| AiProviderStoreError::Storage)?;
             let nonce: Option<Vec<u8>> = row
-                .try_get("secret_nonce")
+                .try_get("nonce")
                 .map_err(|_| AiProviderStoreError::Storage)?;
             let ciphertext: Option<Vec<u8>> = row
-                .try_get("secret_ciphertext")
+                .try_get("ciphertext")
                 .map_err(|_| AiProviderStoreError::Storage)?;
             let api_key = match (key_version, nonce, ciphertext) {
                 (Some(version), Some(nonce), Some(ciphertext)) => {
-                    Some(self.decrypt(user_id, version, &nonce, &ciphertext)?)
+                    Some(self.decrypt_profile_secret(
+                        user_id,
+                        binding.profile_id,
+                        binding.profile_version,
+                        version,
+                        &nonce,
+                        &ciphertext,
+                    )?)
                 }
                 (None, None, None) => None,
                 _ => return Err(AiProviderStoreError::Encryption),
@@ -1061,7 +2389,8 @@ mod postgres {
             Ok(ResolvedAiProvider {
                 provider,
                 api_key,
-                runtime: runtime_from_row(row)?,
+                runtime,
+                model_profile: binding,
             })
         }
     }
@@ -1085,15 +2414,19 @@ mod postgres {
             let runtime = input.runtime()?;
             let provider_preset_id = input.provider_preset_id.trim().to_owned();
             validate_preset_id(&provider_preset_id)?;
-            let vision_model = input
-                .vision_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned);
-            if input.supports_vision && vision_model.is_none() {
-                return Err(AiProviderStoreError::InvalidSettings);
-            }
+            let vision_model = if input.supports_vision {
+                Some(
+                    input
+                        .vision_model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or(AiProviderStoreError::InvalidSettings)?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
             if let Some(model) = vision_model.as_ref() {
                 let mut vision_config = config.clone();
                 vision_config.model = model.clone();
@@ -1109,12 +2442,17 @@ mod postgres {
                 .await
                 .map_err(|_| AiProviderStoreError::Storage)?;
             let lab_id = Self::active_user_lab(&mut transaction, user_id).await?;
-            self.validate_endpoint_for_lab(lab_id, &config).await?;
+            self.validate_endpoint_for_lab(
+                lab_id,
+                AiProviderProtocol::OpenaiChatCompletions,
+                &config,
+            )
+            .await?;
             let current = Self::locked_row(&mut transaction, user_id).await?;
             let before = settings_audit_state(current.as_ref())?;
             let identity_matches = current
                 .as_ref()
-                .map(|row| credential_identity_matches(row, &config, &provider_preset_id))
+                .map(|row| credential_identity_matches(row, &config))
                 .transpose()?
                 .unwrap_or(false);
             let credential_action = match (input.api_key.is_some(), identity_matches) {
@@ -1144,6 +2482,56 @@ mod postgres {
                 },
                 None => (None, None, None),
             };
+            Self::materialize_and_append_default_profile_versions(
+                &mut transaction,
+                user_id,
+                lab_id,
+                &config,
+                runtime,
+                vision_model.as_deref(),
+                audit,
+            )
+            .await?;
+            match input.api_key.as_deref() {
+                Some(secret) => {
+                    self.replace_default_profile_secrets(
+                        &mut transaction,
+                        user_id,
+                        lab_id,
+                        secret,
+                        audit,
+                    )
+                    .await?;
+                }
+                None if identity_matches => {
+                    let legacy_secret = match (key_version, nonce.as_deref(), ciphertext.as_deref())
+                    {
+                        (Some(version), Some(nonce), Some(ciphertext)) => {
+                            Some(self.decrypt(user_id, version, nonce, ciphertext)?)
+                        }
+                        (None, None, None) => None,
+                        _ => return Err(AiProviderStoreError::Encryption),
+                    };
+                    self.preserve_default_profile_secrets(
+                        &mut transaction,
+                        user_id,
+                        lab_id,
+                        legacy_secret.as_ref(),
+                        audit,
+                    )
+                    .await?;
+                }
+                None => {
+                    Self::clear_current_default_profile_secrets(
+                        &mut transaction,
+                        user_id,
+                        lab_id,
+                        audit,
+                        "AI model profile credential omitted after provider address change",
+                    )
+                    .await?;
+                }
+            }
             let row = sqlx::query("INSERT INTO ai_provider_settings (user_id, enabled, provider_config, provider_preset_id, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, context_window_tokens, max_input_tokens, max_output_tokens, history_token_budget, history_turns, temperature, timeout_ms, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,now(),now(),1) ON CONFLICT (user_id) DO UPDATE SET enabled = EXCLUDED.enabled, provider_config = EXCLUDED.provider_config, provider_preset_id = EXCLUDED.provider_preset_id, secret_key_version = EXCLUDED.secret_key_version, secret_nonce = EXCLUDED.secret_nonce, secret_ciphertext = EXCLUDED.secret_ciphertext, supports_vision = EXCLUDED.supports_vision, vision_model = EXCLUDED.vision_model, context_window_tokens = EXCLUDED.context_window_tokens, max_input_tokens = EXCLUDED.max_input_tokens, max_output_tokens = EXCLUDED.max_output_tokens, history_token_budget = EXCLUDED.history_token_budget, history_turns = EXCLUDED.history_turns, temperature = EXCLUDED.temperature, timeout_ms = EXCLUDED.timeout_ms, updated_at = now(), revision = ai_provider_settings.revision + 1 RETURNING enabled, provider_config, provider_preset_id, secret_key_version, secret_nonce, secret_ciphertext, supports_vision, vision_model, context_window_tokens, max_input_tokens, max_output_tokens, history_token_budget, history_turns, temperature, timeout_ms, revision")
                 .bind(user_id)
                 .bind(input.enabled)
@@ -1220,6 +2608,8 @@ mod postgres {
                     settings_audit_state(None)?,
                 )
             };
+            Self::clear_all_compatibility_profile_secrets(&mut transaction, user_id, lab_id, audit)
+                .await?;
             write_settings_audit(
                 &mut transaction,
                 lab_id,
@@ -1239,24 +2629,24 @@ mod postgres {
         }
 
         async fn resolve(&self, user_id: Uuid) -> Result<ResolvedAiProvider, AiProviderStoreError> {
-            let lab_id = self.active_user_lab_from_pool(user_id).await?;
-            let row = self
-                .row(user_id)
-                .await?
-                .ok_or(AiProviderStoreError::MissingCredential)?;
-            self.resolve_row(user_id, lab_id, &row, false).await
+            let binding = self.selected_profile_binding(user_id, false).await?;
+            self.resolve_profile(user_id, binding, false).await
+        }
+
+        async fn resolve_for_profile(
+            &self,
+            user_id: Uuid,
+            binding: AiModelProfileBinding,
+        ) -> Result<ResolvedAiProvider, AiProviderStoreError> {
+            self.resolve_profile(user_id, binding, false).await
         }
 
         async fn resolve_vision(
             &self,
             user_id: Uuid,
         ) -> Result<ResolvedAiProvider, AiProviderStoreError> {
-            let lab_id = self.active_user_lab_from_pool(user_id).await?;
-            let row = self
-                .row(user_id)
-                .await?
-                .ok_or(AiProviderStoreError::MissingCredential)?;
-            self.resolve_row(user_id, lab_id, &row, true).await
+            let binding = self.selected_profile_binding(user_id, true).await?;
+            self.resolve_profile(user_id, binding, true).await
         }
 
         async fn diagnostics(
@@ -1432,7 +2822,7 @@ mod postgres {
             lab_id: Uuid,
         ) -> Result<Vec<AiProviderPresetView>, AiProviderStoreError> {
             let rows = sqlx::query(
-                "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE lab_id = $1 ORDER BY enabled DESC, provider_kind, label, base_url",
+                "SELECT id, provider_kind, protocol, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE lab_id = $1 ORDER BY enabled DESC, protocol, label, base_url",
             )
             .bind(lab_id)
             .fetch_all(self.postgres.pool())
@@ -1462,7 +2852,7 @@ mod postgres {
             lab_id: Uuid,
         ) -> Result<Vec<AiProviderEndpointView>, AiProviderStoreError> {
             let rows = sqlx::query(
-                "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE lab_id = $1 ORDER BY enabled DESC, provider_kind, label, base_url",
+                "SELECT id, provider_kind, protocol, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE lab_id = $1 ORDER BY enabled DESC, protocol, label, base_url",
             )
             .bind(lab_id)
             .fetch_all(self.postgres.pool())
@@ -1494,7 +2884,8 @@ mod postgres {
             let label = Self::validated_endpoint_label(&input.label)?;
             let config = Self::endpoint_config(&input)?;
             let normalized = normalized_url(&config.base_url);
-            if config.kind == ProviderKind::OpenAiCompatible
+            if input.protocol == AiProviderProtocol::OpenaiChatCompletions
+                && config.kind == ProviderKind::OpenAiCompatible
                 && [
                     OFFICIAL_DEEPSEEK_BASE_URL,
                     OFFICIAL_GLM_BASE_URL,
@@ -1516,9 +2907,10 @@ mod postgres {
                 return Err(AiProviderStoreError::Storage);
             }
             let kind = Self::provider_kind_name(config.kind);
+            let protocol = Self::protocol_name(input.protocol);
             let before_row = match endpoint_id {
                 Some(id) => sqlx::query(
-                    "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE id = $1 AND lab_id = $2 AND builtin = FALSE FOR UPDATE",
+                    "SELECT id, provider_kind, protocol, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE id = $1 AND lab_id = $2 AND builtin = FALSE FOR UPDATE",
                 )
                 .bind(id)
                 .bind(lab_id)
@@ -1526,10 +2918,10 @@ mod postgres {
                 .await
                 .map_err(|_| AiProviderStoreError::Storage)?,
                 None => sqlx::query(
-                    "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE lab_id = $1 AND provider_kind = $2 AND normalized_base_url = $3 FOR UPDATE",
+                    "SELECT id, provider_kind, protocol, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE lab_id = $1 AND protocol = $2 AND normalized_base_url = $3 FOR UPDATE",
                 )
                 .bind(lab_id)
-                .bind(kind)
+                .bind(protocol)
                 .bind(&normalized)
                 .fetch_optional(&mut *transaction)
                 .await
@@ -1552,9 +2944,10 @@ mod postgres {
                 .unwrap_or_else(Uuid::new_v4);
             let row = if endpoint_id.is_some() {
                 sqlx::query(
-                    "UPDATE ai_provider_endpoints SET provider_kind = $1, label = $2, base_url = $3, normalized_base_url = $4, enabled = $5, updated_by = $6, updated_at = now(), revision = revision + 1 WHERE id = $7 AND lab_id = $8 AND builtin = FALSE RETURNING id, provider_kind, label, base_url, enabled, builtin, revision",
+                    "UPDATE ai_provider_endpoints SET provider_kind = $1, protocol = $2, label = $3, base_url = $4, normalized_base_url = $5, enabled = $6, updated_by = $7, updated_at = now(), revision = revision + 1 WHERE id = $8 AND lab_id = $9 AND builtin = FALSE RETURNING id, provider_kind, protocol, label, base_url, enabled, builtin, revision",
                 )
                 .bind(kind)
+                .bind(protocol)
                 .bind(&label)
                 .bind(&config.base_url)
                 .bind(&normalized)
@@ -1567,11 +2960,12 @@ mod postgres {
                 .map_err(|_| AiProviderStoreError::Storage)?
             } else {
                 sqlx::query(
-                    "INSERT INTO ai_provider_endpoints (id, lab_id, provider_kind, label, base_url, normalized_base_url, enabled, builtin, created_by, updated_by, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE,$8,$8,now(),now(),1) ON CONFLICT (lab_id, provider_kind, normalized_base_url) DO UPDATE SET label = EXCLUDED.label, base_url = EXCLUDED.base_url, enabled = EXCLUDED.enabled, updated_by = EXCLUDED.updated_by, updated_at = now(), revision = ai_provider_endpoints.revision + 1 RETURNING id, provider_kind, label, base_url, enabled, builtin, revision",
+                    "INSERT INTO ai_provider_endpoints (id, lab_id, provider_kind, protocol, label, base_url, normalized_base_url, enabled, builtin, created_by, updated_by, created_at, updated_at, revision) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,$9,$9,now(),now(),1) ON CONFLICT (lab_id, protocol, normalized_base_url) DO UPDATE SET provider_kind = EXCLUDED.provider_kind, label = EXCLUDED.label, base_url = EXCLUDED.base_url, enabled = EXCLUDED.enabled, updated_by = EXCLUDED.updated_by, updated_at = now(), revision = ai_provider_endpoints.revision + 1 RETURNING id, provider_kind, protocol, label, base_url, enabled, builtin, revision",
                 )
                 .bind(id)
                 .bind(lab_id)
                 .bind(kind)
+                .bind(protocol)
                 .bind(&label)
                 .bind(&config.base_url)
                 .bind(&normalized)
@@ -1623,7 +3017,7 @@ mod postgres {
                 return Err(AiProviderStoreError::Storage);
             }
             let current = sqlx::query(
-                "SELECT id, provider_kind, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE id = $1 AND lab_id = $2 AND builtin = FALSE FOR UPDATE",
+                "SELECT id, provider_kind, protocol, label, base_url, enabled, builtin, revision FROM ai_provider_endpoints WHERE id = $1 AND lab_id = $2 AND builtin = FALSE FOR UPDATE",
             )
             .bind(endpoint_id)
             .bind(lab_id)
@@ -1633,7 +3027,7 @@ mod postgres {
             .ok_or(AiProviderStoreError::InvalidSettings)?;
             let before_view = Self::endpoint_view(&current)?;
             let row = sqlx::query(
-                "UPDATE ai_provider_endpoints SET enabled = FALSE, updated_by = $1, updated_at = now(), revision = revision + 1 WHERE id = $2 AND lab_id = $3 AND builtin = FALSE RETURNING id, provider_kind, label, base_url, enabled, builtin, revision",
+                "UPDATE ai_provider_endpoints SET enabled = FALSE, updated_by = $1, updated_at = now(), revision = revision + 1 WHERE id = $2 AND lab_id = $3 AND builtin = FALSE RETURNING id, provider_kind, protocol, label, base_url, enabled, builtin, revision",
             )
             .bind(actor_user_id)
             .bind(endpoint_id)
@@ -1745,19 +3139,10 @@ mod postgres {
     fn credential_identity_matches(
         row: &sqlx::postgres::PgRow,
         config: &ProviderConfig,
-        provider_preset_id: &str,
     ) -> Result<bool, AiProviderStoreError> {
         let current = decode_config(row)?;
-        let current_preset: String = row
-            .try_get("provider_preset_id")
-            .map_err(|_| AiProviderStoreError::Storage)?;
         Ok(current.kind == config.kind
-            && normalized_url(&current.base_url) == normalized_url(&config.base_url)
-            && current_preset == provider_preset_id)
-    }
-
-    fn aad(user_id: Uuid, version: i32) -> String {
-        format!("MuriArc/ai-provider-secret/v{version}/{user_id}")
+            && normalized_url(&current.base_url) == normalized_url(&config.base_url))
     }
 
     fn validate_settings_audit(
@@ -1838,6 +3223,195 @@ mod postgres {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn write_profile_secret_audit(
+        transaction: &mut Transaction<'_, Postgres>,
+        lab_id: Uuid,
+        profile_id: Uuid,
+        profile_version: i64,
+        action: &'static str,
+        actor_type: &'static str,
+        actor_user_id: Option<Uuid>,
+        actor_display_name: &str,
+        source: &'static str,
+        request_id: Option<&str>,
+        before_present: bool,
+        after_present: bool,
+        reason: &'static str,
+    ) -> Result<(), AiProviderStoreError> {
+        let before = json!({
+            "profile_version": profile_version,
+            "credential_present": before_present,
+            "secret_material_redacted": true,
+        });
+        let after = json!({
+            "profile_version": profile_version,
+            "credential_present": after_present,
+            "secret_material_redacted": true,
+            "aad_binding": "user_profile_version_master_key_version",
+        });
+        sqlx::query(
+            "INSERT INTO audit_entries (
+                id, lab_id, project_id, entity_type, entity_id, action,
+                actor_type, actor_user_id, actor_display_name, source,
+                request_id, reason, before_json, after_json, occurred_at
+             ) VALUES (
+                $1, $2, NULL, 'ai_model_profile', $3, $4,
+                $5, $6, $7, $8, $9, $10, $11, $12, now()
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(lab_id)
+        .bind(profile_id)
+        .bind(action)
+        .bind(actor_type)
+        .bind(actor_user_id)
+        .bind(actor_display_name)
+        .bind(source)
+        .bind(request_id)
+        .bind(reason)
+        .bind(before)
+        .bind(after)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| AiProviderStoreError::Storage)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_human_profile_secret_audit(
+        transaction: &mut Transaction<'_, Postgres>,
+        lab_id: Uuid,
+        profile_id: Uuid,
+        profile_version: i64,
+        action: &'static str,
+        audit: &AuditContext,
+        before_present: bool,
+        after_present: bool,
+        reason: &'static str,
+    ) -> Result<(), AiProviderStoreError> {
+        write_profile_secret_audit(
+            transaction,
+            lab_id,
+            profile_id,
+            profile_version,
+            action,
+            "human",
+            audit.actor.user_id,
+            &audit.actor.display_name,
+            write_source_name(audit.source),
+            audit.request_id.as_deref(),
+            before_present,
+            after_present,
+            reason,
+        )
+        .await
+    }
+
+    async fn write_profile_configuration_audit(
+        transaction: &mut Transaction<'_, Postgres>,
+        lab_id: Uuid,
+        profile_id: Uuid,
+        previous_version: i64,
+        next_version: i64,
+        supports_vision: bool,
+        audit: &AuditContext,
+    ) -> Result<(), AiProviderStoreError> {
+        let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
+        let before = json!({
+            "profile_version": previous_version,
+            "configuration_present": previous_version > 0,
+        });
+        let after = json!({
+            "profile_version": next_version,
+            "protocol": "openai_chat_completions",
+            "base_url_present": true,
+            "model_id_present": true,
+            "supports_vision": supports_vision,
+            "configuration_secret_material_redacted": true,
+        });
+        let (action, reason) = if previous_version == 0 {
+            ("create", "AI model profile configuration initialized")
+        } else {
+            ("update", "AI model profile configuration version appended")
+        };
+        sqlx::query(
+            "INSERT INTO audit_entries (
+                id, lab_id, project_id, entity_type, entity_id, action,
+                actor_type, actor_user_id, actor_display_name, source,
+                 request_id, reason, before_json, after_json, occurred_at
+             ) VALUES (
+                $1, $2, NULL, 'ai_model_profile', $3, $4,
+                'human', $5, $6, $7, $8, $9, $10, $11, now()
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(lab_id)
+        .bind(profile_id)
+        .bind(action)
+        .bind(actor_user_id)
+        .bind(&audit.actor.display_name)
+        .bind(write_source_name(audit.source))
+        .bind(&audit.request_id)
+        .bind(reason)
+        .bind(before)
+        .bind(after)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| AiProviderStoreError::Storage)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_model_defaults_audit(
+        transaction: &mut Transaction<'_, Postgres>,
+        lab_id: Uuid,
+        user_id: Uuid,
+        old_conversation_profile_id: Option<Uuid>,
+        old_vision_profile_id: Option<Uuid>,
+        conversation_profile_id: Uuid,
+        vision_profile_id: Option<Uuid>,
+        created: bool,
+        audit: &AuditContext,
+    ) -> Result<(), AiProviderStoreError> {
+        let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
+        let before = json!({
+            "configured": !created,
+            "default_conversation_profile_id": old_conversation_profile_id,
+            "default_vision_profile_id": old_vision_profile_id,
+        });
+        let after = json!({
+            "configured": true,
+            "default_conversation_profile_id": conversation_profile_id,
+            "default_vision_profile_id": vision_profile_id,
+        });
+        sqlx::query(
+            "INSERT INTO audit_entries (
+                id, lab_id, project_id, entity_type, entity_id, action,
+                actor_type, actor_user_id, actor_display_name, source,
+                request_id, reason, before_json, after_json, occurred_at
+             ) VALUES (
+                $1, $2, NULL, 'ai_user_model_defaults', $3, $4,
+                'human', $5, $6, $7, $8, $9, $10, $11, now()
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(lab_id)
+        .bind(user_id)
+        .bind(if created { "create" } else { "update" })
+        .bind(actor_user_id)
+        .bind(&audit.actor.display_name)
+        .bind(write_source_name(audit.source))
+        .bind(&audit.request_id)
+        .bind("AI model profile defaults initialized")
+        .bind(before)
+        .bind(after)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| AiProviderStoreError::Storage)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn write_settings_audit(
         transaction: &mut Transaction<'_, Postgres>,
         lab_id: Uuid,
@@ -1892,7 +3466,10 @@ mod postgres {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use muriarc_core::{Actor, AuditFilter, EntityType, Lab, MuriArcStore, User};
+        use muriarc_core::{
+            Actor, AiConversation, AiOperationStore, AuditFilter, EntityType, Lab, MuriArcStore,
+            RecordMeta, User,
+        };
 
         fn master() -> AiMasterKey {
             AiMasterKey {
@@ -1902,7 +3479,7 @@ mod postgres {
         }
 
         #[tokio::test]
-        async fn ciphertext_is_user_bound_and_secret_is_redacted() {
+        async fn legacy_ciphertext_is_user_bound_and_secret_is_redacted() {
             let store = PostgresAiProviderStore::new(
                 PostgresStore::from_pool(
                     sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap(),
@@ -1918,6 +3495,117 @@ mod postgres {
             assert!(
                 store
                     .decrypt(Uuid::new_v4(), 1, &nonce, &ciphertext)
+                    .is_err()
+            );
+
+            let profile_id = Uuid::new_v4();
+            let (profile_key_version, profile_nonce, profile_ciphertext) = store
+                .reencrypt_legacy_secret_for_profile(user, profile_id, 1, 1, &nonce, &ciphertext)
+                .unwrap();
+            assert_eq!(
+                store
+                    .decrypt_profile_secret(
+                        user,
+                        profile_id,
+                        1,
+                        profile_key_version,
+                        &profile_nonce,
+                        &profile_ciphertext,
+                    )
+                    .unwrap()
+                    .as_str(),
+                "super-secret-key"
+            );
+            assert_eq!(
+                store
+                    .decrypt(user, 1, &nonce, &ciphertext)
+                    .unwrap()
+                    .as_str(),
+                "super-secret-key"
+            );
+        }
+
+        #[tokio::test]
+        async fn profile_ciphertext_is_bound_to_user_profile_version_and_master_key_version() {
+            let store = PostgresAiProviderStore::new(
+                PostgresStore::from_pool(
+                    sqlx::PgPool::connect_lazy("postgres://localhost/unused").unwrap(),
+                ),
+                master(),
+            );
+            let user_id = Uuid::new_v4();
+            let profile_id = Uuid::new_v4();
+            let profile_version = 7;
+            let (key_version, nonce, ciphertext) = store
+                .encrypt_profile_secret(user_id, profile_id, profile_version, "profile-secret-key")
+                .unwrap();
+
+            assert_eq!(key_version, 1);
+            assert!(!String::from_utf8_lossy(&ciphertext).contains("profile-secret-key"));
+            let decrypted = store
+                .decrypt_profile_secret(
+                    user_id,
+                    profile_id,
+                    profile_version,
+                    key_version,
+                    &nonce,
+                    &ciphertext,
+                )
+                .unwrap();
+            assert_eq!(decrypted.as_str(), "profile-secret-key");
+            assert!(!format!("{decrypted:?}").contains("profile-secret-key"));
+
+            assert!(
+                store
+                    .decrypt_profile_secret(
+                        Uuid::new_v4(),
+                        profile_id,
+                        profile_version,
+                        key_version,
+                        &nonce,
+                        &ciphertext,
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .decrypt_profile_secret(
+                        user_id,
+                        Uuid::new_v4(),
+                        profile_version,
+                        key_version,
+                        &nonce,
+                        &ciphertext,
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .decrypt_profile_secret(
+                        user_id,
+                        profile_id,
+                        profile_version + 1,
+                        key_version,
+                        &nonce,
+                        &ciphertext,
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .decrypt_profile_secret(
+                        user_id,
+                        profile_id,
+                        profile_version,
+                        key_version + 1,
+                        &nonce,
+                        &ciphertext,
+                    )
+                    .is_err()
+            );
+            assert!(
+                store
+                    .decrypt(user_id, key_version, &nonce, &ciphertext)
                     .is_err()
             );
         }
@@ -1954,6 +3642,81 @@ mod postgres {
                 request_id: Some(request_id.to_owned()),
                 reason: Some("test personal AI settings isolation".to_owned()),
             }
+        }
+
+        async fn insert_test_profile_defaults(
+            postgres: &PostgresStore,
+            user: &User,
+            with_vision: bool,
+        ) -> (Uuid, Option<Uuid>) {
+            let conversation_profile_id = Uuid::new_v4();
+            let vision_profile_id = with_vision.then(Uuid::new_v4);
+            let mut transaction = postgres.pool().begin().await.unwrap();
+            for (profile_id, name, model, supports_vision) in [
+                (
+                    conversation_profile_id,
+                    "Test conversation model",
+                    "test-conversation-model",
+                    false,
+                ),
+                (
+                    vision_profile_id.unwrap_or(Uuid::nil()),
+                    "Test vision model",
+                    "test-vision-model",
+                    true,
+                ),
+            ] {
+                if profile_id.is_nil() {
+                    continue;
+                }
+                sqlx::query(
+                    "INSERT INTO ai_model_profiles (
+                        id, lab_id, user_id, name, current_version,
+                        created_at, updated_at, revision
+                     ) VALUES ($1, $2, $3, $4, 1, now(), now(), 1)",
+                )
+                .bind(profile_id)
+                .bind(user.lab_id)
+                .bind(user.id)
+                .bind(name)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO ai_model_profile_versions (
+                        profile_id, version, protocol, transport, base_url,
+                        normalized_base_url, model_id, supports_vision,
+                        context_window_tokens, max_input_tokens, max_output_tokens,
+                        history_token_budget, history_turns, temperature,
+                        timeout_ms, created_at
+                     ) VALUES (
+                        $1, 1, 'openai_chat_completions',
+                        'open_ai_compatible',
+                        'https://api.deepseek.com', 'https://api.deepseek.com',
+                        $2, $3, 131072, 65536, 4096, 32768, 20, 0, 120000, now()
+                     )",
+                )
+                .bind(profile_id)
+                .bind(model)
+                .bind(supports_vision)
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            }
+            sqlx::query(
+                "INSERT INTO ai_user_model_defaults (
+                    user_id, default_conversation_profile_id,
+                    default_vision_profile_id, created_at, updated_at, revision
+                 ) VALUES ($1, $2, $3, now(), now(), 1)",
+            )
+            .bind(user.id)
+            .bind(conversation_profile_id)
+            .bind(vision_profile_id)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+            transaction.commit().await.unwrap();
+            (conversation_profile_id, vision_profile_id)
         }
 
         #[tokio::test]
@@ -2030,6 +3793,7 @@ mod postgres {
                 ),
             ];
             for (user, preset, model, base_url, api_key) in cases {
+                insert_test_profile_defaults(&postgres, user, false).await;
                 let saved = store
                     .save(
                         user.id,
@@ -2142,11 +3906,691 @@ mod postgres {
             );
         }
 
+        #[tokio::test]
+        async fn new_user_save_materializes_defaults_versions_secrets_and_turn_binding() {
+            use muriarc_ai::AiProvider;
+
+            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+                return;
+            };
+            assert!(
+                database_url.contains("muriarc_test"),
+                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
+            );
+            let postgres = PostgresStore::connect(&database_url).await.unwrap();
+            postgres.migrate().await.unwrap();
+            let now = Utc::now();
+            let bootstrap = AuditContext::system(WriteSource::Migration);
+            let lab = Lab::new(format!("AI first-save lab {}", Uuid::new_v4()), now).unwrap();
+            postgres.create_lab(&lab, &bootstrap).await.unwrap();
+            let user = User::new(
+                lab.id,
+                format!("ai-first-save-{}@example.test", Uuid::new_v4()),
+                "AI first save researcher",
+                now,
+            )
+            .unwrap();
+            postgres.create_user(&user, &bootstrap).await.unwrap();
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
+            let mut first_input = settings_input(
+                "deepseek",
+                "first-save-model-v1",
+                OFFICIAL_DEEPSEEK_BASE_URL,
+                Some("first-save-profile-key"),
+            );
+            first_input.supports_vision = true;
+            first_input.vision_model = Some("first-save-vision-v1".to_owned());
+            store
+                .save(user.id, first_input, &user_audit(&user, "first-save-v1"))
+                .await
+                .unwrap();
+
+            let (conversation_profile_id, vision_profile_id): (Uuid, Option<Uuid>) =
+                sqlx::query_as(
+                    "SELECT default_conversation_profile_id,
+                            default_vision_profile_id
+                     FROM ai_user_model_defaults
+                     WHERE user_id = $1 AND deleted_at IS NULL",
+                )
+                .bind(user.id)
+                .fetch_one(postgres.pool())
+                .await
+                .unwrap();
+            let vision_profile_id = vision_profile_id.unwrap();
+            assert_ne!(conversation_profile_id, vision_profile_id);
+            let first = store.resolve(user.id).await.unwrap();
+            let first_conversation_binding = first.model_profile;
+            assert_eq!(first.model_profile.profile_id, conversation_profile_id);
+            assert_eq!(first.model_profile.profile_version, 1);
+            assert_eq!(first.provider.model(), "first-save-model-v1");
+            assert_eq!(
+                first.api_key.as_ref().unwrap().as_str(),
+                "first-save-profile-key"
+            );
+            let vision = store.resolve_vision(user.id).await.unwrap();
+            let first_vision_binding = vision.model_profile;
+            assert_eq!(vision.model_profile.profile_id, vision_profile_id);
+            assert_eq!(vision.model_profile.profile_version, 1);
+            assert_eq!(vision.provider.model(), "first-save-vision-v1");
+            let secret_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM ai_model_profile_secrets
+                 WHERE profile_id = ANY($1)",
+            )
+            .bind(vec![conversation_profile_id, vision_profile_id])
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(secret_count, 2);
+
+            let turn = AiConversation {
+                id: Uuid::new_v4(),
+                lab_id: lab.id,
+                project_id: None,
+                user_id: user.id,
+                title: "First profile-bound turn".to_owned(),
+                model_profile: Some(first.model_profile),
+                legacy_read_only: false,
+                meta: RecordMeta::new(Utc::now()),
+            };
+            postgres
+                .create_ai_conversation(
+                    &turn,
+                    &user_audit(&user, "create-first-profile-bound-turn"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                postgres
+                    .get_ai_conversation(turn.id)
+                    .await
+                    .unwrap()
+                    .model_profile,
+                Some(first.model_profile)
+            );
+
+            let mut repeated = settings_input(
+                "deepseek",
+                "first-save-model-v1",
+                OFFICIAL_DEEPSEEK_BASE_URL,
+                None,
+            );
+            repeated.supports_vision = true;
+            repeated.vision_model = Some("first-save-vision-v1".to_owned());
+            store
+                .save(user.id, repeated, &user_audit(&user, "repeat-first-save"))
+                .await
+                .unwrap();
+            let version_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM ai_model_profile_versions
+                 WHERE profile_id = $1",
+            )
+            .bind(conversation_profile_id)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(version_count, 1);
+
+            let mut model_update = settings_input(
+                "deepseek",
+                "first-save-model-v2",
+                OFFICIAL_DEEPSEEK_BASE_URL,
+                None,
+            );
+            model_update.supports_vision = true;
+            model_update.vision_model = Some("first-save-vision-v1".to_owned());
+            store
+                .save(
+                    user.id,
+                    model_update,
+                    &user_audit(&user, "first-save-model-v2"),
+                )
+                .await
+                .unwrap();
+            let current = store.resolve(user.id).await.unwrap();
+            assert_eq!(current.model_profile.profile_version, 2);
+            assert_eq!(current.provider.model(), "first-save-model-v2");
+            assert_eq!(
+                store
+                    .resolve_for_profile(user.id, first_conversation_binding)
+                    .await
+                    .unwrap()
+                    .api_key
+                    .unwrap()
+                    .as_str(),
+                "first-save-profile-key"
+            );
+
+            let mut provider_change =
+                settings_input("openai", "gpt-test", OFFICIAL_OPENAI_BASE_URL, None);
+            provider_change.supports_vision = true;
+            provider_change.vision_model = Some("gpt-vision-test".to_owned());
+            store
+                .save(
+                    user.id,
+                    provider_change,
+                    &user_audit(&user, "first-save-provider-change"),
+                )
+                .await
+                .unwrap();
+            let secret_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM ai_model_profile_secrets
+                 WHERE profile_id = ANY($1)",
+            )
+            .bind(vec![conversation_profile_id, vision_profile_id])
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(secret_count, 3);
+            assert!(matches!(
+                store.resolve(user.id).await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+            assert!(matches!(
+                store.resolve_vision(user.id).await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+            assert_eq!(
+                store
+                    .resolve_for_profile(user.id, first_conversation_binding)
+                    .await
+                    .unwrap()
+                    .api_key
+                    .unwrap()
+                    .as_str(),
+                "first-save-profile-key"
+            );
+            assert_eq!(
+                store
+                    .resolve_profile(user.id, first_vision_binding, true)
+                    .await
+                    .unwrap()
+                    .api_key
+                    .unwrap()
+                    .as_str(),
+                "first-save-profile-key"
+            );
+
+            let mut provider_change_with_key = settings_input(
+                "openai",
+                "gpt-test",
+                OFFICIAL_OPENAI_BASE_URL,
+                Some("second-provider-key"),
+            );
+            provider_change_with_key.supports_vision = true;
+            provider_change_with_key.vision_model = Some("gpt-vision-test".to_owned());
+            store
+                .save(
+                    user.id,
+                    provider_change_with_key,
+                    &user_audit(&user, "save-second-provider-key"),
+                )
+                .await
+                .unwrap();
+            let second_provider = store.resolve(user.id).await.unwrap();
+            assert_eq!(second_provider.provider.model(), "gpt-test");
+            assert_eq!(
+                second_provider.api_key.unwrap().as_str(),
+                "second-provider-key"
+            );
+            assert_eq!(
+                store
+                    .resolve_for_profile(user.id, first_conversation_binding)
+                    .await
+                    .unwrap()
+                    .api_key
+                    .unwrap()
+                    .as_str(),
+                "first-save-profile-key"
+            );
+
+            let mut disable_vision =
+                settings_input("openai", "gpt-test", OFFICIAL_OPENAI_BASE_URL, None);
+            disable_vision.vision_model = Some("residual-model-must-be-ignored".to_owned());
+            let disabled = store
+                .save(
+                    user.id,
+                    disable_vision,
+                    &user_audit(&user, "disable-default-vision"),
+                )
+                .await
+                .unwrap();
+            assert!(!disabled.supports_vision);
+            assert_eq!(disabled.vision_model, None);
+            let default_vision_profile_id: Option<Uuid> = sqlx::query_scalar(
+                "SELECT default_vision_profile_id
+                 FROM ai_user_model_defaults
+                 WHERE user_id = $1 AND deleted_at IS NULL",
+            )
+            .bind(user.id)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(default_vision_profile_id, None);
+            assert!(matches!(
+                store.resolve_vision(user.id).await,
+                Err(AiProviderStoreError::ProviderNotSelected)
+            ));
+            assert_eq!(
+                store
+                    .resolve_profile(user.id, first_vision_binding, true)
+                    .await
+                    .unwrap()
+                    .api_key
+                    .unwrap()
+                    .as_str(),
+                "first-save-profile-key"
+            );
+
+            let clear_audit = user_audit(&user, "clear-all-profile-secrets");
+            let cleared = store.clear_key(user.id, &clear_audit).await.unwrap();
+            assert!(!cleared.has_key);
+            let secret_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM ai_model_profile_secrets
+                 WHERE profile_id = ANY($1)",
+            )
+            .bind(vec![conversation_profile_id, vision_profile_id])
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(secret_count, 0);
+            assert!(matches!(
+                store
+                    .resolve_for_profile(user.id, first_conversation_binding)
+                    .await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+            assert!(matches!(
+                store
+                    .resolve_profile(user.id, first_vision_binding, true)
+                    .await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+            let secret_delete_audits: Vec<Value> = sqlx::query_scalar(
+                "SELECT after_json
+                 FROM audit_entries
+                 WHERE entity_type = 'ai_model_profile'
+                   AND action = 'delete'
+                   AND request_id = $1
+                 ORDER BY entity_id, occurred_at, id",
+            )
+            .bind("clear-all-profile-secrets")
+            .fetch_all(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(secret_delete_audits.len(), 5);
+            assert!(secret_delete_audits.iter().all(|payload| {
+                payload["profile_version"]
+                    .as_i64()
+                    .is_some_and(|value| value > 0)
+                    && payload["aad_binding"] == "user_profile_version_master_key_version"
+                    && payload["credential_present"] == false
+                    && payload["secret_material_redacted"] == true
+            }));
+        }
+
+        #[tokio::test]
+        async fn https_local_http_transport_round_trips_and_resolves_exactly() {
+            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+                return;
+            };
+            assert!(
+                database_url.contains("muriarc_test"),
+                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
+            );
+            let postgres = PostgresStore::connect(&database_url).await.unwrap();
+            postgres.migrate().await.unwrap();
+            let now = Utc::now();
+            let bootstrap = AuditContext::system(WriteSource::Migration);
+            let lab = Lab::new(
+                format!("AI HTTPS local transport lab {}", Uuid::new_v4()),
+                now,
+            )
+            .unwrap();
+            postgres.create_lab(&lab, &bootstrap).await.unwrap();
+            let user = User::new(
+                lab.id,
+                format!("ai-local-https-{}@example.test", Uuid::new_v4()),
+                "AI HTTPS local transport researcher",
+                now,
+            )
+            .unwrap();
+            postgres.create_user(&user, &bootstrap).await.unwrap();
+
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
+            let base_url = "https://local-gateway.example.test/v1";
+            let audit = user_audit(&user, "save-local-https-transport");
+            let endpoint = store
+                .save_provider_endpoint(
+                    lab.id,
+                    None,
+                    SaveAiProviderEndpointInput {
+                        provider_kind: ProviderKind::LocalHttp,
+                        protocol: AiProviderProtocol::OpenaiChatCompletions,
+                        label: "HTTPS local gateway".to_owned(),
+                        base_url: base_url.to_owned(),
+                        enabled: true,
+                    },
+                    &audit,
+                )
+                .await
+                .unwrap();
+            let mut input = settings_input(&endpoint.id.to_string(), "local-model", base_url, None);
+            input.provider_kind = ProviderKind::LocalHttp;
+            let saved = store.save(user.id, input, &audit).await.unwrap();
+            assert!(!saved.has_key);
+
+            let resolved = store.resolve(user.id).await.unwrap();
+            assert_eq!(resolved.provider.config().kind, ProviderKind::LocalHttp);
+            assert_eq!(resolved.provider.config().base_url, base_url);
+            assert!(resolved.api_key.is_none());
+            let persisted: (String, String) = sqlx::query_as(
+                "SELECT v.transport, v.base_url
+                 FROM ai_model_profiles p
+                 JOIN ai_model_profile_versions v
+                   ON v.profile_id = p.id AND v.version = p.current_version
+                 WHERE p.id = $1",
+            )
+            .bind(resolved.model_profile.profile_id)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(persisted.0, "local_http");
+            assert_eq!(persisted.1, base_url);
+        }
+
+        #[tokio::test]
+        async fn legacy_save_appends_versions_and_old_binding_resolves_original_config() {
+            use muriarc_ai::AiProvider;
+
+            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+                return;
+            };
+            assert!(
+                database_url.contains("muriarc_test"),
+                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
+            );
+            let postgres = PostgresStore::connect(&database_url).await.unwrap();
+            postgres.migrate().await.unwrap();
+            let now = Utc::now();
+            let bootstrap = AuditContext::system(WriteSource::Migration);
+            let lab =
+                Lab::new(format!("AI immutable profile lab {}", Uuid::new_v4()), now).unwrap();
+            postgres.create_lab(&lab, &bootstrap).await.unwrap();
+            let user = User::new(
+                lab.id,
+                format!("ai-immutable-profile-{}@example.test", Uuid::new_v4()),
+                "AI immutable profile researcher",
+                now,
+            )
+            .unwrap();
+            postgres.create_user(&user, &bootstrap).await.unwrap();
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
+            let (profile_id, _) = insert_test_profile_defaults(&postgres, &user, false).await;
+
+            store
+                .save(
+                    user.id,
+                    settings_input(
+                        "deepseek",
+                        "immutable-model-v1",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        Some("immutable-profile-key"),
+                    ),
+                    &user_audit(&user, "save-immutable-v1"),
+                )
+                .await
+                .unwrap();
+            let original = store.resolve(user.id).await.unwrap();
+            let original_binding = original.model_profile;
+            assert_eq!(original_binding.profile_id, profile_id);
+            assert_eq!(original.provider.model(), "immutable-model-v1");
+            assert_eq!(original.runtime.max_output_tokens, 4_096);
+
+            let mut updated = settings_input(
+                "deepseek",
+                "immutable-model-v2",
+                OFFICIAL_DEEPSEEK_BASE_URL,
+                None,
+            );
+            updated.max_output_tokens = 8_192;
+            store
+                .save(user.id, updated, &user_audit(&user, "save-immutable-v2"))
+                .await
+                .unwrap();
+
+            let still_original = store
+                .resolve_for_profile(user.id, original_binding)
+                .await
+                .unwrap();
+            assert_eq!(still_original.model_profile, original_binding);
+            assert_eq!(still_original.provider.model(), "immutable-model-v1");
+            assert_eq!(still_original.runtime.max_output_tokens, 4_096);
+            assert_eq!(
+                still_original.api_key.unwrap().as_str(),
+                "immutable-profile-key"
+            );
+
+            let current = store.resolve(user.id).await.unwrap();
+            assert_eq!(current.model_profile.profile_id, profile_id);
+            assert!(current.model_profile.profile_version > original_binding.profile_version);
+            assert_eq!(current.provider.model(), "immutable-model-v2");
+            assert_eq!(current.runtime.max_output_tokens, 8_192);
+            assert_eq!(current.api_key.unwrap().as_str(), "immutable-profile-key");
+
+            let version_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM ai_model_profile_versions WHERE profile_id = $1",
+            )
+            .bind(profile_id)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(version_count, 3);
+        }
+
+        #[tokio::test]
+        async fn startup_migrates_text_and_vision_secrets_idempotently_without_leaking() {
+            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+                return;
+            };
+            assert!(
+                database_url.contains("muriarc_test"),
+                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
+            );
+            let postgres = PostgresStore::connect(&database_url).await.unwrap();
+            postgres.migrate().await.unwrap();
+            let now = Utc::now();
+            let bootstrap = AuditContext::system(WriteSource::Migration);
+            let lab = Lab::new(
+                format!("AI profile secret migration lab {}", Uuid::new_v4()),
+                now,
+            )
+            .unwrap();
+            postgres.create_lab(&lab, &bootstrap).await.unwrap();
+            let user = User::new(
+                lab.id,
+                format!("ai-secret-migration-{}@example.test", Uuid::new_v4()),
+                "AI secret migration researcher",
+                now,
+            )
+            .unwrap();
+            postgres.create_user(&user, &bootstrap).await.unwrap();
+
+            let sensitive_key = "profile-migration-secret-that-must-stay-redacted";
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
+            let mut input = settings_input(
+                "deepseek",
+                "deepseek-chat",
+                OFFICIAL_DEEPSEEK_BASE_URL,
+                Some(sensitive_key),
+            );
+            input.supports_vision = true;
+            input.vision_model = Some("deepseek-vision-test".to_owned());
+            store
+                .save(user.id, input, &user_audit(&user, "save-legacy-secret"))
+                .await
+                .unwrap();
+            let legacy_before: (Option<i32>, Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+                "SELECT secret_key_version, secret_nonce, secret_ciphertext
+                     FROM ai_provider_settings WHERE user_id = $1",
+            )
+            .bind(user.id)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            let (conversation_profile_id, vision_profile_id): (Uuid, Option<Uuid>) =
+                sqlx::query_as(
+                    "SELECT default_conversation_profile_id,
+                            default_vision_profile_id
+                     FROM ai_user_model_defaults
+                     WHERE user_id = $1 AND deleted_at IS NULL",
+                )
+                .bind(user.id)
+                .fetch_one(postgres.pool())
+                .await
+                .unwrap();
+            let vision_profile_id = vision_profile_id.unwrap();
+            let profile_ids = vec![conversation_profile_id, vision_profile_id];
+            sqlx::query("DELETE FROM ai_model_profile_secrets WHERE profile_id = ANY($1)")
+                .bind(&profile_ids)
+                .execute(postgres.pool())
+                .await
+                .unwrap();
+            sqlx::query(
+                "DELETE FROM audit_entries
+                 WHERE entity_type = 'ai_model_profile' AND entity_id = ANY($1)",
+            )
+            .bind(&profile_ids)
+            .execute(postgres.pool())
+            .await
+            .unwrap();
+
+            let migrated = store.migrate_legacy_profile_secrets().await.unwrap();
+            assert!(migrated >= 2);
+            for profile_id in [conversation_profile_id, vision_profile_id] {
+                let (profile_version, key_version, nonce, ciphertext): (
+                    i64,
+                    i32,
+                    Vec<u8>,
+                    Vec<u8>,
+                ) = sqlx::query_as(
+                    "SELECT profile_version, key_version, nonce, ciphertext
+                         FROM ai_model_profile_secrets WHERE profile_id = $1",
+                )
+                .bind(profile_id)
+                .fetch_one(postgres.pool())
+                .await
+                .unwrap();
+                assert_eq!(
+                    store
+                        .decrypt_profile_secret(
+                            user.id,
+                            profile_id,
+                            profile_version,
+                            key_version,
+                            &nonce,
+                            &ciphertext,
+                        )
+                        .unwrap()
+                        .as_str(),
+                    sensitive_key
+                );
+            }
+            let legacy_after: (Option<i32>, Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as(
+                "SELECT secret_key_version, secret_nonce, secret_ciphertext
+                     FROM ai_provider_settings WHERE user_id = $1",
+            )
+            .bind(user.id)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(legacy_after, legacy_before);
+
+            let text = store.resolve(user.id).await.unwrap();
+            assert_eq!(text.model_profile.profile_id, conversation_profile_id);
+            assert_eq!(text.model_profile.profile_version, 1);
+            assert_eq!(text.api_key.unwrap().as_str(), sensitive_key);
+            let vision = store.resolve_vision(user.id).await.unwrap();
+            assert_eq!(vision.model_profile.profile_id, vision_profile_id);
+            assert_eq!(vision.model_profile.profile_version, 1);
+            assert_eq!(vision.api_key.unwrap().as_str(), sensitive_key);
+
+            let audit_payloads: Vec<String> = sqlx::query_scalar(
+                "SELECT coalesce(reason, '') || coalesce(before_json::text, '')
+                        || coalesce(after_json::text, '')
+                 FROM audit_entries
+                 WHERE entity_type = 'ai_model_profile'
+                   AND entity_id = ANY($1)
+                 ORDER BY occurred_at, id",
+            )
+            .bind(vec![conversation_profile_id, vision_profile_id])
+            .fetch_all(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(audit_payloads.len(), 2);
+            assert!(
+                audit_payloads
+                    .iter()
+                    .all(|payload| !payload.contains(sensitive_key))
+            );
+            assert!(
+                audit_payloads
+                    .iter()
+                    .all(|payload| payload.contains("secret_material_redacted"))
+            );
+
+            let migrated_again = store.migrate_legacy_profile_secrets().await.unwrap();
+            assert_eq!(migrated_again, 0);
+            let audit_count_after: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_entries
+                 WHERE entity_type = 'ai_model_profile'
+                   AND entity_id = ANY($1)",
+            )
+            .bind(vec![conversation_profile_id, vision_profile_id])
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+            assert_eq!(audit_count_after, 2);
+        }
+
         #[test]
         fn master_key_requires_exactly_32_base64_bytes() {
             let encoded = general_purpose::STANDARD.encode([9_u8; KEY_BYTES]);
             assert!(AiMasterKey::from_base64(&encoded, 1).is_ok());
             assert!(AiMasterKey::from_base64("not-a-key", 1).is_err());
+        }
+
+        #[test]
+        fn phase_one_rejects_unimplemented_profile_protocols_before_provider_construction() {
+            for protocol in [
+                AiProviderProtocol::OpenaiResponses,
+                AiProviderProtocol::AnthropicMessages,
+            ] {
+                assert!(matches!(
+                    PostgresAiProviderStore::profile_provider_config(
+                        protocol,
+                        AiProviderTransport::OpenAiCompatible,
+                        "test-model".to_owned(),
+                        OFFICIAL_OPENAI_BASE_URL.to_owned(),
+                        default_timeout_ms(),
+                    ),
+                    Err(AiProviderStoreError::UnsupportedProtocol)
+                ));
+            }
+        }
+
+        #[test]
+        fn https_profile_uses_persisted_local_http_transport_without_scheme_inference() {
+            let base_url = "https://local-gateway.example.test/v1";
+            let config = PostgresAiProviderStore::profile_provider_config(
+                AiProviderProtocol::OpenaiChatCompletions,
+                AiProviderTransport::LocalHttp,
+                "local-model".to_owned(),
+                base_url.to_owned(),
+                default_timeout_ms(),
+            )
+            .unwrap();
+            assert_eq!(config.kind, ProviderKind::LocalHttp);
+            assert_eq!(config.base_url, base_url);
         }
 
         #[tokio::test]
@@ -2177,6 +4621,7 @@ mod postgres {
             let sensitive_model = "private-model-name";
             let sensitive_key = "secret-provider-key-that-must-never-be-audited";
             let store = PostgresAiProviderStore::new(postgres.clone(), master());
+            insert_test_profile_defaults(&postgres, &user, false).await;
             let audit = AuditContext {
                 actor: Actor::human(user.id, user.display_name.clone()),
                 source: WriteSource::Web,
@@ -2190,6 +4635,7 @@ mod postgres {
                     SaveAiProviderEndpointInput {
                         enabled: true,
                         provider_kind: ProviderKind::OpenAiCompatible,
+                        protocol: AiProviderProtocol::OpenaiChatCompletions,
                         label: "Private compatible API".to_owned(),
                         base_url: sensitive_url.to_owned(),
                     },

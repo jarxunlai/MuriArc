@@ -341,20 +341,37 @@ async fn run_turn(
     let workflow = workflow(&state, &metadata)?;
     let context =
         execution_context_with_autonomy(&state, &principal, authentication, &metadata).await?;
+    let existing_binding = match payload.conversation_id {
+        Some(conversation_id) => Some(
+            workflow
+                .conversation_model_profile(&context, conversation_id)
+                .await
+                .map_err(|error| workflow_error(error, &metadata))?,
+        ),
+        None => None,
+    };
+    let resolved = match existing_binding {
+        Some(binding) => {
+            state
+                .ai_providers
+                .resolve_for_profile(principal.user_id, binding)
+                .await
+        }
+        None => state.ai_providers.resolve(principal.user_id).await,
+    }
+    .map_err(|error| provider_resolve_error(error, &metadata))?;
     let ResolvedAiProvider {
         provider,
         api_key,
         runtime,
-    } = state
-        .ai_providers
-        .resolve(principal.user_id)
-        .await
-        .map_err(|error| provider_resolve_error(error, &metadata))?;
+        model_profile,
+    } = resolved;
     let response = workflow
         .run_turn_with_config(
             provider,
             api_key.as_ref().map(|secret| secret.as_str()),
             &context,
+            model_profile,
             payload,
             runtime,
         )
@@ -912,6 +929,11 @@ fn provider_settings_error(error: AiProviderStoreError, metadata: &RequestMetada
             "ai_api_key_missing",
             "AI is enabled and waiting for the current user's API key",
         ),
+        AiProviderStoreError::UnsupportedProtocol => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unsupported_ai_provider_protocol",
+            error.to_string(),
+        ),
         AiProviderStoreError::LabDisabled => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "ai_lab_disabled",
@@ -1012,6 +1034,16 @@ fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiErro
             ApiError::internal()
         }
         AiWorkflowError::InvalidConversationRequest => ApiError::validation(error.to_string()),
+        AiWorkflowError::LegacyConversationReadOnly => ApiError::new(
+            StatusCode::CONFLICT,
+            "legacy_conversation_read_only",
+            error.to_string(),
+        ),
+        AiWorkflowError::ConversationModelProfileMismatch => ApiError::new(
+            StatusCode::CONFLICT,
+            "conversation_model_profile_mismatch",
+            error.to_string(),
+        ),
         AiWorkflowError::InvalidStoredConversation => {
             tracing::error!(kind = ?error, "stored AI conversation data is invalid");
             ApiError::internal()

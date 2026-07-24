@@ -1,3 +1,4 @@
+mod ai_models;
 mod ai_store;
 mod animal;
 mod breeding;
@@ -17,6 +18,7 @@ mod records;
 mod store;
 mod workspace;
 
+pub use ai_models::*;
 pub use ai_store::*;
 pub use animal::*;
 pub use breeding::*;

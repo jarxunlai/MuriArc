@@ -992,6 +992,14 @@ impl DomainToolExecutor for StoreDomainToolExecutor {
             .collect()
     }
 
+    fn fixed_project_id(&self) -> Option<Uuid> {
+        if self.access.allowed_project_ids.len() == 1 {
+            self.access.allowed_project_ids.iter().next().copied()
+        } else {
+            None
+        }
+    }
+
     async fn execute(
         &self,
         request: DomainToolRequest,

@@ -320,6 +320,17 @@ pub trait DomainToolExecutor: Send + Sync {
         Vec::new()
     }
 
+    /// Returns the only project identifier this executor can currently read,
+    /// when its authorization boundary has already been narrowed to exactly
+    /// one project.
+    ///
+    /// The assistant uses this solely to narrow existing `project_id` JSON
+    /// schemas for the model. Executors must still validate every supplied
+    /// identifier and remain the authoritative permission boundary.
+    fn fixed_project_id(&self) -> Option<Uuid> {
+        None
+    }
+
     async fn execute(
         &self,
         request: DomainToolRequest,
@@ -583,9 +594,17 @@ where
         self.limits
     }
 
+    fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        let mut definitions = fixed_tool_definitions();
+        if let Some(project_id) = self.executor.fixed_project_id() {
+            constrain_project_id_schemas(&mut definitions, project_id);
+        }
+        definitions
+    }
+
     pub fn visible_tools(&self, access: &AccessGrant) -> Vec<ToolDefinition> {
         let supported_tools = self.executor.supported_tools();
-        fixed_tool_definitions()
+        self.tool_definitions()
             .into_iter()
             .filter(|definition| {
                 ToolName::from_wire_name(&definition.name).is_some_and(|tool| {
@@ -623,7 +642,7 @@ where
 
         let supported_tools = self.executor.supported_tools();
         let additional_explicit_tools = self.executor.additional_explicit_tools();
-        let definitions = fixed_tool_definitions();
+        let definitions = self.tool_definitions();
         let mut tools = definitions
             .iter()
             .filter(|definition| {
@@ -1642,6 +1661,22 @@ pub fn fixed_tool_definitions() -> Vec<ToolDefinition> {
     ALL_TOOL_NAMES.into_iter().map(tool_definition).collect()
 }
 
+fn constrain_project_id_schemas(definitions: &mut [ToolDefinition], project_id: Uuid) {
+    let allowed = json!([project_id.to_string()]);
+    for definition in definitions {
+        let Some(project_id_schema) = definition
+            .parameters
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("project_id"))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        project_id_schema.insert("enum".to_owned(), allowed.clone());
+    }
+}
+
 fn tool_definition(tool: ToolName) -> ToolDefinition {
     let (description, parameters) = match tool {
         ToolName::ResourceSearch => (
@@ -1842,7 +1877,20 @@ fn tool_definition(tool: ToolName) -> ToolDefinition {
                 "properties": {
                     "project_id": uuid_schema(),
                     "cage_id": uuid_schema(),
-                    "status": short_text_schema(),
+                    "status": {
+                        "type": "string",
+                        "description": "Optional status filter; omit it to include every animal status.",
+                        "enum": [
+                            "planned",
+                            "alive",
+                            "in_experiment",
+                            "sampled",
+                            "deceased",
+                            "euthanized",
+                            "lost",
+                            "archived"
+                        ]
+                    },
                     "query": {"type": "string", "maxLength": 256},
                     "limit": limit_schema(),
                     "offset": offset_schema()
@@ -1877,7 +1925,11 @@ fn tool_definition(tool: ToolName) -> ToolDefinition {
             json!({
                 "type": "object",
                 "properties": {
-                    "status": short_text_schema(),
+                    "status": {
+                        "type": "string",
+                        "description": "Optional status filter; omit it to include every project status.",
+                        "enum": ["active", "archived"]
+                    },
                     "limit": limit_schema(),
                     "offset": offset_schema()
                 },
@@ -1890,7 +1942,11 @@ fn tool_definition(tool: ToolName) -> ToolDefinition {
                 "type": "object",
                 "properties": {
                     "project_id": uuid_schema(),
-                    "status": short_text_schema(),
+                    "status": {
+                        "type": "string",
+                        "description": "Optional status filter; omit it to include every experiment status.",
+                        "enum": ["draft", "active", "completed", "cancelled", "archived"]
+                    },
                     "limit": limit_schema(),
                     "offset": offset_schema()
                 },

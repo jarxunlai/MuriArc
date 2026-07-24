@@ -42,6 +42,19 @@ const STORE_MODEL_READ_TOOLS: [ToolName; 4] = [
     ToolName::ProjectContext,
 ];
 
+/// Legacy V1 reads remain executable for trusted callers, but are exposed to
+/// a model only when the authoritative current user explicitly requests one
+/// by its exact name. They never enter the ordinary advertised tool surface.
+const STORE_EXPLICIT_COMPATIBILITY_READ_TOOLS: [ToolName; 7] = [
+    ToolName::AnimalSearch,
+    ToolName::AnimalTimeline,
+    ToolName::CageList,
+    ToolName::ProjectList,
+    ToolName::ExperimentStatus,
+    ToolName::MeasurementQuery,
+    ToolName::SampleInventory,
+];
+
 /// Store-level access already resolved by the authenticated application layer.
 ///
 /// A value is intentionally scoped to one lab. Project-specific tools can only
@@ -969,6 +982,14 @@ impl DomainToolExecutor for StoreDomainToolExecutor {
             }
         }
         tools
+    }
+
+    fn additional_explicit_tools(&self) -> Vec<ToolName> {
+        let policy = AiActionPolicy::new(self.autonomy_mode);
+        STORE_EXPLICIT_COMPATIBILITY_READ_TOOLS
+            .into_iter()
+            .filter(|tool| policy.allows_tool(*tool))
+            .collect()
     }
 
     async fn execute(

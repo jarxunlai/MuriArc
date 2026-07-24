@@ -523,6 +523,52 @@ impl DomainToolExecutor for AnimalOnlyExecutor {
     }
 }
 
+#[derive(Clone)]
+struct ExplicitLegacyExecutor {
+    requests: Arc<Mutex<Vec<DomainToolRequest>>>,
+    project_id: Uuid,
+}
+
+impl ExplicitLegacyExecutor {
+    fn new(project_id: Uuid) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            project_id,
+        }
+    }
+
+    fn requests(&self) -> Vec<DomainToolRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl DomainToolExecutor for ExplicitLegacyExecutor {
+    fn supported_tools(&self) -> Vec<ToolName> {
+        vec![ToolName::ResourceSearch]
+    }
+
+    fn additional_explicit_tools(&self) -> Vec<ToolName> {
+        vec![ToolName::ProjectList]
+    }
+
+    async fn execute(
+        &self,
+        request: DomainToolRequest,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        self.requests.lock().unwrap().push(request.clone());
+        if request.tool != ToolName::ProjectList {
+            return Err(ToolExecutionError::Rejected {
+                code: "unsupported_tool".to_owned(),
+            });
+        }
+        Ok(DomainToolOutput::read(
+            json!({"items": [{"id": self.project_id, "name": "Acceptance project"}]}),
+            vec![Citation::new(EntityType::Project, self.project_id, Some(1))],
+        ))
+    }
+}
+
 #[test]
 fn executor_declaration_narrows_tools_visible_to_the_model() {
     let provider = MockProvider::new("mock", "model", []);
@@ -541,6 +587,135 @@ fn executor_declaration_narrows_tools_visible_to_the_model() {
         .map(|definition| definition.name)
         .collect::<Vec<_>>();
     assert_eq!(visible, vec![ToolName::AnimalSearch.as_str()]);
+}
+
+#[tokio::test]
+async fn exact_current_request_can_ground_one_hidden_compatibility_read() {
+    let project_id = Uuid::new_v4();
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [
+            Ok(completion(Some("I can answer without data."), vec![])),
+            Ok(completion(
+                None,
+                vec![call(
+                    "project-call-1",
+                    ToolName::ProjectList.as_str(),
+                    json!({}),
+                )],
+            )),
+            Ok(completion(Some("可访问验收项目。"), vec![])),
+        ],
+    );
+    let provider_probe = provider.clone();
+    let executor = ExplicitLegacyExecutor::new(project_id);
+    let executor_probe = executor.clone();
+    let service = AssistantService::new(provider, executor);
+
+    let visible = service
+        .visible_tools(&read_access())
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    assert_eq!(visible, vec![ToolName::ResourceSearch.as_str()]);
+
+    let response = service
+        .run(
+            AssistantRequest::new(
+                Uuid::new_v4(),
+                "请务必调用 project_list 工具列出我能访问的项目；不要凭记忆回答。工具返回后，用一句中文总结。",
+            ),
+            &read_access(),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.content, "可访问验收项目。");
+    assert_eq!(response.tool_runs.len(), 1);
+    assert_eq!(response.tool_runs[0].tool, ToolName::ProjectList);
+    assert_eq!(response.citations.len(), 1);
+    assert_eq!(executor_probe.requests().len(), 1);
+
+    let requests = provider_probe.requests().unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in &requests[..2] {
+        assert_eq!(request.tools.len(), 1);
+        assert_eq!(request.tools[0].name, ToolName::ProjectList.as_str());
+    }
+    assert!(requests[2].tools.is_empty());
+}
+
+#[tokio::test]
+async fn hidden_compatibility_read_is_not_dispatchable_without_an_exact_request() {
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [Ok(completion(
+            None,
+            vec![call(
+                "project-call-1",
+                ToolName::ProjectList.as_str(),
+                json!({}),
+            )],
+        ))],
+    );
+    let provider_probe = provider.clone();
+    let executor = ExplicitLegacyExecutor::new(Uuid::new_v4());
+    let executor_probe = executor.clone();
+    let service = AssistantService::new(provider, executor);
+
+    let error = service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), "列出我能访问的项目。"),
+            &read_access(),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AssistantError::UnsupportedTool {
+            tool: ToolName::ProjectList
+        }
+    ));
+    assert!(executor_probe.requests().is_empty());
+    let requests = provider_probe.requests().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].tools.len(), 1);
+    assert_eq!(requests[0].tools[0].name, ToolName::ResourceSearch.as_str());
+}
+
+#[tokio::test]
+async fn unauthorized_hidden_compatibility_read_is_neither_advertised_nor_executed() {
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [Ok(completion(Some("无法读取项目。"), vec![]))],
+    );
+    let provider_probe = provider.clone();
+    let executor = ExplicitLegacyExecutor::new(Uuid::new_v4());
+    let executor_probe = executor.clone();
+    let service = AssistantService::new(provider, executor);
+    let no_access = AccessGrant::local_user(ScopeSet::default());
+
+    let response = service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), "请调用 project_list 工具。"),
+            &no_access,
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.content, "无法读取项目。");
+    assert!(response.tool_runs.is_empty());
+    assert!(executor_probe.requests().is_empty());
+    let requests = provider_probe.requests().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].tools.is_empty());
 }
 
 #[test]

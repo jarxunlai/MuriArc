@@ -523,6 +523,32 @@ impl DomainToolExecutor for AnimalOnlyExecutor {
     }
 }
 
+struct ProjectScopedExplicitAnimalExecutor {
+    project_id: Uuid,
+}
+
+#[async_trait]
+impl DomainToolExecutor for ProjectScopedExplicitAnimalExecutor {
+    fn supported_tools(&self) -> Vec<ToolName> {
+        vec![ToolName::ResourceSearch]
+    }
+
+    fn additional_explicit_tools(&self) -> Vec<ToolName> {
+        vec![ToolName::AnimalSearch]
+    }
+
+    fn fixed_project_id(&self) -> Option<Uuid> {
+        Some(self.project_id)
+    }
+
+    async fn execute(
+        &self,
+        _request: DomainToolRequest,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        Ok(DomainToolOutput::read(json!({"items": []}), vec![]))
+    }
+}
+
 #[derive(Clone)]
 struct ExplicitLegacyExecutor {
     requests: Arc<Mutex<Vec<DomainToolRequest>>>,
@@ -587,6 +613,59 @@ fn executor_declaration_narrows_tools_visible_to_the_model() {
         .map(|definition| definition.name)
         .collect::<Vec<_>>();
     assert_eq!(visible, vec![ToolName::AnimalSearch.as_str()]);
+}
+
+#[tokio::test]
+async fn single_project_executor_narrows_an_explicit_tools_model_schema_only() {
+    let project_id = Uuid::new_v4();
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [
+            Ok(completion(
+                None,
+                vec![call(
+                    "animal-call-1",
+                    ToolName::AnimalSearch.as_str(),
+                    json!({"project_id": project_id}),
+                )],
+            )),
+            Ok(completion(Some("done"), vec![])),
+        ],
+    );
+    let probe = provider.clone();
+    let service =
+        AssistantService::new(provider, ProjectScopedExplicitAnimalExecutor { project_id });
+
+    let visible = service.visible_tools(&read_access());
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, ToolName::ResourceSearch.as_str());
+
+    service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), "Please call animal_search."),
+            &read_access(),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+
+    let requests = probe.requests().unwrap();
+    assert_eq!(requests[0].tools.len(), 1);
+    assert_eq!(requests[0].tools[0].name, ToolName::AnimalSearch.as_str());
+    assert_eq!(
+        requests[0].tools[0].parameters["properties"]["project_id"]["enum"],
+        json!([project_id.to_string()])
+    );
+
+    let fixed = fixed_tool_definitions()
+        .into_iter()
+        .find(|definition| definition.name == ToolName::AnimalSearch.as_str())
+        .unwrap();
+    assert!(
+        fixed.parameters["properties"]["project_id"]["enum"].is_null(),
+        "the authorization-scoped project id must never leak into global fixed definitions"
+    );
 }
 
 #[tokio::test]
@@ -1245,6 +1324,41 @@ fn fixed_schemas_cover_extended_business_reads_and_safe_audit_query() {
         genotyping.parameters["properties"]["state"]["enum"],
         json!(["unknown", "expected", "confirmed", "rejected"])
     );
+    for (tool, expected_statuses) in [
+        (
+            ToolName::AnimalSearch,
+            json!([
+                "planned",
+                "alive",
+                "in_experiment",
+                "sampled",
+                "deceased",
+                "euthanized",
+                "lost",
+                "archived"
+            ]),
+        ),
+        (ToolName::ProjectList, json!(["active", "archived"])),
+        (
+            ToolName::ExperimentStatus,
+            json!(["draft", "active", "completed", "cancelled", "archived"]),
+        ),
+    ] {
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == tool.as_str())
+            .unwrap();
+        assert_eq!(
+            definition.parameters["properties"]["status"]["enum"], expected_statuses,
+            "{tool:?} must advertise exactly the status values accepted by its executor"
+        );
+        assert!(
+            definition.parameters["required"]
+                .as_array()
+                .is_none_or(|required| required.iter().all(|field| field != "status")),
+            "{tool:?} status must remain optional so omission means no status filter"
+        );
+    }
     assert!(
         !genotyping.parameters["properties"]
             .as_object()

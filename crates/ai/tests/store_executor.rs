@@ -930,6 +930,49 @@ async fn project_and_lab_boundaries_cannot_be_bypassed() {
 }
 
 #[tokio::test]
+async fn legacy_status_filters_use_domain_enum_wire_values_and_reject_unknown_values() {
+    let fixture = fixture().await;
+
+    for (tool, arguments) in [
+        (ToolName::ProjectList, json!({"status": "active"})),
+        (
+            ToolName::AnimalSearch,
+            json!({"project_id": fixture.allowed_project_id, "status": "alive"}),
+        ),
+        (
+            ToolName::ExperimentStatus,
+            json!({"project_id": fixture.allowed_project_id, "status": "draft"}),
+        ),
+    ] {
+        let (data, _) = read_output(
+            fixture
+                .executor
+                .execute(request(tool, arguments))
+                .await
+                .unwrap(),
+        );
+        assert!(data["items"].is_array(), "{tool:?}");
+    }
+
+    for (tool, arguments) in [
+        (ToolName::ProjectList, json!({"status": "all"})),
+        (
+            ToolName::AnimalSearch,
+            json!({"project_id": fixture.allowed_project_id, "status": "all"}),
+        ),
+        (
+            ToolName::ExperimentStatus,
+            json!({"project_id": fixture.allowed_project_id, "status": "all"}),
+        ),
+    ] {
+        assert_rejected(
+            fixture.executor.execute(request(tool, arguments)).await,
+            "invalid_arguments",
+        );
+    }
+}
+
+#[tokio::test]
 async fn project_only_access_cannot_fall_back_to_the_lab_registry() {
     let fixture = fixture().await;
     let executor = project_only_executor(&fixture);

@@ -1,5 +1,5 @@
 use axum::{Json, Router, extract::State, routing::get};
-use muriarc_core::{AuditEntry, AuditFilter, Permission};
+use muriarc_core::{AuditEntry, AuditFilter, Permission, protect_public_audit_entries};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -46,6 +46,7 @@ async fn list(
         &metadata,
     )
     .await?;
+    protect_public_audit_entries(&mut entries);
     entries.reverse();
     truncate(&mut entries, collection_limit(query.limit, &metadata)?);
     Ok(collection(entries, &metadata))

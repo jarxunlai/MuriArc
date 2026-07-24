@@ -193,6 +193,49 @@ impl AttachmentFiles {
         }
     }
 
+    /// Removes exactly the immutable object described by trusted attachment
+    /// metadata.
+    ///
+    /// Callers cannot supply a path directly. The object key must match the
+    /// canonical SHA/attachment-ID layout and its size and digest are verified
+    /// before unlinking. A missing canonical object is an idempotent success.
+    pub async fn remove_verified_object(
+        &self,
+        attachment: &Attachment,
+    ) -> Result<(), AttachmentFileError> {
+        let expected_path = canonical_attachment_relative_path(attachment)?;
+        if attachment.relative_path != expected_path {
+            return Err(AttachmentFileError::UnsafePath);
+        }
+        let root = canonical_storage_root(self.root()).await?;
+        if resolve_existing_object_without_symlinks(&root, &attachment.relative_path)
+            .await?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let verified = match self.open_verified(attachment).await {
+            Ok(verified) => verified,
+            Err(AttachmentFileError::Missing) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        drop(verified.file);
+
+        let root = canonical_storage_root(self.root()).await?;
+        let Some(path) =
+            resolve_existing_object_without_symlinks(&root, &attachment.relative_path).await?
+        else {
+            return Ok(());
+        };
+        let metadata = fs::metadata(&path).await?;
+        if metadata.len()
+            != u64::try_from(attachment.size_bytes).map_err(|_| AttachmentFileError::Integrity)?
+        {
+            return Err(AttachmentFileError::Integrity);
+        }
+        fs::remove_file(path).await.map_err(Into::into)
+    }
+
     pub async fn open_verified(
         &self,
         attachment: &Attachment,
@@ -343,6 +386,64 @@ fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, Attachm
     Ok(resolved)
 }
 
+fn canonical_attachment_relative_path(
+    attachment: &Attachment,
+) -> Result<String, AttachmentFileError> {
+    if attachment.id.is_nil()
+        || attachment.sha256.len() != 64
+        || !attachment
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(AttachmentFileError::Integrity);
+    }
+    let sha256 = attachment.sha256.to_ascii_lowercase();
+    Ok(format!(
+        "objects/{}/{}/{}/{}",
+        &sha256[..2],
+        &sha256[2..4],
+        sha256,
+        attachment.id
+    ))
+}
+
+async fn resolve_existing_object_without_symlinks(
+    root: &Path,
+    relative: &str,
+) -> Result<Option<PathBuf>, AttachmentFileError> {
+    let relative_path = Path::new(relative);
+    let components = relative_path.components().collect::<Vec<_>>();
+    if components.is_empty() {
+        return Err(AttachmentFileError::UnsafePath);
+    }
+    let mut current = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(component) = component else {
+            return Err(AttachmentFileError::UnsafePath);
+        };
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let is_last = index + 1 == components.len();
+        if metadata.file_type().is_symlink()
+            || (is_last && !metadata.is_file())
+            || (!is_last && !metadata.is_dir())
+        {
+            return Err(AttachmentFileError::UnsafePath);
+        }
+        let canonical = fs::canonicalize(&current).await?;
+        if !canonical.starts_with(root) {
+            return Err(AttachmentFileError::UnsafePath);
+        }
+        current = canonical;
+    }
+    Ok(Some(current))
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -352,7 +453,14 @@ mod tests {
 
     fn attachment(object: &StoredAttachmentObject) -> Attachment {
         Attachment {
-            id: Uuid::new_v4(),
+            id: Uuid::parse_str(
+                object
+                    .absolute_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap(),
+            )
+            .unwrap(),
             lab_id: Uuid::new_v4(),
             project_id: None,
             entity_type: "animal".to_owned(),
@@ -433,5 +541,89 @@ mod tests {
             files.open_verified(&record).await,
             Err(AttachmentFileError::UnsafePath)
         ));
+    }
+
+    #[tokio::test]
+    async fn verified_removal_is_idempotent_and_rejects_untrusted_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let files = AttachmentFiles::with_limit(root.path(), 32);
+        let stored = files
+            .write_bytes(Uuid::new_v4(), b"trusted object")
+            .await
+            .unwrap();
+        let record = attachment(&stored);
+        files.remove_verified_object(&record).await.unwrap();
+        assert!(!stored.absolute_path.exists());
+        files.remove_verified_object(&record).await.unwrap();
+
+        let second = files
+            .write_bytes(Uuid::new_v4(), b"second object")
+            .await
+            .unwrap();
+        let mut unsafe_record = attachment(&second);
+        unsafe_record.relative_path = "../outside".to_owned();
+        assert!(matches!(
+            files.remove_verified_object(&unsafe_record).await,
+            Err(AttachmentFileError::UnsafePath)
+        ));
+        assert!(second.absolute_path.exists());
+
+        fs::write(&second.absolute_path, b"object tampered")
+            .await
+            .unwrap();
+        assert!(matches!(
+            files.remove_verified_object(&attachment(&second)).await,
+            Err(AttachmentFileError::Integrity)
+        ));
+        assert!(second.absolute_path.exists());
+    }
+
+    #[tokio::test]
+    async fn installed_object_removal_is_idempotent_and_preserves_shared_shards() {
+        let root = tempfile::tempdir().unwrap();
+        let files = AttachmentFiles::with_limit(root.path(), 32);
+        let first = files
+            .write_bytes(Uuid::new_v4(), b"shared content")
+            .await
+            .unwrap();
+        let second = files
+            .write_bytes(Uuid::new_v4(), b"shared content")
+            .await
+            .unwrap();
+        assert_eq!(first.absolute_path.parent(), second.absolute_path.parent());
+
+        files.remove_installed_object(&first).await.unwrap();
+        assert!(!first.absolute_path.exists());
+        assert!(second.absolute_path.exists());
+        files.remove_installed_object(&first).await.unwrap();
+        assert!(second.absolute_path.exists());
+
+        files.remove_installed_object(&second).await.unwrap();
+        assert!(!second.absolute_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verified_removal_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let files = AttachmentFiles::with_limit(root.path(), 32);
+        let stored = files
+            .write_bytes(Uuid::new_v4(), b"trusted object")
+            .await
+            .unwrap();
+        let record = attachment(&stored);
+        fs::remove_file(&stored.absolute_path).await.unwrap();
+        let outside_file = outside.path().join("outside");
+        fs::write(&outside_file, b"trusted object").await.unwrap();
+        symlink(&outside_file, &stored.absolute_path).unwrap();
+
+        assert!(matches!(
+            files.remove_verified_object(&record).await,
+            Err(AttachmentFileError::UnsafePath)
+        ));
+        assert!(outside_file.exists());
     }
 }

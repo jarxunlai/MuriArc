@@ -13,7 +13,7 @@ use chrono::Duration;
 use muriarc_core::{
     AiModelProfileStore, AiOperationStore, AiScope, LabRole, MuriArcStore, WriteSource,
 };
-use muriarc_data::DataFiles;
+use muriarc_data::{AttachmentFiles, DataFiles, cleanup_expired_ai_conversation_sources};
 use muriarc_server::{
     AiMasterKey, AppState, Authenticator, ChainedAuthenticator, EnvironmentRootConfig,
     LiveBootstrapAuthenticator, PostgresAiProviderStore, PostgresAuthBackend,
@@ -99,7 +99,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tokio::fs::create_dir_all(&data_root).await?;
     tokio::fs::create_dir_all(&attachment_root).await?;
     let state = configure_ai(state, store.clone(), &data_root).await?;
-    let state = state.with_data_storage(DataFiles::new(data_root), attachment_root);
+    let state = state.with_data_storage(DataFiles::new(data_root), attachment_root.clone());
+    let cleanup_store: Arc<dyn MuriArcStore> = store.clone();
+    let _ai_source_cleanup = spawn_ai_source_cleanup(cleanup_store, server_lab_id, attachment_root);
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
     let ui_dir = env::var_os("MURIARC_UI_DIR").map(PathBuf::from);
     if ui_dir.is_none() {
@@ -109,6 +111,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!(address = %bind_address, "MuriArc server listening");
     axum::serve(listener, application_router(state, ui_dir)).await?;
     Ok(())
+}
+
+fn spawn_ai_source_cleanup(
+    store: Arc<dyn MuriArcStore>,
+    lab_id: Uuid,
+    attachment_root: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let files = AttachmentFiles::new(attachment_root);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            // Tokio's first interval tick is immediate. Subsequent bounded
+            // sweeps run hourly and never overlap.
+            interval.tick().await;
+            match cleanup_expired_ai_conversation_sources(
+                store.as_ref(),
+                &files,
+                lab_id,
+                chrono::Utc::now(),
+                muriarc_core::MAX_AI_CONVERSATION_SOURCE_CLEANUP_BATCH,
+                WriteSource::Web,
+            )
+            .await
+            {
+                Ok(report) => tracing::info!(
+                    inspected = report.inspected,
+                    discarded = report.discarded,
+                    cleaned = report.cleaned,
+                    conflicts = report.conflicts,
+                    store_failures = report.store_failures,
+                    object_failures = report.object_failures,
+                    "completed bounded AI conversation source retention sweep"
+                ),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "AI conversation source retention sweep could not list candidates"
+                ),
+            }
+        }
+    })
 }
 
 async fn configure_ai(

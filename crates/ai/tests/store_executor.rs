@@ -8,8 +8,12 @@ use muriarc_ai::{
     ToolExecutionError, ToolName, WriteDraft,
 };
 use muriarc_core::{
-    Animal, AnimalEvent, AnimalEventKind, AuditFilter, Cage, EntityType, Experiment, Measurement,
-    MeasurementValue, MuriArcStore, Participation, Project, Sample, Sex, WriteSource,
+    AiImportResolution, Animal, AnimalEvent, AnimalEventKind, Attachment, AuditFilter, Cage,
+    Cohort, EntityType, Experiment, ExperimentEvent, ExperimentTemplateVersion, Measurement,
+    MeasurementValue, MuriArcStore, Observation, ObservationDefinition, ObservationPolicy,
+    ObservationSubjectType, ObservationValueData, ObservationValueRecord, ObservationValueType,
+    Participation, Project, ProjectAnimalAssignmentFilter, ProjectAnimalAssignmentRemoval,
+    RecordMeta, Sample, Sex, WriteSource,
 };
 use muriarc_core::{AuditContext, Lab};
 use muriarc_store_sqlite::SqliteStore;
@@ -48,6 +52,7 @@ impl AiDataToolBackend for FakeDataBackend {
         &self,
         _access: &AiDataAccessContext,
         _draft: &WriteDraft,
+        _resolution: &AiImportResolution,
         _audit: &AuditContext,
     ) -> Result<AiDataApplyResult, ToolExecutionError> {
         Err(ToolExecutionError::Rejected {
@@ -70,6 +75,8 @@ struct Fixture {
     allowed_event_id: Uuid,
     forbidden_event_id: Uuid,
     measurement_id: Uuid,
+    observation_id: Uuid,
+    cohort_id: Uuid,
 }
 
 async fn fixture() -> Fixture {
@@ -114,11 +121,12 @@ async fn fixture() -> Fixture {
         .create_experiment(&forbidden_experiment, &audit)
         .await
         .unwrap();
+    let cohort = Cohort::new(experiment.id, "Treatment", now).unwrap();
+    store.create_cohort(&cohort, &audit).await.unwrap();
+    let mut participation = Participation::enroll(experiment.id, animal.id, now);
+    participation.cohort_id = Some(cohort.id);
     store
-        .create_participation(
-            &Participation::enroll(experiment.id, animal.id, now),
-            &audit,
-        )
+        .create_participation(&participation, &audit)
         .await
         .unwrap();
     store
@@ -191,6 +199,65 @@ async fn fixture() -> Fixture {
     sample.set_quantity(1.0, "piece").unwrap();
     store.create_sample(&sample, &audit).await.unwrap();
 
+    let experiment_event = ExperimentEvent::new(
+        lab.id,
+        allowed_project.id,
+        experiment.id,
+        "baseline",
+        "Baseline",
+        now,
+        now,
+    )
+    .unwrap();
+    store
+        .create_experiment_event(&experiment_event, &audit)
+        .await
+        .unwrap();
+    let definition = ObservationDefinition::new(
+        lab.id,
+        allowed_project.id,
+        experiment.id,
+        "appearance",
+        "Appearance",
+        ObservationValueType::Text,
+        ObservationPolicy::Versioned,
+        now,
+    )
+    .unwrap();
+    store
+        .create_observation_definition(&definition, &audit)
+        .await
+        .unwrap();
+    let observation = Observation::new(
+        lab.id,
+        allowed_project.id,
+        experiment.id,
+        experiment_event.id,
+        definition.id,
+        ObservationSubjectType::Animal,
+        animal.id,
+        now,
+    )
+    .unwrap();
+    let observation_value = ObservationValueRecord::new(
+        observation.id,
+        1,
+        ObservationValueData::Text("normal".to_owned()),
+        now,
+        now,
+    )
+    .unwrap();
+    store
+        .create_observation(&observation, &observation_value, &audit)
+        .await
+        .unwrap();
+
+    let template = ExperimentTemplateVersion::draft(lab.id, "general", 1, "General", now).unwrap();
+    store
+        .create_template_version(&template, &audit)
+        .await
+        .unwrap();
+
     let access = StoreToolAccessContext::new(lab.id, [allowed_project.id, foreign_project.id])
         .with_lab_registry_read(true);
     let executor = StoreDomainToolExecutor::new(store.clone(), access);
@@ -208,6 +275,8 @@ async fn fixture() -> Fixture {
         allowed_event_id: allowed_event.id,
         forbidden_event_id: forbidden_event.id,
         measurement_id: measurement.id,
+        observation_id: observation.id,
+        cohort_id: cohort.id,
     }
 }
 
@@ -243,7 +312,7 @@ fn assert_rejected(result: Result<DomainToolOutput, ToolExecutionError>, expecte
 }
 
 #[tokio::test]
-async fn all_declared_tools_execute_bounded_reads_with_citations() {
+async fn aggregate_model_tools_execute_bounded_reads_with_citations() {
     let fixture = fixture().await;
     let audit_filter = AuditFilter {
         lab_id: fixture.lab_id,
@@ -257,38 +326,41 @@ async fn all_declared_tools_execute_bounded_reads_with_citations() {
         .unwrap()
         .len();
     let supported = fixture.executor.supported_tools();
-    assert_eq!(supported.len(), 7);
+    assert_eq!(
+        supported,
+        vec![
+            ToolName::ResourceSearch,
+            ToolName::GenotypingQuery,
+            ToolName::AnimalContext,
+            ToolName::ProjectContext,
+        ]
+    );
     assert!(!supported.contains(&ToolName::ImportPreview));
     assert!(!supported.contains(&ToolName::MutationDraft));
+    assert!(
+        !supported.contains(&ToolName::AnimalSearch),
+        "legacy read names must not be advertised to the model"
+    );
 
     let calls = [
         (
-            ToolName::AnimalSearch,
-            json!({"project_id": fixture.allowed_project_id, "query": "M001"}),
+            ToolName::ResourceSearch,
+            json!({
+                "resource": "animals",
+                "project_id": fixture.allowed_project_id,
+                "query": "M001"
+            }),
         ),
         (
-            ToolName::AnimalTimeline,
+            ToolName::AnimalContext,
             json!({
                 "animal_id": fixture.animal_id,
                 "project_id": fixture.allowed_project_id
             }),
         ),
-        (ToolName::CageList, json!({"limit": 1})),
-        (ToolName::ProjectList, json!({"status": "active"})),
         (
-            ToolName::ExperimentStatus,
+            ToolName::ProjectContext,
             json!({"project_id": fixture.allowed_project_id}),
-        ),
-        (
-            ToolName::MeasurementQuery,
-            json!({
-                "project_id": fixture.allowed_project_id,
-                "measurement_key": "body_weight"
-            }),
-        ),
-        (
-            ToolName::SampleInventory,
-            json!({"project_id": fixture.allowed_project_id, "sample_type": "lung"}),
         ),
     ];
     for (tool, arguments) in calls {
@@ -299,16 +371,25 @@ async fn all_declared_tools_execute_bounded_reads_with_citations() {
                 .await
                 .unwrap(),
         );
-        let expected = if tool == ToolName::AnimalTimeline {
-            4
-        } else {
-            1
-        };
-        assert_eq!(
-            data["items"].as_array().unwrap().len(),
-            expected,
-            "{tool:?}"
-        );
+        match tool {
+            ToolName::ResourceSearch => {
+                assert_eq!(data["resource"], "animals");
+                assert_eq!(data["result"]["items"].as_array().unwrap().len(), 1);
+            }
+            ToolName::AnimalContext => {
+                assert_eq!(data["animal"]["id"], fixture.animal_id.to_string());
+                assert_eq!(data["events"]["items"].as_array().unwrap().len(), 4);
+            }
+            ToolName::ProjectContext => {
+                assert_eq!(
+                    data["project"]["id"],
+                    fixture.allowed_project_id.to_string()
+                );
+                assert_eq!(data["animals"]["items"].as_array().unwrap().len(), 1);
+                assert_eq!(data["cages"]["items"].as_array().unwrap().len(), 1);
+            }
+            _ => unreachable!(),
+        }
         assert!(!citations.is_empty(), "{tool:?}");
         assert!(
             citations
@@ -316,6 +397,22 @@ async fn all_declared_tools_execute_bounded_reads_with_citations() {
                 .all(|citation| { citation.revision.is_none_or(|revision| revision > 0) })
         );
     }
+    let (genotyping, citations) = read_output(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::GenotypingQuery,
+                json!({
+                    "project_id": fixture.allowed_project_id,
+                    "state": "expected"
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(genotyping["items"], json!([]));
+    assert_eq!(genotyping["page"]["returned"], 0);
+    assert!(citations.is_empty());
     let audit_count_after = fixture
         .store
         .list_audit_entries(&audit_filter)
@@ -323,6 +420,408 @@ async fn all_declared_tools_execute_bounded_reads_with_citations() {
         .unwrap()
         .len();
     assert_eq!(audit_count_after, audit_count_before);
+}
+
+#[tokio::test]
+async fn model_business_reads_omit_human_account_identifiers() {
+    let fixture = fixture().await;
+    let (context, _) = read_output(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::AnimalContext,
+                json!({
+                    "animal_id": fixture.animal_id,
+                    "project_id": fixture.allowed_project_id
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    let assignment = context["assignments"][0].as_object().unwrap();
+    assert!(!assignment.contains_key("assigned_by"));
+    assert!(!assignment.contains_key("lab_id"));
+    assert!(assignment.contains_key("assigned_at"));
+
+    for event in context["events"]["items"].as_array().unwrap() {
+        let event = event.as_object().unwrap();
+        assert!(!event.contains_key("recorded_by"));
+        assert!(!event.contains_key("lab_id"));
+        assert!(event.contains_key("recorded_at"));
+    }
+    for measurement in context["measurements"]["items"].as_array().unwrap() {
+        let measurement = measurement.as_object().unwrap();
+        assert!(!measurement.contains_key("signed_by"));
+        assert!(!measurement.contains_key("lab_id"));
+        assert!(!measurement.contains_key("meta"));
+        assert!(measurement.contains_key("signed_at"));
+    }
+
+    let (measurements, _) = read_output(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({
+                    "resource": "measurements",
+                    "project_id": fixture.allowed_project_id
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    let measurement = measurements["result"]["items"][0].as_object().unwrap();
+    assert_eq!(
+        measurement["id"],
+        serde_json::Value::String(fixture.measurement_id.to_string())
+    );
+    assert!(!measurement.contains_key("signed_by"));
+    assert!(!measurement.contains_key("meta"));
+
+    let (observation_values, _) = read_output(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({
+                    "resource": "observation_values",
+                    "project_id": fixture.allowed_project_id,
+                    "observation_id": fixture.observation_id
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    let observation_value = observation_values["result"]["items"][0]
+        .as_object()
+        .unwrap();
+    assert!(!observation_value.contains_key("recorded_by"));
+    assert!(!observation_value.contains_key("meta"));
+    assert!(observation_value.contains_key("recorded_at"));
+
+    let (library, _) = read_output(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({"resource": "library"}),
+            ))
+            .await
+            .unwrap(),
+    );
+    let template = library["result"]["items"][0].as_object().unwrap();
+    assert!(!template.contains_key("published_by"));
+    assert!(!template.contains_key("lab_id"));
+    assert!(!template.contains_key("meta"));
+    assert!(template.contains_key("published_at"));
+}
+
+#[tokio::test]
+async fn participation_reads_require_project_scope_and_a_cohort_relation() {
+    let fixture = fixture().await;
+    let (data, citations) = read_output(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({
+                    "resource": "participations",
+                    "project_id": fixture.allowed_project_id,
+                    "cohort_id": fixture.cohort_id
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    let items = data["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["animal_id"], fixture.animal_id.to_string());
+    assert!(!citations.is_empty());
+
+    assert_rejected(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({
+                    "resource": "participations",
+                    "project_id": fixture.allowed_project_id
+                }),
+            ))
+            .await,
+        "cohort_required",
+    );
+    assert_rejected(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({
+                    "resource": "participations",
+                    "project_id": fixture.forbidden_project_id,
+                    "cohort_id": fixture.cohort_id
+                }),
+            ))
+            .await,
+        "project_forbidden",
+    );
+}
+
+#[tokio::test]
+async fn audit_tool_is_fail_closed_and_only_returns_the_safe_projection() {
+    let fixture = fixture().await;
+    let denied = StoreDomainToolExecutor::new(
+        fixture.store.clone(),
+        StoreToolAccessContext::new(fixture.lab_id, [fixture.allowed_project_id])
+            .with_lab_registry_read(true),
+    );
+    assert!(!denied.supported_tools().contains(&ToolName::AuditQuery));
+    assert!(
+        !denied
+            .supported_tools()
+            .contains(&ToolName::ProvenanceQuery)
+    );
+    assert_rejected(
+        denied
+            .execute(request(ToolName::AuditQuery, json!({"limit": 2})))
+            .await,
+        "audit_forbidden",
+    );
+
+    let allowed = StoreDomainToolExecutor::new(
+        fixture.store.clone(),
+        StoreToolAccessContext::new(fixture.lab_id, [fixture.allowed_project_id])
+            .with_lab_registry_read(true)
+            .with_audit_read(true),
+    );
+    assert!(allowed.supported_tools().contains(&ToolName::AuditQuery));
+    let (data, citations) = read_output(
+        allowed
+            .execute(request(ToolName::AuditQuery, json!({"limit": 2})))
+            .await
+            .unwrap(),
+    );
+    let items = data["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    for item in items {
+        let object = item.as_object().unwrap();
+        for hidden in [
+            "before",
+            "after",
+            "operation_params",
+            "reason",
+            "request_id",
+            "actor",
+            "actor_user_id",
+            "actor_display_name",
+            "entity_name_snapshot",
+            "provider",
+            "model",
+            "path",
+            "relative_path",
+            "sha256",
+            "api_key",
+            "key",
+        ] {
+            assert!(!object.contains_key(hidden), "{hidden} leaked");
+        }
+        assert!(object.contains_key("before_available"));
+        assert!(object.contains_key("after_available"));
+    }
+    assert!(!citations.is_empty());
+
+    assert!(
+        allowed
+            .supported_tools()
+            .contains(&ToolName::ProvenanceQuery)
+    );
+    let (provenance, provenance_citations) = read_output(
+        allowed
+            .execute(request(ToolName::ProvenanceQuery, json!({"limit": 2})))
+            .await
+            .unwrap(),
+    );
+    let provenance_items = provenance["items"].as_array().unwrap();
+    assert_eq!(provenance_items.len(), 2);
+    for item in provenance_items {
+        let keys = item
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "confidence",
+                "entity_id",
+                "entity_type",
+                "recorded_at",
+                "source",
+            ])
+        );
+    }
+    assert!(!provenance_citations.is_empty());
+}
+
+#[tokio::test]
+async fn activity_tool_requires_explicit_activity_access() {
+    let fixture = fixture().await;
+    let denied = StoreDomainToolExecutor::new(
+        fixture.store.clone(),
+        StoreToolAccessContext::new(fixture.lab_id, [fixture.allowed_project_id])
+            .with_lab_registry_read(true),
+    );
+    assert_rejected(
+        denied
+            .execute(request(ToolName::ActivityQuery, json!({"limit": 5})))
+            .await,
+        "activity_forbidden",
+    );
+    assert!(!denied.supported_tools().contains(&ToolName::ActivityQuery));
+
+    let allowed = StoreDomainToolExecutor::new(
+        fixture.store.clone(),
+        StoreToolAccessContext::new(fixture.lab_id, [fixture.allowed_project_id])
+            .with_lab_registry_read(true)
+            .with_activity_read(true),
+    );
+    let (data, citations) = read_output(
+        allowed
+            .execute(request(ToolName::ActivityQuery, json!({"limit": 5})))
+            .await
+            .unwrap(),
+    );
+    assert!(allowed.supported_tools().contains(&ToolName::ActivityQuery));
+    let items = data["items"].as_array().unwrap();
+    assert!(!items.is_empty());
+    for item in items {
+        for hidden in [
+            "actor",
+            "actor_user_id",
+            "actor_display_name",
+            "provider",
+            "model",
+            "path",
+            "relative_path",
+            "sha256",
+            "api_key",
+            "key",
+        ] {
+            assert!(item.get(hidden).is_none(), "{hidden} leaked");
+        }
+    }
+    assert!(!citations.is_empty());
+}
+
+#[tokio::test]
+async fn attachment_search_omits_storage_metadata_and_private_ai_resources() {
+    let fixture = fixture().await;
+    let now = Utc::now();
+    let public_attachment = Attachment {
+        id: Uuid::new_v4(),
+        lab_id: fixture.lab_id,
+        project_id: Some(fixture.allowed_project_id),
+        entity_type: EntityType::Animal.as_str().to_owned(),
+        entity_id: fixture.animal_id,
+        file_name: "public-note.txt".to_owned(),
+        media_type: Some("text/plain".to_owned()),
+        relative_path: "secret/storage/public-note.txt".to_owned(),
+        size_bytes: 12,
+        sha256: "a".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    let private_attachment = Attachment {
+        id: Uuid::new_v4(),
+        lab_id: fixture.lab_id,
+        project_id: Some(fixture.allowed_project_id),
+        entity_type: EntityType::AiPrivateImage.as_str().to_owned(),
+        entity_id: Uuid::new_v4(),
+        file_name: "private-ai-image.png".to_owned(),
+        media_type: Some("image/png".to_owned()),
+        relative_path: "secret/storage/private-ai-image.png".to_owned(),
+        size_bytes: 64,
+        sha256: "b".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    let audit = AuditContext::system(WriteSource::Api);
+    fixture
+        .store
+        .create_attachment(&public_attachment, &audit)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .create_attachment(&private_attachment, &audit)
+        .await
+        .unwrap();
+
+    let (data, citations) = read_output(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({
+                    "resource": "attachments",
+                    "project_id": fixture.allowed_project_id
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    let items = data["result"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"], public_attachment.id.to_string());
+    let object = items[0].as_object().unwrap();
+    assert!(!object.contains_key("relative_path"));
+    assert!(!object.contains_key("sha256"));
+    assert!(!citations.iter().any(|citation| {
+        citation.entity_type == EntityType::Attachment
+            && citation.entity_id == private_attachment.id
+    }));
+}
+
+#[tokio::test]
+async fn jobs_are_fail_closed_to_the_authenticated_owner() {
+    let fixture = fixture().await;
+    assert_rejected(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({"resource": "jobs"}),
+            ))
+            .await,
+        "job_owner_required",
+    );
+
+    let executor = StoreDomainToolExecutor::new(
+        fixture.store.clone(),
+        StoreToolAccessContext::new(fixture.lab_id, [fixture.allowed_project_id])
+            .with_lab_registry_read(true)
+            .with_current_user(Uuid::new_v4()),
+    );
+    let (data, _) = read_output(
+        executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({"resource": "jobs"}),
+            ))
+            .await
+            .unwrap(),
+    );
+    assert!(data["result"]["items"].as_array().unwrap().is_empty());
+    assert_rejected(
+        executor
+            .execute(request(
+                ToolName::ResourceSearch,
+                json!({"resource": "jobs", "created_by": Uuid::new_v4()}),
+            ))
+            .await,
+        "invalid_arguments",
+    );
 }
 
 #[tokio::test]
@@ -432,6 +931,18 @@ async fn project_only_access_cannot_fall_back_to_the_lab_registry() {
     assert_rejected(
         executor
             .execute(request(
+                ToolName::ResourceSearch,
+                json!({
+                    "resource": "animal_drafts",
+                    "litter_id": Uuid::new_v4()
+                }),
+            ))
+            .await,
+        "lab_registry_forbidden",
+    );
+    assert_rejected(
+        executor
+            .execute(request(
                 ToolName::AnimalTimeline,
                 json!({"animal_id": fixture.hidden_animal_id}),
             ))
@@ -494,6 +1005,47 @@ async fn project_only_access_cannot_fall_back_to_the_lab_registry() {
         event_ids.len(),
         4,
         "allowed note plus enrollment, measurement and sample events"
+    );
+}
+
+#[tokio::test]
+async fn legacy_timeline_uses_assignment_not_experiment_participation_for_authorization() {
+    let fixture = fixture().await;
+    let assignments = fixture
+        .store
+        .list_project_animal_assignments(&ProjectAnimalAssignmentFilter {
+            lab_id: fixture.lab_id,
+            project_id: Some(fixture.allowed_project_id),
+            animal_id: Some(fixture.animal_id),
+        })
+        .await
+        .unwrap();
+    assert_eq!(assignments.len(), 1);
+    fixture
+        .store
+        .remove_animals_from_project(
+            &[ProjectAnimalAssignmentRemoval {
+                assignment_id: assignments[0].id,
+                expected_revision: assignments[0].meta.revision,
+            }],
+            Utc::now(),
+            &AuditContext::system(WriteSource::Api),
+        )
+        .await
+        .unwrap();
+
+    let executor = project_only_executor(&fixture);
+    assert_rejected(
+        executor
+            .execute(request(
+                ToolName::AnimalTimeline,
+                json!({
+                    "animal_id": fixture.animal_id,
+                    "project_id": fixture.allowed_project_id
+                }),
+            ))
+            .await,
+        "animal_forbidden",
     );
 }
 

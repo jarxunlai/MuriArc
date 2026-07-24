@@ -31,13 +31,46 @@ struct LibraryQuery {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LibraryItem {
-    attachment: Attachment,
+    attachment: LibraryAttachment,
     links: Vec<AttachmentLink>,
     derivatives: Vec<AttachmentDerivative>,
     preview_supported: bool,
     preview_href: Option<String>,
     preview_reason: Option<&'static str>,
     status: &'static str,
+}
+
+/// Human-facing attachment metadata. Object-store addressing is deliberately
+/// absent even for formal project attachments.
+#[derive(Debug, Serialize)]
+struct LibraryAttachment {
+    id: Uuid,
+    project_id: Option<Uuid>,
+    entity_type: String,
+    entity_id: Uuid,
+    file_name: String,
+    media_type: Option<String>,
+    size_bytes: i64,
+    sha256: String,
+    version: i32,
+    meta: RecordMeta,
+}
+
+impl From<Attachment> for LibraryAttachment {
+    fn from(attachment: Attachment) -> Self {
+        Self {
+            id: attachment.id,
+            project_id: attachment.project_id,
+            entity_type: attachment.entity_type,
+            entity_id: attachment.entity_id,
+            file_name: attachment.file_name,
+            media_type: attachment.media_type,
+            size_bytes: attachment.size_bytes,
+            sha256: attachment.sha256,
+            version: attachment.version,
+            meta: attachment.meta,
+        }
+    }
 }
 
 async fn list_library(
@@ -97,7 +130,7 @@ async fn list_library(
         let preview_supported = preview_media_type(attachment.media_type.as_deref());
         let id = attachment.id;
         items.push(LibraryItem {
-            attachment,
+            attachment: attachment.into(),
             links,
             derivatives,
             preview_supported,
@@ -293,4 +326,35 @@ fn preview_media_type(value: Option<&str>) -> bool {
                 | "application/pdf"
         )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::*;
+
+    #[test]
+    fn library_attachment_never_serializes_object_store_path() {
+        let id = Uuid::new_v4();
+        let attachment = Attachment {
+            id,
+            lab_id: Uuid::new_v4(),
+            project_id: Some(Uuid::new_v4()),
+            entity_type: "ai_conversation_source".to_owned(),
+            entity_id: Uuid::new_v4(),
+            file_name: "measurements.csv".to_owned(),
+            media_type: Some("text/csv".to_owned()),
+            relative_path: format!("objects/{id}"),
+            size_bytes: 128,
+            sha256: "a".repeat(64),
+            version: 1,
+            meta: RecordMeta::new(Utc::now()),
+        };
+
+        let value = serde_json::to_value(LibraryAttachment::from(attachment)).unwrap();
+        assert!(value.get("relative_path").is_none());
+        assert_eq!(value["id"], id.to_string());
+        assert_eq!(value["file_name"], "measurements.csv");
+    }
 }

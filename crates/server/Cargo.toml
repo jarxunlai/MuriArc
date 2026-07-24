@@ -32,7 +32,7 @@ sha2 = "0.10.9"
 sqlx = { workspace = true, optional = true, features = ["postgres"] }
 subtle = "2.6.1"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "signal", "sync"] }
+tokio = { workspace = true, features = ["net", "signal", "sync", "time"] }
 tokio-util = { version = "0.7.17", features = ["io"] }
 tower-http = { version = "0.6.8", features = ["fs"] }
 tracing = "0.1.44"
@@ -42,6 +42,7 @@ zeroize = "1.9.0"
 
 [dev-dependencies]
 http-body-util = "0.1.3"
+muriarc-ai = { path = "../ai", features = ["test-support"] }
 muriarc-store-sqlite = { path = "../store-sqlite" }
 sqlx = { workspace = true, features = ["sqlite"] }
 tempfile = "3.23.0"

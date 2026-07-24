@@ -2,6 +2,7 @@
 
 mod animal;
 mod breeding;
+mod business_read;
 mod cage;
 mod experiment;
 mod genetics;
@@ -9,6 +10,7 @@ mod observation;
 mod organization;
 mod project_animal;
 mod records;
+mod research_plan;
 mod validation;
 
 pub use animal::{
@@ -16,6 +18,7 @@ pub use animal::{
     MAX_ANIMAL_DISPLAY_ID_CHARS, MAX_ANIMAL_STRAIN_CHARS, create_animal,
 };
 pub use breeding::*;
+pub use business_read::*;
 pub use cage::{
     CreateCageCommand, MAX_CAGE_DISPLAY_ID_CHARS, MAX_CAGE_LOCATION_CHARS, MAX_CAGE_SECTION_CHARS,
     MAX_TRANSFER_NOTES_BYTES, TransferAnimalsCommand, create_cage, transfer_animals,
@@ -27,6 +30,7 @@ pub use observation::*;
 pub use organization::*;
 pub use project_animal::*;
 pub use records::*;
+pub use research_plan::*;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

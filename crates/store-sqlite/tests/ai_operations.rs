@@ -401,6 +401,8 @@ async fn approved_ai_measurement_is_applied_atomically_as_unsigned_draft() {
             profile_version: 1,
         }),
         legacy_read_only: false,
+        pinned_at: None,
+        archived_at: None,
         meta: RecordMeta::new(now),
     };
     store

@@ -26,8 +26,17 @@ impl AiActionPolicy {
             // force independently of autonomy mode.
             ToolName::ImportCommitDraft
             | ToolName::MutationDraft
+            | ToolName::ExperimentGroupingDraft
             | ToolName::ExperimentTemplateDraft
+            | ToolName::SourceImportPreview
             | ToolName::ImportPreview
+            | ToolName::ResourceSearch
+            | ToolName::GenotypingQuery
+            | ToolName::AnimalContext
+            | ToolName::ProjectContext
+            | ToolName::ActivityQuery
+            | ToolName::AuditQuery
+            | ToolName::ProvenanceQuery
             | ToolName::AnimalSearch
             | ToolName::AnimalTimeline
             | ToolName::CageList

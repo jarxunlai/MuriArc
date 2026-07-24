@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod ai_source_resolver;
+
 mod ai_data_tools;
 mod ai_secrets;
 mod ai_step_up;

@@ -11,6 +11,7 @@ use crate::ToolName;
 pub enum DraftKind {
     OrdinaryWrite,
     MeasurementResult,
+    ResearchPlan,
     BulkImport,
     SoftDelete,
     PermissionChange,
@@ -21,7 +22,9 @@ impl DraftKind {
     pub const fn approval_requirement(self) -> ApprovalRequirement {
         match self {
             Self::OrdinaryWrite => ApprovalRequirement::PreviewConfirmation,
-            Self::MeasurementResult => ApprovalRequirement::ResearcherSignature,
+            Self::MeasurementResult | Self::ResearchPlan => {
+                ApprovalRequirement::ResearcherSignature
+            }
             Self::BulkImport | Self::SoftDelete | Self::PermissionChange | Self::Migration => {
                 ApprovalRequirement::ReinforcedConfirmation
             }
@@ -483,6 +486,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(draft.status(), DraftStatus::Approved);
+    }
+
+    #[test]
+    fn research_plan_cannot_be_approved_without_researcher_signature() {
+        let mut draft = draft(DraftKind::ResearchPlan);
+        let error = draft
+            .decide(
+                draft.revision(),
+                ApprovalDecision::Approve,
+                approver(),
+                Some("   ".to_owned()),
+                false,
+                now() + Duration::minutes(1),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, ApprovalError::SignatureRequired);
+        assert_eq!(draft.status(), DraftStatus::PendingApproval);
     }
 
     #[test]

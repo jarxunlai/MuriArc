@@ -62,7 +62,7 @@ impl DesktopAiImages {
         let file_name = validate_file_name(&input.file_name)?;
         if let Some(conversation_id) = input.conversation_id {
             workflow
-                .get_conversation(context, conversation_id, 1)
+                .conversation_model_profile(context, conversation_id)
                 .await?;
         }
         let attachment_id = Uuid::new_v4();
@@ -169,11 +169,17 @@ impl DesktopAiImages {
 
     pub(crate) async fn archive(
         &self,
+        workflow: &AiWorkflowService,
         context: &AiExecutionContext,
         id: Uuid,
         input: ArchivePrivateAiImageInput,
     ) -> Result<PrivateImageView, DesktopAiError> {
         let (image, _) = self.private_image(id).await?;
+        if let Some(conversation_id) = image.conversation_id {
+            workflow
+                .conversation_model_profile(context, conversation_id)
+                .await?;
+        }
         if image.status == PrivateImageStatus::PendingApproval {
             return Err(DesktopAiError::InvalidImageEvidence);
         }

@@ -265,11 +265,19 @@ async fn preflight_upload_conversation(
         return Err(ApiError::not_found("AI conversation was not found")
             .with_request_id(metadata.request_id.clone()));
     }
+    if conversation.archived_at.is_some() {
+        return Err(ApiError::conflict("AI conversation is archived")
+            .with_request_id(metadata.request_id.clone()));
+    }
     if conversation.legacy_read_only {
         return Err(ApiError::conflict("legacy AI conversation is read-only")
             .with_request_id(metadata.request_id.clone()));
     }
-    Ok(())
+    let binding = conversation.model_profile.ok_or_else(|| {
+        ApiError::conflict("legacy AI conversation is read-only")
+            .with_request_id(metadata.request_id.clone())
+    })?;
+    super::ai_api::ensure_conversation_model_available(state, principal, binding, metadata).await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -421,6 +429,7 @@ async fn archive(
             ApiError::not_found("private image was not found").with_request_id(m.request_id)
         );
     }
+    preflight_upload_conversation(&state, &p, &m, current.conversation_id).await?;
     scope::project_with_permission(&state, &p, &m, q.project_id, Permission::WriteAttachment)
         .await?;
     let image = store(
@@ -1362,10 +1371,11 @@ mod tests {
     use super::*;
     use crate::{StaticTokenAuthenticator, StoreJobRepository};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use muriarc_ai::{AssistantRuntimeConfig, CompletionResponse, MockProvider};
     use muriarc_core::{
-        AuditContext, Experiment, ExperimentEvent, Lab, LabRole, MuriArcStore,
-        ObservationDefinition, ObservationPolicy, ObservationValueType, Project, ProjectRole, User,
-        WorkspaceStore, WriteSource,
+        AiModelProfileBinding, AuditContext, Experiment, ExperimentEvent, Lab, LabRole,
+        MuriArcStore, ObservationDefinition, ObservationPolicy, ObservationValueType, Project,
+        ProjectRole, User, WorkspaceStore, WriteSource,
     };
     use muriarc_data::DataFiles;
     use muriarc_store_sqlite::SqliteStore;
@@ -2049,5 +2059,98 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn visual_extraction_wire_format_never_accepts_model_authored_entity_ids() {
+        let definition = ObservationDefinition::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "body_weight",
+            "Body weight",
+            ObservationValueType::Text,
+            ObservationPolicy::Versioned,
+            Utc::now(),
+        )
+        .unwrap();
+        let images = vec![
+            PreparedAssistantImage::new(
+                Uuid::new_v4(),
+                "a".repeat(64),
+                "image/png",
+                "iVBORw0KGgo=".to_owned(),
+            )
+            .unwrap(),
+        ];
+        let response = |content: &str| CompletionResponse {
+            id: None,
+            model: None,
+            content: Some(content.to_owned()),
+            tool_calls: Vec::new(),
+            finish_reason: Some("stop".to_owned()),
+            usage: None,
+        };
+
+        let safe = MockProvider::new(
+            "vision-provider",
+            "vision-model",
+            [Ok(response(
+                r#"{"candidates":[{"value":{"type":"text","value":"23.4 g"},"confidence":0.92,"sourceLabel":"23.4 g"}]}"#,
+            ))],
+        );
+        let parsed = extract_data_cell_vision(
+            &safe,
+            ProviderCredentials::none(),
+            DataCellVisionExtractionRequest {
+                model_profile: AiModelProfileBinding {
+                    profile_id: Uuid::new_v4(),
+                    profile_version: 1,
+                },
+                runtime: AssistantRuntimeConfig::default(),
+                definition: &definition,
+                images: &images,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            parsed.candidate.value(),
+            &ObservationValueData::Text("23.4 g".to_owned())
+        );
+
+        for forbidden in [
+            format!(
+                r#"{{"candidates":[{{"subjectId":"{}","value":{{"type":"text","value":"23.4 g"}},"confidence":0.92,"sourceLabel":null}}]}}"#,
+                Uuid::new_v4()
+            ),
+            format!(
+                r#"{{"candidates":[{{"definitionId":"{}","value":{{"type":"text","value":"23.4 g"}},"confidence":0.92,"sourceLabel":null}}]}}"#,
+                Uuid::new_v4()
+            ),
+        ] {
+            let provider = MockProvider::new(
+                "vision-provider",
+                "vision-model",
+                [Ok(response(&forbidden))],
+            );
+            assert!(matches!(
+                extract_data_cell_vision(
+                    &provider,
+                    ProviderCredentials::none(),
+                    DataCellVisionExtractionRequest {
+                        model_profile: AiModelProfileBinding {
+                            profile_id: Uuid::new_v4(),
+                            profile_version: 1,
+                        },
+                        runtime: AssistantRuntimeConfig::default(),
+                        definition: &definition,
+                        images: &images,
+                    },
+                )
+                .await,
+                Err(DataCellVisionExtractionError::InvalidResponse)
+            ));
+        }
     }
 }

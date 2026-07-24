@@ -6689,6 +6689,8 @@ mod postgres {
                 title: "First profile-bound turn".to_owned(),
                 model_profile: Some(first.model_profile),
                 legacy_read_only: false,
+                pinned_at: None,
+                archived_at: None,
                 meta: RecordMeta::new(Utc::now()),
             };
             postgres

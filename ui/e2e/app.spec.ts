@@ -286,7 +286,7 @@ test('AI 工作页保留上下文、回答和数据引用', async ({ page }) => 
   await page.goto('/#/ai')
   await expect(page.getByTestId('conversation-mode-status')).toContainText('请求 Full（待启用）')
   await expect(page.getByTestId('conversation-mode-status')).toContainText('实际 尚未开始')
-  const prompt = page.getByPlaceholder('询问动物、实验或数据…')
+  const prompt = page.getByLabel('发送给 AI 的消息')
   await prompt.fill('总结进行中的实验')
   await prompt.press('Enter')
 
@@ -303,6 +303,51 @@ test('AI 工作页保留上下文、回答和数据引用', async ({ page }) => 
   await page.getByRole('button', { name: '新会话', exact: true }).click()
   await expect(page.locator('.message.user')).toHaveCount(0)
   await expect(page.getByText(/选择科研项目后/)).toBeVisible()
+})
+
+test('AI 浮动工作台可由键盘移动缩放并在目标视口内保持可用', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop-chromium', '由单一浏览器覆盖四个明确验收宽度')
+
+  await page.addInitScript(() => localStorage.clear())
+  await page.setViewportSize({ width: 1440, height: 960 })
+  await page.goto('/#/cages')
+  await page.getByRole('button', { name: '问 AI' }).click()
+
+  const workbench = page.getByRole('dialog', { name: 'MuriArc AI 工作台' })
+  const dragHandle = page.getByLabel(/AI 工作台拖动区域/)
+  await expect(workbench).toBeVisible()
+  const initial = await workbench.boundingBox()
+  expect(initial).not.toBeNull()
+
+  await dragHandle.focus()
+  await dragHandle.press('Alt+ArrowLeft')
+  await expect.poll(async () => (await workbench.boundingBox())?.x ?? initial!.x)
+    .toBeLessThan(initial!.x)
+  const moved = await workbench.boundingBox()
+  expect(moved).not.toBeNull()
+
+  await dragHandle.press('Control+Alt+ArrowLeft')
+  await expect.poll(async () => (await workbench.boundingBox())?.width ?? moved!.width)
+    .toBeLessThan(moved!.width)
+  const resized = await workbench.boundingBox()
+  expect(resized).not.toBeNull()
+
+  await page.getByRole('button', { name: '最大化' }).click()
+  await expect(page.getByRole('button', { name: '还原窗口' })).toBeVisible()
+  await page.getByRole('button', { name: '复位大小和位置' }).click()
+
+  for (const width of [375, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 960 })
+    await expect(workbench).toBeVisible()
+    const bounds = await workbench.boundingBox()
+    expect(bounds).not.toBeNull()
+    expect(bounds!.x).toBeGreaterThanOrEqual(-1)
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width + 1)
+    expect(await workbench.evaluate((element) => element.scrollWidth <= element.clientWidth + 1))
+      .toBe(true)
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
+      .toBe(true)
+  }
 })
 
 test('聊天图片明确覆盖无默认、视觉中转与当前模型直接视觉', async ({ page }, testInfo) => {
@@ -477,7 +522,7 @@ test('手机端使用选择动物再选择目标笼位的转笼流程', async ({
   await page.getByRole('button', { name: '移动到笼位' }).click()
 
   const dialog = page.getByRole('dialog')
-  await dialog.getByRole('textbox').click()
+  await dialog.getByLabel('目标笼位').click()
   await page.getByText('A03 · 0/5', { exact: true }).click()
   const confirmMove = dialog.getByRole('button', { name: '确认移动', exact: true })
   await expect(confirmMove).toBeEnabled()

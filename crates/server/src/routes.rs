@@ -2,6 +2,7 @@
 mod admin_users;
 mod ai_api;
 mod ai_images;
+mod ai_sources;
 mod animal_details;
 mod animals;
 mod attachment_files;
@@ -101,6 +102,7 @@ fn base_router(state: AppState) -> Router {
     let ready_json = Router::new()
         .merge(ai_api::router())
         .merge(ai_images::router())
+        .merge(ai_sources::router())
         .merge(auth_api::protected_router())
         .merge(audit::router())
         .merge(animals::router())

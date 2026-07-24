@@ -593,7 +593,12 @@ export interface ManagedUser {
 }
 
 export interface AiCitation {
-  entityType: AiEntityType
+  /**
+   * Providers may return a newly-added entity type before this UI is upgraded.
+   * Keep the runtime value so it can be rendered as plain text without
+   * manufacturing a navigation target.
+   */
+  entityType: string
   entityId: string
   revision?: number
   label: string
@@ -633,7 +638,9 @@ export type AiEntityType =
   | 'measurement'
   | 'sample'
   | 'attachment'
+  | 'project_animal_assignment'
   | 'ai_conversation'
+  | 'ai_conversation_source'
   | 'tool_run'
   | 'approval'
   | 'job'
@@ -641,7 +648,9 @@ export type AiEntityType =
 export type AiDraftKind =
   | 'ordinary_write'
   | 'measurement_result'
+  | 'research_plan'
   | 'bulk_import'
+  | 'bulk_measurement'
   | 'soft_delete'
   | 'permission_change'
   | 'migration'
@@ -665,11 +674,46 @@ export interface AiFieldChange {
   after: unknown | null
 }
 
+export interface AiImportPreviewRow {
+  rowNumber: number
+  animalId: string
+  animalDisplayId: string
+  measurementKey: string
+  value: string
+  unit?: string
+  measuredAt: string
+}
+
+export interface AiImportPreviewIssue {
+  row?: number
+  field?: string
+  severity: 'warning' | 'error'
+  code: string
+  message: string
+}
+
+export interface AiImportPreview {
+  importKind: string
+  projectId: string
+  experimentId: string
+  fileName: string
+  sheetName: string
+  totalRows: number
+  acceptedRows: number
+  issueCount: number
+  issuesTruncated: boolean
+  canConfirm: boolean
+  previewRows: AiImportPreviewRow[]
+  previewRowsTruncated: boolean
+  issues: AiImportPreviewIssue[]
+}
+
 export interface AiWriteDraft {
   id: string
   kind: AiDraftKind
   projectId?: string
   changes: AiFieldChange[]
+  importPreview?: AiImportPreview
   requirement: AiApprovalRequirement
   status: AiDraftStatus
   revision: number
@@ -726,15 +770,17 @@ export interface AiImageEvidence {
 }
 
 export interface AiTurnInput {
-  conversationId?: string
+  conversationId: string
   projectId?: string
   message: string
+  sourceRefs?: string[]
   imageIds?: string[]
   visionModelProfileId?: string
 }
 
 export interface StartAiConversationInput {
   projectId?: string
+  title: string
   modelProfileId?: string
   requestedMode: AiAutonomyMode
   /** Server sessions only. LocalTauriGateway strips this before invoking Rust. */
@@ -748,6 +794,12 @@ export interface AiTurnResponse {
   toolRuns: AiToolRun[]
   drafts: AiWriteDraft[]
   trace: AiAssistantTrace
+  incompleteReason?:
+    | 'iteration_limit_exceeded'
+    | 'tool_call_limit_exceeded'
+    | 'total_timeout_exceeded'
+    | 'provider_failure'
+    | 'tool_execution_failure'
   autonomy?: AiAutonomyView
 }
 
@@ -767,12 +819,15 @@ export interface AiAutonomyUpdateInput {
   mode: AiAutonomyMode
   expectedRevision: number
   currentPassword?: string
+  declared?: boolean
 }
 
 export interface AiConversationSummary {
   id: string
   projectId?: string
   title: string
+  pinnedAt?: string
+  archivedAt?: string
   modelProfileId?: string
   modelProfileVersion?: number
   modelProfileName?: string
@@ -782,6 +837,86 @@ export interface AiConversationSummary {
   createdAt: string
   updatedAt: string
   revision: number
+}
+
+export type AiConversationArchiveFilter = 'active' | 'archived' | 'all'
+
+export interface AiConversationListInput {
+  projectId?: string
+  titleQuery?: string
+  archive?: AiConversationArchiveFilter
+  limit?: number
+}
+
+export type AiConversationAction = 'rename' | 'pin' | 'unpin' | 'archive' | 'unarchive'
+
+export interface AiConversationUpdateInput {
+  action: AiConversationAction
+  expectedRevision: number
+  title?: string
+}
+
+export type AiSourceStatus = 'staged' | 'ready' | 'archived' | 'failed' | 'expired'
+
+export interface AiSource {
+  id: string
+  conversationId?: string
+  projectId?: string
+  fileName: string
+  mediaType: string
+  sizeBytes: number
+  status: AiSourceStatus
+  revision: number
+  createdAt: string
+  expiresAt: string
+}
+
+export interface AiSourceUploadInput {
+  file: File
+  conversationId: string
+  projectId?: string
+}
+
+export interface AiSourceListInput {
+  conversationId: string
+  projectId?: string
+  status?: AiSourceStatus
+}
+
+export interface AiSourceArchiveInput {
+  projectId: string
+  expectedRevision: number
+}
+
+export type AiComposerSourceStatus =
+  | 'uploading'
+  | 'staged'
+  | 'ready'
+  | 'archived'
+  | 'failed'
+  | 'expired'
+  | 'error'
+
+export interface AiComposerSource {
+  clientId: string
+  sourceId?: string
+  projectId?: string
+  fileName: string
+  mediaType: string
+  sizeBytes: number
+  status: AiComposerSourceStatus
+  revision?: number
+  expiresAt?: string
+  error?: string
+  retryable?: boolean
+}
+
+export interface AiConversationSourceRef {
+  sourceId: string
+  sourceRevision: number
+  fileName: string
+  mediaType?: string
+  sizeBytes: number
 }
 
 export interface StartAiConversationResponse {
@@ -794,6 +929,7 @@ export interface AiConversationMessage {
   sequence: number
   role: 'user' | 'assistant'
   content: string
+  sourceRefs?: AiConversationSourceRef[]
   response?: AiTurnResponse
   createdAt: string
 }
@@ -831,6 +967,21 @@ export interface AiMessage {
   toolRuns?: AiToolRun[]
   drafts?: AiWriteDraft[]
   trace?: AiAssistantTrace
+  incompleteReason?:
+    | 'iteration_limit_exceeded'
+    | 'tool_call_limit_exceeded'
+    | 'total_timeout_exceeded'
+    | 'provider_failure'
+    | 'tool_execution_failure'
   pending?: boolean
   error?: boolean
+  sources?: AiMessageSource[]
+}
+
+export interface AiMessageSource {
+  sourceId?: string
+  fileName: string
+  mediaType: string
+  sizeBytes: number
+  released?: boolean
 }

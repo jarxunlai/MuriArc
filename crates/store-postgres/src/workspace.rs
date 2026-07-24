@@ -7,8 +7,99 @@ use uuid::Uuid;
 const LC: &str = "id,lab_id,project_id,attachment_id,target_type,target_id,created_by,created_at,updated_at,deleted_at,revision";
 const DC: &str = "id,lab_id,project_id,attachment_id,kind,media_type,relative_path,size_bytes,sha256,status,error_code,created_at,updated_at,deleted_at,revision";
 const IC: &str = "id,lab_id,user_id,conversation_id,attachment_id,project_id,status,last_activity_at,expires_at,archived_at,created_at,updated_at,deleted_at,revision";
+const SC: &str = "id,lab_id,user_id,conversation_id,project_id,attachment_id,kind,status,last_activity_at,expires_at,archived_at,error_code,created_at,updated_at,deleted_at,revision";
 const XC: &str = "id,lab_id,user_id,project_id,experiment_id,experiment_event_id,private_image_id,attachment_id,image_sha256,provider,model,tool_run_id,data_cell_definition_id,data_cell_subject_type,data_cell_subject_id,model_profile_id,model_profile_version,model_purpose,usage_input_tokens,usage_output_tokens,usage_total_tokens,provider_request_id,trace_json,status,items_json,error_code,created_at,updated_at,deleted_at,revision";
 const EC: &str = "draft_id,display_order,private_image_id,private_attachment_id,promoted_attachment_id,original_sha256,sanitized_sha256,created_at,updated_at,revision";
+type WritableAiConversationRow = (
+    Uuid,
+    Uuid,
+    Option<Uuid>,
+    Option<DateTime<Utc>>,
+    bool,
+    Option<Uuid>,
+    Option<i64>,
+);
+fn safe_source_snapshot(source: &AiConversationSource) -> StoreResult<serde_json::Value> {
+    ai_conversation_source_audit_snapshot(source)
+        .map_err(|error| StoreError::Serialization(error.to_string()))
+}
+fn safe_source_attachment_snapshot(attachment: &Attachment) -> StoreResult<serde_json::Value> {
+    ai_source_attachment_audit_snapshot(attachment)
+        .map_err(|error| StoreError::Serialization(error.to_string()))
+}
+async fn writable_ai_conversation_scope(
+    tx: &mut sqlx::Transaction<'_, Postgres>,
+    conversation_id: Uuid,
+    expected_lab_id: Uuid,
+    expected_user_id: Uuid,
+) -> StoreResult<Option<Uuid>> {
+    let row: Option<WritableAiConversationRow> = sqlx::query_as(
+        "SELECT lab_id,user_id,project_id,archived_at,legacy_read_only,
+                model_profile_id,model_profile_version
+         FROM ai_conversations
+         WHERE id=$1 AND deleted_at IS NULL
+         FOR SHARE",
+    )
+    .bind(conversation_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    let Some((
+        lab_id,
+        user_id,
+        project_id,
+        archived_at,
+        legacy_read_only,
+        profile_id,
+        profile_version,
+    )) = row
+    else {
+        return Err(StoreError::NotFound {
+            entity: "ai_conversation",
+            id: conversation_id,
+        });
+    };
+    if (lab_id, user_id) != (expected_lab_id, expected_user_id) {
+        return Err(StoreError::Validation(
+            "AI conversation scope does not match".to_owned(),
+        ));
+    }
+    let (Some(profile_id), Some(profile_version)) = (profile_id, profile_version) else {
+        return Err(StoreError::Conflict(
+            "AI conversation model profile is unavailable".to_owned(),
+        ));
+    };
+    if archived_at.is_some() || legacy_read_only {
+        return Err(StoreError::Conflict(
+            "AI conversation is read-only".to_owned(),
+        ));
+    }
+    let available: Option<Uuid> = sqlx::query_scalar(
+        "SELECT profile.id
+         FROM ai_model_profiles profile
+         JOIN ai_model_profile_versions profile_version
+           ON profile_version.profile_id=profile.id AND profile_version.version=$1
+         WHERE profile.id=$2
+           AND profile.lab_id=$3
+           AND profile.user_id=$4
+           AND profile.archived_at IS NULL
+           AND profile.deleted_at IS NULL
+         FOR SHARE OF profile",
+    )
+    .bind(profile_version)
+    .bind(profile_id)
+    .bind(lab_id)
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?;
+    if available.is_none() {
+        return Err(StoreError::Conflict(
+            "AI conversation model profile is unavailable".to_owned(),
+        ));
+    }
+    Ok(project_id)
+}
 fn rm(r: &PgRow) -> StoreResult<RecordMeta> {
     Ok(RecordMeta {
         created_at: r.try_get("created_at").map_err(map_sqlx)?,
@@ -59,6 +150,26 @@ fn ir(r: &PgRow) -> StoreResult<PrivateAiImage> {
         archived_at: r.try_get("archived_at").map_err(map_sqlx)?,
         meta: rm(r)?,
     })
+}
+fn sr(r: &PgRow) -> StoreResult<AiConversationSource> {
+    Ok(AiConversationSource {
+        id: r.try_get("id").map_err(map_sqlx)?,
+        lab_id: r.try_get("lab_id").map_err(map_sqlx)?,
+        user_id: r.try_get("user_id").map_err(map_sqlx)?,
+        conversation_id: r.try_get("conversation_id").map_err(map_sqlx)?,
+        project_id: r.try_get("project_id").map_err(map_sqlx)?,
+        attachment_id: r.try_get("attachment_id").map_err(map_sqlx)?,
+        kind: decode(r.try_get("kind").map_err(map_sqlx)?)?,
+        status: decode(r.try_get("status").map_err(map_sqlx)?)?,
+        last_activity_at: r.try_get("last_activity_at").map_err(map_sqlx)?,
+        expires_at: r.try_get("expires_at").map_err(map_sqlx)?,
+        archived_at: r.try_get("archived_at").map_err(map_sqlx)?,
+        error_code: r.try_get("error_code").map_err(map_sqlx)?,
+        meta: rm(r)?,
+    })
+}
+pub(crate) fn ai_conversation_source_from_row(row: &PgRow) -> StoreResult<AiConversationSource> {
+    sr(row)
 }
 fn xr(r: &PgRow) -> StoreResult<AiExtractionDraft> {
     let data_cell_definition_id: Option<Uuid> =
@@ -790,39 +901,11 @@ impl WorkspaceStore for PostgresStore {
             return Err(StoreError::Validation("private owner crosses labs".into()));
         }
         if let Some(c) = i.conversation_id {
-            let x: Option<(Uuid, Uuid, Option<Uuid>, bool)> = sqlx::query_as(
-                "SELECT lab_id,user_id,project_id,legacy_read_only
-                 FROM ai_conversations
-                 WHERE id=$1 AND deleted_at IS NULL
-                 FOR SHARE",
-            )
-            .bind(c)
-            .fetch_optional(&mut *t)
-            .await
-            .map_err(map_sqlx)?;
-            let Some((
-                conversation_lab_id,
-                conversation_user_id,
-                conversation_project_id,
-                legacy_read_only,
-            )) = x
-            else {
-                return Err(StoreError::NotFound {
-                    entity: "ai_conversation",
-                    id: c,
-                });
-            };
-            if (conversation_lab_id, conversation_user_id) != (i.lab_id, i.user_id) {
-                return Err(StoreError::Validation("conversation is not owned".into()));
-            }
+            let conversation_project_id =
+                writable_ai_conversation_scope(&mut t, c, i.lab_id, i.user_id).await?;
             if i.project_id.is_some() && i.project_id != conversation_project_id {
                 return Err(StoreError::Validation(
                     "private image project does not match its conversation".into(),
-                ));
-            }
-            if legacy_read_only {
-                return Err(StoreError::Conflict(
-                    "legacy AI conversation is read-only".into(),
                 ));
             }
         }
@@ -924,6 +1007,9 @@ impl WorkspaceStore for PostgresStore {
         ) {
             return Err(StoreError::Conflict("private image busy or expired".into()));
         }
+        if let Some(conversation_id) = i.conversation_id {
+            writable_ai_conversation_scope(&mut t, conversation_id, i.lab_id, i.user_id).await?;
+        }
         if lab(&mut t, "projects", p).await? != i.lab_id {
             return Err(StoreError::Validation(
                 "archive project crosses labs".into(),
@@ -973,6 +1059,751 @@ impl WorkspaceStore for PostgresStore {
                 })
             })
             .collect()
+    }
+    async fn create_ai_conversation_source(
+        &self,
+        at: &Attachment,
+        s: &AiConversationSource,
+        a: &AuditContext,
+    ) -> StoreResult<()> {
+        s.validate()
+            .map_err(|error| StoreError::Validation(error.to_owned()))?;
+        if at.id != s.attachment_id
+            || at.lab_id != s.lab_id
+            || at.entity_type != "ai_conversation_source"
+            || at.entity_id != s.id
+            || at.project_id.is_some()
+            || at.sha256.len() != 64
+            || at.size_bytes < 0
+            || matches!(
+                s.status,
+                AiConversationSourceStatus::Archived | AiConversationSourceStatus::Expired
+            )
+        {
+            return Err(StoreError::Validation(
+                "invalid AI conversation source".to_owned(),
+            ));
+        }
+        if at.size_bytes > MAX_ACTIVE_AI_CONVERSATION_SOURCE_BYTES_PER_OWNER {
+            return Err(StoreError::Conflict(
+                AI_CONVERSATION_SOURCE_QUOTA_EXCEEDED.to_owned(),
+            ));
+        }
+        let mut t = self.pool.begin().await.map_err(map_sqlx)?;
+        // The owner row is the quota lock. Concurrent uploads for one owner
+        // cannot both observe the same pre-insert count/byte total.
+        let owner_lab: Option<Uuid> = sqlx::query_scalar(
+            "SELECT lab_id FROM users WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(s.user_id)
+        .fetch_optional(&mut *t)
+        .await
+        .map_err(map_sqlx)?;
+        let owner_lab = owner_lab.ok_or(StoreError::NotFound {
+            entity: "workspace_scope",
+            id: s.user_id,
+        })?;
+        if owner_lab != s.lab_id {
+            return Err(StoreError::Validation(
+                "AI source owner crosses labs".to_owned(),
+            ));
+        }
+        let quota: (i64, i64) = sqlx::query_as(
+            "SELECT count(*)::bigint,coalesce(sum(attachment.size_bytes),0)::bigint
+             FROM ai_conversation_sources source
+             JOIN attachments attachment ON attachment.id=source.attachment_id
+             WHERE source.lab_id=$1 AND source.user_id=$2
+               AND source.deleted_at IS NULL
+               AND source.status IN ('staged','ready','failed')",
+        )
+        .bind(s.lab_id)
+        .bind(s.user_id)
+        .fetch_one(&mut *t)
+        .await
+        .map_err(map_sqlx)?;
+        if quota.0 >= MAX_ACTIVE_AI_CONVERSATION_SOURCES_PER_OWNER
+            || quota.1
+                > MAX_ACTIVE_AI_CONVERSATION_SOURCE_BYTES_PER_OWNER
+                    .checked_sub(at.size_bytes)
+                    .ok_or_else(|| {
+                        StoreError::Conflict(AI_CONVERSATION_SOURCE_QUOTA_EXCEEDED.to_owned())
+                    })?
+        {
+            return Err(StoreError::Conflict(
+                AI_CONVERSATION_SOURCE_QUOTA_EXCEEDED.to_owned(),
+            ));
+        }
+        let conversation_id = s.conversation_id.ok_or_else(|| {
+            StoreError::Validation("AI source must be bound to a conversation".to_owned())
+        })?;
+        let conversation_project_id =
+            writable_ai_conversation_scope(&mut t, conversation_id, s.lab_id, s.user_id).await?;
+        if conversation_project_id != s.project_id {
+            return Err(StoreError::Validation(
+                "AI source conversation scope does not match".to_owned(),
+            ));
+        }
+        if let Some(project_id) = s.project_id
+            && lab(&mut t, "projects", project_id).await? != s.lab_id
+        {
+            return Err(StoreError::Validation(
+                "AI source project crosses labs".to_owned(),
+            ));
+        }
+        ia(&mut t, at).await?;
+        sqlx::query(
+            "INSERT INTO ai_conversation_sources(id,lab_id,user_id,conversation_id,project_id,attachment_id,kind,status,last_activity_at,expires_at,archived_at,error_code,created_at,updated_at,deleted_at,revision)VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",
+        )
+        .bind(s.id)
+        .bind(s.lab_id)
+        .bind(s.user_id)
+        .bind(s.conversation_id)
+        .bind(s.project_id)
+        .bind(s.attachment_id)
+        .bind(encode(&s.kind)?)
+        .bind(encode(&s.status)?)
+        .bind(s.last_activity_at)
+        .bind(s.expires_at)
+        .bind(s.archived_at)
+        .bind(&s.error_code)
+        .bind(s.meta.created_at)
+        .bind(s.meta.updated_at)
+        .bind(s.meta.deleted_at)
+        .bind(s.meta.revision)
+        .execute(&mut *t)
+        .await
+        .map_err(map_sqlx)?;
+        for (entity_type, entity_id, project_id, after) in [
+            (
+                EntityType::Attachment,
+                at.id,
+                at.project_id,
+                ai_source_attachment_audit_snapshot(at)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?,
+            ),
+            (
+                EntityType::AiConversationSource,
+                s.id,
+                None,
+                ai_conversation_source_audit_snapshot(s)
+                    .map_err(|error| StoreError::Serialization(error.to_string()))?,
+            ),
+        ] {
+            write_audit(
+                &mut t,
+                s.lab_id,
+                project_id,
+                entity_type,
+                entity_id,
+                AuditAction::Create,
+                a,
+                None,
+                Some(after),
+            )
+            .await?;
+            insert_provenance(
+                &mut t,
+                &Provenance::from_audit(
+                    s.lab_id,
+                    project_id,
+                    entity_type,
+                    entity_id,
+                    a,
+                    s.meta.created_at,
+                ),
+            )
+            .await?;
+        }
+        t.commit().await.map_err(map_sqlx)
+    }
+    async fn get_ai_conversation_source(&self, id: Uuid) -> StoreResult<AiConversationSource> {
+        let row = sqlx::query(&format!(
+            "SELECT {SC} FROM ai_conversation_sources WHERE id=$1 AND deleted_at IS NULL"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "ai_conversation_source",
+            id,
+        })?;
+        sr(&row)
+    }
+    async fn list_ai_conversation_sources(
+        &self,
+        f: &AiConversationSourceFilter,
+    ) -> StoreResult<Vec<AiConversationSource>> {
+        let mut query = QueryBuilder::<Postgres>::new(format!(
+            "SELECT {SC} FROM ai_conversation_sources WHERE lab_id="
+        ));
+        query
+            .push_bind(f.lab_id)
+            .push(" AND user_id=")
+            .push_bind(f.user_id)
+            .push(" AND deleted_at IS NULL");
+        if let Some(value) = f.conversation_id {
+            query.push(" AND conversation_id=").push_bind(value);
+        }
+        if let Some(value) = f.project_id {
+            query.push(" AND project_id=").push_bind(value);
+        }
+        if let Some(value) = f.status {
+            query.push(" AND status=").push_bind(encode(&value)?);
+        }
+        if f.unconsumed_only {
+            query.push(
+                " AND NOT EXISTS (
+                    SELECT 1
+                    FROM ai_conversation_messages message,
+                         jsonb_array_elements(message.source_refs_json) source_ref
+                    WHERE message.deleted_at IS NULL
+                      AND message.conversation_id=ai_conversation_sources.conversation_id
+                      AND source_ref->>'sourceId'=ai_conversation_sources.id::text
+                )",
+            );
+        }
+        query.push(" ORDER BY created_at DESC,id");
+        query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .iter()
+            .map(sr)
+            .collect()
+    }
+    async fn list_expired_ai_conversation_sources(
+        &self,
+        lab_id: Uuid,
+        now: DateTime<Utc>,
+        limit: i64,
+    ) -> StoreResult<Vec<ExpiredAiConversationSource>> {
+        if !(1..=MAX_AI_CONVERSATION_SOURCE_CLEANUP_BATCH).contains(&limit) {
+            return Err(StoreError::Validation(
+                "AI source cleanup limit must be between 1 and 100".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let rows = sqlx::query(&format!(
+            "SELECT {SC} FROM ai_conversation_sources
+             WHERE lab_id=$1 AND deleted_at IS NULL AND expires_at<=$2
+               AND status IN ('staged','ready','failed')
+             ORDER BY expires_at,id LIMIT $3"
+        ))
+        .bind(lab_id)
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let mut expired = Vec::with_capacity(rows.len());
+        for row in rows {
+            let source = sr(&row)?;
+            let attachment_row = sqlx::query(&format!(
+                "SELECT {ATTACHMENT_COLUMNS} FROM attachments
+                 WHERE id=$1 AND deleted_at IS NULL"
+            ))
+            .bind(source.attachment_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "attachment",
+                id: source.attachment_id,
+            })?;
+            let attachment = attachment_from_row(&attachment_row)?;
+            if attachment.lab_id != source.lab_id
+                || attachment.project_id.is_some()
+                || attachment.entity_type != "ai_conversation_source"
+                || attachment.entity_id != source.id
+            {
+                return Err(StoreError::Validation(
+                    "AI source cleanup attachment relationship is invalid".to_owned(),
+                ));
+            }
+            expired.push(ExpiredAiConversationSource { source, attachment });
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(expired)
+    }
+    async fn list_pending_ai_conversation_source_object_deletions(
+        &self,
+        lab_id: Uuid,
+        limit: i64,
+    ) -> StoreResult<Vec<PendingAiConversationSourceObjectDeletion>> {
+        if !(1..=MAX_AI_CONVERSATION_SOURCE_CLEANUP_BATCH).contains(&limit) {
+            return Err(StoreError::Validation(
+                "AI source cleanup limit must be between 1 and 100".to_owned(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let queue_rows = sqlx::query(
+            "SELECT source_id,attachment_id,enqueued_at
+             FROM ai_conversation_source_object_deletions
+             WHERE lab_id=$1 ORDER BY enqueued_at,source_id LIMIT $2",
+        )
+        .bind(lab_id)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let mut pending = Vec::with_capacity(queue_rows.len());
+        for queue_row in queue_rows {
+            let source_id = queue_row.try_get("source_id").map_err(map_sqlx)?;
+            let attachment_id = queue_row.try_get("attachment_id").map_err(map_sqlx)?;
+            let enqueued_at = queue_row.try_get("enqueued_at").map_err(map_sqlx)?;
+            let source_row = sqlx::query(&format!(
+                "SELECT {SC} FROM ai_conversation_sources WHERE id=$1"
+            ))
+            .bind(source_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "ai_conversation_source",
+                id: source_id,
+            })?;
+            let source = sr(&source_row)?;
+            let attachment_row = sqlx::query(&format!(
+                "SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE id=$1"
+            ))
+            .bind(attachment_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "attachment",
+                id: attachment_id,
+            })?;
+            let attachment = attachment_from_row(&attachment_row)?;
+            if source.lab_id != lab_id
+                || source.status != AiConversationSourceStatus::Expired
+                || source.meta.deleted_at.is_none()
+                || source.archived_at.is_some()
+                || source.attachment_id != attachment_id
+                || attachment.lab_id != lab_id
+                || attachment.project_id.is_some()
+                || attachment.meta.deleted_at.is_none()
+                || attachment.entity_type != "ai_conversation_source"
+                || attachment.entity_id != source_id
+            {
+                return Err(StoreError::Validation(
+                    "AI source object cleanup queue relationship is invalid".to_owned(),
+                ));
+            }
+            pending.push(PendingAiConversationSourceObjectDeletion {
+                source,
+                attachment,
+                enqueued_at,
+            });
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(pending)
+    }
+    async fn complete_ai_conversation_source_object_deletion(
+        &self,
+        source_id: Uuid,
+        attachment_id: Uuid,
+        cleaned_at: DateTime<Utc>,
+        a: &AuditContext,
+    ) -> StoreResult<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let queued: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT source_id,attachment_id
+             FROM ai_conversation_source_object_deletions
+             WHERE source_id=$1 FOR UPDATE",
+        )
+        .bind(source_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let Some((queued_source, queued_attachment)) = queued else {
+            tx.commit().await.map_err(map_sqlx)?;
+            return Ok(());
+        };
+        if queued_source != source_id || queued_attachment != attachment_id {
+            return Err(StoreError::Conflict(
+                "AI source object cleanup queue changed".to_owned(),
+            ));
+        }
+        let source_row = sqlx::query(&format!(
+            "SELECT {SC} FROM ai_conversation_sources WHERE id=$1 FOR UPDATE"
+        ))
+        .bind(source_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let source = sr(&source_row)?;
+        if source.status != AiConversationSourceStatus::Expired
+            || source.meta.deleted_at.is_none()
+            || source.archived_at.is_some()
+            || source.attachment_id != attachment_id
+        {
+            return Err(StoreError::Validation(
+                "AI source object cleanup queue relationship is invalid".to_owned(),
+            ));
+        }
+        let deleted = sqlx::query(
+            "DELETE FROM ai_conversation_source_object_deletions
+             WHERE source_id=$1 AND attachment_id=$2",
+        )
+        .bind(source_id)
+        .bind(attachment_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if deleted.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "AI source object cleanup queue changed".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            source.lab_id,
+            None,
+            EntityType::AiConversationSource,
+            source_id,
+            AuditAction::Cleanup,
+            a,
+            Some(safe_source_snapshot(&source)?),
+            Some(serde_json::json!({
+                "object_removed": true,
+            })),
+        )
+        .await?;
+        insert_provenance(
+            &mut tx,
+            &Provenance::from_audit(
+                source.lab_id,
+                None,
+                EntityType::AiConversationSource,
+                source_id,
+                a,
+                cleaned_at,
+            ),
+        )
+        .await?;
+        tx.commit().await.map_err(map_sqlx)
+    }
+    async fn archive_ai_conversation_source(
+        &self,
+        id: Uuid,
+        project_id: Uuid,
+        expected_revision: i64,
+        archived_at: DateTime<Utc>,
+        a: &AuditContext,
+    ) -> StoreResult<AiConversationSource> {
+        let mut t = self.pool.begin().await.map_err(map_sqlx)?;
+        let row = sqlx::query(&format!(
+            "SELECT {SC} FROM ai_conversation_sources WHERE id=$1 AND deleted_at IS NULL FOR UPDATE"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *t)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "ai_conversation_source",
+            id,
+        })?;
+        let mut source = sr(&row)?;
+        if source.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "AI conversation source revision changed".to_owned(),
+            ));
+        }
+        if !matches!(
+            source.status,
+            AiConversationSourceStatus::Staged | AiConversationSourceStatus::Ready
+        ) || source
+            .project_id
+            .is_some_and(|bound_project| bound_project != project_id)
+            || source.expires_at <= archived_at
+        {
+            return Err(StoreError::Conflict(
+                "AI conversation source cannot be archived".to_owned(),
+            ));
+        }
+        let conversation_id = source.conversation_id.ok_or_else(|| {
+            StoreError::Validation("AI source must be bound to a conversation".to_owned())
+        })?;
+        let conversation_project_id =
+            writable_ai_conversation_scope(&mut t, conversation_id, source.lab_id, source.user_id)
+                .await?;
+        if conversation_project_id != source.project_id
+            || conversation_project_id != Some(project_id)
+        {
+            return Err(StoreError::Validation(
+                "AI source conversation scope does not match its archive project".to_owned(),
+            ));
+        }
+        if lab(&mut t, "projects", project_id).await? != source.lab_id {
+            return Err(StoreError::Validation(
+                "AI source archive project crosses labs".to_owned(),
+            ));
+        }
+        let attachment_row = sqlx::query(&format!(
+            "SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE id=$1 AND deleted_at IS NULL FOR UPDATE"
+        ))
+        .bind(source.attachment_id)
+        .fetch_optional(&mut *t)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "attachment",
+            id: source.attachment_id,
+        })?;
+        let mut attachment = attachment_from_row(&attachment_row)?;
+        if attachment.lab_id != source.lab_id
+            || attachment.entity_type != "ai_conversation_source"
+            || attachment.entity_id != source.id
+        {
+            return Err(StoreError::Validation(
+                "AI source attachment relationship is invalid".to_owned(),
+            ));
+        }
+        let before = safe_source_snapshot(&source)?;
+        let attachment_before = safe_source_attachment_snapshot(&attachment)?;
+        source.project_id = Some(project_id);
+        source.status = AiConversationSourceStatus::Archived;
+        source.archived_at = Some(archived_at);
+        source.last_activity_at = archived_at;
+        source.meta.touch(archived_at);
+        let attachment_expected_revision = attachment.meta.revision;
+        attachment.project_id = Some(project_id);
+        attachment.meta.touch(archived_at);
+        let updated = sqlx::query("UPDATE ai_conversation_sources SET project_id=$1,status=$2,last_activity_at=$3,archived_at=$4,updated_at=$5,revision=$6 WHERE id=$7 AND revision=$8")
+            .bind(project_id)
+            .bind(encode(&source.status)?)
+            .bind(source.last_activity_at)
+            .bind(source.archived_at)
+            .bind(source.meta.updated_at)
+            .bind(source.meta.revision)
+            .bind(id)
+            .bind(expected_revision)
+            .execute(&mut *t)
+            .await
+            .map_err(map_sqlx)?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "AI conversation source revision changed".to_owned(),
+            ));
+        }
+        let attachment_updated = sqlx::query(
+            "UPDATE attachments SET project_id=$1,updated_at=$2,revision=$3 WHERE id=$4 AND revision=$5 AND deleted_at IS NULL",
+        )
+        .bind(project_id)
+        .bind(attachment.meta.updated_at)
+        .bind(attachment.meta.revision)
+        .bind(source.attachment_id)
+        .bind(attachment_expected_revision)
+        .execute(&mut *t)
+        .await
+        .map_err(map_sqlx)?;
+        if attachment_updated.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "AI source attachment revision changed".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut t,
+            source.lab_id,
+            Some(project_id),
+            EntityType::AiConversationSource,
+            id,
+            AuditAction::Archive,
+            a,
+            Some(before),
+            Some(safe_source_snapshot(&source)?),
+        )
+        .await?;
+        insert_provenance(
+            &mut t,
+            &Provenance::from_audit(
+                source.lab_id,
+                Some(project_id),
+                EntityType::AiConversationSource,
+                id,
+                a,
+                archived_at,
+            ),
+        )
+        .await?;
+        write_audit(
+            &mut t,
+            attachment.lab_id,
+            attachment.project_id,
+            EntityType::Attachment,
+            attachment.id,
+            AuditAction::Update,
+            a,
+            Some(attachment_before),
+            Some(safe_source_attachment_snapshot(&attachment)?),
+        )
+        .await?;
+        insert_provenance(
+            &mut t,
+            &Provenance::from_audit(
+                attachment.lab_id,
+                attachment.project_id,
+                EntityType::Attachment,
+                attachment.id,
+                a,
+                archived_at,
+            ),
+        )
+        .await?;
+        t.commit().await.map_err(map_sqlx)?;
+        Ok(source)
+    }
+    async fn discard_ai_conversation_source(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        discarded_at: DateTime<Utc>,
+        a: &AuditContext,
+    ) -> StoreResult<AiConversationSource> {
+        let mut t = self.pool.begin().await.map_err(map_sqlx)?;
+        let row = sqlx::query(&format!(
+            "SELECT {SC} FROM ai_conversation_sources WHERE id=$1 AND deleted_at IS NULL FOR UPDATE"
+        ))
+        .bind(id)
+        .fetch_optional(&mut *t)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "ai_conversation_source",
+            id,
+        })?;
+        let mut source = sr(&row)?;
+        if source.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "AI conversation source revision changed".to_owned(),
+            ));
+        }
+        if source.status == AiConversationSourceStatus::Archived {
+            return Err(StoreError::Conflict(
+                "archived AI source cannot be discarded".to_owned(),
+            ));
+        }
+        let attachment_row = sqlx::query(&format!(
+            "SELECT {ATTACHMENT_COLUMNS} FROM attachments WHERE id=$1 AND deleted_at IS NULL FOR UPDATE"
+        ))
+        .bind(source.attachment_id)
+        .fetch_optional(&mut *t)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or(StoreError::NotFound {
+            entity: "attachment",
+            id: source.attachment_id,
+        })?;
+        let mut attachment = attachment_from_row(&attachment_row)?;
+        if attachment.lab_id != source.lab_id
+            || attachment.entity_type != "ai_conversation_source"
+            || attachment.entity_id != source.id
+        {
+            return Err(StoreError::Validation(
+                "AI source attachment relationship is invalid".to_owned(),
+            ));
+        }
+        let before = safe_source_snapshot(&source)?;
+        let attachment_before = safe_source_attachment_snapshot(&attachment)?;
+        source.status = AiConversationSourceStatus::Expired;
+        source.last_activity_at = discarded_at;
+        source.meta.soft_delete(discarded_at);
+        let attachment_expected_revision = attachment.meta.revision;
+        attachment.meta.soft_delete(discarded_at);
+        let updated = sqlx::query("UPDATE ai_conversation_sources SET status=$1,last_activity_at=$2,updated_at=$3,deleted_at=$4,revision=$5 WHERE id=$6 AND revision=$7")
+            .bind(encode(&source.status)?)
+            .bind(source.last_activity_at)
+            .bind(source.meta.updated_at)
+            .bind(source.meta.deleted_at)
+            .bind(source.meta.revision)
+            .bind(id)
+            .bind(expected_revision)
+            .execute(&mut *t)
+            .await
+            .map_err(map_sqlx)?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "AI conversation source revision changed".to_owned(),
+            ));
+        }
+        let attachment_updated = sqlx::query("UPDATE attachments SET updated_at=$1,deleted_at=$2,revision=$3 WHERE id=$4 AND revision=$5 AND deleted_at IS NULL")
+            .bind(attachment.meta.updated_at)
+            .bind(attachment.meta.deleted_at)
+            .bind(attachment.meta.revision)
+            .bind(source.attachment_id)
+            .bind(attachment_expected_revision)
+            .execute(&mut *t)
+            .await
+            .map_err(map_sqlx)?;
+        if attachment_updated.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "AI source attachment revision changed".to_owned(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO ai_conversation_source_object_deletions
+             (source_id,attachment_id,lab_id,enqueued_at) VALUES($1,$2,$3,$4)",
+        )
+        .bind(source.id)
+        .bind(attachment.id)
+        .bind(source.lab_id)
+        .bind(discarded_at)
+        .execute(&mut *t)
+        .await
+        .map_err(map_sqlx)?;
+        write_audit(
+            &mut t,
+            source.lab_id,
+            None,
+            EntityType::AiConversationSource,
+            id,
+            AuditAction::SoftDelete,
+            a,
+            Some(before),
+            Some(safe_source_snapshot(&source)?),
+        )
+        .await?;
+        insert_provenance(
+            &mut t,
+            &Provenance::from_audit(
+                source.lab_id,
+                None,
+                EntityType::AiConversationSource,
+                id,
+                a,
+                discarded_at,
+            ),
+        )
+        .await?;
+        write_audit(
+            &mut t,
+            attachment.lab_id,
+            attachment.project_id,
+            EntityType::Attachment,
+            attachment.id,
+            AuditAction::SoftDelete,
+            a,
+            Some(attachment_before),
+            Some(safe_source_attachment_snapshot(&attachment)?),
+        )
+        .await?;
+        insert_provenance(
+            &mut t,
+            &Provenance::from_audit(
+                attachment.lab_id,
+                attachment.project_id,
+                EntityType::Attachment,
+                attachment.id,
+                a,
+                discarded_at,
+            ),
+        )
+        .await?;
+        t.commit().await.map_err(map_sqlx)?;
+        Ok(source)
     }
     async fn create_ai_extraction_draft(
         &self,

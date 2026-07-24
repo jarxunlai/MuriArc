@@ -15,9 +15,9 @@ use muriarc_ai::{
     WriteDraftSummary,
 };
 use muriarc_core::{
-    Actor, AiAutonomyMode, AiExtractionDraft, AiModelProfileBinding, AiModelProfileStore,
-    AiOperationStore, AppliedAiExtraction, AuditContext, LOCAL_LAB_ID, LOCAL_USER_ID, MuriArcStore,
-    StoreError, WriteSource,
+    Actor, AiAutonomyMode, AiConversationArchiveFilter, AiConversationChange, AiExtractionDraft,
+    AiModelProfileBinding, AiModelProfileStore, AiOperationStore, AppliedAiExtraction,
+    AuditContext, LOCAL_LAB_ID, LOCAL_USER_ID, MuriArcStore, StoreError, WriteSource,
 };
 use muriarc_data::AttachmentFileError;
 use muriarc_store_sqlite::SqliteStore;
@@ -31,6 +31,7 @@ use crate::{
         DesktopAiImages, PrivateImageContent, PrivateImageView, RejectAiExtractionInput,
         UploadPrivateAiImageInput,
     },
+    ai_source_resolver::DesktopAiSourceResolver,
     data::DesktopDataState,
     settings::{SettingsError, SettingsService},
 };
@@ -87,6 +88,7 @@ impl DesktopAiState {
         let store = Arc::new(data.store_ref().clone());
         let domain_store: Arc<dyn MuriArcStore> = store.clone();
         let operation_store: Arc<dyn AiOperationStore> = store.clone();
+        let source_resolver = Arc::new(DesktopAiSourceResolver::new(data.clone()));
         let model_profiles: Arc<dyn AiModelProfileStore> = store.clone();
         let data_tools = Arc::new(DesktopAiDataTools::new(data.clone()));
         let images = DesktopAiImages::new(
@@ -98,7 +100,8 @@ impl DesktopAiState {
             store,
             workflow: AiWorkflowService::new(domain_store, operation_store)
                 .with_model_profiles(model_profiles)
-                .with_data_tools(data_tools),
+                .with_data_tools(data_tools)
+                .with_source_resolver(source_resolver),
             settings,
             images,
             startup: DesktopStartupAuthorization::new(),
@@ -184,6 +187,7 @@ impl DesktopAiState {
                 model_profile,
                 AssistantConversationStartRequest {
                     project_id: input.project_id,
+                    title: input.title,
                     requested_mode: input.requested_mode,
                 },
                 full && self.startup.full_declared(),
@@ -200,35 +204,9 @@ impl DesktopAiState {
         let context = self.context().await?;
         let model_profile = {
             let _profile_operation = self.settings.profile_coordinator().lock().await;
-            match request.conversation_id {
-                Some(conversation_id) => {
-                    self.workflow
-                        .conversation_model_profile(&context, conversation_id)
-                        .await?
-                }
-                None => {
-                    let defaults = self
-                        .store
-                        .get_ai_user_model_defaults(LOCAL_USER_ID)
-                        .await?
-                        .ok_or(SettingsError::DefaultModelNotConfigured)?;
-                    let profile_id = defaults
-                        .default_conversation_profile_id
-                        .ok_or(SettingsError::DefaultModelNotConfigured)?;
-                    let profile = self.store.get_ai_model_profile(profile_id).await?;
-                    if profile.lab_id != LOCAL_LAB_ID
-                        || profile.user_id != LOCAL_USER_ID
-                        || profile.archived_at.is_some()
-                        || profile.meta.deleted_at.is_some()
-                    {
-                        return Err(SettingsError::DefaultModelNotConfigured.into());
-                    }
-                    AiModelProfileBinding {
-                        profile_id,
-                        profile_version: profile.current_version,
-                    }
-                }
-            }
+            self.workflow
+                .conversation_model_profile(&context, request.conversation_id)
+                .await?
         };
         let resolved = preflight_then_resolve(
             &self.workflow,
@@ -244,8 +222,25 @@ impl DesktopAiState {
             },
         )
         .await?;
+        let source_bundle = self
+            .workflow
+            .resolve_turn_sources(&context, model_profile, &request)
+            .await?;
+        let source_images = source_bundle.images().to_vec();
+        let images = if request.image_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.images
+                .prepare_assistant_images(
+                    &context,
+                    Some(request.conversation_id),
+                    request.project_id,
+                    &request.image_ids,
+                )
+                .await?
+        };
         let vision_route = plan_desktop_vision_route(
-            !request.image_ids.is_empty(),
+            !images.is_empty() || !source_images.is_empty(),
             resolved.supports_vision,
             request.vision_model_profile_id,
         )?;
@@ -257,37 +252,28 @@ impl DesktopAiState {
         };
         let media = match vision_route {
             DesktopVisionRoute::None => AssistantTurnMedia::default(),
-            DesktopVisionRoute::Direct | DesktopVisionRoute::Relay(_) => {
-                let prepared = self
-                    .images
-                    .prepare_assistant_images(
-                        &context,
-                        request.conversation_id,
-                        request.project_id,
-                        &request.image_ids,
+            DesktopVisionRoute::Direct => {
+                AssistantTurnMedia::direct_with_sources(images, source_images)?
+            }
+            DesktopVisionRoute::Relay(_) => {
+                let (vision_binding, vision) =
+                    relay_provider.ok_or(DesktopAiError::VisionModelSelectionRequired)?;
+                let observation = self
+                    .workflow
+                    .observe_images_with_sources(
+                        vision.provider,
+                        vision.api_key.as_ref().map(|secret| secret.as_str()),
+                        vision_binding,
+                        &images,
+                        &source_images,
+                        vision.runtime,
                     )
                     .await?;
-                if vision_route == DesktopVisionRoute::Direct {
-                    AssistantTurnMedia::direct(prepared)?
-                } else {
-                    let (vision_binding, vision) =
-                        relay_provider.ok_or(DesktopAiError::VisionModelSelectionRequired)?;
-                    let observation = self
-                        .workflow
-                        .observe_images(
-                            vision.provider,
-                            vision.api_key.as_ref().map(|secret| secret.as_str()),
-                            vision_binding,
-                            &prepared,
-                            vision.runtime,
-                        )
-                        .await?;
-                    AssistantTurnMedia::relayed(prepared, observation)?
-                }
+                AssistantTurnMedia::relayed_with_sources(images, source_images, observation)?
             }
         };
         self.workflow
-            .run_turn_with_media_config(
+            .run_turn_with_resolved_sources_config(
                 resolved.provider,
                 resolved.api_key.as_ref().map(|secret| secret.as_str()),
                 &context,
@@ -295,6 +281,7 @@ impl DesktopAiState {
                 request,
                 resolved.runtime,
                 media,
+                source_bundle,
             )
             .await
             .map_err(Into::into)
@@ -329,7 +316,9 @@ impl DesktopAiState {
         input: ArchivePrivateAiImageInput,
     ) -> Result<PrivateImageView, DesktopAiError> {
         let context = self.context().await?;
-        self.images.archive(&context, id, input).await
+        self.images
+            .archive(&self.workflow, &context, id, input)
+            .await
     }
 
     pub(crate) async fn list_ai_extractions(
@@ -368,10 +357,37 @@ impl DesktopAiState {
     pub(crate) async fn list_conversations(
         &self,
         project_id: Option<Uuid>,
+        title_query: Option<String>,
+        archive: AiConversationArchiveFilter,
         limit: u32,
     ) -> Result<Vec<AssistantConversationSummary>, DesktopAiError> {
         self.workflow
-            .list_conversations(&self.context().await?, project_id, limit)
+            .list_conversations(
+                &self.context().await?,
+                project_id,
+                title_query,
+                archive,
+                limit,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    pub(crate) async fn update_conversation(
+        &self,
+        conversation_id: Uuid,
+        input: DesktopConversationUpdateInput,
+    ) -> Result<AssistantConversationSummary, DesktopAiError> {
+        let context = self.context().await?;
+        let audit = AuditContext {
+            actor: Actor::human(context.user_id, context.user_display_name.clone()),
+            source: WriteSource::Desktop,
+            request_id: Some(Uuid::new_v4().to_string()),
+            reason: Some("update_ai_conversation".to_owned()),
+        };
+        let (expected_revision, change) = input.into_change()?;
+        self.workflow
+            .update_conversation(&context, conversation_id, expected_revision, change, &audit)
             .await
             .map_err(Into::into)
     }
@@ -502,6 +518,7 @@ impl DesktopAiState {
             project_ids.iter().copied(),
             true,
         )
+        .with_governance_reads(true, true)
         .with_autonomy_context(Some(self.startup.session_id), AiAutonomyMode::Full))
     }
 }
@@ -516,12 +533,14 @@ pub(crate) struct DesktopDraftDecisionInput {
     pub statement: Option<String>,
 }
 
-/// The renderer may select only an editable profile identity and requested
-/// mode. Exact versions, startup proof and the process Session UUID are native.
+/// The renderer may select only a bounded display title, editable profile
+/// identity, project and requested mode. Exact versions, startup proof and the
+/// process Session UUID are native.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DesktopConversationStartInput {
     pub project_id: Option<Uuid>,
+    pub title: Option<String>,
     pub model_profile_id: Option<Uuid>,
     pub requested_mode: AiAutonomyMode,
 }
@@ -531,6 +550,45 @@ pub(crate) struct DesktopConversationStartInput {
 pub(crate) struct DesktopAutonomyInput {
     pub mode: AiAutonomyMode,
     pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DesktopConversationUpdateAction {
+    Rename,
+    Pin,
+    Unpin,
+    Archive,
+    Unarchive,
+}
+
+/// Renderer input is deliberately smaller than the core tagged enum. It can
+/// request one metadata action but cannot provide actor, source or audit data.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DesktopConversationUpdateInput {
+    pub action: DesktopConversationUpdateAction,
+    pub title: Option<String>,
+    pub expected_revision: i64,
+}
+
+impl DesktopConversationUpdateInput {
+    fn into_change(self) -> Result<(i64, AiConversationChange), DesktopAiError> {
+        let change = match (self.action, self.title) {
+            (DesktopConversationUpdateAction::Rename, Some(title)) => {
+                AiConversationChange::Rename { title }
+            }
+            (DesktopConversationUpdateAction::Rename, None) => {
+                return Err(DesktopAiError::InvalidConversationUpdate);
+            }
+            (DesktopConversationUpdateAction::Pin, None) => AiConversationChange::Pin,
+            (DesktopConversationUpdateAction::Unpin, None) => AiConversationChange::Unpin,
+            (DesktopConversationUpdateAction::Archive, None) => AiConversationChange::Archive,
+            (DesktopConversationUpdateAction::Unarchive, None) => AiConversationChange::Unarchive,
+            (_, Some(_)) => return Err(DesktopAiError::InvalidConversationUpdate),
+        };
+        Ok((self.expected_revision, change))
+    }
 }
 
 fn trusted_desktop_decision(
@@ -572,6 +630,8 @@ pub(crate) enum DesktopAiError {
     Workflow(#[from] AiWorkflowError),
     #[error("invalid AI draft identifier")]
     InvalidId,
+    #[error("invalid AI conversation update")]
+    InvalidConversationUpdate,
     #[error("AI operation is forbidden")]
     Forbidden,
     #[error("加强确认必须填写不超过 500 字的人工声明")]
@@ -667,9 +727,10 @@ fn plan_desktop_vision_route(
 impl DesktopAiError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
-            Self::InvalidId | Self::InvalidApprovalStatement | Self::InvalidExtraction => {
-                "validation"
-            }
+            Self::InvalidId
+            | Self::InvalidConversationUpdate
+            | Self::InvalidApprovalStatement
+            | Self::InvalidExtraction => "validation",
             Self::AutonomyDeclarationRequired => "autonomy_declaration_required",
             Self::ModelSelectionRequired => "model_selection_required",
             Self::VisionModelSelectionRequired => "vision_model_selection_required",
@@ -683,15 +744,9 @@ impl DesktopAiError {
             Self::SelectedModelUnavailable
             | Self::Workflow(AiWorkflowError::ConversationModelUnavailable) => "model_unavailable",
             Self::Forbidden | Self::Workflow(AiWorkflowError::Forbidden) => "forbidden",
-            Self::Settings(
-                SettingsError::MissingCredential | SettingsError::DefaultModelNotConfigured,
-            ) => "ai_not_configured",
+            Self::Settings(SettingsError::MissingCredential) => "ai_not_configured",
             Self::Settings(error) if error.is_validation() => "validation",
-            Self::Workflow(AiWorkflowError::Assistant(_))
-            | Self::ProviderUnavailable
-            | Self::Workflow(AiWorkflowError::DataTool(
-                muriarc_ai::ToolExecutionError::Unavailable,
-            )) => "ai_unavailable",
+            Self::ProviderUnavailable => "ai_unavailable",
             Self::Store(StoreError::NotFound { .. })
             | Self::Settings(SettingsError::ModelProfileStore(StoreError::NotFound { .. })) => {
                 "not_found"
@@ -701,34 +756,46 @@ impl DesktopAiError {
                 "conflict"
             }
             Self::Store(StoreError::Validation(_))
-            | Self::Settings(SettingsError::ModelProfileStore(StoreError::Validation(_)))
-            | Self::Workflow(AiWorkflowError::Config(_))
-            | Self::Workflow(AiWorkflowError::Approval(_))
-            | Self::Workflow(AiWorkflowError::InvalidStoredDraft)
-            | Self::Workflow(AiWorkflowError::UnsupportedDraftOperation)
-            | Self::Workflow(AiWorkflowError::InvalidConversationRequest)
-            | Self::Workflow(AiWorkflowError::LegacyConversationReadOnly)
-            | Self::Workflow(AiWorkflowError::ConversationModelProfileMismatch)
-            | Self::Workflow(AiWorkflowError::DataTool(
-                muriarc_ai::ToolExecutionError::Rejected { .. },
-            ))
-            | Self::Workflow(AiWorkflowError::Credential(_)) => "validation",
+            | Self::Settings(SettingsError::ModelProfileStore(StoreError::Validation(_))) => {
+                "validation"
+            }
+            Self::Workflow(error) => error.code(),
             Self::Store(StoreError::Database(_) | StoreError::Serialization(_))
             | Self::ImageStorage(_)
             | Self::Settings(SettingsError::ModelProfileStore(
                 StoreError::Database(_) | StoreError::Serialization(_),
             ))
-            | Self::Settings(_)
-            | Self::Workflow(AiWorkflowError::Store(_))
-            | Self::Workflow(AiWorkflowError::InvalidStoredConversation) => "storage_error",
+            | Self::Settings(_) => "storage_error",
         }
     }
 
     pub(crate) fn safe_message(&self) -> String {
         match self.code() {
             "storage_error" => "本地 AI 数据或安全存储操作失败".to_owned(),
-            "ai_unavailable" => "AI Provider 暂时不可用，请检查配置后重试".to_owned(),
+            "request_timeout" => "AI 请求已超过受控执行时限，请稍后重试".to_owned(),
+            "context_exceeded" => "当前问题与必要上下文超过模型输入上限，请缩小问题范围".to_owned(),
+            "ai_unavailable"
+            | "ai_data_unavailable"
+            | "provider_unreachable"
+            | "provider_transport_error"
+            | "provider_http_error"
+            | "provider_unavailable"
+            | "response_format_incompatible"
+            | "response_too_large"
+            | "output_budget_exhausted" => "AI Provider 暂时不可用，请检查配置后重试".to_owned(),
+            "api_key_rejected" => "AI Provider 拒绝了当前凭据，请重新配置密钥".to_owned(),
+            "model_not_found" => "当前配置的 AI 模型不可用，请检查模型设置".to_owned(),
+            "invalid_provider" => "AI Provider 配置无效，请检查设置".to_owned(),
             "ai_not_configured" => "请先启用 AI 并配置所需密钥".to_owned(),
+            "invalid_ai_source" => {
+                "所选文件已过期、范围不匹配，或无法通过完整性校验，请重新上传".to_owned()
+            }
+            "iteration_limit_exceeded" => {
+                "AI 在完成任何工具结果前达到了受控迭代上限，请缩小问题范围后重试".to_owned()
+            }
+            "tool_call_limit_exceeded" => {
+                "AI 在完成任何工具结果前达到了受控工具调用上限，请缩小问题范围后重试".to_owned()
+            }
             "model_selection_required" => "请选择一个可用的对话模型".to_owned(),
             "vision_model_selection_required" => {
                 "当前对话模型不支持视觉，请明确选择一个可用的视觉模型".to_owned()
@@ -740,6 +807,10 @@ impl DesktopAiError {
             }
             "model_archived" => "该会话绑定的模型已停用，只能查看历史记录".to_owned(),
             "model_unavailable" => "该会话绑定的模型当前不可用，只能查看历史记录".to_owned(),
+            "conversation_read_only" => "该历史会话无法证明原始模型版本，只能查看记录".to_owned(),
+            "conversation_model_mismatch" => {
+                "当前模型与会话绑定的精确版本不一致，已拒绝继续执行".to_owned()
+            }
             _ => self.to_string(),
         }
     }
@@ -752,6 +823,7 @@ pub(crate) fn parse_uuid(value: &str) -> Result<Uuid, DesktopAiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muriarc_ai::AssistantError;
 
     #[tokio::test]
     async fn invalid_turn_preflight_never_resolves_provider_credentials() {
@@ -771,9 +843,10 @@ mod tests {
         );
         let resolver_calls = std::sync::atomic::AtomicUsize::new(0);
         let request = AssistantTurnRequest {
-            conversation_id: None,
+            conversation_id: Uuid::new_v4(),
             project_id: None,
             message: " \n ".to_owned(),
+            source_refs: Vec::new(),
             image_ids: vec![Uuid::new_v4()],
             vision_model_profile_id: Some(Uuid::new_v4()),
         };
@@ -818,11 +891,25 @@ mod tests {
     fn conversation_errors_have_stable_safe_codes() {
         assert_eq!(
             DesktopAiError::Workflow(AiWorkflowError::InvalidConversationRequest).code(),
-            "validation"
+            "validation_error"
         );
         assert_eq!(
             DesktopAiError::Workflow(AiWorkflowError::InvalidStoredConversation).code(),
             "storage_error"
+        );
+        assert_eq!(
+            DesktopAiError::Workflow(AiWorkflowError::Assistant(
+                AssistantError::TotalTimeoutExceeded
+            ))
+            .code(),
+            "request_timeout"
+        );
+        assert_eq!(
+            DesktopAiError::Workflow(AiWorkflowError::DataTool(
+                muriarc_ai::ToolExecutionError::Unavailable
+            ))
+            .code(),
+            "ai_data_unavailable"
         );
         assert_eq!(
             DesktopAiError::Settings(SettingsError::ModelProfileStore(StoreError::NotFound {
@@ -885,6 +972,111 @@ mod tests {
     }
 
     #[test]
+    fn desktop_conversation_update_input_cannot_smuggle_audit_authority() {
+        let input: DesktopConversationUpdateInput = serde_json::from_value(serde_json::json!({
+            "action": "rename",
+            "title": "  Updated title  ",
+            "expectedRevision": 3
+        }))
+        .unwrap();
+        let (revision, change) = input.into_change().unwrap();
+        assert_eq!(revision, 3);
+        assert_eq!(
+            change,
+            AiConversationChange::Rename {
+                title: "  Updated title  ".to_owned()
+            }
+        );
+
+        for unsafe_input in [
+            serde_json::json!({
+                "action": "pin",
+                "expectedRevision": 3,
+                "actor": {"actorType": "human"}
+            }),
+            serde_json::json!({
+                "action": "pin",
+                "expected_revision": 3
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<DesktopConversationUpdateInput>(unsafe_input).is_err()
+            );
+        }
+        let unexpected_title: DesktopConversationUpdateInput =
+            serde_json::from_value(serde_json::json!({
+                "action": "archive",
+                "title": "not accepted",
+                "expectedRevision": 3
+            }))
+            .unwrap();
+        assert!(matches!(
+            unexpected_title.into_change(),
+            Err(DesktopAiError::InvalidConversationUpdate)
+        ));
+        assert_eq!(
+            serde_json::from_value::<AiConversationArchiveFilter>(serde_json::json!("archived"))
+                .unwrap(),
+            AiConversationArchiveFilter::Archived
+        );
+    }
+
+    #[test]
+    fn desktop_conversation_start_input_cannot_smuggle_identity_or_audit() {
+        let project_id = Uuid::new_v4();
+        let model_profile_id = Uuid::new_v4();
+        let input: DesktopConversationStartInput = serde_json::from_value(serde_json::json!({
+            "projectId": project_id,
+            "title": "Source review",
+            "modelProfileId": model_profile_id,
+            "requestedMode": "ask"
+        }))
+        .unwrap();
+        assert_eq!(input.project_id, Some(project_id));
+        assert_eq!(input.title.as_deref(), Some("Source review"));
+        assert_eq!(input.model_profile_id, Some(model_profile_id));
+
+        for unsafe_input in [
+            serde_json::json!({
+                "projectId": project_id,
+                "title": "Source review",
+                "modelProfileId": model_profile_id,
+                "requestedMode": "ask",
+                "userId": Uuid::new_v4()
+            }),
+            serde_json::json!({
+                "projectId": project_id,
+                "title": "Source review",
+                "modelProfileId": model_profile_id,
+                "requestedMode": "ask",
+                "audit": {"source": "desktop"}
+            }),
+        ] {
+            assert!(serde_json::from_value::<DesktopConversationStartInput>(unsafe_input).is_err());
+        }
+    }
+
+    #[test]
+    fn zero_progress_assistant_limits_have_stable_safe_codes() {
+        let cases = [
+            (
+                AssistantError::IterationLimitExceeded,
+                "iteration_limit_exceeded",
+            ),
+            (
+                AssistantError::ToolCallLimitExceeded,
+                "tool_call_limit_exceeded",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let error = DesktopAiError::Workflow(AiWorkflowError::Assistant(error));
+            assert_eq!(error.code(), expected);
+            assert!(!error.safe_message().contains("Provider"));
+        }
+    }
+
+    #[test]
     fn desktop_vision_routing_distinguishes_direct_relay_and_invalid_requests() {
         let selected_vision_profile = Uuid::new_v4();
         assert_eq!(
@@ -929,6 +1121,7 @@ mod tests {
 
         let valid = serde_json::json!({
             "projectId": null,
+            "title": "New conversation",
             "modelProfileId": null,
             "requestedMode": "full",
         });
@@ -936,6 +1129,7 @@ mod tests {
         for forbidden in ["declared", "sessionId", "currentPassword", "stepUpVerified"] {
             let mut value = serde_json::json!({
                 "projectId": null,
+                "title": "New conversation",
                 "modelProfileId": null,
                 "requestedMode": "full",
             });

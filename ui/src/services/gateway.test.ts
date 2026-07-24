@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import { currentAuthSession, DemoGateway, LocalTauriGateway, RemoteHttpGateway, createGateway } from './gateway'
+import {
+  currentAuthSession,
+  DemoGateway,
+  GatewayError,
+  LocalTauriGateway,
+  RemoteHttpGateway,
+  createGateway,
+} from './gateway'
 import { currentProjectId } from './projectContext'
 
 describe('MuriArc gateway selection', () => {
@@ -23,6 +30,19 @@ describe('MuriArc gateway selection', () => {
       'move_animals',
       { input: { animalIds: ['animal-1'], targetCageId: 'cage-2' } },
     ]])
+  })
+
+  it('preserves structured Tauri error codes for UI recovery decisions', async () => {
+    const gateway = new LocalTauriGateway(async () => {
+      throw { code: 'conflict', message: 'AI 会话 revision 已变化' }
+    })
+
+    const operation = gateway.getAiConversation('conversation-1')
+    await expect(operation).rejects.toBeInstanceOf(GatewayError)
+    await expect(operation).rejects.toMatchObject({
+      code: 'conflict',
+      message: 'AI 会话 revision 已变化',
+    })
   })
 
   it('never forwards a Server password or client step-up claim to the local Tauri decision DTO', async () => {
@@ -240,13 +260,27 @@ describe('MuriArc gateway selection', () => {
       return {
         conversationId: 'conversation-1',
         content: '已找到 1 只动物',
-        citations: [{ entity_type: 'animal', entity_id: 'animal-1', revision: 3 }],
+        citations: [
+          { entity_type: 'animal', entity_id: 'animal-1', revision: 3 },
+          {
+            entity_type: 'project_animal_assignment',
+            entity_id: 'assignment-1',
+            revision: 7,
+          },
+          {
+            entity_type: 'ai_conversation_source',
+            entity_id: 'source-1',
+            revision: 2,
+          },
+          { entity_type: 'future_entity', entity_id: 'future-1', revision: 1 },
+        ],
         toolRuns: [{
           tool_run_id: 'run-1', provider_call_id: 'call-1', tool: 'animal_search',
           arguments: { display_id: 'M-001' }, outcome: 'read',
           citations: [{ entity_type: 'animal', entity_id: 'animal-1', revision: 3 }],
         }],
         drafts: [],
+        incompleteReason: 'tool_call_limit_exceeded',
         trace: {
           providerId: 'local-provider', model: 'test-model',
           usage: { provider_calls: 1, tool_calls: 1, input_tokens: 10, output_tokens: 5, total_tokens: 15 },
@@ -255,16 +289,50 @@ describe('MuriArc gateway selection', () => {
     }
     const local = new LocalTauriGateway(invokeCommand)
 
-    const response = await local.aiTurn({ projectId: 'project-1', message: '查找 M-001' })
+    const response = await local.aiTurn({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+      message: '查找 M-001',
+    })
     await local.listAiDrafts('project-1', 'pending_approval')
 
-    expect(calls[0]).toEqual(['ai_turn', { input: { projectId: 'project-1', message: '查找 M-001' } }])
+    expect(calls[0]).toEqual(['ai_turn', {
+      input: {
+        conversationId: 'conversation-1',
+        projectId: 'project-1',
+        message: '查找 M-001',
+      },
+    }])
     expect(calls[1]).toEqual(['list_ai_drafts', { projectId: 'project-1', status: 'pending_approval' }])
     expect(response.citations[0]).toEqual(expect.objectContaining({
       entityType: 'animal', entityId: 'animal-1', revision: 3, route: '/animals?animal=animal-1',
     }))
+    expect(response.citations[1]).toEqual(expect.objectContaining({
+      entityType: 'project_animal_assignment',
+      entityId: 'assignment-1',
+      revision: 7,
+      label: expect.stringContaining('项目动物关系'),
+      route: undefined,
+    }))
+    expect(response.citations[2]).toEqual(expect.objectContaining({
+      entityType: 'ai_conversation_source',
+      entityId: 'source-1',
+      revision: 2,
+      label: expect.stringContaining('AI 会话来源'),
+      route: undefined,
+    }))
+    expect(response.citations[3]).toEqual(expect.objectContaining({
+      entityType: 'future_entity',
+      entityId: 'future-1',
+      label: expect.stringContaining('未知实体（future_entity）'),
+      route: undefined,
+    }))
+    expect(response.citations.map((citation) => citation.label)).not.toContain(
+      expect.stringContaining('undefined'),
+    )
     expect(response.toolRuns[0]).toEqual(expect.objectContaining({ toolRunId: 'run-1', outcome: 'read' }))
     expect(response.trace.usage.totalTokens).toBe(15)
+    expect(response.incompleteReason).toBe('tool_call_limit_exceeded')
   })
 
   it('loads and maps persisted AI conversations through Tauri commands', async () => {
@@ -283,7 +351,14 @@ describe('MuriArc gateway selection', () => {
           createdAt: '2026-07-19T01:00:00Z', updatedAt: '2026-07-19T02:00:00Z',
         },
         messages: [{
-          id: 'message-1', sequence: 1, role: 'assistant', content: '已恢复',
+          id: 'message-1', sequence: 1, role: 'user', content: '检查文件',
+          sourceRefs: [{
+            sourceId: 'source-1', sourceRevision: 2,
+            fileName: 'weights.csv', mediaType: 'text/csv', sizeBytes: 2048,
+          }],
+          createdAt: '2026-07-19T01:59:59Z',
+        }, {
+          id: 'message-2', sequence: 2, role: 'assistant', content: '已恢复',
           createdAt: '2026-07-19T02:00:00Z',
           response: {
             conversationId: 'conversation-1', content: '已恢复',
@@ -306,7 +381,14 @@ describe('MuriArc gateway selection', () => {
       ['get_ai_conversation', { conversationId: 'conversation-1', limit: 40 }],
     ])
     expect(conversations[0].projectId).toBeUndefined()
-    expect(detail.messages[0].response?.citations[0]).toEqual(expect.objectContaining({
+    expect(detail.messages[0].sourceRefs).toEqual([{
+      sourceId: 'source-1',
+      sourceRevision: 2,
+      fileName: 'weights.csv',
+      mediaType: 'text/csv',
+      sizeBytes: 2048,
+    }])
+    expect(detail.messages[1].response?.citations[0]).toEqual(expect.objectContaining({
       entityId: 'animal-1', revision: 4,
     }))
   })
@@ -340,6 +422,330 @@ describe('MuriArc gateway selection', () => {
       'https://lab.example/api/v1/ai/conversations/conversation-1?limit=60',
     ])
     expect(requests.every((request) => new Headers(request.init?.headers).get('X-CSRF-Token') === null)).toBe(true)
+  })
+
+  it('uses revisioned conversation actions and opaque staged source APIs on Server', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const summary = {
+      id: 'conversation-1', projectId: 'project-1', title: '实验进度',
+      pinnedAt: '2026-07-23T09:00:00Z', archivedAt: null, revision: 3,
+      createdAt: '2026-07-23T08:00:00Z', updatedAt: '2026-07-23T09:00:00Z',
+    }
+    const source = {
+      id: 'source-1', conversationId: 'conversation-1', projectId: 'project-1',
+      fileName: 'measurements.xlsx',
+      mediaType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      sizeBytes: 4, status: 'ready', revision: 1,
+      createdAt: '2026-07-23T09:01:00Z', expiresAt: '2026-08-22T09:01:00Z',
+    }
+    const listedSources = [
+      source,
+      { ...source, id: 'source-staged', status: 'staged' },
+      { ...source, id: 'source-archived', status: 'archived', revision: 2 },
+      { ...source, id: 'source-failed', status: 'failed' },
+      { ...source, id: 'source-expired', status: 'expired' },
+    ]
+    const archivedSource = { ...source, status: 'archived', revision: 2 }
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      if (url.endsWith('/auth/login')) {
+        return new Response(JSON.stringify({ data: {
+          user: { id: 'user-1', lab_id: 'lab-1', display_name: '研究者', lab_roles: [], project_roles: [], authentication: 'session' },
+          csrf_token: 'csrf-ai-workbench', expires_at: '2026-07-23T12:00:00Z',
+        }, request_id: 'req-login' }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/ai/sources/source-1/archive') && init?.method === 'POST') {
+        return new Response(JSON.stringify({ data: archivedSource, request_id: 'req-archive' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.includes('/ai/sources/source-1') && init?.method === 'DELETE') {
+        return new Response(null, { status: 204 })
+      }
+      if (url.includes('/ai/sources?')) {
+        const status = new URL(url).searchParams.get('status')
+        const data = status
+          ? listedSources.filter((candidate) => candidate.status === status)
+          : listedSources
+        return new Response(JSON.stringify({
+          data, count: data.length, request_id: 'req-source-list',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.includes('/ai/sources/upload')) {
+        return new Response(JSON.stringify({ data: source, request_id: 'req-source' }), {
+          status: 201, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/ai/conversations') && init?.method === 'POST') {
+        return new Response(JSON.stringify({
+          data: {
+            conversation: summary,
+            autonomy: {
+              mode: 'ask',
+              effectiveMode: 'ask',
+              maxMode: 'full',
+              batchLimit: 1,
+              revision: 1,
+              requiresHumanApproval: [],
+            },
+          },
+          request_id: 'req-create',
+        }), {
+          status: 201, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.endsWith('/ai/conversations/conversation-1') && init?.method === 'PATCH') {
+        return new Response(JSON.stringify({ data: summary, request_id: 'req-update' }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ data: [summary], count: 1, request_id: 'req-list' }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchRequest,
+    })
+    await remote.login({ email: 'r@example.org', password: 'not-retained' })
+
+    await remote.startAiConversation({
+      projectId: 'project-1',
+      title: '新对话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
+    })
+    const conversations = await remote.queryAiConversations({
+      projectId: 'project-1',
+      titleQuery: '实验',
+      archive: 'active',
+      limit: 80,
+    })
+    await remote.updateAiConversation('conversation-1', {
+      action: 'rename',
+      title: '新的实验标题',
+      expectedRevision: 2,
+    })
+    const file = new File(['xlsx'], 'measurements.xlsx', {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    })
+    const uploaded = await remote.uploadAiSource({
+      file,
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    const sources = await remote.listAiSources({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    const archivedSources = await remote.listAiSources({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+      status: 'archived',
+    })
+    const archived = await remote.archiveAiSource(uploaded.id, {
+      projectId: 'project-1',
+      expectedRevision: uploaded.revision,
+    })
+    await remote.deleteAiSource(uploaded.id)
+
+    expect(conversations[0]).toEqual(expect.objectContaining({
+      id: 'conversation-1',
+      pinnedAt: '2026-07-23T09:00:00Z',
+      archivedAt: undefined,
+    }))
+    expect(sources.map((candidate) => candidate.status)).toEqual([
+      'ready', 'staged', 'archived', 'failed', 'expired',
+    ])
+    expect(archivedSources).toEqual([
+      expect.objectContaining({ id: 'source-archived', status: 'archived', revision: 2 }),
+    ])
+    expect(archived).toEqual(expect.objectContaining({
+      id: 'source-1',
+      status: 'archived',
+      revision: 2,
+    }))
+    const create = requests.find((request) =>
+      request.url.endsWith('/ai/conversations') && request.init?.method === 'POST')!
+    expect(JSON.parse(String(create.init?.body))).toEqual({
+      projectId: 'project-1',
+      title: '新对话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
+    })
+    expect(requests.some((request) => request.url.endsWith(
+      '/ai/conversations?archive=active&limit=80&project_id=project-1&q=%E5%AE%9E%E9%AA%8C',
+    ))).toBe(true)
+    const update = requests.find((request) =>
+      request.url.endsWith('/ai/conversations/conversation-1') && request.init?.method === 'PATCH')!
+    expect(JSON.parse(String(update.init?.body))).toEqual({
+      action: 'rename',
+      expected_revision: 2,
+      title: '新的实验标题',
+    })
+    const upload = requests.find((request) => request.url.includes('/ai/sources/upload?'))!
+    expect(new URL(upload.url).searchParams.get('conversation_id')).toBe('conversation-1')
+    expect(upload.init?.body).toBe(file)
+    expect(requests.some((request) => request.url.endsWith(
+      '/ai/sources?conversation_id=conversation-1&project_id=project-1',
+    ))).toBe(true)
+    expect(requests.some((request) => request.url.endsWith(
+      '/ai/sources?conversation_id=conversation-1&project_id=project-1&status=archived',
+    ))).toBe(true)
+    const archive = requests.find((request) =>
+      request.url.endsWith('/ai/sources/source-1/archive') && request.init?.method === 'POST')!
+    expect(JSON.parse(String(archive.init?.body))).toEqual({
+      project_id: 'project-1',
+      expected_revision: 1,
+    })
+    for (const request of requests.filter((request) =>
+      !request.url.endsWith('/auth/login')
+      && ['PATCH', 'POST', 'DELETE'].includes(request.init?.method ?? ''))) {
+      expect(new Headers(request.init?.headers).get('X-CSRF-Token')).toBe('csrf-ai-workbench')
+    }
+  })
+
+  it('sends source bytes and conversation actions through typed Tauri commands', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const summary = {
+      id: 'conversation-1', projectId: null, title: '已置顶', pinnedAt: '2026-07-23T09:00:00Z',
+      archivedAt: null, createdAt: '2026-07-23T08:00:00Z',
+      updatedAt: '2026-07-23T09:00:00Z', revision: 3,
+    }
+    const source = {
+      id: 'source-1', conversationId: 'conversation-1', projectId: 'project-1',
+      fileName: 'notes.txt', mediaType: 'text/plain', sizeBytes: 3,
+      status: 'ready', revision: 1, createdAt: '2026-07-23T09:00:00Z',
+      expiresAt: '2026-08-22T09:00:00Z',
+    }
+    const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      calls.push([command, args])
+      if (command === 'list_ai_conversations') return [summary] as T
+      if (command === 'start_ai_conversation') {
+        return {
+          conversation: summary,
+          autonomy: {
+            mode: 'ask',
+            effectiveMode: 'ask',
+            maxMode: 'full',
+            batchLimit: 1,
+            revision: 1,
+            requiresHumanApproval: [],
+          },
+        } as T
+      }
+      if (command === 'upload_ai_source') return source as T
+      if (command === 'list_ai_sources') {
+        return [
+          source,
+          { ...source, id: 'source-staged', status: 'staged' },
+          { ...source, id: 'source-archived', status: 'archived', revision: 2 },
+          { ...source, id: 'source-failed', status: 'failed' },
+          { ...source, id: 'source-expired', status: 'expired' },
+        ] as T
+      }
+      if (command === 'archive_ai_source') {
+        return { ...source, status: 'archived', revision: 2 } as T
+      }
+      return summary as T
+    }
+    const local = new LocalTauriGateway(invokeCommand)
+
+    await local.startAiConversation({
+      projectId: 'project-1',
+      title: '新对话',
+      modelProfileId: 'profile-1',
+      requestedMode: 'ask',
+    })
+    await local.queryAiConversations({ titleQuery: '置顶', archive: 'all', limit: 40 })
+    await local.updateAiConversation('conversation-1', {
+      action: 'pin',
+      expectedRevision: 2,
+    })
+    const file = {
+      name: 'notes.txt',
+      type: 'text/plain',
+      size: 3,
+      arrayBuffer: async () => Uint8Array.from([97, 98, 99]).buffer,
+    } as File
+    await local.uploadAiSource({
+      file,
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    const sources = await local.listAiSources({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    const archived = await local.archiveAiSource('source-1', {
+      projectId: 'project-1',
+      expectedRevision: 1,
+    })
+    await local.deleteAiSource('source-1')
+
+    expect(sources.map((candidate) => candidate.status)).toEqual([
+      'ready', 'staged', 'archived', 'failed', 'expired',
+    ])
+    expect(archived).toEqual(expect.objectContaining({
+      id: 'source-1',
+      status: 'archived',
+      revision: 2,
+    }))
+    expect(calls).toEqual([
+      ['start_ai_conversation', {
+        input: {
+          projectId: 'project-1',
+          title: '新对话',
+          modelProfileId: 'profile-1',
+          requestedMode: 'ask',
+        },
+      }],
+      ['list_ai_conversations', {
+        projectId: undefined, titleQuery: '置顶', archive: 'all', limit: 40,
+      }],
+      ['update_ai_conversation', {
+        conversationId: 'conversation-1',
+        input: { action: 'pin', expectedRevision: 2 },
+      }],
+      ['upload_ai_source', { input: {
+        fileName: 'notes.txt', mediaType: 'text/plain',
+        conversationId: 'conversation-1', projectId: 'project-1', bytes: [97, 98, 99],
+      } }],
+      ['list_ai_sources', { input: {
+        conversationId: 'conversation-1', projectId: 'project-1', status: undefined,
+      } }],
+      ['archive_ai_source', {
+        sourceId: 'source-1',
+        input: { projectId: 'project-1', expectedRevision: 1 },
+      }],
+      ['delete_ai_source', { sourceId: 'source-1' }],
+    ])
+  })
+
+  it('rejects unknown AI source states instead of silently treating them as ready', async () => {
+    const local = new LocalTauriGateway(async <T>(command: string): Promise<T> => {
+      if (command !== 'list_ai_sources') return undefined as T
+      return [{
+        id: 'source-unknown',
+        conversationId: 'conversation-1',
+        projectId: 'project-1',
+        fileName: 'unknown.csv',
+        mediaType: 'text/csv',
+        sizeBytes: 12,
+        status: 'mystery',
+        revision: 1,
+        createdAt: '2026-07-23T09:00:00Z',
+        expiresAt: '2026-08-22T09:00:00Z',
+      }] as T
+    })
+
+    const operation = local.listAiSources({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+    })
+    await expect(operation).rejects.toBeInstanceOf(GatewayError)
+    await expect(operation).rejects.toMatchObject({ code: 'invalid_ai_source_status' })
   })
 
   it('keeps workspace settings local while exposing per-user Server AI settings', () => {
@@ -621,7 +1027,11 @@ describe('MuriArc gateway selection', () => {
       maxOutputTokens: 4096, historyTokenBudget: 32768, historyTurns: 20,
       temperature: 0, timeoutMs: 120000, apiKey: 'write-only-key',
     })
-    const turn = await remote.aiTurn({ projectId: 'project-1', message: '总结进度' })
+    const turn = await remote.aiTurn({
+      conversationId: 'conversation-1',
+      projectId: 'project-1',
+      message: '总结进度',
+    })
     await remote.listAiDrafts('project-1', 'pending_approval')
     await remote.decideAiDraft('draft-1', {
       expectedRevision: 2,
@@ -645,6 +1055,84 @@ describe('MuriArc gateway selection', () => {
       currentPassword: 'one-request-password',
     })
     expect(String(decision?.init?.body)).not.toContain('stepUpVerified')
+  })
+
+  it('keeps an explicit lab-wide AI scope independent from the top-bar project', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    currentProjectId.value = 'top-bar-project'
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      if (url.endsWith('/auth/login')) {
+        return new Response(JSON.stringify({
+          data: {
+            user: {
+              id: 'lab-reader',
+              lab_id: 'lab-1',
+              display_name: 'Lab reader',
+              lab_roles: [],
+              project_roles: [],
+              authentication: 'session',
+            },
+            csrf_token: 'csrf-lab-scope',
+            expires_at: '2026-07-24T12:00:00Z',
+          },
+          request_id: 'req-lab-login',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      if (url.endsWith('/ai/turns')) {
+        return new Response(JSON.stringify({
+          data: {
+            conversationId: 'lab-conversation',
+            content: '只读查询完成',
+            citations: [],
+            toolRuns: [],
+            drafts: [],
+            trace: {
+              providerId: 'server-provider',
+              model: 'gpt-test',
+              usage: {
+                provider_calls: 1,
+                tool_calls: 0,
+                input_tokens: 2,
+                output_tokens: 2,
+                total_tokens: 4,
+              },
+            },
+          },
+          request_id: 'req-lab-turn',
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        data: [],
+        count: 0,
+        request_id: 'req-lab-drafts',
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }) as unknown as typeof fetch
+    const remote = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchRequest,
+    })
+    await remote.login({ email: 'reader@example.org', password: 'not-retained' })
+
+    try {
+      await remote.aiTurn({
+        conversationId: 'lab-conversation',
+        message: '跨项目只读汇总',
+      })
+      await remote.listAiDrafts(undefined, 'pending_approval')
+    } finally {
+      currentProjectId.value = undefined
+    }
+
+    const turn = requests.find((request) => request.url.endsWith('/ai/turns'))
+    expect(JSON.parse(String(turn?.init?.body))).toEqual({
+      conversationId: 'lab-conversation',
+      message: '跨项目只读汇总',
+    })
+    expect(requests.some((request) =>
+      request.url.endsWith('/ai/approvals?status=pending_approval'))).toBe(true)
+    expect(JSON.stringify(requests)).not.toContain('top-bar-project')
   })
 
   it('uses session-only CSRF-protected admin routes without retaining passwords', async () => {
@@ -952,12 +1440,18 @@ describe('MuriArc gateway selection', () => {
     const fetchRequest = vi.fn(async () => new Response(JSON.stringify({
       data: [
         {
-          id: 'job-failed', kind: 'import', status: 'failed', idempotency_key: 'failed-import',
-          progress_current: 2, progress_total: 5, meta: { created_at: '2026-07-19T09:00:00Z' },
+          id: 'job-failed', kind: 'import', status: 'failed',
+          progress_current: 2, progress_total: 5,
+          result_available: false, error_report_available: true,
+          cancellation_requested: false, revision: 2,
+          created_at: '2026-07-19T09:00:00Z', updated_at: '2026-07-19T09:01:00Z',
         },
         {
-          id: 'job-cancelled', kind: 'export', status: 'cancelled', idempotency_key: 'cancelled-export',
-          progress_current: 1, progress_total: 4, meta: { created_at: '2026-07-19T09:05:00Z' },
+          id: 'job-cancelled', kind: 'export', status: 'cancelled',
+          progress_current: 1, progress_total: 4,
+          result_available: false, error_report_available: false,
+          cancellation_requested: true, revision: 3,
+          created_at: '2026-07-19T09:05:00Z', updated_at: '2026-07-19T09:06:00Z',
         },
       ],
       count: 2,
@@ -1419,6 +1913,7 @@ describe('conversation start gateway contracts', () => {
 
     const started = await local.startAiConversation({
       projectId: 'project-1',
+      title: '受治理会话',
       modelProfileId: 'profile-1',
       requestedMode: 'full',
       currentPassword: 'must-not-cross-local-ipc',
@@ -1442,6 +1937,7 @@ describe('conversation start gateway contracts', () => {
       ['start_ai_conversation', {
         input: {
           projectId: 'project-1',
+          title: '受治理会话',
           modelProfileId: 'profile-1',
           requestedMode: 'full',
         },
@@ -1468,6 +1964,7 @@ describe('conversation start gateway contracts', () => {
     })
 
     await expect(local.startAiConversation({
+      title: '声明失败会话',
       modelProfileId: 'profile-1',
       requestedMode: 'full',
     })).rejects.toThrow('尚未声明')
@@ -1506,12 +2003,14 @@ describe('conversation start gateway contracts', () => {
 
     await remote.startAiConversation({
       projectId: 'project-1',
+      title: 'Full 会话',
       modelProfileId: 'profile-1',
       requestedMode: 'full',
       currentPassword: 'one-request-password',
     })
     await remote.startAiConversation({
       projectId: 'project-1',
+      title: 'Ask 会话',
       modelProfileId: 'profile-1',
       requestedMode: 'ask',
       currentPassword: 'must-be-stripped-for-ask',
@@ -1521,12 +2020,14 @@ describe('conversation start gateway contracts', () => {
     expect(starts).toHaveLength(2)
     expect(JSON.parse(String(starts[0].init?.body))).toEqual({
       projectId: 'project-1',
+      title: 'Full 会话',
       modelProfileId: 'profile-1',
       requestedMode: 'full',
       currentPassword: 'one-request-password',
     })
     expect(JSON.parse(String(starts[1].init?.body))).toEqual({
       projectId: 'project-1',
+      title: 'Ask 会话',
       modelProfileId: 'profile-1',
       requestedMode: 'ask',
     })
@@ -1557,7 +2058,7 @@ describe('conversation start gateway contracts', () => {
     })
     await remote.listAiModelProfiles(true)
     expect(fetchMock.mock.calls[0][0]).toBe(
-      'https://lab.example/api/v1/ai/models?include_archived=true',
+      'https://lab.example/api/v1/ai/models?includeArchived=true',
     )
   })
 
@@ -1567,6 +2068,7 @@ describe('conversation start gateway contracts', () => {
     const profile = profiles[0]
     const started = await demo.startAiConversation({
       projectId: 'project-1',
+      title: '演示受治理会话',
       modelProfileId: profile.id,
       requestedMode: 'full',
     })
@@ -1589,6 +2091,162 @@ describe('conversation start gateway contracts', () => {
     }))
     expect((await demo.listAiModelProfiles(true)).some((item) =>
       item.id === profile.id && item.archivedAt)).toBe(true)
+    await expect(demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '归档模型不能继续执行',
+    })).rejects.toThrow('只读')
+    await expect(demo.uploadAiSource({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      file: new File(['blocked'], 'blocked.md', { type: 'text/markdown' }),
+    })).rejects.toThrow('只读')
+  })
+
+  it('requires a governed writable Demo conversation and keeps its exact model snapshot', async () => {
+    const demo = new DemoGateway()
+    const profiles = await demo.listAiModelProfiles()
+    const conversationProfile = profiles.find((profile) => !profile.supportsVision)!
+    const visionProfile = profiles.find((profile) => profile.supportsVision)!
+    const started = await demo.startAiConversation({
+      projectId: 'project-1',
+      title: '新会话',
+      modelProfileId: conversationProfile.id,
+      requestedMode: 'ask',
+    })
+    const sourceFile = new File(['# governed'], 'governed.md', {
+      type: 'text/markdown',
+    })
+
+    await expect(demo.aiTurn({
+      conversationId: 'missing-conversation',
+      projectId: 'project-1',
+      message: '不得隐式创建',
+    })).rejects.toThrow('会话不存在')
+    await expect(demo.uploadAiSource({
+      conversationId: 'missing-conversation',
+      projectId: 'project-1',
+      file: sourceFile,
+    })).rejects.toThrow('会话不存在')
+
+    const source = await demo.uploadAiSource({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      file: sourceFile,
+    })
+    const imageBytes = new TextEncoder().encode('image')
+    const imageFile = {
+      name: 'evidence.png',
+      type: 'image/png',
+      size: imageBytes.byteLength,
+      arrayBuffer: async () => imageBytes.buffer,
+      slice: () => new Blob([imageBytes], { type: 'image/png' }),
+    } as unknown as File
+    const image = await demo.uploadPrivateImage(imageFile, started.conversation.id)
+    const updated = await demo.updateAiModelProfile(conversationProfile.id, {
+      name: `${conversationProfile.name}（新版本）`,
+      protocol: conversationProfile.protocol,
+      transport: conversationProfile.transport,
+      baseUrl: conversationProfile.baseUrl,
+      modelId: `${conversationProfile.modelId}-new`,
+      supportsVision: true,
+      contextWindowTokens: conversationProfile.contextWindowTokens,
+      maxInputTokens: conversationProfile.maxInputTokens,
+      maxOutputTokens: conversationProfile.maxOutputTokens,
+      historyTokenBudget: conversationProfile.historyTokenBudget,
+      historyTurns: conversationProfile.historyTurns,
+      temperature: conversationProfile.temperature,
+      timeoutMs: conversationProfile.timeoutMs,
+      expectedRevision: conversationProfile.revision,
+    })
+    expect(updated.currentVersion).toBe(conversationProfile.currentVersion + 1)
+
+    await expect(demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '文本来源不能静默携带视觉模型',
+      sourceRefs: [source.id],
+      visionModelProfileId: visionProfile.id,
+    })).rejects.toThrow('只能用于需要中转的图片证据')
+
+    const turn = await demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '读取受治理来源和图片',
+      sourceRefs: [source.id],
+      imageIds: [image.image.id],
+      visionModelProfileId: visionProfile.id,
+    })
+    expect(turn.content).toContain('视觉中转')
+    expect(turn.trace.stages).toEqual([
+      expect.objectContaining({
+        profileId: visionProfile.id,
+        profileVersion: visionProfile.currentVersion,
+        purpose: 'vision_observation',
+      }),
+      expect.objectContaining({
+        profileId: conversationProfile.id,
+        profileVersion: conversationProfile.currentVersion,
+        modelId: conversationProfile.modelId,
+        purpose: 'final_answer',
+      }),
+    ])
+
+    const imageSource = await demo.uploadAiSource({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      file: imageFile,
+    })
+    const sourceTurn = await demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '只读取图片来源',
+      sourceRefs: [imageSource.id],
+      visionModelProfileId: visionProfile.id,
+    })
+    expect(sourceTurn.content).toContain('视觉中转')
+    expect(sourceTurn.trace.stages).toEqual([
+      expect.objectContaining({
+        profileId: visionProfile.id,
+        purpose: 'vision_observation',
+      }),
+      expect.objectContaining({
+        profileId: conversationProfile.id,
+        profileVersion: conversationProfile.currentVersion,
+        purpose: 'final_answer',
+      }),
+    ])
+
+    const directStarted = await demo.startAiConversation({
+      projectId: 'project-1',
+      title: '直接视觉会话',
+      modelProfileId: visionProfile.id,
+      requestedMode: 'ask',
+    })
+    const directImage = await demo.uploadPrivateImage(imageFile, directStarted.conversation.id)
+    await expect(demo.aiTurn({
+      conversationId: directStarted.conversation.id,
+      projectId: 'project-1',
+      message: '直接视觉不能携带中转模型',
+      imageIds: [directImage.image.id],
+      visionModelProfileId: visionProfile.id,
+    })).rejects.toThrow('只能用于需要中转的图片证据')
+
+    const detail = await demo.getAiConversation(started.conversation.id)
+    await demo.updateAiConversation(started.conversation.id, {
+      action: 'archive',
+      expectedRevision: detail.conversation.revision,
+    })
+    await expect(demo.aiTurn({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      message: '归档会话不能继续执行',
+    })).rejects.toThrow('已归档')
+    await expect(demo.uploadAiSource({
+      conversationId: started.conversation.id,
+      projectId: 'project-1',
+      file: sourceFile,
+    })).rejects.toThrow('已归档')
   })
 })
 

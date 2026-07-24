@@ -18,6 +18,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 async-trait.workspace = true
+base64 = "0.22.1"
 chrono.workspace = true
 muriarc-application = { path = "../crates/application" }
 muriarc-ai = { path = "../crates/ai" }

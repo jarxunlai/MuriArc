@@ -3,7 +3,14 @@ import { Bot, ChevronRight } from '@lucide/vue'
 import { useRoute } from 'vue-router'
 import { useAiAssistant } from '@/composables/useAiAssistant'
 
-defineProps<{ title: string; description?: string; section?: string }>()
+withDefaults(defineProps<{
+  title: string
+  description?: string
+  section?: string
+  showAskAi?: boolean
+}>(), {
+  showAskAi: true,
+})
 const route = useRoute()
 const ai = useAiAssistant()
 </script>
@@ -18,7 +25,7 @@ const ai = useAiAssistant()
       <p v-if="description">{{ description }}</p>
     </div>
     <div class="actions">
-      <n-button secondary class="ask-ai" @click="ai.open(title, route.fullPath)">
+      <n-button v-if="showAskAi" secondary class="ask-ai" @click="ai.open(title, route.fullPath)">
         <template #icon><Bot :size="17" /></template>
         问 AI
       </n-button>

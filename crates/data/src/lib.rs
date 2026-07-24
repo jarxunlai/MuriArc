@@ -1,14 +1,29 @@
 #![forbid(unsafe_code)]
 
+mod ai_source_cleanup;
+mod ai_source_import;
 mod attachment_files;
 mod attachment_inspection;
+mod source_material;
 
+pub use ai_source_cleanup::{
+    AiConversationSourceCleanupReport, cleanup_expired_ai_conversation_sources,
+};
+pub use ai_source_import::{
+    AiSourceImportValidationError, ValidatedAiSourceImport, ai_source_import_idempotency_key,
+    validate_ai_source_import,
+};
 pub use attachment_files::{
     AttachmentFileError, AttachmentFiles, MAX_ATTACHMENT_BYTES, StoredAttachmentObject,
     VerifiedAttachmentObject,
 };
 pub use attachment_inspection::{
     AttachmentContentKind, AttachmentInspection, AttachmentInspectionError, inspect_attachment,
+};
+pub use source_material::{
+    AiSourceMaterial, AiSourceMaterialError, AiSourceVisionAsset, MAX_AI_SOURCE_COLUMNS,
+    MAX_AI_SOURCE_ROWS, MAX_AI_SOURCE_TEXT_BYTES, MAX_AI_SOURCE_VISION_ASSETS,
+    extract_ai_source_material, extract_ai_source_vision_assets,
 };
 
 use std::{
@@ -20,22 +35,24 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use muriarc_core::{
-    AiExtractionStatus, AnimalFilter, AnimalStatus, Attachment, AuditContext, AuditFilter,
-    DerivativeKind, EntityType, ExperimentFilter, FieldValueType, GenotypeComponentMode,
-    GenotypingState, IdentifierScope, ImportCommitOptions, ImportCommitResult, ImportPlan, Job,
-    MeasurementFilter, MuriArcStore, ObservationFilter, ParticipationFilter, PrivateImageFilter,
-    ProjectAnimalAssignmentFilter, ProvenanceFilter, SampleFilter, Sex, StoreError, TemplateStatus,
-    UserFilter,
+    AiExtractionStatus, AiImportResolution, AnimalFilter, AnimalStatus, Attachment, AuditContext,
+    AuditFilter, DerivativeKind, EntityType, ExperimentFilter, FieldValueType,
+    GenotypeComponentMode, GenotypingState, IdentifierScope, ImportCommitOptions,
+    ImportCommitResult, ImportPlan, ImportSourceArchive, Job, MeasurementFilter, MuriArcStore,
+    ObservationFilter, ParticipationFilter, PrivateImageFilter, ProjectAnimalAssignmentFilter,
+    ProvenanceFilter, SampleFilter, Sex, StoreError, TemplateStatus, UserFilter,
+    is_ai_managed_attachment_entity_type, is_ai_operational_or_configuration_entity_type,
+    is_ai_source_import_job, is_private_ai_source_attachment_audit, is_private_ai_source_job_audit,
 };
 use muriarc_importer::{
     AnimalDirectory, AnimalExportFilter, AnimalExportOptions, AnimalExportRecord, CageDirectory,
     ExportAnimalStatus, ExportCage, ExportGenotype, ExportGenotypingState, ExportSex, FieldMapping,
     GeneticDirectory, ImportError, ImportIssue, ImportPlanContext, ImportPreview, IssueSeverity,
     MeasurementCatalog, MeasurementDefinition, MeasurementFieldMapping,
-    MeasurementImportPlanContext, MeasurementImportPreview, MeasurementValueType, TabularData,
-    build_animal_import_plan, build_measurement_import_plan, export_animals_csv_with_options,
-    export_animals_xlsx_with_options, preview_animals_with_directory, preview_measurements,
-    read_csv, read_xlsx,
+    MeasurementImportPlanContext, MeasurementImportPreview, MeasurementImportValue,
+    MeasurementValueType, TabularData, build_animal_import_plan, build_measurement_import_plan,
+    export_animals_csv_with_options, export_animals_xlsx_with_options,
+    preview_animals_with_directory, preview_measurements, read_csv, read_xlsx,
 };
 use muriarc_snapshot::{
     BundleEntry, EntryKind, SnapshotError, SnapshotManifest, sha256_hex, write_bundle,
@@ -63,6 +80,12 @@ pub enum ImportKind {
 pub struct DataFiles {
     root: Arc<PathBuf>,
     max_upload_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImportConfirmOptions {
+    pub source_archive: Option<ImportSourceArchive>,
+    pub ai_resolution: Option<AiImportResolution>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -202,7 +225,7 @@ impl From<&PendingMeasurementImport> for MeasurementImportPreviewResponse {
             preview_hash: value.preview_hash.clone(),
             total_rows: value.preview.total_rows,
             accepted_rows: value.preview.accepted_rows.len(),
-            preview_rows: Vec::new(),
+            preview_rows: measurement_preview_rows(&value.preview),
             issues: value.preview.issues.clone(),
             can_confirm: value.preview.can_confirm(),
         }
@@ -224,11 +247,38 @@ impl From<&PendingMeasurementImport> for AnimalImportPreviewResponse {
             preview_hash: value.preview_hash.clone(),
             total_rows: value.preview.total_rows,
             accepted_rows: value.preview.accepted_rows.len(),
-            preview_rows: Vec::new(),
+            preview_rows: measurement_preview_rows(&value.preview),
             issues: value.preview.issues.clone(),
             can_confirm: value.preview.can_confirm(),
         }
     }
+}
+
+fn measurement_preview_rows(preview: &MeasurementImportPreview) -> Vec<BTreeMap<String, String>> {
+    preview
+        .accepted_rows
+        .iter()
+        .take(20)
+        .map(|row| {
+            let value = match &row.value {
+                MeasurementImportValue::Number(value) => value.to_string(),
+                MeasurementImportValue::Text(value) | MeasurementImportValue::Category(value) => {
+                    value.clone()
+                }
+                MeasurementImportValue::Boolean(value) => value.to_string(),
+                MeasurementImportValue::Date(value) => value.to_string(),
+            };
+            BTreeMap::from([
+                ("row_number".to_owned(), row.source_row.to_string()),
+                ("animal_id".to_owned(), row.animal_id.to_string()),
+                ("animal_display_id".to_owned(), row.display_id.clone()),
+                ("measurement_key".to_owned(), row.measurement_key.clone()),
+                ("value".to_owned(), value),
+                ("unit".to_owned(), row.unit.clone().unwrap_or_default()),
+                ("measured_at".to_owned(), row.measured_at.to_rfc3339()),
+            ])
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -749,6 +799,27 @@ impl DataFiles {
         audit: &AuditContext,
         confirmed_at: DateTime<Utc>,
     ) -> Result<ImportCommitResult, DataError> {
+        self.confirm_animal_import_with_options(
+            job,
+            expected_preview_hash,
+            store,
+            audit,
+            confirmed_at,
+            ImportConfirmOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn confirm_animal_import_with_options(
+        &self,
+        job: &Job,
+        expected_preview_hash: &str,
+        store: &dyn MuriArcStore,
+        audit: &AuditContext,
+        confirmed_at: DateTime<Utc>,
+        options: ImportConfirmOptions,
+    ) -> Result<ImportCommitResult, DataError> {
+        ensure_ai_source_import_resolution(job, &options)?;
         let plan = self
             .build_animal_import_plan(job, expected_preview_hash, store, confirmed_at)
             .await?;
@@ -758,6 +829,8 @@ impl DataFiles {
                 ImportCommitOptions {
                     cancellation_requested: job.cancellation_requested,
                     job_id: Some(job.id),
+                    source_archive: options.source_archive,
+                    ai_resolution: options.ai_resolution,
                 },
                 audit,
             )
@@ -839,6 +912,27 @@ impl DataFiles {
         audit: &AuditContext,
         confirmed_at: DateTime<Utc>,
     ) -> Result<ImportCommitResult, DataError> {
+        self.confirm_measurement_import_with_options(
+            job,
+            expected_preview_hash,
+            store,
+            audit,
+            confirmed_at,
+            ImportConfirmOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn confirm_measurement_import_with_options(
+        &self,
+        job: &Job,
+        expected_preview_hash: &str,
+        store: &dyn MuriArcStore,
+        audit: &AuditContext,
+        confirmed_at: DateTime<Utc>,
+        options: ImportConfirmOptions,
+    ) -> Result<ImportCommitResult, DataError> {
+        ensure_ai_source_import_resolution(job, &options)?;
         let plan = self
             .build_measurement_import_plan(job, expected_preview_hash, store, confirmed_at)
             .await?;
@@ -848,6 +942,8 @@ impl DataFiles {
                 ImportCommitOptions {
                     cancellation_requested: job.cancellation_requested,
                     job_id: Some(job.id),
+                    source_archive: options.source_archive,
+                    ai_resolution: options.ai_resolution,
                 },
                 audit,
             )
@@ -942,6 +1038,22 @@ impl DataFiles {
     }
     fn artifact_metadata_path(&self, job_id: Uuid) -> PathBuf {
         self.root.join("artifacts").join(format!("{job_id}.json"))
+    }
+}
+
+fn ensure_ai_source_import_resolution(
+    job: &Job,
+    options: &ImportConfirmOptions,
+) -> Result<(), DataError> {
+    if is_ai_source_import_job(job)
+        && (options.source_archive.is_none() || options.ai_resolution.is_none())
+    {
+        Err(DataError::Conflict(
+            "AI source import requires its reviewed source archive and approval resolution"
+                .to_owned(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -1440,6 +1552,51 @@ pub async fn build_lab_snapshot(
             ..ProvenanceFilter::default()
         })
         .await?;
+    let staged_ai_attachment_ids = attachments
+        .iter()
+        .filter(|attachment| {
+            attachment.project_id.is_none()
+                && is_ai_managed_attachment_entity_type(&attachment.entity_type)
+        })
+        .map(|attachment| attachment.id)
+        .collect::<BTreeSet<_>>();
+    let formal_ai_attachment_ids = attachments
+        .iter()
+        .filter(|attachment| {
+            attachment.project_id.is_some()
+                && is_ai_managed_attachment_entity_type(&attachment.entity_type)
+        })
+        .map(|attachment| attachment.id)
+        .collect::<BTreeSet<_>>();
+    attachments.retain(|attachment| !staged_ai_attachment_ids.contains(&attachment.id));
+    let mut excluded_entities = audits
+        .iter()
+        .filter(|entry| {
+            (is_ai_operational_or_configuration_entity_type(entry.entity_type)
+                && !(entry.entity_type == EntityType::AiExtractionDraft
+                    && approved_draft_ids.contains(&entry.entity_id)))
+                || (entry.entity_type == EntityType::Attachment
+                    && staged_ai_attachment_ids.contains(&entry.entity_id))
+                || (is_private_ai_source_attachment_audit(entry)
+                    && !formal_ai_attachment_ids.contains(&entry.entity_id))
+                || is_private_ai_source_job_audit(entry)
+        })
+        .map(|entry| (entry.entity_type.as_str(), entry.entity_id))
+        .collect::<BTreeSet<_>>();
+    excluded_entities.extend(
+        staged_ai_attachment_ids
+            .iter()
+            .map(|id| (EntityType::Attachment.as_str(), *id)),
+    );
+    audits.retain(|entry| {
+        !excluded_entities.contains(&(entry.entity_type.as_str(), entry.entity_id))
+    });
+    provenance.retain(|record| {
+        (!is_ai_operational_or_configuration_entity_type(record.entity_type)
+            || (record.entity_type == EntityType::AiExtractionDraft
+                && approved_draft_ids.contains(&record.entity_id)))
+            && !excluded_entities.contains(&(record.entity_type.as_str(), record.entity_id))
+    });
     audits.retain(|entry| match entry.entity_type {
         EntityType::AiPrivateImage => false,
         EntityType::AiExtractionDraft => {
@@ -1992,19 +2149,22 @@ pub enum DataError {
 #[cfg(test)]
 mod tests {
     use muriarc_core::{
-        Actor, AiExtractionApprovalInput, AiExtractionApprovalSelection, AiExtractionDraft,
+        Actor, ActorType, AiConversation, AiConversationMessage, AiConversationMessageRole,
+        AiConversationSource, AiConversationSourceKind, AiConversationSourceStatus,
+        AiExtractionApprovalInput, AiExtractionApprovalSelection, AiExtractionDraft,
         AiExtractionEvidence, AiExtractionItem, AiExtractionModelTrace, AiExtractionRejectionInput,
         AiExtractionStatus, AiModelProfile, AiModelProfileStore, AiModelProfileVersion,
-        AiModelPurpose, AiObservationDataCell, AiProviderProtocol, AiProviderTransport, Allele,
-        Animal, AnimalDraft, Attachment, AttachmentDerivative, AuditContext, BreedingLine,
-        BreedingMemberRole, BreedingPair, BreedingPairMember, Colony, DerivativeKind,
-        DerivativeStatus, Experiment, ExperimentEvent, ExperimentTemplateVersion, FieldValueType,
-        GeneLocus, GenotypeComponent, GenotypeComponentMode, GenotypeDefinition, GenotypingRecord,
-        GenotypingState, Lab, Litter, MatingEvent, MeasurementFilter, MuriArcStore, Observation,
-        ObservationDefinition, ObservationPolicy, ObservationSubjectType, ObservationValueData,
-        ObservationValueRecord, ObservationValueType, Participation, PrivateAiImage,
-        PrivateImageStatus, Project, RecordMeta, RecordStatus, Sex, TemplateField, User,
-        WorkspaceStore, WriteSource,
+        AiModelPurpose, AiObservationDataCell, AiOperationStore, AiProviderProtocol,
+        AiProviderTransport, Allele, Animal, AnimalDraft, Approval, ApprovalDecision, Attachment,
+        AttachmentDerivative, AuditContext, BreedingLine, BreedingMemberRole, BreedingPair,
+        BreedingPairMember, Colony, DerivativeKind, DerivativeStatus, Experiment, ExperimentEvent,
+        ExperimentTemplateVersion, FieldValueType, GeneLocus, GenotypeComponent,
+        GenotypeComponentMode, GenotypeDefinition, GenotypingRecord, GenotypingState, Lab, Litter,
+        MatingEvent, MeasurementFilter, MuriArcStore, Observation, ObservationDefinition,
+        ObservationPolicy, ObservationSubjectType, ObservationValueData, ObservationValueRecord,
+        ObservationValueType, Participation, PrivateAiImage, PrivateImageStatus, Project,
+        RecordMeta, RecordStatus, Sex, TemplateField, ToolRun, ToolRunStatus, User, WorkspaceStore,
+        WriteSource,
     };
     use muriarc_snapshot::verify_bundle;
     use muriarc_store_sqlite::SqliteStore;
@@ -2012,6 +2172,77 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    async fn create_ai_source_fixture(
+        store: &SqliteStore,
+        files: &AttachmentFiles,
+        conversation: &AiConversation,
+        file_name: &str,
+        bytes: &[u8],
+        now: DateTime<Utc>,
+    ) -> (AiConversationSource, Attachment) {
+        let attachment_id = Uuid::new_v4();
+        let object = files.write_bytes(attachment_id, bytes).await.unwrap();
+        let source_id = Uuid::new_v4();
+        let attachment = Attachment {
+            id: attachment_id,
+            lab_id: conversation.lab_id,
+            project_id: None,
+            entity_type: "ai_conversation_source".to_owned(),
+            entity_id: source_id,
+            file_name: file_name.to_owned(),
+            media_type: Some("text/plain".to_owned()),
+            relative_path: object.relative_path,
+            size_bytes: object.size_bytes,
+            sha256: object.sha256,
+            version: 1,
+            meta: RecordMeta::new(now),
+        };
+        let source = AiConversationSource {
+            id: source_id,
+            lab_id: conversation.lab_id,
+            user_id: conversation.user_id,
+            conversation_id: Some(conversation.id),
+            project_id: conversation.project_id,
+            attachment_id,
+            kind: AiConversationSourceKind::Text,
+            status: AiConversationSourceStatus::Ready,
+            last_activity_at: now,
+            expires_at: now + chrono::Duration::days(7),
+            archived_at: None,
+            error_code: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_ai_conversation_source(
+                &attachment,
+                &source,
+                &AuditContext::system(WriteSource::Migration),
+            )
+            .await
+            .unwrap();
+        (source, attachment)
+    }
+
+    fn read_snapshot_entries(snapshot: &[u8]) -> BTreeMap<String, Vec<u8>> {
+        let mut archive = zip::ZipArchive::new(Cursor::new(snapshot)).unwrap();
+        let mut entries = BTreeMap::new();
+        for index in 0..archive.len() {
+            let mut file = archive.by_index(index).unwrap();
+            let path = file.name().to_owned();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            entries.insert(path, bytes);
+        }
+        entries
+    }
+
+    fn snapshot_contains(entries: &BTreeMap<String, Vec<u8>>, needle: &str) -> bool {
+        let needle = needle.as_bytes();
+        entries
+            .values()
+            .any(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+    }
 
     struct SnapshotAiFixture {
         draft: AiExtractionDraft,
@@ -2277,6 +2508,245 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == "data/provenance.jsonl")
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_excludes_private_ai_operations_but_keeps_archived_source_attachment() {
+        const CHAT_SENTINEL: &str = "OWNER_CHAT_SENTINEL";
+        const TOOL_SENTINEL: &str = "TOOL_OUTPUT_SENTINEL";
+        const APPROVAL_SENTINEL: &str = "APPROVAL_STATEMENT_SENTINEL";
+        const STAGED_BYTES: &[u8] = b"STAGED_SOURCE_BYTES_SENTINEL";
+        const ARCHIVED_BYTES: &[u8] = b"ARCHIVED_SOURCE_BYTES_SENTINEL";
+
+        let store = SqliteStore::in_memory().await.unwrap();
+        store.migrate().await.unwrap();
+        let now = Utc::now();
+        let migration = AuditContext::system(WriteSource::Migration);
+        let lab = Lab::new("Private AI snapshot lab", now).unwrap();
+        store.create_lab(&lab, &migration).await.unwrap();
+        let user = User::new(
+            lab.id,
+            "snapshot-ai-owner@example.test",
+            "Snapshot AI owner",
+            now,
+        )
+        .unwrap();
+        store.create_user(&user, &migration).await.unwrap();
+        let profile = AiModelProfile {
+            id: Uuid::new_v4(),
+            lab_id: lab.id,
+            user_id: user.id,
+            name: "Snapshot source model".to_owned(),
+            current_version: 1,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        let profile_version = AiModelProfileVersion {
+            profile_id: profile.id,
+            version: 1,
+            protocol: AiProviderProtocol::OpenaiChatCompletions,
+            transport: AiProviderTransport::OpenAiCompatible,
+            base_url: "https://provider.example.test/v1".to_owned(),
+            normalized_base_url: "https://provider.example.test/v1".to_owned(),
+            model_id: "snapshot-source-model".to_owned(),
+            supports_vision: false,
+            context_window_tokens: 16_384,
+            max_input_tokens: 8_192,
+            max_output_tokens: 2_048,
+            history_token_budget: 4_096,
+            history_turns: 20,
+            temperature: 0.0,
+            timeout_ms: 30_000,
+            created_at: now,
+        };
+        store
+            .create_ai_model_profile(&profile, &profile_version, &migration)
+            .await
+            .unwrap();
+        let project = Project::new(lab.id, "Formal archive project", now).unwrap();
+        store.create_project(&project, &migration).await.unwrap();
+
+        let ai_audit = AuditContext {
+            actor: Actor {
+                actor_type: ActorType::Ai,
+                user_id: Some(user.id),
+                display_name: "MuriArc AI".to_owned(),
+            },
+            source: WriteSource::Ai,
+            request_id: Some("snapshot-private-ai-turn".to_owned()),
+            reason: None,
+        };
+        let conversation = AiConversation {
+            id: Uuid::new_v4(),
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            user_id: user.id,
+            title: "Owner-private conversation".to_owned(),
+            model_profile: Some(muriarc_core::AiModelProfileBinding {
+                profile_id: profile.id,
+                profile_version: profile_version.version,
+            }),
+            legacy_read_only: false,
+            pinned_at: None,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_ai_conversation(&conversation, &ai_audit)
+            .await
+            .unwrap();
+        let user_message = AiConversationMessage::new(
+            conversation.id,
+            lab.id,
+            Some(project.id),
+            user.id,
+            1,
+            AiConversationMessageRole::User,
+            CHAT_SENTINEL,
+            None,
+            now + chrono::Duration::milliseconds(1),
+        )
+        .unwrap();
+        let assistant_message = AiConversationMessage::new(
+            conversation.id,
+            lab.id,
+            Some(project.id),
+            user.id,
+            2,
+            AiConversationMessageRole::Assistant,
+            "Safe assistant response",
+            Some(serde_json::json!({"content": "Safe assistant response"})),
+            now + chrono::Duration::milliseconds(2),
+        )
+        .unwrap();
+        let tool_run = ToolRun {
+            id: Uuid::new_v4(),
+            conversation_id: Some(conversation.id),
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            user_id: user.id,
+            tool_name: "private_snapshot_probe".to_owned(),
+            input: serde_json::json!({"operation": "read"}),
+            output: Some(serde_json::json!({"private": TOOL_SENTINEL})),
+            status: ToolRunStatus::AwaitingApproval,
+            source: WriteSource::Ai,
+            started_at: Some(now + chrono::Duration::milliseconds(1)),
+            completed_at: None,
+            error: None,
+            meta: RecordMeta::new(now + chrono::Duration::milliseconds(1)),
+        };
+        let approval = Approval {
+            id: Uuid::new_v4(),
+            tool_run_id: tool_run.id,
+            requested_diff: serde_json::json!({"statement": APPROVAL_SENTINEL}),
+            decision: ApprovalDecision::Pending,
+            decided_by: None,
+            decided_at: None,
+            reason: None,
+            meta: RecordMeta::new(now + chrono::Duration::milliseconds(1)),
+        };
+        store
+            .append_ai_turn_records(
+                &user_message,
+                &assistant_message,
+                std::slice::from_ref(&tool_run),
+                std::slice::from_ref(&approval),
+                0,
+                &ai_audit,
+            )
+            .await
+            .unwrap();
+
+        let temp = tempdir().unwrap();
+        let attachment_root = temp.path().join("attachments");
+        let files = AttachmentFiles::new(&attachment_root);
+        let (staged_source, staged_attachment) = create_ai_source_fixture(
+            &store,
+            &files,
+            &conversation,
+            "staged-private.txt",
+            STAGED_BYTES,
+            now,
+        )
+        .await;
+        let (archived_source, archived_attachment) = create_ai_source_fixture(
+            &store,
+            &files,
+            &conversation,
+            "archived-formal.txt",
+            ARCHIVED_BYTES,
+            now,
+        )
+        .await;
+        store
+            .archive_ai_conversation_source(
+                archived_source.id,
+                project.id,
+                archived_source.meta.revision,
+                now + chrono::Duration::seconds(1),
+                &AuditContext::system(WriteSource::Desktop),
+            )
+            .await
+            .unwrap();
+
+        let snapshot = build_lab_snapshot(
+            &store,
+            &attachment_root,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            lab.id,
+            Some(user.id),
+            now + chrono::Duration::seconds(2),
+        )
+        .await
+        .unwrap();
+        verify_bundle(Cursor::new(snapshot.as_slice())).unwrap();
+        let entries = read_snapshot_entries(&snapshot);
+
+        for sentinel in [CHAT_SENTINEL, TOOL_SENTINEL, APPROVAL_SENTINEL] {
+            assert!(
+                !snapshot_contains(&entries, sentinel),
+                "{sentinel} leaked into the shared snapshot"
+            );
+        }
+        assert!(!snapshot_contains(
+            &entries,
+            std::str::from_utf8(STAGED_BYTES).unwrap()
+        ));
+        assert!(!snapshot_contains(
+            &entries,
+            &staged_attachment.relative_path
+        ));
+        assert!(!snapshot_contains(&entries, &staged_source.id.to_string()));
+        assert!(!snapshot_contains(
+            &entries,
+            &staged_attachment.id.to_string()
+        ));
+
+        let archived_content_path = format!(
+            "attachments/{}/v{}/content",
+            archived_attachment.id, archived_attachment.version
+        );
+        assert_eq!(
+            entries.get(&archived_content_path).map(Vec::as_slice),
+            Some(ARCHIVED_BYTES)
+        );
+        let attachment_jsonl = String::from_utf8(entries["data/attachment.jsonl"].clone()).unwrap();
+        assert!(attachment_jsonl.contains(&archived_attachment.id.to_string()));
+        assert!(attachment_jsonl.contains("archived-formal.txt"));
+        assert!(!attachment_jsonl.contains(&staged_attachment.id.to_string()));
+
+        let audit_jsonl = String::from_utf8(entries["data/audit.jsonl"].clone()).unwrap();
+        assert!(!audit_jsonl.contains(&conversation.id.to_string()));
+        assert!(!audit_jsonl.contains(&user_message.id.to_string()));
+        assert!(!audit_jsonl.contains(&tool_run.id.to_string()));
+        assert!(!audit_jsonl.contains(&approval.id.to_string()));
+
+        let provenance_jsonl = String::from_utf8(entries["data/provenance.jsonl"].clone()).unwrap();
+        assert!(provenance_jsonl.contains(&archived_attachment.id.to_string()));
+        assert!(!provenance_jsonl.contains(&archived_source.id.to_string()));
+        assert!(!provenance_jsonl.contains(&staged_source.id.to_string()));
+        assert!(!provenance_jsonl.contains(&staged_attachment.id.to_string()));
     }
 
     #[tokio::test]
@@ -3287,6 +3757,24 @@ mod tests {
             pending.preview.issues
         );
         assert_eq!(pending.preview.accepted_rows.len(), 1);
+        let public_preview = MeasurementImportPreviewResponse::from(&pending);
+        assert_eq!(public_preview.preview_rows.len(), 1);
+        assert_eq!(public_preview.preview_rows[0]["row_number"], "2");
+        assert_eq!(
+            public_preview.preview_rows[0]["animal_id"],
+            animal.id.to_string()
+        );
+        assert_eq!(public_preview.preview_rows[0]["animal_display_id"], "M001");
+        assert_eq!(
+            public_preview.preview_rows[0]["measurement_key"],
+            "body_weight"
+        );
+        assert_eq!(public_preview.preview_rows[0]["value"], "22.4");
+        assert_eq!(public_preview.preview_rows[0]["unit"], "g");
+        assert_eq!(
+            public_preview.preview_rows[0]["measured_at"],
+            "2026-07-19T08:00:00+00:00"
+        );
         let receipt = files
             .confirm_measurement_import(&job, &pending.preview_hash, &store, &audit, now)
             .await

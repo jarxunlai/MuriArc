@@ -1,20 +1,26 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use muriarc_ai::{
-    AiDataAccessContext, AiDataApplyResult, AiDataToolBackend, AiExportFormat, AiExportResource,
-    Citation, DomainToolOutput, DomainToolRequest, DraftKind, ExportCreateArguments, FieldChange,
-    ImportCommitDraftArguments, ImportCommitDraftPayload, ImportPreviewArguments, ProposalActor,
+    AiDataAccessContext, AiDataApplyResult, AiDataToolBackend, AiExportArtifactView,
+    AiExportFormat, AiExportResource, AiSourceImportKind, Citation, DomainToolOutput,
+    DomainToolRequest, DraftKind, ExportCreateArguments, FieldChange, ImportCommitDraftArguments,
+    ImportCommitDraftPayload, ImportDraftPreviewSummary, ImportPreviewArguments, ProposalActor,
+    SOURCE_IMPORT_JOB_BINDING_KEY, SourceImportJobBinding, SourceImportPreviewArguments,
     ToolExecutionError, ToolName, WriteDraft, valid_sha256,
 };
 use muriarc_core::{
-    Actor, ActorType, AuditContext, EntityType, ImportCommitResult, Job, JobKind, JobStatus,
-    MuriArcStore, RecordMeta, WriteSource,
+    Actor, ActorType, AiConversationSourceStatus, AiImportResolution,
+    ApprovalDecision as StoredApprovalDecision, AuditContext, EntityType, ImportCommitResult,
+    ImportSourceArchive, Job, JobKind, JobStatus, MuriArcStore, ProvenanceFilter, RecordMeta,
+    StoreError, ToolRunStatus, WriteSource, canonical_import_receipt, completed_ai_import_tool_run,
 };
 use muriarc_data::{
-    AnimalImportPreviewResponse, ArtifactKind, ArtifactMetadata, DataError, DataFiles,
-    ExportFormat, artifact_metadata, export_animals_scoped,
+    AiSourceImportValidationError, AnimalImportPreviewResponse, ArtifactKind, ArtifactMetadata,
+    AttachmentFiles, DataError, DataFiles, ExportFormat, ImportConfirmOptions, ImportKind,
+    ai_source_import_idempotency_key, artifact_metadata, export_animals_scoped,
+    validate_ai_source_import,
 };
 use muriarc_importer::AnimalExportFilter;
 use serde_json::{Value, json};
@@ -34,6 +40,7 @@ pub(crate) struct ServerAiDataTools {
     store: Arc<dyn MuriArcStore>,
     jobs: Arc<dyn JobRepository>,
     files: Arc<DataFiles>,
+    attachments: Option<AttachmentFiles>,
 }
 
 impl ServerAiDataTools {
@@ -42,7 +49,253 @@ impl ServerAiDataTools {
         jobs: Arc<dyn JobRepository>,
         files: Arc<DataFiles>,
     ) -> Self {
-        Self { store, jobs, files }
+        Self {
+            store,
+            jobs,
+            files,
+            attachments: None,
+        }
+    }
+
+    pub(crate) fn with_attachment_root(mut self, root: &Path) -> Self {
+        self.attachments = Some(AttachmentFiles::new(root));
+        self
+    }
+
+    async fn execute_source_import_preview(
+        &self,
+        access: &AiDataAccessContext,
+        request: DomainToolRequest,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        let arguments: SourceImportPreviewArguments = parse_arguments(request.arguments)?;
+        let conversation_id = access
+            .conversation_id()
+            .filter(|value| !value.is_nil())
+            .ok_or_else(|| rejected("source_import_unavailable"))?;
+        if arguments.source_id.is_nil() {
+            return Err(rejected("invalid_arguments"));
+        }
+
+        let (import_kind, project_id, experiment_id) = match arguments.import_kind {
+            AiSourceImportKind::Animal => return Err(rejected("source_import_forbidden")),
+            AiSourceImportKind::Measurement => {
+                let experiment_id = arguments
+                    .experiment_id
+                    .filter(|value| !value.is_nil())
+                    .ok_or_else(|| rejected("invalid_arguments"))?;
+                let experiment = self
+                    .store
+                    .get_experiment(experiment_id)
+                    .await
+                    .map_err(|_| rejected("source_import_forbidden"))?;
+                if experiment.lab_id != access.lab_id()
+                    || access.conversation_project_id() != Some(experiment.project_id)
+                    || !access.can_import_project(experiment.project_id)
+                {
+                    return Err(rejected("source_import_forbidden"));
+                }
+                (
+                    ImportKind::Measurement,
+                    Some(experiment.project_id),
+                    Some(experiment_id),
+                )
+            }
+        };
+
+        let source = self
+            .store
+            .get_ai_conversation_source(arguments.source_id)
+            .await
+            .map_err(|_| rejected("source_import_source_unavailable"))?;
+        let attachment = self
+            .store
+            .get_attachment(source.attachment_id)
+            .await
+            .map_err(|_| rejected("source_import_source_unavailable"))?;
+        let attachment_files = self
+            .attachments
+            .as_ref()
+            .ok_or_else(|| rejected("source_import_unavailable"))?;
+        let bytes = attachment_files
+            .read_verified_bytes(&attachment)
+            .await
+            .map_err(|_| rejected("source_import_invalid_material"))?;
+        if bytes.len() as u64 > self.files.max_upload_bytes() {
+            return Err(rejected("source_import_invalid_file"));
+        }
+        let validated = validate_ai_source_import(
+            &source,
+            &attachment,
+            &bytes,
+            access.lab_id(),
+            access.user_id(),
+            conversation_id,
+            project_id,
+            import_kind,
+            Utc::now(),
+        )
+        .map_err(map_source_validation_error)?;
+
+        let idempotency_key =
+            ai_source_import_idempotency_key(source.id, import_kind, experiment_id);
+        let binding = SourceImportJobBinding::new(
+            source.id,
+            source.meta.revision,
+            source.project_id,
+            attachment.id,
+            attachment.meta.revision,
+            conversation_id,
+        );
+        let audit = ai_audit(access, request.tool_run_id, "ai_source_import_preview");
+        let requested = Job {
+            id: Uuid::new_v4(),
+            lab_id: access.lab_id(),
+            project_id,
+            created_by: access.user_id(),
+            kind: JobKind::Import,
+            status: JobStatus::Parsing,
+            idempotency_key: idempotency_key.clone(),
+            progress_current: 0,
+            progress_total: Some(3),
+            result: None,
+            error_report: None,
+            cancellation_requested: false,
+            meta: RecordMeta::new(Utc::now()),
+        };
+        let outcome = self
+            .jobs
+            .create(requested, audit.clone())
+            .await
+            .map_err(map_job_error)?;
+        let mut job = outcome.job;
+        ensure_source_import_job(
+            &job,
+            access,
+            project_id,
+            &idempotency_key,
+            &binding,
+            outcome.created,
+        )?;
+        if !outcome.created {
+            return self.source_import_output(&job, &binding).await;
+        }
+
+        let operation = async {
+            self.files
+                .write_upload_bytes(job.id, &validated.file_name, &bytes)
+                .await?;
+            let preview: AnimalImportPreviewResponse = match import_kind {
+                ImportKind::Animal => (&self
+                    .files
+                    .preview_animal_import(&job, self.store.as_ref())
+                    .await?)
+                    .into(),
+                ImportKind::Measurement => (&self
+                    .files
+                    .preview_measurement_import(
+                        &job,
+                        experiment_id.expect("measurement source import has an experiment"),
+                        self.store.as_ref(),
+                    )
+                    .await?)
+                    .into(),
+            };
+            Ok::<_, DataError>(preview)
+        }
+        .await;
+
+        match operation {
+            Ok(preview) => {
+                let result = source_import_job_result(&preview, &binding)?;
+                if transition_job(
+                    self.jobs.as_ref(),
+                    &mut job,
+                    JobStatus::AwaitingConfirmation,
+                    2,
+                    Some(result),
+                    None,
+                    &audit,
+                )
+                .await
+                .is_err()
+                {
+                    self.cleanup_failed_source_import(job.id, &audit, "storage_error")
+                        .await;
+                    return Err(ToolExecutionError::Unavailable);
+                }
+                self.source_import_output(&job, &binding).await
+            }
+            Err(error) => {
+                let code = source_import_data_error_code(&error);
+                let _ = transition_job(
+                    self.jobs.as_ref(),
+                    &mut job,
+                    JobStatus::Failed,
+                    0,
+                    None,
+                    Some(json!({"code": code})),
+                    &audit,
+                )
+                .await;
+                let _ = self.files.clear_pending_import(job.id).await;
+                let _ = self.files.clear_upload(job.id).await;
+                Err(map_source_import_data_error(error))
+            }
+        }
+    }
+
+    async fn source_import_output(
+        &self,
+        job: &Job,
+        expected_binding: &SourceImportJobBinding,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        let stored_binding = source_import_binding(job)?;
+        if &stored_binding != expected_binding {
+            return Err(rejected("source_import_job_conflict"));
+        }
+        let (_, mut preview) = self.pending_preview(job).await?;
+        let preview_object = preview
+            .as_object_mut()
+            .ok_or(ToolExecutionError::Unavailable)?;
+        preview_object.insert("source_id".to_owned(), json!(stored_binding.source_id));
+        Ok(DomainToolOutput::read(
+            preview,
+            vec![
+                Citation::new(
+                    EntityType::AiConversationSource,
+                    stored_binding.source_id,
+                    Some(stored_binding.source_revision),
+                ),
+                Citation::new(EntityType::Job, job.id, Some(job.meta.revision)),
+            ],
+        ))
+    }
+
+    async fn cleanup_failed_source_import(
+        &self,
+        job_id: Uuid,
+        audit: &AuditContext,
+        code: &'static str,
+    ) {
+        let _ = self.files.clear_pending_import(job_id).await;
+        let _ = self.files.clear_upload(job_id).await;
+        if let Ok(mut current) = self.jobs.get(job_id).await
+            && !matches!(
+                current.status,
+                JobStatus::AwaitingConfirmation | JobStatus::Completed | JobStatus::Failed
+            )
+        {
+            let _ = transition_job(
+                self.jobs.as_ref(),
+                &mut current,
+                JobStatus::Failed,
+                0,
+                None,
+                Some(json!({"code": code})),
+                audit,
+            )
+            .await;
+        }
     }
 
     async fn import_job(
@@ -57,24 +310,20 @@ impl ServerAiDataTools {
         {
             return Err(rejected("import_job_not_found"));
         }
-        match job.project_id {
-            Some(project_id) if !access.can_import_project(project_id) => {
-                return Err(rejected("import_job_not_found"));
-            }
-            None if !access.can_import_lab() => {
-                return Err(rejected("import_job_not_found"));
-            }
-            _ => {}
-        }
-        if let Some(project_id) = job.project_id {
-            let project = self
-                .store
-                .get_project(project_id)
-                .await
-                .map_err(|_| rejected("import_job_not_found"))?;
-            if project.lab_id != access.lab_id() {
-                return Err(rejected("import_job_not_found"));
-            }
+        let project_id = job
+            .project_id
+            .filter(|project_id| {
+                access.conversation_project_id() == Some(*project_id)
+                    && access.can_import_project(*project_id)
+            })
+            .ok_or_else(|| rejected("import_job_not_found"))?;
+        let project = self
+            .store
+            .get_project(project_id)
+            .await
+            .map_err(|_| rejected("import_job_not_found"))?;
+        if project.lab_id != access.lab_id() {
+            return Err(rejected("import_job_not_found"));
         }
         Ok(job)
     }
@@ -128,6 +377,7 @@ impl ServerAiDataTools {
         };
         let preview_hash = response.preview_hash.clone();
         let issue_count = response.issues.len();
+        let preview_row_count = response.preview_rows.len();
         let issues = response
             .issues
             .into_iter()
@@ -148,6 +398,8 @@ impl ServerAiDataTools {
                 "preview_hash": preview_hash,
                 "total_rows": response.total_rows,
                 "accepted_rows": response.accepted_rows,
+                "preview_rows": response.preview_rows,
+                "preview_rows_truncated": response.accepted_rows > preview_row_count,
                 "can_confirm": response.can_confirm,
                 "issue_count": issue_count,
                 "issues": issues,
@@ -195,6 +447,10 @@ impl ServerAiDataTools {
         if preview.get("can_confirm").and_then(Value::as_bool) != Some(true) {
             return Err(rejected("import_preview_blocked"));
         }
+        let preview_summary = ImportDraftPreviewSummary::from_public_preview(&preview)?;
+        if Some(preview_summary.project_id) != job.project_id {
+            return Err(rejected("invalid_import_preview"));
+        }
 
         let now = Utc::now();
         let expires_at = job.meta.created_at + IMPORT_PREVIEW_TTL;
@@ -203,6 +459,7 @@ impl ServerAiDataTools {
             job_id: job.id,
             preview_hash: preview_hash.clone(),
             expected_revision: job.meta.revision,
+            preview: preview_summary,
         };
         let draft = WriteDraft::new(
             DraftKind::BulkImport,
@@ -365,6 +622,7 @@ impl ServerAiDataTools {
         job: &Job,
         draft: &WriteDraft,
         binding: &ImportCommitDraftPayload,
+        resolution: &AiImportResolution,
     ) -> Result<Option<AiDataApplyResult>, ToolExecutionError> {
         if job.status != JobStatus::Completed {
             return Ok(None);
@@ -386,7 +644,7 @@ impl ServerAiDataTools {
         {
             return Err(rejected("import_revision_conflict"));
         }
-        let receipt: ImportCommitResult = serde_json::from_value(value)
+        let mut receipt: ImportCommitResult = serde_json::from_value(value)
             .map_err(|_| rejected("import_completed_result_invalid"))?;
         if !receipt
             .preview_hash
@@ -394,10 +652,86 @@ impl ServerAiDataTools {
         {
             return Err(rejected("import_preview_hash_conflict"));
         }
+        let expected_tool_run =
+            completed_ai_import_tool_run(resolution, job.id, &canonical_import_receipt(&receipt))
+                .map_err(|_| rejected("import_revision_conflict"))?;
+        let stored_tool_run = self
+            .store
+            .get_tool_run(expected_tool_run.id)
+            .await
+            .map_err(|_| rejected("import_revision_conflict"))?;
+        let stored_approval = self
+            .store
+            .get_approval(resolution.approval.id)
+            .await
+            .map_err(|_| rejected("import_revision_conflict"))?;
+        if stored_tool_run != expected_tool_run || stored_approval != resolution.approval {
+            return Err(rejected("import_revision_conflict"));
+        }
+        self.validate_completed_import_source(job, &receipt).await?;
+        receipt.replayed = true;
         Ok(Some(AiDataApplyResult {
             job_id: job.id,
             result: serde_json::to_value(receipt).map_err(|_| ToolExecutionError::Unavailable)?,
         }))
+    }
+
+    async fn validate_completed_import_source(
+        &self,
+        job: &Job,
+        receipt: &ImportCommitResult,
+    ) -> Result<(), ToolExecutionError> {
+        let Some(binding) = optional_source_import_binding(job)? else {
+            return Ok(());
+        };
+        let source = self
+            .store
+            .get_ai_conversation_source(binding.source_id)
+            .await
+            .map_err(|_| rejected("import_revision_conflict"))?;
+        let attachment = self
+            .store
+            .get_attachment(binding.attachment_id)
+            .await
+            .map_err(|_| rejected("import_revision_conflict"))?;
+        if source.lab_id != job.lab_id
+            || source.user_id != job.created_by
+            || source.conversation_id != Some(binding.conversation_id)
+            || source.project_id != binding.source_project_id
+            || source.attachment_id != binding.attachment_id
+            || source.status != AiConversationSourceStatus::Archived
+            || source.meta.revision != binding.source_revision + 1
+            || attachment.lab_id != job.lab_id
+            || attachment.project_id != binding.source_project_id
+            || attachment.entity_type != "ai_conversation_source"
+            || attachment.entity_id != binding.source_id
+            || attachment.meta.revision != binding.attachment_revision + 1
+        {
+            return Err(rejected("import_revision_conflict"));
+        }
+        for (entity_type, entity_id) in [
+            (EntityType::AiConversationSource, binding.source_id),
+            (EntityType::Attachment, binding.attachment_id),
+        ] {
+            let provenance = self
+                .store
+                .list_provenance(&ProvenanceFilter {
+                    lab_id: job.lab_id,
+                    project_id: binding.source_project_id,
+                    entity_type: Some(entity_type),
+                    entity_id: Some(entity_id),
+                    source: None,
+                })
+                .await
+                .map_err(|_| rejected("import_revision_conflict"))?;
+            if !provenance.iter().any(|record| {
+                record.import_job_id == Some(job.id)
+                    && record.import_commit_id == Some(receipt.commit_id)
+            }) {
+                return Err(rejected("import_revision_conflict"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -405,7 +739,13 @@ impl ServerAiDataTools {
 impl AiDataToolBackend for ServerAiDataTools {
     fn supported_tools(&self, access: &AiDataAccessContext) -> Vec<ToolName> {
         let mut tools = Vec::new();
-        if access.can_import_anything() {
+        if access
+            .conversation_project_id()
+            .is_some_and(|project_id| access.can_import_project(project_id))
+        {
+            if self.attachments.is_some() && access.conversation_id().is_some() {
+                tools.push(ToolName::SourceImportPreview);
+            }
             tools.extend([ToolName::ImportPreview, ToolName::ImportCommitDraft]);
         }
         if access.can_export_anything() {
@@ -423,6 +763,9 @@ impl AiDataToolBackend for ServerAiDataTools {
             return Err(rejected("data_tool_forbidden"));
         }
         match request.tool {
+            ToolName::SourceImportPreview => {
+                self.execute_source_import_preview(access, request).await
+            }
             ToolName::ImportPreview => self.execute_import_preview(access, request).await,
             ToolName::ImportCommitDraft => self.execute_import_commit_draft(access, request).await,
             ToolName::ExportCreate => self.execute_export(access, request).await,
@@ -434,6 +777,7 @@ impl AiDataToolBackend for ServerAiDataTools {
         &self,
         access: &AiDataAccessContext,
         draft: &WriteDraft,
+        resolution: &AiImportResolution,
         audit: &AuditContext,
     ) -> Result<AiDataApplyResult, ToolExecutionError> {
         if audit.actor.actor_type != ActorType::Human
@@ -441,84 +785,75 @@ impl AiDataToolBackend for ServerAiDataTools {
             || draft.kind() != DraftKind::BulkImport
             || draft.tool() != ToolName::ImportCommitDraft
             || draft.status() != muriarc_ai::DraftStatus::Approved
+            || resolution.approval.id != draft.id()
+            || resolution.approval.tool_run_id != resolution.tool_run.id
+            || resolution.approval.decision != StoredApprovalDecision::Approved
+            || resolution.tool_run.status != ToolRunStatus::Completed
+            || resolution.tool_run.lab_id != access.lab_id()
+            || resolution.tool_run.project_id != draft.project_id()
+            || resolution.tool_run.user_id != access.user_id()
+            || resolution.tool_run.conversation_id != access.conversation_id()
+            || resolution.tool_run.tool_name != ToolName::ImportCommitDraft.as_str()
         {
             return Err(rejected("invalid_import_approval"));
         }
         let binding: ImportCommitDraftPayload = serde_json::from_value(draft.payload().clone())
             .map_err(|_| rejected("invalid_import_binding"))?;
         binding.validate()?;
-        let mut job = self.import_job(access, binding.job_id).await?;
+        if resolution.expected_job_revision != binding.expected_revision {
+            return Err(rejected("invalid_import_approval"));
+        }
+        let job = self.import_job(access, binding.job_id).await?;
         if draft.project_id() != job.project_id {
             return Err(rejected("import_job_not_found"));
         }
-        if let Some(result) = self.completed_import_replay(&job, draft, &binding).await? {
+        if let Some(result) = self
+            .completed_import_replay(&job, draft, &binding, resolution)
+            .await?
+        {
             return Ok(result);
         }
         if job.meta.revision != binding.expected_revision {
             return Err(rejected("import_revision_conflict"));
         }
-        let (preview_hash, _) = self.pending_preview(&job).await?;
+        let (preview_hash, preview) = self.pending_preview(&job).await?;
         if !preview_hash.eq_ignore_ascii_case(binding.preview_hash.trim()) {
             return Err(rejected("import_preview_hash_conflict"));
         }
+        let current_preview = ImportDraftPreviewSummary::from_public_preview(&preview)?;
+        if current_preview != binding.preview {
+            return Err(rejected("import_preview_conflict"));
+        }
 
+        let source_binding = optional_source_import_binding(&job)?;
+        let confirm_options = ImportConfirmOptions {
+            source_archive: source_binding.as_ref().map(import_source_archive),
+            ai_resolution: Some(resolution.clone()),
+        };
         let receipt = if job.project_id.is_some() {
             self.files
-                .confirm_measurement_import(
+                .confirm_measurement_import_with_options(
                     &job,
                     &binding.preview_hash,
                     self.store.as_ref(),
                     audit,
                     Utc::now(),
+                    confirm_options,
                 )
                 .await
         } else {
             self.files
-                .confirm_animal_import(
+                .confirm_animal_import_with_options(
                     &job,
                     &binding.preview_hash,
                     self.store.as_ref(),
                     audit,
                     Utc::now(),
+                    confirm_options,
                 )
                 .await
         }
         .map_err(map_data_error)?;
-
-        let mut stored_result =
-            serde_json::to_value(&receipt).map_err(|_| ToolExecutionError::Unavailable)?;
-        let object = stored_result
-            .as_object_mut()
-            .ok_or(ToolExecutionError::Unavailable)?;
-        object.insert("_ai_draft_id".to_owned(), json!(draft.id()));
-        object.insert(
-            "_ai_expected_revision".to_owned(),
-            json!(binding.expected_revision),
-        );
-        let completed_progress = job.progress_total.unwrap_or(3);
-        let transition = transition_job(
-            self.jobs.as_ref(),
-            &mut job,
-            JobStatus::Completed,
-            completed_progress,
-            Some(stored_result),
-            None,
-            audit,
-        )
-        .await;
-        if transition.is_err() {
-            // A domain import is idempotent. If the job transition raced with
-            // an exact retry of this same draft, accept only the marked,
-            // completed state; every other revision remains a hard conflict.
-            let current = self.jobs.get(job.id).await.map_err(map_job_lookup)?;
-            if let Some(result) = self
-                .completed_import_replay(&current, draft, &binding)
-                .await?
-            {
-                return Ok(result);
-            }
-            return Err(ToolExecutionError::Unavailable);
-        }
         if let Err(error) = self.files.clear_pending_import(job.id).await {
             tracing::warn!(job_id = %job.id, error = %error, "AI import pending cleanup failed");
         }
@@ -532,22 +867,169 @@ impl AiDataToolBackend for ServerAiDataTools {
     }
 }
 
+fn source_import_job_result(
+    preview: &AnimalImportPreviewResponse,
+    binding: &SourceImportJobBinding,
+) -> Result<Value, ToolExecutionError> {
+    let mut result = serde_json::to_value(preview).map_err(|_| ToolExecutionError::Unavailable)?;
+    result
+        .as_object_mut()
+        .ok_or(ToolExecutionError::Unavailable)?
+        .insert(
+            SOURCE_IMPORT_JOB_BINDING_KEY.to_owned(),
+            serde_json::to_value(binding).map_err(|_| ToolExecutionError::Unavailable)?,
+        );
+    Ok(result)
+}
+
+fn source_import_binding(job: &Job) -> Result<SourceImportJobBinding, ToolExecutionError> {
+    let binding = job
+        .result
+        .as_ref()
+        .and_then(|value| value.get(SOURCE_IMPORT_JOB_BINDING_KEY))
+        .cloned()
+        .ok_or_else(|| rejected("source_import_job_conflict"))?;
+    let binding: SourceImportJobBinding =
+        serde_json::from_value(binding).map_err(|_| rejected("source_import_job_conflict"))?;
+    if binding.validate() {
+        Ok(binding)
+    } else {
+        Err(rejected("source_import_job_conflict"))
+    }
+}
+
+fn optional_source_import_binding(
+    job: &Job,
+) -> Result<Option<SourceImportJobBinding>, ToolExecutionError> {
+    let Some(value) = job
+        .result
+        .as_ref()
+        .and_then(|value| value.get(SOURCE_IMPORT_JOB_BINDING_KEY))
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let binding: SourceImportJobBinding =
+        serde_json::from_value(value).map_err(|_| rejected("source_import_job_conflict"))?;
+    if binding.validate() {
+        Ok(Some(binding))
+    } else {
+        Err(rejected("source_import_job_conflict"))
+    }
+}
+
+fn import_source_archive(binding: &SourceImportJobBinding) -> ImportSourceArchive {
+    ImportSourceArchive {
+        source_id: binding.source_id,
+        expected_revision: binding.source_revision,
+        attachment_id: binding.attachment_id,
+        expected_attachment_revision: binding.attachment_revision,
+        conversation_id: binding.conversation_id,
+        project_id: binding.source_project_id,
+    }
+}
+
+fn ensure_source_import_job(
+    job: &Job,
+    access: &AiDataAccessContext,
+    project_id: Option<Uuid>,
+    idempotency_key: &str,
+    binding: &SourceImportJobBinding,
+    created: bool,
+) -> Result<(), ToolExecutionError> {
+    if job.lab_id != access.lab_id()
+        || job.created_by != access.user_id()
+        || job.project_id != project_id
+        || job.kind != JobKind::Import
+        || job.idempotency_key != idempotency_key
+        || job.cancellation_requested
+    {
+        return Err(rejected("source_import_job_conflict"));
+    }
+    if created {
+        if job.status != JobStatus::Parsing || job.result.is_some() {
+            return Err(rejected("source_import_job_conflict"));
+        }
+    } else if job.status != JobStatus::AwaitingConfirmation
+        || source_import_binding(job)? != *binding
+    {
+        return Err(rejected("source_import_job_conflict"));
+    }
+    Ok(())
+}
+
+fn map_source_validation_error(error: AiSourceImportValidationError) -> ToolExecutionError {
+    match error {
+        AiSourceImportValidationError::SourceUnavailable
+        | AiSourceImportValidationError::ScopeMismatch => {
+            rejected("source_import_source_unavailable")
+        }
+        AiSourceImportValidationError::InvalidAttachment => {
+            rejected("source_import_invalid_material")
+        }
+        AiSourceImportValidationError::UnsupportedFile => rejected("source_import_invalid_file"),
+    }
+}
+
+fn source_import_data_error_code(error: &DataError) -> &'static str {
+    match error {
+        DataError::InvalidFileName
+        | DataError::EmptyUpload
+        | DataError::UnsupportedUpload(_)
+        | DataError::UploadTooLarge(_)
+        | DataError::Import(_)
+        | DataError::Directory(_)
+        | DataError::ChecksumMismatch(_)
+        | DataError::CorruptState(_) => "source_import_invalid_file",
+        DataError::NotFound
+        | DataError::ScopeMismatch
+        | DataError::PreviewHasErrors
+        | DataError::Plan(_)
+        | DataError::Conflict(_) => "source_import_conflict",
+        DataError::ArtifactTooLarge(_)
+        | DataError::Attachment(_)
+        | DataError::Store(_)
+        | DataError::Snapshot(_)
+        | DataError::Json(_)
+        | DataError::Io(_) => "storage_error",
+    }
+}
+
+fn map_source_import_data_error(error: DataError) -> ToolExecutionError {
+    match source_import_data_error_code(&error) {
+        "source_import_invalid_file" => rejected("source_import_invalid_file"),
+        "source_import_conflict" => rejected("source_import_conflict"),
+        _ => ToolExecutionError::Unavailable,
+    }
+}
+
 fn export_output(
     project_id: Uuid,
     project_revision: i64,
     job: &Job,
     artifact: ArtifactMetadata,
 ) -> Result<DomainToolOutput, ToolExecutionError> {
-    if artifact.job_id != job.id || artifact.kind != ArtifactKind::Export {
+    if artifact.job_id != job.id
+        || artifact.kind != ArtifactKind::Export
+        || job.project_id != Some(project_id)
+        || job.status != JobStatus::Completed
+    {
         return Err(ToolExecutionError::Unavailable);
     }
+    // Keep model-visible output transport-neutral. The human UI can resolve the
+    // ordinary artifact download action from the stable job identifier.
     Ok(DomainToolOutput::read(
         json!({
             "job_id": job.id,
             "project_id": project_id,
             "status": job.status,
-            "artifact": artifact,
-            "download_url": format!("/api/v1/data/artifacts/{}", job.id),
+            "artifact": AiExportArtifactView {
+                kind: "export".to_owned(),
+                file_name: artifact.file_name,
+                media_type: artifact.media_type,
+                size_bytes: artifact.size_bytes,
+                created_at: artifact.created_at,
+            },
         }),
         vec![
             Citation::new(EntityType::Project, project_id, Some(project_revision)),
@@ -619,7 +1101,10 @@ fn map_job_error(error: JobRepositoryError) -> ToolExecutionError {
 fn map_data_error(error: DataError) -> ToolExecutionError {
     match error {
         DataError::NotFound | DataError::ScopeMismatch => rejected("import_job_not_found"),
-        DataError::Conflict(_) => rejected("import_conflict"),
+        DataError::Conflict(_) | DataError::Store(StoreError::Conflict(_)) => {
+            rejected("import_conflict")
+        }
+        DataError::Store(StoreError::NotFound { .. }) => rejected("import_job_not_found"),
         DataError::PreviewHasErrors | DataError::Plan(_) => rejected("import_preview_blocked"),
         _ => ToolExecutionError::Unavailable,
     }
@@ -628,8 +1113,13 @@ fn map_data_error(error: DataError) -> ToolExecutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muriarc_ai::{ApprovalDecision, DomainToolOutput, HumanApprover};
-    use muriarc_core::{Lab, Project, Sex, User};
+    use muriarc_ai::DomainToolOutput;
+    use muriarc_core::{
+        AiConversation, AiConversationSource, AiConversationSourceKind, AiConversationSourceStatus,
+        AiModelProfile, AiModelProfileBinding, AiModelProfileStore, AiModelProfileVersion,
+        AiOperationStore, AiProviderProtocol, AiProviderTransport, Attachment, Lab, Project, Sex,
+        User, WorkspaceStore,
+    };
     use muriarc_store_sqlite::SqliteStore;
     use tempfile::TempDir;
 
@@ -642,6 +1132,7 @@ mod tests {
         backend: ServerAiDataTools,
         lab_id: Uuid,
         user_id: Uuid,
+        conversation_id: Uuid,
         project_id: Uuid,
         other_project_id: Uuid,
     }
@@ -657,6 +1148,56 @@ mod tests {
             store.create_lab(&lab, &bootstrap).await.unwrap();
             let user = User::new(lab.id, "ai-data@example.test", "AI Data", now).unwrap();
             store.create_user(&user, &bootstrap).await.unwrap();
+            let model_profile = AiModelProfile {
+                id: Uuid::new_v4(),
+                lab_id: lab.id,
+                user_id: user.id,
+                name: "AI data fixture model".to_owned(),
+                current_version: 1,
+                archived_at: None,
+                meta: RecordMeta::new(now),
+            };
+            let model_version = AiModelProfileVersion {
+                profile_id: model_profile.id,
+                version: 1,
+                protocol: AiProviderProtocol::OpenaiChatCompletions,
+                transport: AiProviderTransport::OpenAiCompatible,
+                base_url: "https://provider.example.test/v1".to_owned(),
+                normalized_base_url: "https://provider.example.test/v1".to_owned(),
+                model_id: "ai-data-fixture-model".to_owned(),
+                supports_vision: false,
+                context_window_tokens: 16_384,
+                max_input_tokens: 8_192,
+                max_output_tokens: 2_048,
+                history_token_budget: 4_096,
+                history_turns: 20,
+                temperature: 0.0,
+                timeout_ms: 30_000,
+                created_at: now,
+            };
+            store
+                .create_ai_model_profile(&model_profile, &model_version, &bootstrap)
+                .await
+                .unwrap();
+            let conversation = AiConversation {
+                id: Uuid::new_v4(),
+                lab_id: lab.id,
+                project_id: None,
+                user_id: user.id,
+                title: "Source import".to_owned(),
+                model_profile: Some(AiModelProfileBinding {
+                    profile_id: model_profile.id,
+                    profile_version: 1,
+                }),
+                legacy_read_only: false,
+                pinned_at: None,
+                archived_at: None,
+                meta: RecordMeta::new(now),
+            };
+            store
+                .create_ai_conversation(&conversation, &bootstrap)
+                .await
+                .unwrap();
             let project = Project::new(lab.id, "Allowed project", now).unwrap();
             let other_project = Project::new(lab.id, "Other project", now).unwrap();
             store.create_project(&project, &bootstrap).await.unwrap();
@@ -672,7 +1213,8 @@ mod tests {
 
             let jobs = Arc::new(StoreJobRepository::new(store.clone()));
             let files = Arc::new(DataFiles::new(temp.path().join("data")));
-            let backend = ServerAiDataTools::new(store.clone(), jobs.clone(), files);
+            let backend = ServerAiDataTools::new(store.clone(), jobs.clone(), files)
+                .with_attachment_root(&temp.path().join("attachments"));
             Self {
                 _temp: temp,
                 store,
@@ -680,6 +1222,7 @@ mod tests {
                 backend,
                 lab_id: lab.id,
                 user_id: user.id,
+                conversation_id: conversation.id,
                 project_id: project.id,
                 other_project_id: other_project.id,
             }
@@ -702,6 +1245,55 @@ mod tests {
                 [self.project_id],
                 true,
             )
+            .with_conversation(self.conversation_id, None)
+        }
+
+        async fn upload_csv_source(&self, bytes: &[u8]) -> AiConversationSource {
+            let now = Utc::now();
+            let source_id = Uuid::new_v4();
+            let attachment_id = Uuid::new_v4();
+            let object = self
+                .backend
+                .attachments
+                .as_ref()
+                .unwrap()
+                .write_bytes(attachment_id, bytes)
+                .await
+                .unwrap();
+            let attachment = Attachment {
+                id: attachment_id,
+                lab_id: self.lab_id,
+                project_id: None,
+                entity_type: "ai_conversation_source".to_owned(),
+                entity_id: source_id,
+                file_name: "animals.csv".to_owned(),
+                media_type: Some("text/csv".to_owned()),
+                relative_path: object.relative_path,
+                size_bytes: object.size_bytes,
+                sha256: object.sha256,
+                version: 1,
+                meta: RecordMeta::new(now),
+            };
+            let source = AiConversationSource {
+                id: source_id,
+                lab_id: self.lab_id,
+                user_id: self.user_id,
+                conversation_id: Some(self.conversation_id),
+                project_id: None,
+                attachment_id,
+                kind: AiConversationSourceKind::DelimitedText,
+                status: AiConversationSourceStatus::Ready,
+                last_activity_at: now,
+                expires_at: now + Duration::hours(1),
+                archived_at: None,
+                error_code: None,
+                meta: RecordMeta::new(now),
+            };
+            self.store
+                .create_ai_conversation_source(&attachment, &source, &self.human_audit())
+                .await
+                .unwrap();
+            source
         }
 
         async fn pending_animal_import(&self, created_at: chrono::DateTime<Utc>) -> Job {
@@ -765,9 +1357,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_and_reinforced_apply_are_owner_bound_and_idempotent() {
+    async fn lab_wide_animal_imports_are_not_exposed_or_staged_by_ai() {
         let fixture = Fixture::new().await;
         let access = fixture.access();
+        for forbidden in [
+            ToolName::SourceImportPreview,
+            ToolName::ImportPreview,
+            ToolName::ImportCommitDraft,
+        ] {
+            assert!(
+                !fixture
+                    .backend
+                    .supported_tools(&access)
+                    .contains(&forbidden),
+                "lab-wide AI access advertised {forbidden:?}"
+            );
+        }
+        let source = fixture
+            .upload_csv_source(b"display_id,sex\nAI-SOURCE-001,female\n")
+            .await;
+        let source_error = fixture
+            .backend
+            .execute(
+                &access,
+                fixture.request(
+                    ToolName::SourceImportPreview,
+                    json!({
+                        "source_id": source.id,
+                        "import_kind": "animal",
+                    }),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(source_error, rejected("source_import_forbidden"));
+        assert_eq!(
+            fixture
+                .store
+                .get_ai_conversation_source(source.id)
+                .await
+                .unwrap()
+                .status,
+            AiConversationSourceStatus::Ready
+        );
+        assert!(fixture.jobs.list(fixture.lab_id).await.unwrap().is_empty());
+
         let job = fixture.pending_animal_import(Utc::now()).await;
         let pending = fixture
             .backend
@@ -775,23 +1409,16 @@ mod tests {
             .read_pending_import(job.id)
             .await
             .unwrap();
-
-        let preview = fixture
+        let preview_error = fixture
             .backend
             .execute(
                 &access,
                 fixture.request(ToolName::ImportPreview, json!({"job_id": job.id})),
             )
             .await
-            .unwrap();
-        let DomainToolOutput::Read { data, citations } = preview else {
-            panic!("preview must be read-only");
-        };
-        assert_eq!(data["job_revision"], job.meta.revision);
-        assert_eq!(data["preview_hash"], pending.preview_hash);
-        assert_eq!(citations[0].entity_id, job.id);
-
-        let output = fixture
+            .unwrap_err();
+        assert_eq!(preview_error, rejected("import_job_not_found"));
+        let commit_error = fixture
             .backend
             .execute(
                 &access,
@@ -805,134 +1432,12 @@ mod tests {
                 ),
             )
             .await
-            .unwrap();
-        let DomainToolOutput::WriteDraft { mut draft, .. } = output else {
-            panic!("commit tool must only create a draft");
-        };
-        assert_eq!(draft.kind(), DraftKind::BulkImport);
-        draft
-            .decide(
-                draft.revision(),
-                ApprovalDecision::Approve,
-                HumanApprover {
-                    user_id: fixture.user_id,
-                    display_name: "AI Data".to_owned(),
-                },
-                Some("I reviewed this import preview".to_owned()),
-                true,
-                Utc::now(),
-            )
-            .unwrap();
-        let applied = fixture
-            .backend
-            .apply_import_draft(&access, &draft, &fixture.human_audit())
-            .await
-            .unwrap();
-        assert_eq!(applied.job_id, job.id);
+            .unwrap_err();
+        assert_eq!(commit_error, rejected("import_job_not_found"));
         assert_eq!(
             fixture.jobs.get(job.id).await.unwrap().status,
-            JobStatus::Completed
+            JobStatus::AwaitingConfirmation
         );
-        let replayed = fixture
-            .backend
-            .apply_import_draft(&access, &draft, &fixture.human_audit())
-            .await
-            .unwrap();
-        assert_eq!(replayed.job_id, job.id);
-        assert_eq!(
-            fixture
-                .store
-                .list_animals(&muriarc_core::AnimalFilter {
-                    lab_id: fixture.lab_id,
-                    ..Default::default()
-                })
-                .await
-                .unwrap()
-                .len(),
-            2,
-            "the exact replay must not duplicate the imported animal"
-        );
-    }
-
-    #[tokio::test]
-    async fn import_rejects_unknown_owner_expiry_hash_and_revision_without_leaking_jobs() {
-        let fixture = Fixture::new().await;
-        let access = fixture.access();
-        let job = fixture.pending_animal_import(Utc::now()).await;
-        let pending = fixture
-            .backend
-            .files
-            .read_pending_import(job.id)
-            .await
-            .unwrap();
-
-        let unknown = fixture
-            .backend
-            .execute(
-                &access,
-                fixture.request(ToolName::ImportPreview, json!({"job_id": Uuid::new_v4()})),
-            )
-            .await;
-        assert!(matches!(unknown, Err(ToolExecutionError::Rejected { .. })));
-
-        let other_user = AiDataAccessContext::new(
-            fixture.lab_id,
-            Uuid::new_v4(),
-            [fixture.project_id],
-            [fixture.project_id],
-            true,
-        );
-        let other_owner = fixture
-            .backend
-            .execute(
-                &other_user,
-                DomainToolRequest {
-                    user_id: other_user.user_id(),
-                    ..fixture.request(ToolName::ImportPreview, json!({"job_id": job.id}))
-                },
-            )
-            .await;
-        assert!(matches!(
-            other_owner,
-            Err(ToolExecutionError::Rejected { ref code }) if code == "import_job_not_found"
-        ));
-
-        for arguments in [
-            json!({
-                "job_id": job.id,
-                "preview_hash": "b".repeat(64),
-                "expected_revision": job.meta.revision,
-            }),
-            json!({
-                "job_id": job.id,
-                "preview_hash": pending.preview_hash,
-                "expected_revision": job.meta.revision + 1,
-            }),
-        ] {
-            let result = fixture
-                .backend
-                .execute(
-                    &access,
-                    fixture.request(ToolName::ImportCommitDraft, arguments),
-                )
-                .await;
-            assert!(matches!(result, Err(ToolExecutionError::Rejected { .. })));
-        }
-
-        let expired = fixture
-            .pending_animal_import(Utc::now() - Duration::hours(25))
-            .await;
-        let result = fixture
-            .backend
-            .execute(
-                &access,
-                fixture.request(ToolName::ImportPreview, json!({"job_id": expired.id})),
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(ToolExecutionError::Rejected { ref code }) if code == "import_preview_expired"
-        ));
     }
 
     #[tokio::test]
@@ -982,16 +1487,41 @@ mod tests {
         assert_eq!(job.project_id, Some(fixture.project_id));
         assert_eq!(job.status, JobStatus::Completed);
         assert_eq!(data["artifact"]["kind"], "export");
-        assert!(
-            data["download_url"]
-                .as_str()
-                .unwrap()
-                .starts_with("/api/v1/data/artifacts/")
-        );
+        let output_fields = data.as_object().unwrap();
+        assert_eq!(output_fields.len(), 4);
+        for field in ["job_id", "project_id", "status", "artifact"] {
+            assert!(output_fields.contains_key(field), "missing field {field}");
+        }
+        let serialized = data.to_string().to_ascii_lowercase();
+        assert!(!serialized.contains("download_url"));
+        assert!(!serialized.contains("relative_path"));
+        assert!(!serialized.contains("\"path\""));
+        assert!(!serialized.contains("\"url\""));
+        assert!(!serialized.contains("\"bytes\""));
+        assert!(!serialized.contains("sha256"));
         assert!(
             citations
                 .iter()
                 .any(|citation| citation.entity_id == job_id)
         );
+
+        let artifact = fixture
+            .backend
+            .files
+            .artifact_metadata(job_id)
+            .await
+            .unwrap();
+        let mut wrong_project = job.clone();
+        wrong_project.project_id = Some(fixture.other_project_id);
+        assert!(matches!(
+            export_output(fixture.project_id, 1, &wrong_project, artifact.clone()),
+            Err(ToolExecutionError::Unavailable)
+        ));
+        let mut incomplete = job;
+        incomplete.status = JobStatus::Writing;
+        assert!(matches!(
+            export_output(fixture.project_id, 1, &incomplete, artifact),
+            Err(ToolExecutionError::Unavailable)
+        ));
     }
 }

@@ -13,9 +13,12 @@ use muriarc_ai::{
     AssistantConversationStartResponse, AssistantConversationSummary, AssistantError,
     AssistantTurnMedia, AssistantTurnRequest, AssistantTurnResponse, ChatMessage,
     CompletionRequest, DraftDecisionRequest, DraftDecisionResponse, DraftStatus,
-    ProviderCredentials, ProviderError, ScopeSet, ToolScope, TransportFailure, WriteDraftSummary,
+    ProviderCredentials, ProviderError, ScopeSet, ToolScope, WriteDraftSummary,
 };
-use muriarc_core::{AiAutonomyMode, AiModelProfileBinding, Permission, StoreError};
+use muriarc_core::{
+    AiAutonomyMode, AiConversationArchiveFilter, AiConversationChange, AiModelProfileBinding,
+    Permission, StoreError,
+};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use uuid::Uuid;
@@ -28,7 +31,8 @@ use crate::{
     AuthError, AuthPrincipal, AuthenticationMethod, RequestMetadata, ResolvedAiProvider,
     SaveAiLabSettingsInput, SaveAiModelDefaultsInput, SaveAiModelProfileInput,
     SaveAiProviderEndpointInput, SaveAiProviderSettingsInput, ValidateAiModelProfileInput,
-    ai_data_tools::ServerAiDataTools, ai_step_up::AiStepUpLimit,
+    ai_data_tools::ServerAiDataTools, ai_source_resolver::ServerAiSourceResolver,
+    ai_step_up::AiStepUpLimit,
 };
 
 use super::{
@@ -77,7 +81,10 @@ pub(super) fn router() -> Router<AppState> {
             "/ai/conversations",
             get(list_conversations).post(start_conversation),
         )
-        .route("/ai/conversations/{id}", get(get_conversation))
+        .route(
+            "/ai/conversations/{id}",
+            get(get_conversation).patch(update_conversation),
+        )
         .route(
             "/ai/conversations/{id}/autonomy",
             get(get_autonomy).put(set_autonomy),
@@ -494,30 +501,7 @@ fn ensure_lab_admin(principal: &AuthPrincipal, metadata: &RequestMetadata) -> Re
 }
 
 fn provider_test_error_code(error: ProviderError) -> &'static str {
-    match error {
-        ProviderError::InvalidConfig(_) | ProviderError::InvalidRequest(_) => "invalid_provider",
-        ProviderError::RequestTooLarge { .. } => "context_exceeded",
-        ProviderError::ResponseTooLarge { .. } => "response_too_large",
-        ProviderError::Transport {
-            kind: TransportFailure::Timeout,
-        } => "request_timeout",
-        ProviderError::Transport {
-            kind: TransportFailure::Connection,
-        } => "provider_unreachable",
-        ProviderError::Transport {
-            kind: TransportFailure::Request,
-        } => "provider_transport_error",
-        ProviderError::HttpStatus {
-            status: 401 | 403, ..
-        } => "api_key_rejected",
-        ProviderError::HttpStatus { status: 404, .. } => "model_not_found",
-        ProviderError::HttpStatus { .. } => "provider_http_error",
-        ProviderError::MalformedResponse | ProviderError::EmptyResponse => {
-            "response_format_incompatible"
-        }
-        ProviderError::OutputBudgetExhausted => "output_budget_exhausted",
-        ProviderError::MockExhausted | ProviderError::MockUnavailable => "provider_unavailable",
-    }
+    error.code()
 }
 
 async fn run_turn(
@@ -530,30 +514,16 @@ async fn run_turn(
     let workflow = workflow(&state, &metadata)?;
     let context =
         execution_context_with_autonomy(&state, &principal, authentication, &metadata).await?;
-    let existing_binding = match payload.conversation_id {
-        Some(conversation_id) => Some(
-            workflow
-                .conversation_model_profile(&context, conversation_id)
-                .await
-                .map_err(|error| workflow_error(error, &metadata))?,
-        ),
-        None => None,
-    };
-    let resolved = match existing_binding {
-        Some(binding) => {
-            ensure_conversation_model_available(&state, &principal, binding, &metadata).await?;
-            state
-                .ai_providers
-                .resolve_for_profile(principal.user_id, binding)
-                .await
-                .map_err(|error| conversation_model_resolve_error(error, &metadata))
-        }
-        None => state
-            .ai_providers
-            .resolve(principal.user_id)
-            .await
-            .map_err(|error| provider_resolve_error(error, &metadata)),
-    }?;
+    let existing_binding = workflow
+        .conversation_model_profile(&context, payload.conversation_id)
+        .await
+        .map_err(|error| workflow_error(error, &metadata))?;
+    ensure_conversation_model_available(&state, &principal, existing_binding, &metadata).await?;
+    let resolved = state
+        .ai_providers
+        .resolve_for_profile(principal.user_id, existing_binding)
+        .await
+        .map_err(|error| conversation_model_resolve_error(error, &metadata))?;
     let ResolvedAiProvider {
         provider,
         api_key,
@@ -565,63 +535,64 @@ async fn run_turn(
         .preflight_turn_request(&context, model_profile, &payload)
         .await
         .map_err(|error| workflow_error(error, &metadata))?;
-    let response = if payload.image_ids.is_empty() {
-        workflow
-            .run_turn_with_config(
-                provider,
-                api_key.as_ref().map(|secret| secret.as_str()),
-                &context,
-                model_profile,
-                payload,
-                runtime,
-            )
-            .await
+    let source_bundle = workflow
+        .resolve_turn_sources(&context, model_profile, &payload)
+        .await
+        .map_err(|error| workflow_error(error, &metadata))?;
+    let source_images = source_bundle.images().to_vec();
+    let images = if payload.image_ids.is_empty() {
+        Vec::new()
     } else {
-        let images = super::ai_images::prepare_assistant_images(
+        super::ai_images::prepare_assistant_images(
             &state,
             &principal,
             &metadata,
-            payload.conversation_id,
+            Some(payload.conversation_id),
             payload.project_id,
             &payload.image_ids,
         )
+        .await?
+    };
+    let media = if images.is_empty() && source_images.is_empty() {
+        AssistantTurnMedia::default()
+    } else if supports_vision {
+        AssistantTurnMedia::direct_with_sources(images, source_images)
+            .map_err(|error| workflow_error(error, &metadata))?
+    } else {
+        let vision = resolve_turn_vision_provider(
+            &state,
+            &principal,
+            payload.vision_model_profile_id,
+            &metadata,
+        )
         .await?;
-        let media = if supports_vision {
-            AssistantTurnMedia::direct(images)
-        } else {
-            let vision = resolve_turn_vision_provider(
-                &state,
-                &principal,
-                payload.vision_model_profile_id,
-                &metadata,
-            )
-            .await?;
-            let observation = workflow
-                .observe_images(
-                    vision.provider,
-                    vision.api_key.as_ref().map(|secret| secret.as_str()),
-                    vision.model_profile,
-                    &images,
-                    vision.runtime,
-                )
-                .await
-                .map_err(|error| workflow_error(error, &metadata))?;
-            AssistantTurnMedia::relayed(images, observation)
-        }
-        .map_err(|error| workflow_error(error, &metadata))?;
-        workflow
-            .run_turn_with_media_config(
-                provider,
-                api_key.as_ref().map(|secret| secret.as_str()),
-                &context,
-                model_profile,
-                payload,
-                runtime,
-                media,
+        let observation = workflow
+            .observe_images_with_sources(
+                vision.provider,
+                vision.api_key.as_ref().map(|secret| secret.as_str()),
+                vision.model_profile,
+                &images,
+                &source_images,
+                vision.runtime,
             )
             .await
-    }
-    .map_err(|error| workflow_error(error, &metadata))?;
+            .map_err(|error| workflow_error(error, &metadata))?;
+        AssistantTurnMedia::relayed_with_sources(images, source_images, observation)
+            .map_err(|error| workflow_error(error, &metadata))?
+    };
+    let response = workflow
+        .run_turn_with_resolved_sources_config(
+            provider,
+            api_key.as_ref().map(|secret| secret.as_str()),
+            &context,
+            model_profile,
+            payload,
+            runtime,
+            media,
+            source_bundle,
+        )
+        .await
+        .map_err(|error| workflow_error(error, &metadata))?;
     Ok(item(response, &metadata))
 }
 
@@ -687,6 +658,8 @@ struct ConversationStartHttpRequest {
     #[serde(default)]
     project_id: Option<Uuid>,
     #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
     model_profile_id: Option<Uuid>,
     requested_mode: AiAutonomyMode,
     #[serde(default)]
@@ -733,6 +706,7 @@ async fn start_conversation(
             model_profile,
             AssistantConversationStartRequest {
                 project_id: payload.project_id,
+                title: payload.title,
                 requested_mode: payload.requested_mode,
             },
             step_up_verified,
@@ -796,21 +770,44 @@ async fn conversation_start_model_binding(
     Ok(binding)
 }
 
-async fn ensure_conversation_model_available(
+pub(super) async fn ensure_conversation_model_available(
     state: &AppState,
     principal: &AuthPrincipal,
     binding: AiModelProfileBinding,
     metadata: &RequestMetadata,
 ) -> Result<(), ApiError> {
-    let profile = state
-        .ai_providers
-        .get_model_profile(principal.user_id, binding.profile_id)
-        .await
-        .map_err(|error| conversation_model_resolve_error(error, metadata))?;
+    let profiles = state
+        .ai_model_profiles
+        .as_ref()
+        .ok_or_else(|| ai_disabled(metadata))?;
+    let profile = match profiles.get_ai_model_profile(binding.profile_id).await {
+        Ok(profile) => profile,
+        Err(StoreError::NotFound { .. }) => return Err(model_unavailable(metadata)),
+        Err(error) => {
+            return Err(ApiError::from_store(error).with_request_id(metadata.request_id.clone()));
+        }
+    };
+    if profile.lab_id != principal.lab_id
+        || profile.user_id != principal.user_id
+        || profile.meta.deleted_at.is_some()
+    {
+        return Err(model_unavailable(metadata));
+    }
     if profile.archived_at.is_some() {
-        Err(model_archived(metadata))
-    } else {
-        Ok(())
+        return Err(model_archived(metadata));
+    }
+    match profiles
+        .get_ai_model_profile_version(binding.profile_id, binding.profile_version)
+        .await
+    {
+        Ok(version)
+            if version.profile_id == binding.profile_id
+                && version.version == binding.profile_version =>
+        {
+            Ok(())
+        }
+        Ok(_) | Err(StoreError::NotFound { .. }) => Err(model_unavailable(metadata)),
+        Err(error) => Err(ApiError::from_store(error).with_request_id(metadata.request_id.clone())),
     }
 }
 
@@ -818,6 +815,10 @@ async fn ensure_conversation_model_available(
 #[serde(deny_unknown_fields)]
 struct ConversationListQuery {
     project_id: Option<Uuid>,
+    q: Option<String>,
+    title_query: Option<String>,
+    #[serde(default)]
+    archive: AiConversationArchiveFilter,
     limit: Option<u32>,
 }
 
@@ -831,10 +832,79 @@ async fn list_conversations(
     let workflow = workflow(&state, &metadata)?;
     let context = execution_context(&state, &principal, &metadata).await?;
     let conversations = workflow
-        .list_conversations(&context, query.project_id, query.limit.unwrap_or(50))
+        .list_conversations(
+            &context,
+            query.project_id,
+            query.q.or(query.title_query),
+            query.archive,
+            query.limit.unwrap_or(50),
+        )
         .await
         .map_err(|error| workflow_error(error, &metadata))?;
     Ok(collection(conversations, &metadata))
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ConversationUpdateAction {
+    Rename,
+    Pin,
+    Unpin,
+    Archive,
+    Unarchive,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationUpdateHttpRequest {
+    action: ConversationUpdateAction,
+    title: Option<String>,
+    expected_revision: i64,
+}
+
+impl ConversationUpdateHttpRequest {
+    fn into_change(self) -> Result<(i64, AiConversationChange), AiWorkflowError> {
+        let change = match (self.action, self.title) {
+            (ConversationUpdateAction::Rename, Some(title)) => {
+                AiConversationChange::Rename { title }
+            }
+            (ConversationUpdateAction::Rename, None) => {
+                return Err(AiWorkflowError::InvalidConversationRequest);
+            }
+            (ConversationUpdateAction::Pin, None) => AiConversationChange::Pin,
+            (ConversationUpdateAction::Unpin, None) => AiConversationChange::Unpin,
+            (ConversationUpdateAction::Archive, None) => AiConversationChange::Archive,
+            (ConversationUpdateAction::Unarchive, None) => AiConversationChange::Unarchive,
+            (_, Some(_)) => return Err(AiWorkflowError::InvalidConversationRequest),
+        };
+        Ok((self.expected_revision, change))
+    }
+}
+
+async fn update_conversation(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<ConversationUpdateHttpRequest>,
+) -> Result<Json<ItemResponse<AssistantConversationSummary>>, ApiError> {
+    ensure_human(&principal, &metadata)?;
+    let workflow = workflow(&state, &metadata)?;
+    let context = execution_context(&state, &principal, &metadata).await?;
+    let (expected_revision, change) = payload
+        .into_change()
+        .map_err(|error| workflow_error(error, &metadata))?;
+    let conversation = workflow
+        .update_conversation(
+            &context,
+            id,
+            expected_revision,
+            change,
+            &principal.audit_context(&metadata),
+        )
+        .await
+        .map_err(|error| workflow_error(error, &metadata))?;
+    Ok(item(conversation, &metadata))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1219,10 +1289,17 @@ fn workflow(state: &AppState, metadata: &RequestMetadata) -> Result<AiWorkflowSe
     let mut workflow =
         AiWorkflowService::new(state.store.clone(), operations).with_model_profiles(model_profiles);
     if let Some(files) = state.data_files.as_ref() {
-        workflow = workflow.with_data_tools(std::sync::Arc::new(ServerAiDataTools::new(
+        let mut data_tools =
+            ServerAiDataTools::new(state.store.clone(), state.jobs.clone(), files.clone());
+        if let Some(root) = state.attachment_root.as_ref() {
+            data_tools = data_tools.with_attachment_root(root.as_ref());
+        }
+        workflow = workflow.with_data_tools(std::sync::Arc::new(data_tools));
+    }
+    if let Some(root) = state.attachment_root.as_ref() {
+        workflow = workflow.with_source_resolver(std::sync::Arc::new(ServerAiSourceResolver::new(
             state.store.clone(),
-            state.jobs.clone(),
-            files.clone(),
+            root.as_ref(),
         )));
     }
     Ok(workflow)
@@ -1267,6 +1344,14 @@ async fn execution_context(
     let lab_registry_read = principal.is_lab_operator()
         && principal.can(Permission::ReadAnimal, None)
         && principal.can(Permission::ReadExperiment, None);
+    let read_activity = principal.can(Permission::ReadActivity, None)
+        || allowed_project_ids
+            .iter()
+            .any(|project_id| principal.can(Permission::ReadActivity, Some(*project_id)));
+    let read_audit = principal.can(Permission::ReadAudit, None)
+        || allowed_project_ids
+            .iter()
+            .any(|project_id| principal.can(Permission::ReadAudit, Some(*project_id)));
 
     let mut effective_scopes = BTreeSet::new();
     if lab_registry_read || !allowed_project_ids.is_empty() {
@@ -1301,7 +1386,8 @@ async fn execution_context(
         lab_registry_read,
         access_grant,
     )
-    .with_data_access(importable_project_ids, exportable_project_ids, lab_import))
+    .with_data_access(importable_project_ids, exportable_project_ids, lab_import)
+    .with_governance_reads(read_activity, read_audit))
 }
 
 async fn execution_context_with_autonomy(
@@ -1529,7 +1615,21 @@ pub(super) fn provider_api_error(error: ProviderError, metadata: &RequestMetadat
 fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiError {
     let api_error = match error {
         AiWorkflowError::Forbidden => ApiError::forbidden(),
-        AiWorkflowError::Store(error) => return store_error(error, metadata),
+        AiWorkflowError::Store(StoreError::NotFound { entity, id }) => {
+            ApiError::not_found(format!("{entity} {id} was not found"))
+        }
+        AiWorkflowError::Store(StoreError::Conflict(message)) => ApiError::conflict(message),
+        AiWorkflowError::Store(StoreError::Validation(message)) => ApiError::validation(message),
+        AiWorkflowError::Store(
+            error @ (StoreError::Database(_) | StoreError::Serialization(_)),
+        ) => {
+            tracing::error!(kind = ?error, "AI workflow storage operation failed");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "the AI workflow could not access its persisted state",
+            )
+        }
         AiWorkflowError::Approval(ApprovalError::RevisionConflict { .. }) => {
             ApiError::conflict("AI draft revision changed before the decision was applied")
         }
@@ -1556,6 +1656,16 @@ fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiErro
             "request_timeout",
             "the AI request exceeded the configured timeout",
         ),
+        AiWorkflowError::Assistant(AssistantError::IterationLimitExceeded) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "iteration_limit_exceeded",
+            "the AI reached its bounded iteration limit before completing any tool result",
+        ),
+        AiWorkflowError::Assistant(AssistantError::ToolCallLimitExceeded) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "tool_call_limit_exceeded",
+            "the AI reached its bounded tool-call limit before completing any tool result",
+        ),
         AiWorkflowError::Assistant(error) => {
             tracing::warn!(kind = ?error, "AI provider or tool execution failed");
             ApiError::new(
@@ -1565,6 +1675,11 @@ fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiErro
             )
         }
         AiWorkflowError::Config(error) => ApiError::validation(error.to_string()),
+        AiWorkflowError::Source(error) => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_ai_source",
+            error.to_string(),
+        ),
         AiWorkflowError::DataTool(muriarc_ai::ToolExecutionError::Rejected { code }) => {
             ApiError::conflict(format!("AI data operation was rejected ({code})"))
         }
@@ -1575,7 +1690,11 @@ fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiErro
         ),
         AiWorkflowError::InvalidStoredDraft | AiWorkflowError::UnsupportedDraftOperation => {
             tracing::error!(kind = ?error, "stored AI approval data is invalid");
-            ApiError::internal()
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "stored AI approval data is invalid",
+            )
         }
         AiWorkflowError::InvalidConversationRequest => ApiError::validation(error.to_string()),
         AiWorkflowError::LegacyConversationReadOnly => ApiError::new(
@@ -1608,14 +1727,14 @@ fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiErro
         ),
         AiWorkflowError::InvalidStoredConversation => {
             tracing::error!(kind = ?error, "stored AI conversation data is invalid");
-            ApiError::internal()
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "stored AI conversation data is invalid",
+            )
         }
     };
     api_error.with_request_id(metadata.request_id.clone())
-}
-
-fn store_error(error: StoreError, metadata: &RequestMetadata) -> ApiError {
-    ApiError::from_store(error).with_request_id(metadata.request_id.clone())
 }
 
 #[cfg(test)]
@@ -1645,14 +1764,17 @@ mod tests {
     use chrono::{Duration, Utc};
     use http_body_util::BodyExt;
     use muriarc_ai::{
-        AssistantRuntimeConfig, BuiltinProvider, DraftKind, FieldChange, ImportCommitDraftPayload,
-        ProposalActor, ProviderConfig, ToolName, WriteDraft,
+        AiSourceImportKind, AssistantRuntimeConfig, BuiltinProvider, DraftKind, FieldChange,
+        ImportCommitDraftPayload, ImportDraftPreviewSummary, ProposalActor, ProviderConfig,
+        ToolName, TransportFailure, WriteDraft,
     };
     use muriarc_core::{
-        AiModelProfile, AiModelProfileStore, AiModelProfileVersion, AiOperationStore, AiScope,
-        Approval, ApprovalDecision as StoredApprovalDecision, AuditContext, Job, JobKind,
-        JobStatus, Lab, LabRole, MuriArcStore, RecordMeta, ToolRun, ToolRunStatus, User,
-        WriteSource,
+        ActorType, AiConversation, AiConversationUpdate, AiModelProfile, AiModelProfileStore,
+        AiModelProfileVersion, AiOperationStore, AiScope, Animal, Approval,
+        ApprovalDecision as StoredApprovalDecision, AuditContext, AuditFilter, EntityType,
+        Experiment, ExperimentTemplateVersion, FieldValueType, Job, JobKind, JobStatus, Lab,
+        LabRole, MuriArcStore, Participation, Project, RecordMeta, Sex, TemplateField, ToolRun,
+        ToolRunStatus, User, WriteSource,
     };
     use muriarc_data::{AnimalImportPreviewResponse, DataFiles};
     #[cfg(feature = "postgres")]
@@ -1718,6 +1840,51 @@ mod tests {
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
             )
             .unwrap()
+    }
+
+    async fn create_test_model_profile(
+        store: &SqliteStore,
+        lab_id: Uuid,
+        user_id: Uuid,
+        name: &str,
+        now: chrono::DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> AiModelProfileBinding {
+        let profile = AiModelProfile {
+            id: Uuid::new_v4(),
+            lab_id,
+            user_id,
+            name: name.to_owned(),
+            current_version: 1,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        let version = AiModelProfileVersion {
+            profile_id: profile.id,
+            version: 1,
+            protocol: muriarc_core::AiProviderProtocol::OpenaiChatCompletions,
+            transport: muriarc_core::AiProviderTransport::LocalHttp,
+            base_url: "http://127.0.0.1:9".to_owned(),
+            normalized_base_url: "http://127.0.0.1:9".to_owned(),
+            model_id: "route-test-model".to_owned(),
+            supports_vision: false,
+            context_window_tokens: 32_768,
+            max_input_tokens: 16_384,
+            max_output_tokens: 2_048,
+            history_token_budget: 8_192,
+            history_turns: 20,
+            temperature: 0.0,
+            timeout_ms: 1_000,
+            created_at: now,
+        };
+        store
+            .create_ai_model_profile(&profile, &version, audit)
+            .await
+            .unwrap();
+        AiModelProfileBinding {
+            profile_id: profile.id,
+            profile_version: version.version,
+        }
     }
 
     fn spawn_provider_sequence(
@@ -1844,6 +2011,411 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(provider_test_error_code(error), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn zero_progress_assistant_limits_have_stable_diagnostic_codes() {
+        let metadata = RequestMetadata {
+            request_id: "limit-request".to_owned(),
+            reason: None,
+        };
+        let cases = [
+            (
+                AssistantError::IterationLimitExceeded,
+                "iteration_limit_exceeded",
+            ),
+            (
+                AssistantError::ToolCallLimitExceeded,
+                "tool_call_limit_exceeded",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            let response =
+                workflow_error(AiWorkflowError::Assistant(error), &metadata).into_response();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["error"]["code"], expected_code);
+            assert_eq!(payload["error"]["request_id"], "limit-request");
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupted_ai_state_uses_the_shared_storage_error_code() {
+        let metadata = RequestMetadata {
+            request_id: "storage-request".to_owned(),
+            reason: None,
+        };
+        let response =
+            workflow_error(AiWorkflowError::InvalidStoredConversation, &metadata).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], "storage_error");
+        assert_eq!(payload["error"]["request_id"], "storage-request");
+    }
+
+    #[tokio::test]
+    async fn human_can_search_and_manage_only_owned_conversations_with_http_audit() {
+        let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+        store.migrate().await.unwrap();
+        let now = Utc::now();
+        let bootstrap = AuditContext::system(WriteSource::Migration);
+        let lab = Lab::new("Conversation HTTP lab", now).unwrap();
+        store.create_lab(&lab, &bootstrap).await.unwrap();
+        let user = User::new(
+            lab.id,
+            "conversation-http@example.test",
+            "Conversation owner",
+            now,
+        )
+        .unwrap();
+        store.create_user(&user, &bootstrap).await.unwrap();
+        let other = User::new(
+            lab.id,
+            "conversation-other@example.test",
+            "Other owner",
+            now,
+        )
+        .unwrap();
+        store.create_user(&other, &bootstrap).await.unwrap();
+        let project = muriarc_core::Project::new(lab.id, "Conversation project", now).unwrap();
+        store.create_project(&project, &bootstrap).await.unwrap();
+        let principal = AuthPrincipal::human(
+            user.id,
+            user.display_name.clone(),
+            lab.id,
+            [LabRole::LabAdmin],
+        );
+        let owner_model = create_test_model_profile(
+            store.as_ref(),
+            lab.id,
+            user.id,
+            "Conversation HTTP model",
+            now,
+            &bootstrap,
+        )
+        .await;
+        let other_model = create_test_model_profile(
+            store.as_ref(),
+            lab.id,
+            other.id,
+            "Other owner HTTP model",
+            now,
+            &bootstrap,
+        )
+        .await;
+        let owner_audit = principal.audit_context(&RequestMetadata {
+            request_id: "conversation-create".to_owned(),
+            reason: Some("prepare conversation fixture".to_owned()),
+        });
+        let active = AiConversation {
+            id: Uuid::new_v4(),
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            user_id: user.id,
+            title: "Alpha longitudinal study".to_owned(),
+            model_profile: Some(owner_model),
+            legacy_read_only: false,
+            pinned_at: Some(now),
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        let archived = AiConversation {
+            id: Uuid::new_v4(),
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            user_id: user.id,
+            title: "Archived study notes".to_owned(),
+            model_profile: Some(owner_model),
+            legacy_read_only: false,
+            pinned_at: None,
+            archived_at: Some(now),
+            meta: RecordMeta::new(now),
+        };
+        let hidden = AiConversation {
+            id: Uuid::new_v4(),
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            user_id: other.id,
+            title: "Alpha other owner".to_owned(),
+            model_profile: Some(other_model),
+            legacy_read_only: false,
+            pinned_at: None,
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_ai_conversation(&active, &owner_audit)
+            .await
+            .unwrap();
+        store
+            .create_ai_conversation(&archived, &owner_audit)
+            .await
+            .unwrap();
+        let other_audit = AuditContext {
+            actor: muriarc_core::Actor::human(other.id, other.display_name.clone()),
+            source: WriteSource::Web,
+            request_id: Some("other-conversation-create".to_owned()),
+            reason: None,
+        };
+        store
+            .create_ai_conversation(&hidden, &other_audit)
+            .await
+            .unwrap();
+
+        let authenticator =
+            StaticTokenAuthenticator::new([(BEARER_TOKEN.to_owned(), principal)]).unwrap();
+        let jobs = Arc::new(StoreJobRepository::new(store.clone()));
+        let providers = Arc::new(ConversationProviderStore::new(
+            user.id,
+            owner_model.profile_id,
+            Some(owner_model.profile_id),
+            AiAutonomyMode::Ask,
+        ));
+        let state = AppState::new(store.clone(), Arc::new(authenticator), jobs).with_ai(
+            store.clone(),
+            store.clone(),
+            providers,
+        );
+        let app = application_router(state, None);
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ai/conversations")
+                    .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+                    .header("x-request-id", "conversation-create-http")
+                    .header("x-audit-reason", "prepare source-bound conversation")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "projectId": project.id,
+                            "title": "  Source review  ",
+                            "modelProfileId": owner_model.profile_id,
+                            "requestedMode": "ask"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::CREATED);
+        let create = response_json(create).await;
+        let created_id: Uuid =
+            serde_json::from_value(create["data"]["conversation"]["id"].clone()).unwrap();
+        assert_eq!(
+            create["data"]["conversation"]["projectId"],
+            project.id.to_string()
+        );
+        assert_eq!(create["data"]["conversation"]["title"], "Source review");
+        assert!(
+            store
+                .list_ai_conversation_messages(created_id, 20)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let create_audits = store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_id: Some(created_id),
+            })
+            .await
+            .unwrap();
+        let create_audit = create_audits
+            .iter()
+            .find(|entry| entry.entity_type == EntityType::AiConversation)
+            .unwrap();
+        assert_eq!(create_audit.actor.actor_type, ActorType::Human);
+        assert_eq!(create_audit.actor.user_id, Some(user.id));
+        assert_eq!(create_audit.source, WriteSource::Web);
+        assert_eq!(
+            create_audit.request_id.as_deref(),
+            Some("conversation-create-http")
+        );
+        assert_eq!(
+            create_audit.reason.as_deref(),
+            Some("prepare source-bound conversation")
+        );
+
+        let forbidden_create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/ai/conversations")
+                    .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "projectId": Uuid::new_v4(),
+                            "title": "Out of scope",
+                            "modelProfileId": owner_model.profile_id,
+                            "requestedMode": "ask"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden_create.status(), StatusCode::FORBIDDEN);
+
+        let search = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/v1/ai/conversations?project_id={}&q=ALPHA&archive=active&limit=20",
+                        project.id
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(search.status(), StatusCode::OK);
+        let search = response_json(search).await;
+        assert_eq!(search["count"], 1);
+        assert_eq!(search["data"][0]["id"], active.id.to_string());
+        assert!(search["data"][0]["pinnedAt"].is_string());
+        assert!(search["data"][0]["archivedAt"].is_null());
+
+        let alias = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/api/v1/ai/conversations?project_id={}&title_query=notes&archive=archived",
+                        project.id
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(alias.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(alias).await["data"][0]["id"],
+            archived.id.to_string()
+        );
+
+        let invalid_query = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/ai/conversations?q={}", "a".repeat(257)))
+                    .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid_query.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let update = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/v1/ai/conversations/{}", active.id))
+                    .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+                    .header("x-request-id", "conversation-update-http")
+                    .header("x-audit-reason", "rename a study conversation")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "action": "rename",
+                            "title": "  Renamed study  ",
+                            "expected_revision": active.meta.revision
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update.status(), StatusCode::OK);
+        let update = response_json(update).await;
+        assert_eq!(update["data"]["title"], "Renamed study");
+        assert_eq!(update["data"]["revision"], 2);
+        let persisted = store.get_ai_conversation(active.id).await.unwrap();
+        assert_eq!(persisted.title, "Renamed study");
+
+        let audits = store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                entity_id: Some(active.id),
+            })
+            .await
+            .unwrap();
+        let audit = audits
+            .iter()
+            .find(|entry| {
+                entry.entity_type == EntityType::AiConversation && entry.entity_revision == Some(2)
+            })
+            .unwrap();
+        assert_eq!(audit.actor.actor_type, ActorType::Human);
+        assert_eq!(audit.actor.user_id, Some(user.id));
+        assert_eq!(audit.source, WriteSource::Web);
+        assert_eq!(
+            audit.request_id.as_deref(),
+            Some("conversation-update-http")
+        );
+        assert_eq!(audit.reason.as_deref(), Some("rename a study conversation"));
+
+        let stale = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/v1/ai/conversations/{}", active.id))
+                    .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "action": "archive",
+                            "expected_revision": active.meta.revision
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let forbidden = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PATCH)
+                    .uri(format!("/api/v1/ai/conversations/{}", hidden.id))
+                    .header(header::AUTHORIZATION, format!("Bearer {BEARER_TOKEN}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "action": "archive",
+                            "expected_revision": hidden.meta.revision
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
     }
 
     #[derive(Clone)]
@@ -2594,9 +3166,16 @@ mod tests {
         _temp: TempDir,
         app: Router,
         store: Arc<SqliteStore>,
+        conversation_id: Uuid,
         draft_id: Uuid,
         job_id: Uuid,
         verification_calls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ApprovalFixtureScope {
+        Project,
+        LabWide,
     }
 
     impl ApprovalFixture {
@@ -2604,7 +3183,15 @@ mod tests {
             Self::with_step_up_policy(AiStepUpPolicy::default()).await
         }
 
+        async fn lab_wide() -> Self {
+            Self::with_scope(AiStepUpPolicy::default(), ApprovalFixtureScope::LabWide).await
+        }
+
         async fn with_step_up_policy(policy: AiStepUpPolicy) -> Self {
+            Self::with_scope(policy, ApprovalFixtureScope::Project).await
+        }
+
+        async fn with_scope(policy: AiStepUpPolicy, scope: ApprovalFixtureScope) -> Self {
             let temp = tempfile::tempdir().unwrap();
             let store = Arc::new(SqliteStore::in_memory().await.unwrap());
             store.migrate().await.unwrap();
@@ -2630,10 +3217,71 @@ mod tests {
                 request_id: "step-up-fixture".to_owned(),
                 reason: Some("prepare import preview".to_owned()),
             });
+            let (project_id, experiment_id) = match scope {
+                ApprovalFixtureScope::Project => {
+                    let project = Project::new(lab.id, "Step-up project", now).unwrap();
+                    store.create_project(&project, &bootstrap).await.unwrap();
+                    let mut template = ExperimentTemplateVersion::draft(
+                        lab.id,
+                        "step-up-measurements",
+                        1,
+                        "Step-up measurements",
+                        now,
+                    )
+                    .unwrap();
+                    template
+                        .replace_fields(
+                            vec![TemplateField {
+                                key: "body_weight".to_owned(),
+                                label: "Body weight".to_owned(),
+                                value_type: FieldValueType::Number,
+                                unit: Some("g".to_owned()),
+                                required: true,
+                                categories: Vec::new(),
+                                minimum: Some(0.0),
+                                maximum: None,
+                                display_order: 0,
+                                ai_writable: true,
+                            }],
+                            now,
+                        )
+                        .unwrap();
+                    store
+                        .create_template_version(&template, &bootstrap)
+                        .await
+                        .unwrap();
+                    let published = store
+                        .publish_template_version(
+                            template.id,
+                            template.meta.revision,
+                            user.id,
+                            now,
+                            &audit,
+                        )
+                        .await
+                        .unwrap();
+                    let mut experiment =
+                        Experiment::new(lab.id, project.id, "Step-up weights", now).unwrap();
+                    experiment.template_version_id = Some(published.id);
+                    store
+                        .create_experiment(&experiment, &bootstrap)
+                        .await
+                        .unwrap();
+                    let animal = Animal::new_mouse(lab.id, "M-STEP-UP", Sex::Female, now).unwrap();
+                    store.create_animal(&animal, &bootstrap).await.unwrap();
+                    let participation = Participation::enroll(experiment.id, animal.id, now);
+                    store
+                        .create_participation(&participation, &bootstrap)
+                        .await
+                        .unwrap();
+                    (Some(project.id), Some(experiment.id))
+                }
+                ApprovalFixtureScope::LabWide => (None, None),
+            };
             let mut job = Job {
                 id: Uuid::new_v4(),
                 lab_id: lab.id,
-                project_id: None,
+                project_id,
                 created_by: user.id,
                 kind: JobKind::Import,
                 status: JobStatus::Parsing,
@@ -2646,24 +3294,109 @@ mod tests {
                 meta: RecordMeta::new(now),
             };
             jobs.create(job.clone(), audit.clone()).await.unwrap();
-            files
-                .write_upload_bytes(job.id, "animals.csv", b"display_id,sex\nM-STEP-UP,female\n")
-                .await
-                .unwrap();
-            let pending = files
-                .preview_animal_import(&job, store.as_ref())
-                .await
-                .unwrap();
+            let preview = if let Some(experiment_id) = experiment_id {
+                files
+                    .write_upload_bytes(
+                        job.id,
+                        "measurements.csv",
+                        b"display_id,measurement_key,value_type,value,unit,measured_at\nM-STEP-UP,body_weight,number,22.4,g,2026-07-19T08:00:00Z\n",
+                    )
+                    .await
+                    .unwrap();
+                let pending = files
+                    .preview_measurement_import(&job, experiment_id, store.as_ref())
+                    .await
+                    .unwrap();
+                AnimalImportPreviewResponse::from(&pending)
+            } else {
+                files
+                    .write_upload_bytes(
+                        job.id,
+                        "animals.csv",
+                        b"display_id,sex\nM-STEP-UP,female\n",
+                    )
+                    .await
+                    .unwrap();
+                let pending = files
+                    .preview_animal_import(&job, store.as_ref())
+                    .await
+                    .unwrap();
+                AnimalImportPreviewResponse::from(&pending)
+            };
+            assert!(preview.can_confirm);
+            let import_preview =
+                if let (Some(project_id), Some(experiment_id)) = (project_id, experiment_id) {
+                    let issue_count = preview.issues.len();
+                    let preview_row_count = preview.preview_rows.len();
+                    ImportDraftPreviewSummary::from_public_preview(&json!({
+                        "project_id": project_id,
+                        "import_kind": preview.import_kind,
+                        "experiment_id": experiment_id,
+                        "file_name": preview.file_name.clone(),
+                        "sheet_name": preview.sheet_name.clone(),
+                        "total_rows": preview.total_rows,
+                        "accepted_rows": preview.accepted_rows,
+                        "issue_count": issue_count,
+                        "issues_truncated": issue_count > 50,
+                        "can_confirm": preview.can_confirm,
+                        "preview_rows": preview.preview_rows.clone(),
+                        "preview_rows_truncated": preview.accepted_rows > preview_row_count,
+                        "issues": preview.issues.iter().take(50).collect::<Vec<_>>(),
+                    }))
+                    .unwrap()
+                } else {
+                    // Legacy lab-wide fixtures are rejection-only and never reach
+                    // the import backend, but retain a structurally valid payload.
+                    ImportDraftPreviewSummary {
+                        import_kind: AiSourceImportKind::Measurement,
+                        project_id: Uuid::new_v4(),
+                        experiment_id: Uuid::new_v4(),
+                        file_name: preview.file_name.clone(),
+                        sheet_name: preview.sheet_name.clone(),
+                        total_rows: preview.total_rows,
+                        accepted_rows: preview.accepted_rows,
+                        issue_count: 0,
+                        issues_truncated: false,
+                        can_confirm: true,
+                        preview_rows: Vec::new(),
+                        preview_rows_truncated: preview.accepted_rows > 0,
+                        issues: Vec::new(),
+                    }
+                };
             let expected_job_revision = job.meta.revision;
             job.status = JobStatus::AwaitingConfirmation;
             job.progress_current = 2;
-            job.result =
-                Some(serde_json::to_value(AnimalImportPreviewResponse::from(&pending)).unwrap());
+            job.result = Some(serde_json::to_value(&preview).unwrap());
             job.meta.touch(Utc::now());
             jobs.update(job.clone(), expected_job_revision, audit.clone())
                 .await
                 .unwrap();
 
+            let model_profile = create_test_model_profile(
+                store.as_ref(),
+                lab.id,
+                user.id,
+                "Approval fixture model",
+                now,
+                &audit,
+            )
+            .await;
+            let conversation = AiConversation {
+                id: Uuid::new_v4(),
+                lab_id: lab.id,
+                project_id,
+                user_id: user.id,
+                title: "Import approval conversation".to_owned(),
+                model_profile: Some(model_profile),
+                legacy_read_only: false,
+                pinned_at: None,
+                archived_at: None,
+                meta: RecordMeta::new(now),
+            };
+            store
+                .create_ai_conversation(&conversation, &audit)
+                .await
+                .unwrap();
             let tool_run_id = Uuid::new_v4();
             let draft = WriteDraft::new(
                 DraftKind::BulkImport,
@@ -2672,7 +3405,7 @@ mod tests {
                     user_id: user.id,
                     tool_run_id,
                 },
-                None,
+                project_id,
                 vec![FieldChange {
                     path: format!("/data/imports/{}", job.id),
                     before: Some(json!({"status": "awaiting_confirmation"})),
@@ -2681,8 +3414,9 @@ mod tests {
                 serde_json::to_value(ImportCommitDraftPayload {
                     operation: ImportCommitDraftPayload::OPERATION.to_owned(),
                     job_id: job.id,
-                    preview_hash: pending.preview_hash,
+                    preview_hash: preview.preview_hash.clone(),
                     expected_revision: job.meta.revision,
+                    preview: import_preview,
                 })
                 .unwrap(),
                 Utc::now(),
@@ -2691,9 +3425,9 @@ mod tests {
             .unwrap();
             let tool_run = ToolRun {
                 id: tool_run_id,
-                conversation_id: None,
+                conversation_id: Some(conversation.id),
                 lab_id: lab.id,
-                project_id: None,
+                project_id,
                 user_id: user.id,
                 tool_name: ToolName::ImportCommitDraft.as_str().to_owned(),
                 input: json!({"job_id": job.id}),
@@ -2745,6 +3479,7 @@ mod tests {
                 _temp: temp,
                 app: application_router(state, None),
                 store,
+                conversation_id: conversation.id,
                 draft_id: draft.id(),
                 job_id: job.id,
                 verification_calls,
@@ -2837,14 +3572,17 @@ mod tests {
         }
     }
 
-    async fn upload_test_image(fixture: &ConversationFixture) -> Uuid {
+    async fn upload_test_image(fixture: &ConversationFixture) -> (Uuid, Uuid) {
+        let conversation_id = start_test_conversation(fixture).await;
         let response = fixture
             .app
             .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/api/v1/ai/images/upload?file_name=evidence.png&media_type=image%2Fpng")
+                    .uri(format!(
+                        "/api/v1/ai/images/upload?file_name=evidence.png&media_type=image%2Fpng&conversation_id={conversation_id}"
+                    ))
                     .header(
                         header::COOKIE,
                         format!("{SESSION_COOKIE_NAME}={SESSION_TOKEN}"),
@@ -2857,7 +3595,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
-        response_json(response).await["data"]["image"]["id"]
+        let image_id = response_json(response).await["data"]["image"]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        (conversation_id, image_id)
+    }
+
+    async fn start_test_conversation(fixture: &ConversationFixture) -> Uuid {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/conversations",
+                Some(json!({
+                    "title": "Source image routing",
+                    "modelProfileId": fixture.profile_id,
+                    "requestedMode": "ask",
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response_json(response).await["data"]["conversation"]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    async fn upload_test_image_source(
+        fixture: &ConversationFixture,
+        conversation_id: Uuid,
+    ) -> Uuid {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/ai/sources/upload?file_name=source.png&media_type=image%2Fpng&conversation_id={conversation_id}"
+                    ))
+                    .header(
+                        header::COOKIE,
+                        format!("{SESSION_COOKIE_NAME}={SESSION_TOKEN}"),
+                    )
+                    .header(crate::auth::CSRF_HEADER_NAME, CSRF_TOKEN)
+                    .header(header::CONTENT_TYPE, "image/png")
+                    .body(Body::from(portable_png()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response_json(response).await["data"]["id"]
             .as_str()
             .unwrap()
             .parse()
@@ -2866,6 +3660,7 @@ mod tests {
 
     async fn run_test_image_turn(
         fixture: &ConversationFixture,
+        conversation_id: Uuid,
         image_id: Uuid,
     ) -> axum::response::Response {
         fixture
@@ -2875,8 +3670,30 @@ mod tests {
                 Method::POST,
                 "/api/v1/ai/turns",
                 Some(json!({
+                    "conversationId": conversation_id,
                     "message": "Describe only the visible evidence",
                     "imageIds": [image_id],
+                })),
+            ))
+            .await
+            .unwrap()
+    }
+
+    async fn run_test_source_image_turn(
+        fixture: &ConversationFixture,
+        conversation_id: Uuid,
+        source_id: Uuid,
+    ) -> axum::response::Response {
+        fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({
+                    "conversationId": conversation_id,
+                    "message": "Describe only the selected source image",
+                    "sourceRefs": [source_id],
                 })),
             ))
             .await
@@ -2917,8 +3734,8 @@ mod tests {
             "Direct grounded answer",
         )]);
         let fixture = ConversationFixture::with_vision_runtime(base_url, true).await;
-        let image_id = upload_test_image(&fixture).await;
-        let response = run_test_image_turn(&fixture, image_id).await;
+        let (conversation_id, image_id) = upload_test_image(&fixture).await;
+        let response = run_test_image_turn(&fixture, conversation_id, image_id).await;
         assert_eq!(response.status(), StatusCode::OK);
         let response = response_json(response).await;
         assert_eq!(response["data"]["content"], "Direct grounded answer");
@@ -2943,6 +3760,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_vision_rejects_an_unused_relay_profile_before_any_provider_call() {
+        let (base_url, calls, handle) = spawn_no_call_probe();
+        let fixture = ConversationFixture::with_vision_runtime(base_url, true).await;
+        let (conversation_id, image_id) = upload_test_image(&fixture).await;
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({
+                    "conversationId": conversation_id,
+                    "message": "Do not silently ignore the relay selection",
+                    "imageIds": [image_id],
+                    "visionModelProfileId": Uuid::new_v4(),
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "image_evidence_invalid"
+        );
+        handle.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn relayed_vision_http_chain_records_two_stages_and_json_evidence_envelope() {
         let observation = json!({
             "observations": [{"imageIndex": 1, "description": "one visible panel"}]
@@ -2957,8 +3803,8 @@ mod tests {
             ),
         ]);
         let fixture = ConversationFixture::with_vision_runtime(base_url, false).await;
-        let image_id = upload_test_image(&fixture).await;
-        let response = run_test_image_turn(&fixture, image_id).await;
+        let (conversation_id, image_id) = upload_test_image(&fixture).await;
+        let response = run_test_image_turn(&fixture, conversation_id, image_id).await;
         assert_eq!(response.status(), StatusCode::OK);
         let response = response_json(response).await;
         assert_eq!(response["data"]["content"], "Relayed grounded answer");
@@ -2993,8 +3839,94 @@ mod tests {
     async fn missing_default_vision_http_chain_returns_selection_error_with_zero_network_calls() {
         let (base_url, calls, handle) = spawn_no_call_probe();
         let fixture = ConversationFixture::with_missing_vision_runtime(base_url).await;
-        let image_id = upload_test_image(&fixture).await;
-        let response = run_test_image_turn(&fixture, image_id).await;
+        let (conversation_id, image_id) = upload_test_image(&fixture).await;
+        let response = run_test_image_turn(&fixture, conversation_id, image_id).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "vision_model_selection_required"
+        );
+        handle.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn source_image_routes_directly_when_the_bound_conversation_model_supports_vision() {
+        let (base_url, captured, handle) = spawn_provider_sequence(vec![chat_response(
+            "source-direct-final",
+            "conversation-test-model",
+            "Direct source-grounded answer",
+        )]);
+        let fixture = ConversationFixture::with_vision_runtime(base_url, true).await;
+        let conversation_id = start_test_conversation(&fixture).await;
+        let source_id = upload_test_image_source(&fixture, conversation_id).await;
+        let response = run_test_source_image_turn(&fixture, conversation_id, source_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["data"]["content"], "Direct source-grounded answer");
+        assert_eq!(response["data"]["trace"]["usage"]["provider_calls"], 1);
+        assert!(
+            response["data"]["trace"]
+                .as_object()
+                .unwrap()
+                .get("imageEvidence")
+                .is_none()
+        );
+
+        let requests = captured.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].contains("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn source_image_uses_the_selected_vision_relay_for_a_text_only_conversation_model() {
+        let observation = json!({
+            "observations": [{"imageIndex": 1, "description": "one source image"}]
+        })
+        .to_string();
+        let (base_url, captured, handle) = spawn_provider_sequence(vec![
+            chat_response("source-observation", "vision-test-model", &observation),
+            chat_response(
+                "source-relay-final",
+                "conversation-test-model",
+                "Relayed source-grounded answer",
+            ),
+        ]);
+        let fixture = ConversationFixture::with_vision_runtime(base_url, false).await;
+        let conversation_id = start_test_conversation(&fixture).await;
+        let source_id = upload_test_image_source(&fixture, conversation_id).await;
+        let response = run_test_source_image_turn(&fixture, conversation_id, source_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(
+            response["data"]["content"],
+            "Relayed source-grounded answer"
+        );
+        assert_eq!(response["data"]["trace"]["usage"]["provider_calls"], 2);
+        assert!(
+            response["data"]["trace"]
+                .as_object()
+                .unwrap()
+                .get("imageEvidence")
+                .is_none()
+        );
+
+        let requests = captured.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("data:image/png;base64,"));
+        assert!(!requests[1].contains("data:image/png;base64,"));
+        assert!(requests[1].contains("MURIARC_VISION_EVIDENCE_V1="));
+    }
+
+    #[tokio::test]
+    async fn source_image_without_a_default_vision_model_fails_before_any_provider_call() {
+        let (base_url, calls, handle) = spawn_no_call_probe();
+        let fixture = ConversationFixture::with_missing_vision_runtime(base_url).await;
+        let conversation_id = start_test_conversation(&fixture).await;
+        let source_id = upload_test_image_source(&fixture, conversation_id).await;
+        let response = run_test_source_image_turn(&fixture, conversation_id, source_id).await;
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             response_json(response).await["error"]["code"],
@@ -3561,6 +4493,114 @@ mod tests {
         assert_eq!(
             fixture.store.get_job(fixture.job_id).await.unwrap().status,
             JobStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn lab_wide_write_draft_application_is_forbidden_but_rejection_remains_available() {
+        let fixture = ApprovalFixture::lab_wide().await;
+
+        let blocked = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(approval_request(Some(CORRECT_PASSWORD))))
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response_json(blocked).await["error"]["code"], "forbidden");
+        assert_eq!(fixture.verification_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .store
+                .get_approval(fixture.draft_id)
+                .await
+                .unwrap()
+                .decision,
+            StoredApprovalDecision::Pending
+        );
+        assert_eq!(
+            fixture.store.get_job(fixture.job_id).await.unwrap().status,
+            JobStatus::AwaitingConfirmation
+        );
+
+        let rejected = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(json!({
+                "expectedRevision": 1,
+                "decision": "reject",
+                "statement": "A write draft must be bound to a project"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(rejected).await["data"]["draft"]["status"],
+            "rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn archived_conversation_allows_rejection_but_blocks_draft_application() {
+        let fixture = ApprovalFixture::new().await;
+        let conversation = fixture
+            .store
+            .get_ai_conversation(fixture.conversation_id)
+            .await
+            .unwrap();
+        fixture
+            .store
+            .update_ai_conversation(
+                &AiConversationUpdate {
+                    id: conversation.id,
+                    expected_revision: conversation.meta.revision,
+                    change: AiConversationChange::Archive,
+                    updated_at: Utc::now(),
+                },
+                &AuditContext {
+                    actor: muriarc_core::Actor::human(conversation.user_id, "Step-up researcher"),
+                    source: WriteSource::Web,
+                    request_id: Some("archive-before-approval".to_owned()),
+                    reason: Some("verify archived conversation write boundary".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let blocked = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(approval_request(Some(CORRECT_PASSWORD))))
+            .await
+            .unwrap();
+        assert_eq!(blocked.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            fixture
+                .store
+                .get_approval(fixture.draft_id)
+                .await
+                .unwrap()
+                .decision,
+            StoredApprovalDecision::Pending
+        );
+        assert_eq!(
+            fixture.store.get_job(fixture.job_id).await.unwrap().status,
+            JobStatus::AwaitingConfirmation
+        );
+
+        let rejected = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(json!({
+                "expectedRevision": 1,
+                "decision": "reject"
+            })))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(rejected).await["data"]["draft"]["status"],
+            "rejected"
         );
     }
 

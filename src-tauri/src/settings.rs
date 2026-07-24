@@ -46,8 +46,6 @@ pub(crate) enum SettingsError {
     CredentialStore,
     #[error("the selected cloud provider requires an API key")]
     MissingCredential,
-    #[error("no default conversation model is configured")]
-    DefaultModelNotConfigured,
     #[error("AI model profile storage is unavailable")]
     ModelProfileStore(#[from] StoreError),
 }
@@ -60,7 +58,6 @@ impl SettingsError {
                 | Self::InvalidCredential
                 | Self::InvalidFile
                 | Self::MissingCredential
-                | Self::DefaultModelNotConfigured
         )
     }
 }

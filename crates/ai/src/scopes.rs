@@ -47,6 +47,15 @@ impl ScopeSet {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolName {
+    ResourceSearch,
+    GenotypingQuery,
+    AnimalContext,
+    ProjectContext,
+    ActivityQuery,
+    AuditQuery,
+    ProvenanceQuery,
+    /// Legacy read names remain decodable for persisted traces and compatible
+    /// callers, but production executors do not advertise them to models.
     AnimalSearch,
     AnimalTimeline,
     CageList,
@@ -54,16 +63,25 @@ pub enum ToolName {
     ExperimentStatus,
     MeasurementQuery,
     SampleInventory,
+    SourceImportPreview,
     ImportPreview,
     ImportCommitDraft,
     ExportCreate,
     ExperimentTemplateDraft,
     MutationDraft,
+    ExperimentGroupingDraft,
 }
 
 impl ToolName {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ResourceSearch => "resource_search",
+            Self::GenotypingQuery => "genotyping_query",
+            Self::AnimalContext => "animal_context",
+            Self::ProjectContext => "project_context",
+            Self::ActivityQuery => "activity_query",
+            Self::AuditQuery => "audit_query",
+            Self::ProvenanceQuery => "provenance_query",
             Self::AnimalSearch => "animal_search",
             Self::AnimalTimeline => "animal_timeline",
             Self::CageList => "cage_list",
@@ -71,16 +89,25 @@ impl ToolName {
             Self::ExperimentStatus => "experiment_status",
             Self::MeasurementQuery => "measurement_query",
             Self::SampleInventory => "sample_inventory",
+            Self::SourceImportPreview => "source_import_preview",
             Self::ImportPreview => "import_preview",
             Self::ImportCommitDraft => "import_commit_draft",
             Self::ExportCreate => "export_create",
             Self::ExperimentTemplateDraft => "experiment_template_draft",
             Self::MutationDraft => "mutation_draft",
+            Self::ExperimentGroupingDraft => "experiment_grouping_draft",
         }
     }
 
     pub fn from_wire_name(value: &str) -> Option<Self> {
         match value {
+            "resource_search" => Some(Self::ResourceSearch),
+            "genotyping_query" => Some(Self::GenotypingQuery),
+            "animal_context" => Some(Self::AnimalContext),
+            "project_context" => Some(Self::ProjectContext),
+            "activity_query" => Some(Self::ActivityQuery),
+            "audit_query" => Some(Self::AuditQuery),
+            "provenance_query" => Some(Self::ProvenanceQuery),
             "animal_search" => Some(Self::AnimalSearch),
             "animal_timeline" => Some(Self::AnimalTimeline),
             "cage_list" => Some(Self::CageList),
@@ -88,11 +115,13 @@ impl ToolName {
             "experiment_status" => Some(Self::ExperimentStatus),
             "measurement_query" => Some(Self::MeasurementQuery),
             "sample_inventory" => Some(Self::SampleInventory),
+            "source_import_preview" => Some(Self::SourceImportPreview),
             "import_preview" => Some(Self::ImportPreview),
             "import_commit_draft" => Some(Self::ImportCommitDraft),
             "export_create" => Some(Self::ExportCreate),
             "experiment_template_draft" => Some(Self::ExperimentTemplateDraft),
             "mutation_draft" => Some(Self::MutationDraft),
+            "experiment_grouping_draft" => Some(Self::ExperimentGroupingDraft),
             _ => None,
         }
     }
@@ -102,7 +131,10 @@ impl ToolName {
     pub const fn is_draft_only(self) -> bool {
         matches!(
             self,
-            Self::ImportCommitDraft | Self::ExperimentTemplateDraft | Self::MutationDraft
+            Self::ImportCommitDraft
+                | Self::ExperimentTemplateDraft
+                | Self::MutationDraft
+                | Self::ExperimentGroupingDraft
         )
     }
 
@@ -110,18 +142,25 @@ impl ToolName {
         use ToolScope::{Export, Import, Read, TemplateDraft, WriteDraft};
 
         match self {
-            Self::AnimalSearch
+            Self::ResourceSearch
+            | Self::GenotypingQuery
+            | Self::AnimalContext
+            | Self::ProjectContext
+            | Self::ActivityQuery
+            | Self::AuditQuery
+            | Self::ProvenanceQuery
+            | Self::AnimalSearch
             | Self::AnimalTimeline
             | Self::CageList
             | Self::ProjectList
             | Self::ExperimentStatus
             | Self::MeasurementQuery
             | Self::SampleInventory => &[Read],
-            Self::ImportPreview => &[Read, Import],
+            Self::SourceImportPreview | Self::ImportPreview => &[Read, Import],
             Self::ImportCommitDraft => &[Import, WriteDraft],
             Self::ExportCreate => &[Read, Export],
             Self::ExperimentTemplateDraft => &[TemplateDraft],
-            Self::MutationDraft => &[WriteDraft],
+            Self::MutationDraft | Self::ExperimentGroupingDraft => &[Read, WriteDraft],
         }
     }
 }

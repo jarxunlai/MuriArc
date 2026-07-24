@@ -3,12 +3,14 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use muriarc_core::{
-    AiAutonomyMode, AiConversation, AiConversationMessageRole, AiModelProfileBinding,
+    AiAutonomyMode, AiConversation, AiConversationMessageRole, AiConversationSourceRef,
+    AiModelProfileBinding,
 };
 
 use crate::{
-    ApprovalRequirement, AssistantResponse, AssistantUsage, Citation, ContextManagementTrace,
-    DraftKind, DraftStatus, FieldChange, ToolRunTrace, WriteDraft,
+    ApprovalRequirement, AssistantIncompleteReason, AssistantResponse, AssistantUsage, Citation,
+    ContextManagementTrace, DraftKind, DraftStatus, FieldChange, ImportCommitDraftPayload,
+    ImportDraftPreviewSummary, ToolRunTrace, WriteDraft,
 };
 
 /// Stable request contract shared by Tauri commands and `/api/v1/ai/turns`.
@@ -17,11 +19,14 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssistantTurnRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub conversation_id: Option<Uuid>,
+    /// Governed transports require `start_conversation` before any model call
+    /// or source/image upload.
+    pub conversation_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -38,6 +43,8 @@ pub struct AssistantTurnRequest {
 pub struct AssistantConversationStartRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub requested_mode: AiAutonomyMode,
 }
 
@@ -57,6 +64,10 @@ pub struct AssistantTurnResponse {
     pub tool_runs: Vec<ToolRunTrace>,
     pub drafts: Vec<WriteDraftSummary>,
     pub trace: AssistantTrace,
+    /// Absent for complete responses and for responses persisted by older
+    /// MuriArc versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<AssistantIncompleteReason>,
     #[serde(default)]
     pub autonomy: AiAutonomyView,
 }
@@ -116,6 +127,10 @@ pub struct AssistantConversationSummary {
     pub project_id: Option<Uuid>,
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_profile_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_profile_version: Option<i64>,
@@ -145,6 +160,8 @@ impl From<AiConversation> for AssistantConversationSummary {
             id: value.id,
             project_id: value.project_id,
             title: value.title,
+            pinned_at: value.pinned_at,
+            archived_at: value.archived_at,
             model_profile_id: value.model_profile.map(|binding| binding.profile_id),
             model_profile_version: value.model_profile.map(|binding| binding.profile_version),
             model_profile_name: None,
@@ -160,6 +177,33 @@ impl From<AiConversation> for AssistantConversationSummary {
     }
 }
 
+/// Safe historical source metadata returned to renderers.
+///
+/// `attachment_id` remains part of the internal persisted source snapshot for
+/// integrity checks, but it is deliberately omitted from this public DTO.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AssistantConversationSourceRef {
+    pub source_id: Uuid,
+    pub source_revision: i64,
+    pub file_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    pub size_bytes: i64,
+}
+
+impl From<AiConversationSourceRef> for AssistantConversationSourceRef {
+    fn from(value: AiConversationSourceRef) -> Self {
+        Self {
+            source_id: value.source_id,
+            source_revision: value.source_revision,
+            file_name: value.file_name,
+            media_type: value.media_type,
+            size_bytes: value.size_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AssistantConversationMessage {
@@ -167,6 +211,8 @@ pub struct AssistantConversationMessage {
     pub sequence: i64,
     pub role: AiConversationMessageRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_refs: Vec<AssistantConversationSourceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response: Option<AssistantTurnResponse>,
     pub created_at: DateTime<Utc>,
@@ -245,6 +291,8 @@ pub struct WriteDraftSummary {
     pub kind: DraftKind,
     pub project_id: Option<Uuid>,
     pub changes: Vec<FieldChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_preview: Option<ImportDraftPreviewSummary>,
     pub requirement: ApprovalRequirement,
     pub status: DraftStatus,
     pub revision: u64,
@@ -259,6 +307,13 @@ impl From<&WriteDraft> for WriteDraftSummary {
             kind: draft.kind(),
             project_id: draft.project_id(),
             changes: draft.changes().to_vec(),
+            import_preview: (draft.kind() == DraftKind::BulkImport)
+                .then(|| {
+                    serde_json::from_value::<ImportCommitDraftPayload>(draft.payload().clone())
+                        .ok()
+                        .map(|payload| payload.preview)
+                })
+                .flatten(),
             requirement: draft.requirement(),
             status: draft.status(),
             revision: draft.revision(),
@@ -321,6 +376,7 @@ impl AssistantTurnResponse {
                 model_calls: prior_model_calls,
                 image_evidence,
             },
+            incomplete_reason: response.incomplete_reason,
             autonomy,
         }
     }
@@ -349,6 +405,129 @@ mod tests {
             "sql": "select * from animals"
         });
         assert!(serde_json::from_value::<AssistantTurnRequest>(value).is_err());
+    }
+
+    #[test]
+    fn stored_turn_without_incomplete_reason_remains_deserializable() {
+        let value = serde_json::json!({
+            "conversationId": Uuid::new_v4(),
+            "content": "complete legacy response",
+            "citations": [],
+            "toolRuns": [],
+            "drafts": [],
+            "trace": {
+                "providerId": "legacy-provider",
+                "model": "legacy-model",
+                "usage": {
+                    "provider_calls": 1,
+                    "tool_calls": 0,
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "total_tokens": 15
+                },
+                "context": {
+                    "estimatedInputTokens": 10,
+                    "inputTokenCountIsEstimate": true,
+                    "contextTrimmed": false,
+                    "trimmedHistoryTurns": 0
+                }
+            }
+        });
+
+        let response: AssistantTurnResponse = serde_json::from_value(value).unwrap();
+
+        assert_eq!(response.incomplete_reason, None);
+        let serialized = serde_json::to_value(response).unwrap();
+        assert!(serialized.get("incompleteReason").is_none());
+        assert_eq!(
+            serde_json::to_value(AssistantIncompleteReason::IterationLimitExceeded).unwrap(),
+            "iteration_limit_exceeded"
+        );
+        assert_eq!(
+            serde_json::to_value(AssistantIncompleteReason::ToolCallLimitExceeded).unwrap(),
+            "tool_call_limit_exceeded"
+        );
+    }
+
+    #[test]
+    fn public_historical_source_refs_hide_internal_attachment_identity() {
+        let source_id = Uuid::new_v4();
+        let public = AssistantConversationSourceRef::from(AiConversationSourceRef {
+            source_id,
+            source_revision: 3,
+            attachment_id: Uuid::new_v4(),
+            file_name: "weights.csv".to_owned(),
+            media_type: Some("text/csv".to_owned()),
+            size_bytes: 42,
+        });
+
+        let serialized = serde_json::to_value(public).unwrap();
+        assert_eq!(serialized["sourceId"], source_id.to_string());
+        assert!(serialized.get("attachmentId").is_none());
+        assert!(serialized.get("sha256").is_none());
+    }
+
+    #[test]
+    fn bulk_import_summary_exposes_the_persisted_bounded_preview() {
+        let now = Utc::now();
+        let project_id = Uuid::new_v4();
+        let preview = ImportDraftPreviewSummary {
+            import_kind: crate::AiSourceImportKind::Measurement,
+            project_id,
+            experiment_id: Uuid::new_v4(),
+            file_name: "measurements.csv".to_owned(),
+            sheet_name: "Sheet1".to_owned(),
+            total_rows: 1,
+            accepted_rows: 1,
+            issue_count: 0,
+            issues_truncated: false,
+            can_confirm: true,
+            preview_rows: vec![crate::ImportDraftPreviewRow {
+                row_number: 2,
+                animal_id: Uuid::new_v4(),
+                animal_display_id: "M-001".to_owned(),
+                measurement_key: "body_weight".to_owned(),
+                value: "22.4".to_owned(),
+                unit: Some("g".to_owned()),
+                measured_at: "2026-07-23T08:00:00Z".to_owned(),
+            }],
+            preview_rows_truncated: false,
+            issues: Vec::new(),
+        };
+        let draft = WriteDraft::new(
+            DraftKind::BulkImport,
+            crate::ToolName::ImportCommitDraft,
+            crate::ProposalActor::Ai {
+                user_id: Uuid::new_v4(),
+                tool_run_id: Uuid::new_v4(),
+            },
+            Some(project_id),
+            vec![FieldChange {
+                path: "/data/imports/test".to_owned(),
+                before: Some(serde_json::json!({"status": "awaiting_confirmation"})),
+                after: Some(serde_json::json!({"status": "completed"})),
+            }],
+            serde_json::to_value(ImportCommitDraftPayload {
+                operation: ImportCommitDraftPayload::OPERATION.to_owned(),
+                job_id: Uuid::new_v4(),
+                preview_hash: "a".repeat(64),
+                expected_revision: 2,
+                preview: preview.clone(),
+            })
+            .unwrap(),
+            now,
+            now + chrono::Duration::hours(1),
+        )
+        .unwrap();
+
+        let summary = WriteDraftSummary::from(&draft);
+        assert_eq!(summary.import_preview, Some(preview));
+        let serialized = serde_json::to_value(summary).unwrap();
+        assert_eq!(
+            serialized["importPreview"]["previewRows"][0]["measurementKey"],
+            "body_weight"
+        );
+        assert!(serialized["importPreview"].get("preview_rows").is_none());
     }
 
     #[test]

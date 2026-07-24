@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import { Plus, RefreshCw, Search, UsersRound } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -23,6 +23,7 @@ const showMove = ref(false)
 const moveTarget = ref<string | null>(null)
 const busy = ref(false)
 const highlightedCage = ref<string | null>(null)
+let highlightTimer: number | undefined
 const newCage = reactive({ code: '', room: 'SPF-A', rack: 'R1', capacity: 5 })
 const canManageCages = computed(() => gateway.mode === 'local' || hasLabRegistryAccess())
 const accessContext = computed(() => currentProjectId.value
@@ -54,12 +55,17 @@ async function load() {
       gateway.listCages(accessContext.value),
       gateway.listAnimals(accessContext.value),
     ])
-    const focus = route.query.focus
-    if (typeof focus === 'string') {
-      highlightedCage.value = focus
-      window.setTimeout(() => { highlightedCage.value = null }, 1800)
-    }
   } finally { loading.value = false }
+}
+
+function applyRouteFocus(focus: unknown) {
+  if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
+  highlightedCage.value = typeof focus === 'string' ? focus : null
+  if (!highlightedCage.value) return
+  highlightTimer = window.setTimeout(() => {
+    highlightedCage.value = null
+    highlightTimer = undefined
+  }, 1800)
 }
 
 function animalLabel(id: string) { return animalById.value.get(id)?.code ?? id }
@@ -108,6 +114,10 @@ async function createCage() {
 }
 
 onMounted(load)
+onUnmounted(() => {
+  if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
+})
+watch(() => route.query.focus, applyRouteFocus, { immediate: true })
 watch(currentProjectId, () => {
   if (gateway.mode === 'remote') void load()
 })

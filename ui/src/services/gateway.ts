@@ -4,7 +4,9 @@ import type {
   AiAutonomyUpdateInput,
   AiAutonomyView,
   AiConversationDetail,
+  AiConversationListInput,
   AiConversationSummary,
+  AiConversationUpdateInput,
   AiDraftDecisionInput,
   AiDraftDecisionResponse,
   AiDraftStatus,
@@ -12,6 +14,10 @@ import type {
   AiProviderKind,
   AiProviderPreset,
   AiSettings,
+  AiSource,
+  AiSourceArchiveInput,
+  AiSourceListInput,
+  AiSourceUploadInput,
   AiTurnInput,
   AiTurnResponse,
   AiWriteDraft,
@@ -850,7 +856,16 @@ export interface MuriArcGateway {
   startAiConversation(input: StartAiConversationInput): Promise<StartAiConversationResponse>
   aiTurn(input: AiTurnInput): Promise<AiTurnResponse>
   listAiConversations(projectId?: string, limit?: number): Promise<AiConversationSummary[]>
+  queryAiConversations?(input?: AiConversationListInput): Promise<AiConversationSummary[]>
   getAiConversation(conversationId: string, limit?: number): Promise<AiConversationDetail>
+  updateAiConversation?(
+    conversationId: string,
+    input: AiConversationUpdateInput,
+  ): Promise<AiConversationSummary>
+  uploadAiSource?(input: AiSourceUploadInput): Promise<AiSource>
+  listAiSources?(input: AiSourceListInput): Promise<AiSource[]>
+  archiveAiSource?(sourceId: string, input: AiSourceArchiveInput): Promise<AiSource>
+  deleteAiSource?(sourceId: string): Promise<void>
   getAiAutonomy?(conversationId: string): Promise<AiAutonomyView>
   setAiAutonomy?(conversationId: string, input: AiAutonomyUpdateInput): Promise<AiAutonomyView>
   listAiDrafts(projectId?: string, status?: AiDraftStatus): Promise<AiWriteDraft[]>
@@ -876,18 +891,35 @@ export interface MuriArcGateway {
 type Invoke = <T>(command: string, args?: Record<string, unknown>) => Promise<T>
 type GatewaySelection = GatewayMode | 'demo'
 
+export class GatewayError extends Error {
+  constructor(message: string, readonly code?: string) {
+    super(message)
+    this.name = 'GatewayError'
+  }
+}
+
 function gatewayError(error: unknown): Error {
   if (error instanceof Error) return error
-  if (typeof error === 'string') return new Error(error)
+  if (typeof error === 'string') return new GatewayError(error)
   if (error && typeof error === 'object') {
     const record = error as Record<string, unknown>
-    if (typeof record.message === 'string') return new Error(record.message)
+    if (typeof record.message === 'string') {
+      return new GatewayError(
+        record.message,
+        typeof record.code === 'string' ? record.code : undefined,
+      )
+    }
     if (record.error && typeof record.error === 'object') {
-      const message = (record.error as Record<string, unknown>).message
-      if (typeof message === 'string') return new Error(message)
+      const nested = record.error as Record<string, unknown>
+      if (typeof nested.message === 'string') {
+        return new GatewayError(
+          nested.message,
+          typeof nested.code === 'string' ? nested.code : undefined,
+        )
+      }
     }
   }
-  return new Error('MuriArc 操作失败')
+  return new GatewayError('MuriArc 操作失败')
 }
 
 export class LocalTauriGateway implements MuriArcGateway {
@@ -1278,6 +1310,7 @@ export class LocalTauriGateway implements MuriArcGateway {
     }
     const localInput = {
       ...(input.projectId ? { projectId: input.projectId } : {}),
+      title: input.title,
       ...(input.modelProfileId ? { modelProfileId: input.modelProfileId } : {}),
       requestedMode: input.requestedMode,
     }
@@ -1297,12 +1330,62 @@ export class LocalTauriGateway implements MuriArcGateway {
     return this.call<RawAiConversationSummary[]>('list_ai_conversations', { projectId, limit })
       .then((items) => items.map(mapAiConversationSummary))
   }
+  queryAiConversations(input: AiConversationListInput = {}) {
+    return this.call<RawAiConversationSummary[]>('list_ai_conversations', {
+      projectId: input.projectId,
+      titleQuery: input.titleQuery,
+      archive: input.archive ?? 'active',
+      limit: input.limit ?? 100,
+    }).then((items) => items.map(mapAiConversationSummary))
+  }
   async getAiConversation(conversationId: string, limit = 200) {
     const detail = await this.call<RawAiConversationDetail>('get_ai_conversation', {
       conversationId,
       limit,
     })
     return mapAiConversationDetail(detail)
+  }
+  updateAiConversation(conversationId: string, input: AiConversationUpdateInput) {
+    return this.call<RawAiConversationSummary>('update_ai_conversation', {
+      conversationId,
+      input,
+    }).then(mapAiConversationSummary)
+  }
+  async uploadAiSource(input: AiSourceUploadInput): Promise<AiSource> {
+    const bytes = Array.from(new Uint8Array(await input.file.arrayBuffer()))
+    const source = await this.call<RawAiSource>('upload_ai_source', {
+      input: {
+        fileName: input.file.name,
+        mediaType: input.file.type || 'application/octet-stream',
+        conversationId: input.conversationId,
+        projectId: input.projectId,
+        bytes,
+      },
+    })
+    return mapAiSource(source)
+  }
+  async listAiSources(input: AiSourceListInput): Promise<AiSource[]> {
+    const sources = await this.call<RawAiSource[]>('list_ai_sources', {
+      input: {
+        conversationId: input.conversationId,
+        projectId: input.projectId,
+        status: input.status,
+      },
+    })
+    return sources.map(mapAiSource)
+  }
+  async archiveAiSource(sourceId: string, input: AiSourceArchiveInput): Promise<AiSource> {
+    const source = await this.call<RawAiSource>('archive_ai_source', {
+      sourceId,
+      input: {
+        projectId: input.projectId,
+        expectedRevision: input.expectedRevision,
+      },
+    })
+    return mapAiSource(source)
+  }
+  async deleteAiSource(sourceId: string): Promise<void> {
+    await this.call<unknown>('delete_ai_source', { sourceId })
   }
   getAiAutonomy(conversationId: string) {
     return this.call<AiAutonomyView>('get_ai_autonomy', { conversationId })
@@ -1760,14 +1843,17 @@ interface RawExperiment {
 }
 interface RawJob {
   id: string
+  project_id?: string | null
   kind: 'import' | 'export' | 'snapshot' | 'bulk_operation'
   status: 'queued' | 'parsing' | 'validating' | 'awaiting_confirmation' | 'writing' | 'completed' | 'failed' | 'cancelled'
-  idempotency_key: string
   progress_current: number
   progress_total?: number | null
-  result?: unknown
-  error_report?: unknown
-  meta: { created_at: string }
+  result_available: boolean
+  error_report_available: boolean
+  cancellation_requested: boolean
+  revision: number
+  created_at: string
+  updated_at: string
 }
 
 interface RawAttachment {
@@ -1812,7 +1898,7 @@ interface RawCsrfResponse {
 }
 
 interface RawAiCitation {
-  entity_type: AiEntityType
+  entity_type: string
   entity_id: string
   revision?: number | null
 }
@@ -1869,7 +1955,27 @@ interface RawAiTurnResponse {
       sanitizedSha256: string
     }>
   }
+  incompleteReason?:
+    | 'iteration_limit_exceeded'
+    | 'tool_call_limit_exceeded'
+    | 'total_timeout_exceeded'
+    | 'provider_failure'
+    | 'tool_execution_failure'
+    | null
   autonomy?: AiAutonomyView
+}
+
+interface RawAiConversationSourceRef {
+  sourceId?: string
+  source_id?: string
+  sourceRevision?: number
+  source_revision?: number
+  fileName?: string
+  file_name?: string
+  mediaType?: string | null
+  media_type?: string | null
+  sizeBytes?: number
+  size_bytes?: number
 }
 
 interface RawAiConversationMessage {
@@ -1877,6 +1983,8 @@ interface RawAiConversationMessage {
   sequence: number
   role: 'user' | 'assistant'
   content: string
+  sourceRefs?: RawAiConversationSourceRef[]
+  source_refs?: RawAiConversationSourceRef[]
   response?: RawAiTurnResponse | null
   createdAt: string
 }
@@ -1884,15 +1992,28 @@ interface RawAiConversationMessage {
 interface RawAiConversationSummary {
   id: string
   projectId?: string | null
+  project_id?: string | null
   title: string
+  pinnedAt?: string | null
+  pinned_at?: string | null
+  archivedAt?: string | null
+  archived_at?: string | null
   modelProfileId?: string | null
+  model_profile_id?: string | null
   modelProfileVersion?: number | null
+  model_profile_version?: number | null
   modelProfileName?: string | null
+  model_profile_name?: string | null
   modelId?: string | null
+  model_id?: string | null
   readOnly?: boolean
+  read_only?: boolean
   readOnlyReason?: 'legacy_model_unknown' | 'model_archived' | 'model_unavailable' | null
+  read_only_reason?: 'legacy_model_unknown' | 'model_archived' | 'model_unavailable' | null
   createdAt: string
+  created_at?: string
   updatedAt: string
+  updated_at?: string
   revision: number
 }
 
@@ -1901,9 +2022,29 @@ interface RawAiConversationDetail {
   messages: RawAiConversationMessage[]
 }
 
-export class HttpGatewayError extends Error {
-  constructor(readonly status: number, message: string, readonly code?: string) {
-    super(message)
+interface RawAiSource {
+  id: string
+  conversationId?: string | null
+  conversation_id?: string | null
+  projectId?: string | null
+  project_id?: string | null
+  fileName: string
+  file_name?: string
+  mediaType: string
+  media_type?: string
+  sizeBytes: number
+  size_bytes?: number
+  status: string
+  revision: number
+  createdAt: string
+  created_at?: string
+  expiresAt?: string
+  expires_at?: string
+}
+
+export class HttpGatewayError extends GatewayError {
+  constructor(readonly status: number, message: string, code?: string) {
+    super(message, code)
     this.name = 'HttpGatewayError'
   }
 }
@@ -3351,7 +3492,7 @@ export class RemoteHttpGateway implements MuriArcGateway {
   }
 
   async listAiModelProfiles(includeArchived = false): Promise<AiModelProfileView[]> {
-    const suffix = includeArchived ? '?include_archived=true' : ''
+    const suffix = includeArchived ? '?includeArchived=true' : ''
     return (await this.request<ApiCollection<AiModelProfileView>>(`/ai/models${suffix}`)).data
   }
 
@@ -3426,7 +3567,8 @@ export class RemoteHttpGateway implements MuriArcGateway {
     }>>('/ai/conversations', {
       method: 'POST',
       body: JSON.stringify({
-        projectId: input.projectId ?? activeProjectId(),
+        projectId: input.projectId,
+        title: input.title,
         modelProfileId: input.modelProfileId,
         requestedMode: input.requestedMode,
         ...(input.requestedMode === 'full' && input.currentPassword
@@ -3443,10 +3585,10 @@ export class RemoteHttpGateway implements MuriArcGateway {
   async aiTurn(input: AiTurnInput): Promise<AiTurnResponse> {
     const response = await this.request<ApiItem<RawAiTurnResponse>>('/ai/turns', {
       method: 'POST',
-      body: JSON.stringify({
-        ...input,
-        projectId: input.projectId ?? activeProjectId(),
-      }),
+      // AI workspace scope is explicit. An absent projectId means a
+      // lab-registry, read-only conversation and must never inherit the
+      // unrelated top-bar project context.
+      body: JSON.stringify(input),
     })
     return mapAiTurn(response.data)
   }
@@ -3460,12 +3602,89 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return response.data.map(mapAiConversationSummary)
   }
 
+  async queryAiConversations(input: AiConversationListInput = {}): Promise<AiConversationSummary[]> {
+    const query = new URLSearchParams({
+      archive: input.archive ?? 'active',
+      limit: String(input.limit ?? 100),
+    })
+    if (input.projectId) query.set('project_id', input.projectId)
+    if (input.titleQuery?.trim()) query.set('q', input.titleQuery.trim())
+    const response = await this.request<ApiCollection<RawAiConversationSummary>>(
+      `/ai/conversations?${query.toString()}`,
+    )
+    return response.data.map(mapAiConversationSummary)
+  }
+
   async getAiConversation(conversationId: string, limit = 200): Promise<AiConversationDetail> {
     const query = new URLSearchParams({ limit: String(limit) })
     const response = await this.request<ApiItem<RawAiConversationDetail>>(
       `/ai/conversations/${encodeURIComponent(conversationId)}?${query.toString()}`,
     )
     return mapAiConversationDetail(response.data)
+  }
+
+  async updateAiConversation(
+    conversationId: string,
+    input: AiConversationUpdateInput,
+  ): Promise<AiConversationSummary> {
+    const response = await this.request<ApiItem<RawAiConversationSummary>>(
+      `/ai/conversations/${encodeURIComponent(conversationId)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({
+          action: input.action,
+          expected_revision: input.expectedRevision,
+          ...(input.title === undefined ? {} : { title: input.title }),
+        }),
+      },
+    )
+    return mapAiConversationSummary(response.data)
+  }
+
+  async uploadAiSource(input: AiSourceUploadInput): Promise<AiSource> {
+    const query = new URLSearchParams({
+      file_name: input.file.name,
+      media_type: input.file.type || 'application/octet-stream',
+    })
+    query.set('conversation_id', input.conversationId)
+    if (input.projectId) query.set('project_id', input.projectId)
+    const response = await this.request<ApiItem<RawAiSource>>(
+      `/ai/sources/upload?${query.toString()}`,
+      { method: 'POST', body: input.file },
+      { contentType: input.file.type || 'application/octet-stream' },
+    )
+    return mapAiSource(response.data)
+  }
+
+  async listAiSources(input: AiSourceListInput): Promise<AiSource[]> {
+    const query = new URLSearchParams({ conversation_id: input.conversationId })
+    if (input.projectId) query.set('project_id', input.projectId)
+    if (input.status) query.set('status', input.status)
+    const response = await this.request<ApiCollection<RawAiSource>>(
+      `/ai/sources?${query.toString()}`,
+    )
+    return response.data.map(mapAiSource)
+  }
+
+  async archiveAiSource(sourceId: string, input: AiSourceArchiveInput): Promise<AiSource> {
+    const response = await this.request<ApiItem<RawAiSource>>(
+      `/ai/sources/${encodeURIComponent(sourceId)}/archive`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: input.projectId,
+          expected_revision: input.expectedRevision,
+        }),
+      },
+    )
+    return mapAiSource(response.data)
+  }
+
+  async deleteAiSource(sourceId: string): Promise<void> {
+    await this.request<void>(
+      `/ai/sources/${encodeURIComponent(sourceId)}`,
+      { method: 'DELETE' },
+    )
   }
 
   async getAiAutonomy(conversationId: string): Promise<AiAutonomyView> {
@@ -3495,8 +3714,7 @@ export class RemoteHttpGateway implements MuriArcGateway {
 
   async listAiDrafts(projectId?: string, status?: AiDraftStatus): Promise<AiWriteDraft[]> {
     const query = new URLSearchParams()
-    const scopedProjectId = activeProjectId(projectId)
-    if (scopedProjectId) query.set('project_id', scopedProjectId)
+    if (projectId) query.set('project_id', projectId)
     if (status) query.set('status', status)
     const suffix = query.size ? `?${query.toString()}` : ''
     const response = await this.request<ApiCollection<AiWriteDraft>>(`/ai/approvals${suffix}`)
@@ -3527,31 +3745,29 @@ const aiEntityLabels: Record<AiEntityType, string> = {
   observation_definition: '观察定义', observation: '观察记录',
   observation_value: '观察值', experiment_template_version: '实验模板',
   experiment: '实验', cohort: '实验组', participation: '实验参与', procedure: '实验步骤',
-  measurement: '测量', sample: '样本', attachment: '附件', ai_conversation: 'AI 会话',
-  tool_run: '工具执行', approval: '审批', job: '数据任务',
+  measurement: '测量', sample: '样本', attachment: '附件',
+  project_animal_assignment: '项目动物关系', ai_conversation: 'AI 会话',
+  ai_conversation_source: 'AI 会话来源', tool_run: '工具执行', approval: '审批',
+  job: '数据任务',
 }
 
-function aiEntityRoute(entityType: AiEntityType, entityId: string): string | undefined {
+function aiEntityRoute(entityType: string, entityId: string): string | undefined {
   const encoded = encodeURIComponent(entityId)
   if (entityType === 'animal') return `/animals?animal=${encoded}`
   if (entityType === 'cage') return `/cages?focus=${encoded}`
-  if (['project', 'experiment', 'experiment_template_version', 'cohort', 'participation', 'procedure', 'experiment_event', 'observation_definition', 'observation', 'observation_value'].includes(entityType)) {
-    return `/experiments?entity=${encoded}`
-  }
-  if (['gene_locus', 'allele', 'genotype', 'genotype_definition', 'genotyping_record', 'breeding_line', 'colony', 'breeding_pair', 'breeding_pair_member', 'mating_event', 'litter', 'animal_draft', 'pedigree'].includes(entityType)) {
-    return `/breeding?entity=${encoded}`
-  }
-  if (['measurement', 'sample', 'attachment', 'job'].includes(entityType)) return `/data?entity=${encoded}`
-  if (['ai_conversation', 'tool_run', 'approval'].includes(entityType)) return '/ai'
+  // Only emit routes whose target views consume the exact focus query. A
+  // generic section URL would look actionable while silently losing context.
   return undefined
 }
 
 function mapAiCitation(raw: RawAiCitation) {
+  const entityLabel = aiEntityLabels[raw.entity_type as AiEntityType]
+    ?? `未知实体（${raw.entity_type}）`
   return {
     entityType: raw.entity_type,
     entityId: raw.entity_id,
     revision: raw.revision ?? undefined,
-    label: `${aiEntityLabels[raw.entity_type]} ${raw.entity_id.slice(0, 8)}`,
+    label: `${entityLabel} ${raw.entity_id.slice(0, 8)}`,
     route: aiEntityRoute(raw.entity_type, raw.entity_id),
   }
 }
@@ -3603,6 +3819,7 @@ function mapAiTurn(raw: RawAiTurnResponse): AiTurnResponse {
         displayOrder,
       })) ?? [],
     },
+    incompleteReason: raw.incompleteReason ?? undefined,
     autonomy: raw.autonomy ?? defaultAiAutonomy(),
   }
 }
@@ -3633,6 +3850,13 @@ function mapAiConversationDetail(raw: RawAiConversationDetail): AiConversationDe
       sequence: message.sequence,
       role: message.role,
       content: message.content,
+      sourceRefs: (message.sourceRefs ?? message.source_refs ?? []).map((source) => ({
+        sourceId: source.sourceId ?? source.source_id ?? '',
+        sourceRevision: source.sourceRevision ?? source.source_revision ?? 0,
+        fileName: source.fileName ?? source.file_name ?? '',
+        mediaType: source.mediaType ?? source.media_type ?? undefined,
+        sizeBytes: source.sizeBytes ?? source.size_bytes ?? 0,
+      })),
       response: message.response ? mapAiTurn(message.response) : undefined,
       createdAt: message.createdAt,
     })),
@@ -3642,17 +3866,45 @@ function mapAiConversationDetail(raw: RawAiConversationDetail): AiConversationDe
 function mapAiConversationSummary(raw: RawAiConversationSummary): AiConversationSummary {
   return {
     id: raw.id,
-    projectId: raw.projectId ?? undefined,
+    projectId: raw.projectId ?? raw.project_id ?? undefined,
     title: raw.title,
-    modelProfileId: raw.modelProfileId ?? undefined,
-    modelProfileVersion: raw.modelProfileVersion ?? undefined,
-    modelProfileName: raw.modelProfileName ?? undefined,
-    modelId: raw.modelId ?? undefined,
-    readOnly: raw.readOnly ?? false,
-    readOnlyReason: raw.readOnlyReason ?? undefined,
-    createdAt: raw.createdAt,
-    updatedAt: raw.updatedAt,
+    pinnedAt: raw.pinnedAt ?? raw.pinned_at ?? undefined,
+    archivedAt: raw.archivedAt ?? raw.archived_at ?? undefined,
+    modelProfileId: raw.modelProfileId ?? raw.model_profile_id ?? undefined,
+    modelProfileVersion: raw.modelProfileVersion ?? raw.model_profile_version ?? undefined,
+    modelProfileName: raw.modelProfileName ?? raw.model_profile_name ?? undefined,
+    modelId: raw.modelId ?? raw.model_id ?? undefined,
+    readOnly: raw.readOnly ?? raw.read_only ?? false,
+    readOnlyReason: raw.readOnlyReason ?? raw.read_only_reason ?? undefined,
+    createdAt: raw.createdAt ?? raw.created_at ?? '',
+    updatedAt: raw.updatedAt ?? raw.updated_at ?? '',
     revision: raw.revision,
+  }
+}
+
+function mapAiSourceStatus(status: string): AiSource['status'] {
+  if (status === 'staged'
+    || status === 'ready'
+    || status === 'archived'
+    || status === 'failed'
+    || status === 'expired') {
+    return status
+  }
+  throw new GatewayError('服务端返回了无法识别的 AI 来源状态', 'invalid_ai_source_status')
+}
+
+function mapAiSource(raw: RawAiSource): AiSource {
+  return {
+    id: raw.id,
+    conversationId: raw.conversationId ?? raw.conversation_id ?? undefined,
+    projectId: raw.projectId ?? raw.project_id ?? undefined,
+    fileName: raw.fileName ?? raw.file_name ?? '未命名文件',
+    mediaType: raw.mediaType ?? raw.media_type ?? 'application/octet-stream',
+    sizeBytes: raw.sizeBytes ?? raw.size_bytes ?? 0,
+    status: mapAiSourceStatus(raw.status),
+    revision: raw.revision,
+    createdAt: raw.createdAt ?? raw.created_at ?? '',
+    expiresAt: raw.expiresAt ?? raw.expires_at ?? '',
   }
 }
 
@@ -4199,20 +4451,22 @@ function mapJob(raw: RawJob): DataJob {
   const progress = raw.progress_total && raw.progress_total > 0
     ? Math.round(raw.progress_current / raw.progress_total * 100)
     : raw.status === 'completed' ? 100 : 0
+  const kind = raw.kind === 'bulk_operation' ? 'import' : raw.kind
+  const kindName = kind === 'import' ? '导入任务' : kind === 'export' ? '导出任务' : '快照任务'
   return {
     id: raw.id,
-    name: raw.idempotency_key,
-    kind: raw.kind === 'bulk_operation' ? 'import' : raw.kind,
+    name: `${kindName} ${raw.id.slice(0, 8)}`,
+    kind,
     status: raw.status === 'completed' ? 'completed'
       : raw.status === 'awaiting_confirmation' ? 'needs-review'
         : raw.status === 'queued' ? 'queued'
           : raw.status === 'failed' ? 'failed'
             : raw.status === 'cancelled' ? 'cancelled' : 'running',
     progress,
-    createdAt: new Date(raw.meta.created_at).toLocaleString('zh-CN'),
+    createdAt: new Date(raw.created_at).toLocaleString('zh-CN'),
     detail: raw.status === 'failed' ? '任务执行失败，请查看报告'
       : raw.status === 'cancelled' ? '任务已取消'
-        : raw.result ? '任务已生成结果' : '任务处理中',
+        : raw.result_available ? '任务已生成结果' : '任务处理中',
   }
 }
 
@@ -4390,6 +4644,23 @@ function mapAppliedAiExtraction(raw: unknown): AppliedAiExtraction {
 }
 
 const clone = <T>(value: T): T => structuredClone(value)
+const DEMO_AI_SOURCE_IMAGE_MEDIA_TYPES = new Set([
+  'image/jpeg',
+  'image/png',
+  'image/tiff',
+])
+
+function isDemoAiSourceImage(source: AiSource): boolean {
+  const mediaType = source.mediaType.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+  if (DEMO_AI_SOURCE_IMAGE_MEDIA_TYPES.has(mediaType)) return true
+  if (mediaType && mediaType !== 'application/octet-stream') return false
+  const extension = source.fileName.split('.').at(-1)?.toLowerCase()
+  return extension === 'png'
+    || extension === 'jpg'
+    || extension === 'jpeg'
+    || extension === 'tif'
+    || extension === 'tiff'
+}
 
 class DemoDomainStore {
   cages = clone(seedCages)
@@ -4638,6 +4909,19 @@ class DemoDomainStore {
 
 const pause = (duration: number) => new Promise((resolve) => globalThis.setTimeout(resolve, duration))
 
+function compareAiConversations(left: AiConversationSummary, right: AiConversationSummary): number {
+  const pinOrder = Number(Boolean(right.pinnedAt)) - Number(Boolean(left.pinnedAt))
+  return pinOrder || right.updatedAt.localeCompare(left.updatedAt)
+}
+
+interface DemoConversationModelBinding {
+  profileId: string
+  profileVersion: number
+  profileName: string
+  modelId: string
+  supportsVision: boolean
+}
+
 function assertDemoObservationValue(
   definition: ObservationDefinition,
   value: ObservationValueData,
@@ -4655,7 +4939,9 @@ export class DemoGateway implements MuriArcGateway {
   readonly displayName = '浏览器演示数据'
   private readonly store = new DemoDomainStore()
   private readonly aiConversations = new Map<string, AiConversationDetail>()
+  private readonly aiSources = new Map<string, AiSource>()
   private readonly aiConversationAutonomy = new Map<string, AiAutonomyView>()
+  private readonly aiConversationModels = new Map<string, DemoConversationModelBinding>()
   private readonly privateImages: PrivateImageRecord[] = []
   private readonly privateImageFiles = new Map<string, Blob>()
   private readonly aiExtractions: AiExtractionRecord[] = []
@@ -5954,7 +6240,7 @@ export class DemoGateway implements MuriArcGateway {
     const conversation: AiConversationSummary = {
       id: crypto.randomUUID(),
       projectId: input.projectId,
-      title: '新会话',
+      title: input.title,
       modelProfileId: profile.id,
       modelProfileVersion: profile.currentVersion,
       modelProfileName: profile.name,
@@ -5972,13 +6258,31 @@ export class DemoGateway implements MuriArcGateway {
     }
     this.aiConversations.set(conversation.id, { conversation, messages: [] })
     this.aiConversationAutonomy.set(conversation.id, autonomy)
+    this.aiConversationModels.set(conversation.id, {
+      profileId: profile.id,
+      profileVersion: profile.currentVersion,
+      profileName: profile.name,
+      modelId: profile.modelId,
+      supportsVision: profile.supportsVision,
+    })
     return clone({ conversation, autonomy })
   }
   async aiTurn(input: AiTurnInput): Promise<AiTurnResponse> {
     await pause(80)
-    const conversationId = input.conversationId ?? crypto.randomUUID()
-    const detail = this.aiConversations.get(conversationId)
-    if (input.conversationId && !detail) throw new Error('AI 会话不存在')
+    const governed = this.requireWritableAiConversation(input.conversationId, input.projectId)
+    const { detail, model: conversationModel, autonomy } = governed
+    const conversationId = detail.conversation.id
+    const selectedSources = (input.sourceRefs ?? []).map((sourceId) => {
+      const source = this.aiSources.get(sourceId)
+      if (!source
+        || source.conversationId !== conversationId
+        || source.projectId !== detail.conversation.projectId
+        || source.status !== 'ready'
+        || Date.parse(source.expiresAt) <= Date.now()) {
+        throw new Error('所选 AI 文件已失效，请重新上传')
+      }
+      return source
+    })
     const imageIds = input.imageIds ?? []
     if (imageIds.length > 8 || new Set(imageIds).size !== imageIds.length) {
       throw new Error('每轮最多使用 8 张不重复的图片')
@@ -5991,10 +6295,17 @@ export class DemoGateway implements MuriArcGateway {
       if (!image) throw new Error('图片证据不存在或不属于当前会话')
       return { imageId: id, sha256: image.sha256, displayOrder }
     })
-    const conversationProfile = this.store.aiModelProfiles.find((profile) =>
-      profile.id === detail?.conversation.modelProfileId)
+    const sourceImageCount = selectedSources.filter(isDemoAiSourceImage).length
+    const visualInputCount = imageIds.length + sourceImageCount
+    if (visualInputCount > 8) {
+      throw new Error('每轮最多使用 8 个图片输入')
+    }
+    if (input.visionModelProfileId
+      && (!visualInputCount || conversationModel.supportsVision)) {
+      throw new Error('视觉模型只能用于需要中转的图片证据')
+    }
     let visionProfile: AiModelProfileView | undefined
-    if (imageIds.length && !conversationProfile?.supportsVision) {
+    if (visualInputCount && !conversationModel.supportsVision) {
       const profileId = input.visionModelProfileId
         ?? this.store.aiModelDefaults.defaultVisionProfileId
       visionProfile = this.store.aiModelProfiles.find((profile) =>
@@ -6010,8 +6321,14 @@ export class DemoGateway implements MuriArcGateway {
     }
     const response: AiTurnResponse = {
       conversationId,
-      content: imageIds.length
-        ? `已按${visionProfile ? '视觉中转' : '当前模型直接视觉'}路径读取 ${imageIds.length} 张演示图片。浏览器演示不会调用真实 Provider。`
+      content: input.sourceRefs?.length || imageIds.length
+        ? [
+            input.sourceRefs?.length ? `已收到 ${input.sourceRefs.length} 个演示文件` : undefined,
+            visualInputCount
+              ? `已按${visionProfile ? '视觉中转' : '当前模型直接视觉'}路径读取 ${visualInputCount} 张演示图片`
+              : undefined,
+            '浏览器演示不会调用真实 Provider、解析正式附件或写入正式数据库。',
+          ].filter(Boolean).join('；')
         : '演示数据中有 1 只动物的基因型仍待确认。浏览器演示不会读取正式数据库，也不会创建写入草稿。',
       citations: [citation],
       toolRuns: [{
@@ -6029,7 +6346,7 @@ export class DemoGateway implements MuriArcGateway {
           trimmedHistoryTurns: 0,
           trimReasons: [],
         },
-        stages: imageIds.length
+        stages: visualInputCount
           ? visionProfile
             ? [
                 {
@@ -6042,20 +6359,20 @@ export class DemoGateway implements MuriArcGateway {
                   totalTokens: 0,
                 },
                 {
-                  profileId: conversationProfile?.id ?? '',
-                  profileVersion: conversationProfile?.currentVersion ?? 0,
+                  profileId: conversationModel.profileId,
+                  profileVersion: conversationModel.profileVersion,
                   purpose: 'final_answer',
-                  modelId: conversationProfile?.modelId,
+                  modelId: conversationModel.modelId,
                   inputTokens: 0,
                   outputTokens: 0,
                   totalTokens: 0,
                 },
               ]
             : [{
-                profileId: conversationProfile?.id ?? '',
-                profileVersion: conversationProfile?.currentVersion ?? 0,
+                profileId: conversationModel.profileId,
+                profileVersion: conversationModel.profileVersion,
                 purpose: 'vision_and_final',
-                modelId: conversationProfile?.modelId,
+                modelId: conversationModel.modelId,
                 inputTokens: 0,
                 outputTokens: 0,
                 totalTokens: 0,
@@ -6063,25 +6380,9 @@ export class DemoGateway implements MuriArcGateway {
           : [],
         imageEvidence,
       },
-      autonomy: clone(this.aiConversationAutonomy.get(conversationId) ?? defaultAiAutonomy()),
+      autonomy: clone(autonomy),
     }
-    let conversationDetail = detail
-    if (!conversationDetail) {
-      conversationDetail = {
-        conversation: {
-          id: conversationId,
-          projectId: input.projectId,
-          title: input.message.trim().slice(0, 80) || '新会话',
-          readOnly: false,
-          createdAt: now,
-          updatedAt: now,
-          revision: 0,
-        },
-        messages: [],
-      }
-      this.aiConversations.set(conversationId, conversationDetail)
-      this.aiConversationAutonomy.set(conversationId, defaultAiAutonomy())
-    }
+    const conversationDetail = detail
     if (!conversationDetail.messages.length && conversationDetail.conversation.title === '新会话') {
       conversationDetail.conversation.title = input.message.trim().slice(0, 80) || '新会话'
     }
@@ -6130,9 +6431,25 @@ export class DemoGateway implements MuriArcGateway {
     await pause(20)
     return [...this.aiConversations.values()]
       .map((detail) => detail.conversation)
+      .filter((conversation) => !conversation.archivedAt)
       .filter((conversation) => !projectId || conversation.projectId === projectId)
-      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .sort(compareAiConversations)
       .slice(0, limit)
+      .map(clone)
+  }
+  async queryAiConversations(input: AiConversationListInput = {}) {
+    await pause(20)
+    const query = input.titleQuery?.trim().toLocaleLowerCase()
+    return [...this.aiConversations.values()]
+      .map((detail) => detail.conversation)
+      .filter((conversation) => !input.projectId || conversation.projectId === input.projectId)
+      .filter((conversation) => {
+        if ((input.archive ?? 'active') === 'all') return true
+        return (input.archive === 'archived') === Boolean(conversation.archivedAt)
+      })
+      .filter((conversation) => !query || conversation.title.toLocaleLowerCase().includes(query))
+      .sort(compareAiConversations)
+      .slice(0, input.limit ?? 100)
       .map(clone)
   }
   async getAiConversation(conversationId: string, limit = 200) {
@@ -6143,6 +6460,133 @@ export class DemoGateway implements MuriArcGateway {
       conversation: detail.conversation,
       messages: detail.messages.slice(-limit),
     })
+  }
+  async updateAiConversation(
+    conversationId: string,
+    input: AiConversationUpdateInput,
+  ): Promise<AiConversationSummary> {
+    await pause(20)
+    const detail = this.aiConversations.get(conversationId)
+    if (!detail || detail.conversation.revision !== input.expectedRevision) {
+      throw new Error('AI 会话已变化，请刷新后重试')
+    }
+    const now = new Date().toISOString()
+    if (input.action === 'rename') {
+      const title = input.title?.trim()
+      if (!title) throw new Error('会话标题不能为空')
+      detail.conversation.title = title.slice(0, 120)
+    } else if (input.action === 'pin') {
+      detail.conversation.pinnedAt = now
+    } else if (input.action === 'unpin') {
+      detail.conversation.pinnedAt = undefined
+    } else if (input.action === 'archive') {
+      detail.conversation.archivedAt = now
+    } else {
+      detail.conversation.archivedAt = undefined
+    }
+    detail.conversation.updatedAt = now
+    detail.conversation.revision += 1
+    return clone(detail.conversation)
+  }
+  async uploadAiSource(input: AiSourceUploadInput): Promise<AiSource> {
+    await pause(40)
+    const { detail } = this.requireWritableAiConversation(
+      input.conversationId,
+      input.projectId,
+    )
+    const conversation = detail.conversation
+    const now = new Date().toISOString()
+    const source: AiSource = {
+      id: crypto.randomUUID(),
+      conversationId: input.conversationId,
+      projectId: conversation.projectId,
+      fileName: input.file.name,
+      mediaType: input.file.type || 'application/octet-stream',
+      sizeBytes: input.file.size,
+      status: 'ready',
+      revision: 1,
+      createdAt: now,
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    }
+    this.aiSources.set(source.id, source)
+    return clone(source)
+  }
+  private requireWritableAiConversation(
+    conversationId: string,
+    projectId?: string,
+  ): {
+    detail: AiConversationDetail
+    model: DemoConversationModelBinding
+    autonomy: AiAutonomyView
+  } {
+    const detail = this.aiConversations.get(conversationId)
+    if (!detail) throw new Error('AI 会话不存在')
+    const conversation = detail.conversation
+    if (conversation.archivedAt) throw new Error('已归档的 AI 会话为只读')
+    if (conversation.readOnly) throw new Error('AI 会话为只读，当前模型不可用')
+    if (projectId !== undefined && projectId !== conversation.projectId) {
+      throw new Error('AI 会话不存在或文件范围不匹配')
+    }
+
+    const model = this.aiConversationModels.get(conversationId)
+    const liveProfile = model
+      ? this.store.aiModelProfiles.find((profile) => profile.id === model.profileId)
+      : undefined
+    if (!model
+      || conversation.modelProfileId !== model.profileId
+      || conversation.modelProfileVersion !== model.profileVersion
+      || conversation.modelProfileName !== model.profileName
+      || conversation.modelId !== model.modelId
+      || !liveProfile
+      || liveProfile.currentVersion < model.profileVersion) {
+      conversation.readOnly = true
+      conversation.readOnlyReason = 'model_unavailable'
+      conversation.revision += 1
+      throw new Error('会话绑定的模型不可用')
+    }
+    if (liveProfile.archivedAt) {
+      conversation.readOnly = true
+      conversation.readOnlyReason = 'model_archived'
+      conversation.revision += 1
+      throw new Error('会话绑定的模型已归档')
+    }
+
+    const autonomy = this.aiConversationAutonomy.get(conversationId)
+    if (!autonomy) {
+      conversation.readOnly = true
+      conversation.readOnlyReason = 'model_unavailable'
+      conversation.revision += 1
+      throw new Error('AI 会话治理状态不可用')
+    }
+    return { detail, model, autonomy }
+  }
+  async listAiSources(input: AiSourceListInput): Promise<AiSource[]> {
+    await pause(20)
+    return clone([...this.aiSources.values()].filter((source) =>
+      source.conversationId === input.conversationId
+      && source.projectId === input.projectId
+      && (!input.status || source.status === input.status)))
+  }
+  async archiveAiSource(sourceId: string, input: AiSourceArchiveInput): Promise<AiSource> {
+    await pause(20)
+    const source = this.aiSources.get(sourceId)
+    if (!source
+      || source.projectId !== input.projectId
+      || source.revision !== input.expectedRevision
+      || (source.status !== 'staged' && source.status !== 'ready')) {
+      throw new Error('AI 来源已变化或不能归档')
+    }
+    source.status = 'archived'
+    source.revision += 1
+    return clone(source)
+  }
+  async deleteAiSource(sourceId: string): Promise<void> {
+    await pause(20)
+    const source = this.aiSources.get(sourceId)
+    if (source?.status === 'archived' || source?.status === 'expired') {
+      throw new Error('已归档或过期的 AI 来源不能作为暂存文件删除')
+    }
+    this.aiSources.delete(sourceId)
   }
   async listAiDrafts() { return [] }
   async getAiDraft(_draftId: string): Promise<AiWriteDraft> { throw new Error('演示模式没有正式 AI 草稿') }

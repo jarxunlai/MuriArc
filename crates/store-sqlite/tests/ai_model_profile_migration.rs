@@ -48,6 +48,16 @@ async fn sqlite_model_profile_migration_supports_fresh_database_and_ledger_repla
             .await
             .expect("migration ledger must be readable");
     assert_eq!(
+        MIGRATOR.iter().count(),
+        28,
+        "the merged SQLite migration set must contain 28 files (version 0005 is intentionally absent)"
+    );
+    assert_eq!(
+        MIGRATOR.iter().map(|migration| migration.version).max(),
+        Some(29),
+        "the merged SQLite migration set must end at 0029"
+    );
+    assert_eq!(
         ledger,
         (
             i64::try_from(MIGRATOR.iter().count()).unwrap(),

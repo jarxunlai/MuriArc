@@ -1,19 +1,229 @@
 <script setup lang="ts">
-import { computed,onMounted,ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { ImagePlus, Images, ScanSearch, ShieldCheck } from '@lucide/vue'
 import { useMessage } from 'naive-ui'
 import PageHeader from '@/components/PageHeader.vue'
-import { gateway,type AiExtractionRecord,type PrivateImageRecord } from '@/services/gateway'
-const msg=useMessage(),images=ref<PrivateImageRecord[]>([]),drafts=ref<AiExtractionRecord[]>([]),projects=ref<Array<{id:string;name:string}>>([]),experiments=ref<Array<{id:string;projectId:string;name:string}>>([]),events=ref<Array<{id:string;experimentId:string;label:string}>>([]),project=ref<string>(),experiment=ref<string>(),event=ref<string>(),selectedImage=ref<string>(),busy=ref(false)
-const projectOptions=computed(()=>projects.value.map(x=>({label:x.name,value:x.id}))),experimentOptions=computed(()=>experiments.value.filter(x=>x.projectId===project.value).map(x=>({label:x.name,value:x.id}))),eventOptions=computed(()=>events.value.filter(x=>x.experimentId===experiment.value).map(x=>({label:x.label,value:x.id})))
-async function load(){if(!gateway.listPrivateImages)return;images.value=await gateway.listPrivateImages();drafts.value=await gateway.listAiExtractions?.(project.value)??[]}
-async function upload(ev:Event){const files=Array.from((ev.target as HTMLInputElement).files??[]);if(files.reduce((n,f)=>n+f.size,0)>500*1024*1024){msg.error('单批总量不能超过 500 MiB');return}busy.value=true;for(const file of files){try{await gateway.uploadPrivateImage?.(file)}catch(e){msg.error(file.name+'：'+(e instanceof Error?e.message:'上传失败'))}}busy.value=false;await load()}
-async function extract(){if(!selectedImage.value||!project.value||!experiment.value||!event.value||!gateway.createAiExtraction)return;busy.value=true;try{await gateway.createAiExtraction({private_image_id:selectedImage.value,project_id:project.value,experiment_id:experiment.value,experiment_event_id:event.value});msg.success('已生成结构化草稿，请核对置信度和单元格差异');await load()}catch(e){msg.error(e instanceof Error?e.message:'提取失败')}finally{busy.value=false}}
-async function approve(d:AiExtractionRecord){if(!gateway.approveAiExtraction)return;busy.value=true;try{await gateway.approveAiExtraction(d.id,d.meta.revision,d.items.map((_,i)=>i));msg.success('已原子写入 Observation、Audit 与 Provenance');await load()}catch(e){msg.error(e instanceof Error?e.message:'批准失败')}finally{busy.value=false}}
-onMounted(async()=>{[projects.value,experiments.value]=await Promise.all([gateway.listProjects(),gateway.listExperiments()]);for(const x of experiments.value){events.value.push(...await gateway.listExperimentEvents(x.id))}project.value=projects.value[0]?.id;await load()})
+import {
+  gateway,
+  type AiExtractionRecord,
+  type PrivateImageRecord,
+} from '@/services/gateway'
+
+const toast = useMessage()
+const images = ref<PrivateImageRecord[]>([])
+const drafts = ref<AiExtractionRecord[]>([])
+const projects = ref<Array<{ id: string; name: string }>>([])
+const projectId = ref<string | null>(null)
+const busy = ref(false)
+const errorMessage = ref('')
+const fileInput = ref<HTMLInputElement | null>(null)
+const localPreviewUrls = new Map<string, string>()
+
+const projectOptions = computed(() => projects.value.map((project) => ({
+  label: project.name,
+  value: project.id,
+})))
+
+function releaseLocalPreviews() {
+  for (const previewUrl of localPreviewUrls.values()) URL.revokeObjectURL(previewUrl)
+  localPreviewUrls.clear()
+}
+
+async function previewFor(image: PrivateImageRecord) {
+  if (image.previewHref) return image.previewHref
+  if (!gateway.readPrivateImage) return ''
+  const content = await gateway.readPrivateImage(image.image.id)
+  const previewUrl = URL.createObjectURL(content)
+  localPreviewUrls.set(image.image.id, previewUrl)
+  return previewUrl
+}
+
+async function load() {
+  if (!gateway.listPrivateImages) return
+  errorMessage.value = ''
+  releaseLocalPreviews()
+  const [loadedImages, loadedDrafts] = await Promise.all([
+    gateway.listPrivateImages(undefined, projectId.value ?? undefined),
+    gateway.listAiExtractions?.(projectId.value ?? undefined) ?? [],
+  ])
+  images.value = await Promise.all(loadedImages.map(async (image) => ({
+    ...image,
+    previewHref: await previewFor(image).catch(() => ''),
+  })))
+  drafts.value = loadedDrafts
+}
+
+function chooseImages() {
+  fileInput.value?.click()
+}
+
+async function upload(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  if (!gateway.uploadPrivateImage || !files.length) return
+  if (files.length > 8) {
+    errorMessage.value = '每批最多上传 8 张图片'
+    return
+  }
+  const allowed = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif'])
+  const invalid = files.find((file) =>
+    !allowed.has(file.type.toLowerCase()) || !file.size || file.size > 100 * 1024 * 1024)
+  if (invalid) {
+    errorMessage.value = `${invalid.name} 必须是小于 100 MiB 的 JPEG、PNG、WebP 或 GIF`
+    return
+  }
+  busy.value = true
+  errorMessage.value = ''
+  try {
+    for (const file of files) await gateway.uploadPrivateImage(file)
+    toast.success(`已上传 ${files.length} 张私人图片`)
+    await load()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '上传失败'
+  } finally {
+    busy.value = false
+  }
+}
+
+function formatValue(value: unknown) {
+  if (value === null || value === undefined) return '—'
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value)
+  }
+  return JSON.stringify(value)
+}
+
+function statusLabel(status: string) {
+  return {
+    active: '可用',
+    processing: '处理中',
+    pending_approval: '待审批',
+    archived: '已归档',
+    failed: '失败',
+    expired: '已过期',
+    approved: '已批准',
+    rejected: '已拒绝',
+  }[status] ?? status
+}
+
+onMounted(async () => {
+  projects.value = await gateway.listProjects()
+  await load()
+})
+onUnmounted(releaseLocalPreviews)
 </script>
-<template><div class="page"><PageHeader title="私人 AI 图片" description="按用户/会话隔离；未归档图片从最后活动起保留 30 天，运行中与待审批图片不清理。"/>
-<section class="controls surface"><label class="pick">上传图片<input type="file" multiple accept="image/*,.tif,.tiff,.heic,.heif" capture="environment" @change="upload"/></label><n-select v-model:value="project" :options="projectOptions" placeholder="项目"/><n-select v-model:value="experiment" :options="experimentOptions" placeholder="实验"/><n-select v-model:value="event" :options="eventOptions" placeholder="采集节点"/><n-button type="primary" :loading="busy" :disabled="!selectedImage||!event" @click="extract">视觉提取</n-button></section>
-<section class="images"><article v-for="x in images" :key="x.image.id" class="surface" :class="{selected:selectedImage===x.image.id}" @click="selectedImage=x.image.id"><img :src="x.previewHref"/><strong>{{x.fileName}}</strong><span>{{(x.sizeBytes/1048576).toFixed(1)}} MiB · {{x.retentionDays}} 天后到期</span><n-tag size="small">{{x.image.status}}</n-tag></article><n-empty v-if="!images.length" description="尚未上传私人图片"/></section>
-<h2>提取草稿</h2><section class="drafts"><article v-for="d in drafts" :key="d.id" class="surface"><header><strong>{{d.status}}</strong><span>{{d.items.length}} 个候选值</span></header><div v-for="(x,i) in d.items" :key="i" class="diff"><span>{{x.source_label??x.observation.definition_id}}</span><code>{{JSON.stringify(x.value.value)}}</code><n-progress type="line" :percentage="Math.round(x.confidence*100)" :show-indicator="true"/></div><n-button v-if="d.status==='pending_approval'||d.status==='draft'" type="primary" :loading="busy" @click="approve(d)">批准全部选中项并写回</n-button></article></section>
-</div></template>
-<style scoped>.controls{display:grid;grid-template-columns:auto repeat(3,minmax(130px,1fr)) auto;gap:9px;padding:12px;margin-bottom:12px}.pick{display:flex;align-items:center;padding:0 14px;border-radius:7px;color:#fff;background:var(--muri-primary);cursor:pointer}.pick input{display:none}.images{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:9px}.images article{display:flex;padding:9px;flex-direction:column;gap:5px;cursor:pointer}.images article.selected{outline:2px solid var(--muri-primary)}.images img{width:100%;height:150px;object-fit:cover;border-radius:6px}.images span,.drafts span{color:var(--muri-text-tertiary);font-size:11px}.drafts{display:grid;gap:10px}.drafts article{padding:14px}.drafts header{display:flex;justify-content:space-between}.diff{display:grid;grid-template-columns:1fr 1fr 180px;gap:10px;padding:8px 0;border-bottom:1px solid var(--muri-border)}@media(max-width:800px){.controls{grid-template-columns:1fr}.images{grid-template-columns:1fr 1fr}.diff{grid-template-columns:1fr}.images img{height:130px}}@media(max-width:460px){.images{grid-template-columns:1fr}}</style>
+
+<template>
+  <div class="page">
+    <PageHeader
+      title="私人 AI 图片"
+      description="图片按用户与会话隔离；只有经人工批准的数据录入才会提升为项目正式附件。"
+    >
+      <template #actions>
+        <n-button type="primary" :loading="busy" @click="chooseImages">
+          <template #icon><ImagePlus :size="17" /></template>
+          上传图片
+        </n-button>
+      </template>
+    </PageHeader>
+
+    <input
+      ref="fileInput"
+      class="visually-hidden"
+      type="file"
+      multiple
+      accept="image/jpeg,image/png,image/webp,image/gif"
+      aria-label="上传私人 AI 图片"
+      @change="upload"
+    >
+
+    <section class="image-boundary surface">
+      <div>
+        <ShieldCheck :size="17" />
+        <span>
+          未归档图片从最后活动起保留 30 天；处理中与待审批图片不会清理。AI 不能直接把私人图片写入项目资料。
+        </span>
+      </div>
+      <n-select
+        v-model:value="projectId"
+        :options="projectOptions"
+        clearable
+        filterable
+        placeholder="全部私人图片"
+        aria-label="按科研项目筛选私人图片"
+        @update:value="load"
+      />
+    </section>
+
+    <p v-if="errorMessage" class="page-error" role="alert" aria-live="assertive">
+      {{ errorMessage }}
+    </p>
+
+    <section class="image-grid" aria-label="私人图片列表">
+      <article v-for="entry in images" :key="entry.image.id" class="surface image-card">
+        <img
+          v-if="entry.previewHref"
+          :src="entry.previewHref"
+          :alt="`私人图片：${entry.fileName}`"
+        >
+        <div v-else class="preview-unavailable"><Images :size="28" />无法预览</div>
+        <div class="image-copy">
+          <strong>{{ entry.fileName }}</strong>
+          <small>{{ (entry.sizeBytes / 1048576).toFixed(1) }} MiB · SHA {{ entry.sha256.slice(0, 12) }}</small>
+          <small>{{ entry.retentionDays }} 天后到期</small>
+        </div>
+        <n-tag size="small">{{ statusLabel(entry.image.status) }}</n-tag>
+      </article>
+      <n-empty v-if="!images.length" description="尚未上传私人图片" />
+    </section>
+
+    <section class="extraction-history">
+      <header>
+        <div><ScanSearch :size="18" /><h2>数据单元识别记录</h2></div>
+        <span>{{ drafts.length }} 项</span>
+      </header>
+      <div class="draft-list">
+        <article v-for="draft in drafts" :key="draft.id" class="surface draft-card">
+          <header>
+            <div>
+              <strong>{{ statusLabel(draft.status) }}</strong>
+              <small>
+                {{ draft.evidence.length }} 张证据
+                · 模型 v{{ draft.modelTrace?.profileVersion ?? '—' }}
+                · revision {{ draft.revision }}
+              </small>
+            </div>
+            <n-tag
+              size="small"
+              :type="draft.status === 'approved' ? 'success' : 'warning'"
+            >{{ statusLabel(draft.status) }}</n-tag>
+          </header>
+          <div v-for="candidate in draft.candidates" :key="candidate.itemIndex" class="candidate-row">
+            <span>{{ candidate.sourceLabel ?? draft.currentDataCell?.definitionId }}</span>
+            <code>{{ formatValue(candidate.value.value) }}</code>
+            <n-progress
+              type="line"
+              :percentage="Math.round(candidate.confidence * 100)"
+              :show-indicator="true"
+            />
+          </div>
+          <p v-if="draft.status === 'pending_approval'">
+            请回到对应实验的“录入实验数据”窗口编辑并批准；此页面不会绕过当前数据单元确认。
+          </p>
+        </article>
+        <n-empty v-if="!drafts.length" description="尚无图片识别候选" />
+      </div>
+    </section>
+  </div>
+</template>
+
+<style scoped>
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.image-boundary { display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, 260px); align-items: center; gap: 14px; margin-bottom: 12px; padding: 12px; }.image-boundary > div { display: flex; align-items: flex-start; gap: 7px; color: var(--muri-text-secondary); font-size: 11px; line-height: 1.55; }.image-boundary svg { flex: 0 0 auto; margin-top: 1px; color: var(--muri-primary); }
+.page-error { margin: 0 0 12px; padding: 8px 10px; border: 1px solid #efd0d0; border-radius: 7px; color: var(--muri-danger); background: #fff7f7; font-size: 11px; }
+.image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(205px, 1fr)); gap: 10px; }.image-card { position: relative; display: flex; min-width: 0; padding: 9px; flex-direction: column; gap: 7px; }.image-card > img,.preview-unavailable { width: 100%; height: 150px; border-radius: 7px; object-fit: cover; }.preview-unavailable { display: grid; place-content: center; gap: 5px; color: var(--muri-text-tertiary); background: var(--muri-surface-muted); text-align: center; font-size: 11px; }.image-copy { display: flex; min-width: 0; flex-direction: column; }.image-copy strong,.image-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.image-copy strong { color: var(--muri-text); font-size: 12px; }.image-copy small { color: var(--muri-text-tertiary); font-size: 10px; }.image-card :deep(.n-tag) { align-self: flex-start; }
+.extraction-history { margin-top: 22px; }.extraction-history > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }.extraction-history > header > div { display: flex; align-items: center; gap: 7px; }.extraction-history h2 { margin: 0; font-size: 17px; }.extraction-history svg { color: var(--muri-primary); }.extraction-history > header > span { color: var(--muri-text-tertiary); font-size: 11px; }.draft-list { display: grid; gap: 10px; }.draft-card { padding: 14px; }.draft-card > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }.draft-card > header > div { display: flex; min-width: 0; flex-direction: column; }.draft-card small { color: var(--muri-text-tertiary); font-size: 10px; }.candidate-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(100px, 1fr) minmax(150px, 220px); align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--muri-border); }.candidate-row span { color: var(--muri-text-secondary); font-size: 11px; }.candidate-row code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.draft-card > p { margin: 10px 0 0; color: var(--muri-text-secondary); font-size: 11px; }
+@media (max-width: 768px) { .image-boundary { grid-template-columns: minmax(0, 1fr); }.candidate-row { grid-template-columns: minmax(0, 1fr); }.image-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 430px) { .image-grid { grid-template-columns: minmax(0, 1fr); }.image-card > img,.preview-unavailable { height: 180px; } }
+</style>

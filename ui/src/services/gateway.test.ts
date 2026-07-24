@@ -1742,4 +1742,74 @@ describe('browser demo gateway', () => {
     expect((await gateway.listObservationValues(first.observation.id)).map((value) => value.version))
       .toEqual([1, 2])
   })
+
+  it('keeps demo extraction pending, releases every image on reject, and promotes on approval', async () => {
+    const gateway = new DemoGateway()
+    const experiment = (await gateway.listExperiments()).find((entry) => entry.id === 'exp-001')!
+    const event = await gateway.createExperimentEvent({
+      experimentId: experiment.id,
+      eventKey: 'vision_contract',
+      label: 'Vision contract',
+    })
+    const definition = await gateway.createObservationDefinition({
+      experimentId: experiment.id,
+      key: 'vision_contract_value',
+      label: '视觉候选',
+      valueType: 'number',
+      unit: 'g',
+      policy: 'versioned',
+    })
+    const profile = (await gateway.listAiModelProfiles()).find((entry) =>
+      entry.supportsVision && !entry.archivedAt)!
+    const imageBytes = new TextEncoder().encode('portable-image')
+    const imageFile = {
+      name: 'vision.png',
+      type: 'image/png',
+      size: imageBytes.byteLength,
+      arrayBuffer: async () => imageBytes.buffer,
+      slice: () => new Blob([imageBytes], { type: 'image/png' }),
+    } as unknown as File
+    const image = await gateway.uploadPrivateImage(imageFile)
+    const createInput = {
+      imageIds: [image.image.id],
+      projectId: experiment.projectId,
+      experimentId: experiment.id,
+      experimentEventId: event.id,
+      currentDataCell: {
+        definitionId: definition.id,
+        subjectType: 'experiment' as const,
+        subjectId: experiment.id,
+      },
+      visionModelProfileId: profile.id,
+    }
+
+    const pending = await gateway.createAiExtraction(createInput)
+    expect(pending.candidates[0].selected).toBe(false)
+    expect(pending.modelTrace?.purpose).toBe('vision')
+    expect((await gateway.listPrivateImages()).find((entry) =>
+      entry.image.id === image.image.id)?.image.status).toBe('pending_approval')
+
+    const rejected = await gateway.rejectAiExtraction(pending.id, {
+      expectedRevision: pending.revision,
+    })
+    expect(rejected.status).toBe('rejected')
+    expect((await gateway.listPrivateImages()).find((entry) =>
+      entry.image.id === image.image.id)?.image.status).toBe('active')
+
+    const second = await gateway.createAiExtraction(createInput)
+    const applied = await gateway.approveAiExtraction(second.id, {
+      expectedRevision: second.revision,
+      selections: [{
+        itemIndex: second.candidates[0].itemIndex,
+        value: { type: 'number', value: 12.5 },
+        notes: 'human checked',
+      }],
+    })
+    expect(applied.attachments).toHaveLength(1)
+    expect(applied.links).toHaveLength(1)
+    expect(applied.draft.candidates[0].selected).toBe(true)
+    expect((await gateway.listPrivateImages()).find((entry) =>
+      entry.image.id === image.image.id)?.image.status).toBe('archived')
+    await expect(gateway.readPrivateImage(image.image.id)).resolves.toBeInstanceOf(Blob)
+  })
 })

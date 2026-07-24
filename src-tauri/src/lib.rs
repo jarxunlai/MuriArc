@@ -4,6 +4,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 mod ai;
 mod ai_data_tools;
+mod ai_images;
 mod animal_details;
 mod application;
 mod data;
@@ -14,6 +15,10 @@ mod settings;
 use ai::{
     DesktopAiError, DesktopAiState, DesktopAutonomyInput, DesktopConversationStartInput,
     DesktopDraftDecisionInput, parse_uuid,
+};
+use ai_images::{
+    ApproveAiExtractionInput, ArchivePrivateAiImageInput, CreateAiExtractionInput,
+    PrivateImageContent, PrivateImageView, RejectAiExtractionInput, UploadPrivateAiImageInput,
 };
 use animal_details::{
     AlleleView, AnimalDetailView, CreateAlleleInput, CreateAnimalSampleInput, CreateGeneLocusInput,
@@ -926,6 +931,89 @@ async fn ai_turn(
 }
 
 #[tauri::command]
+async fn list_private_ai_images(
+    state: tauri::State<'_, DesktopAiState>,
+    conversation_id: Option<uuid::Uuid>,
+    project_id: Option<uuid::Uuid>,
+) -> CommandResult<Vec<PrivateImageView>> {
+    state
+        .list_private_images(conversation_id, project_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn upload_private_ai_image(
+    state: tauri::State<'_, DesktopAiState>,
+    input: UploadPrivateAiImageInput,
+) -> CommandResult<PrivateImageView> {
+    state.upload_private_image(input).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn read_private_ai_image(
+    state: tauri::State<'_, DesktopAiState>,
+    id: uuid::Uuid,
+) -> CommandResult<PrivateImageContent> {
+    state.read_private_image(id).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn archive_private_ai_image(
+    state: tauri::State<'_, DesktopAiState>,
+    id: uuid::Uuid,
+    input: ArchivePrivateAiImageInput,
+) -> CommandResult<PrivateImageView> {
+    state
+        .archive_private_image(id, input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn list_ai_extractions(
+    state: tauri::State<'_, DesktopAiState>,
+    project_id: Option<uuid::Uuid>,
+) -> CommandResult<Vec<muriarc_core::AiExtractionDraft>> {
+    state
+        .list_ai_extractions(project_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn create_ai_extraction(
+    state: tauri::State<'_, DesktopAiState>,
+    input: CreateAiExtractionInput,
+) -> CommandResult<muriarc_core::AiExtractionDraft> {
+    state.create_ai_extraction(input).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn approve_ai_extraction(
+    state: tauri::State<'_, DesktopAiState>,
+    id: uuid::Uuid,
+    input: ApproveAiExtractionInput,
+) -> CommandResult<muriarc_core::AppliedAiExtraction> {
+    state
+        .approve_ai_extraction(id, input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn reject_ai_extraction(
+    state: tauri::State<'_, DesktopAiState>,
+    id: uuid::Uuid,
+    input: RejectAiExtractionInput,
+) -> CommandResult<muriarc_core::AiExtractionDraft> {
+    state
+        .reject_ai_extraction(id, input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
 async fn list_ai_conversations(
     state: tauri::State<'_, DesktopAiState>,
     project_id: Option<String>,
@@ -1226,6 +1314,14 @@ pub fn run() {
             declare_ai_full_startup,
             start_ai_conversation,
             ai_turn,
+            list_private_ai_images,
+            upload_private_ai_image,
+            read_private_ai_image,
+            archive_private_ai_image,
+            list_ai_extractions,
+            create_ai_extraction,
+            approve_ai_extraction,
+            reject_ai_extraction,
             list_ai_conversations,
             get_ai_conversation,
             get_ai_autonomy,

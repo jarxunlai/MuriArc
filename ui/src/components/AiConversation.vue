@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, reactive, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
 import {
   AlertTriangle,
@@ -9,8 +9,11 @@ import {
   CornerDownLeft,
   Database,
   FileSignature,
+  ImagePlus,
   Layers3,
+  ScanSearch,
   ShieldCheck,
+  Trash2,
   UserRound,
   X,
 } from '@lucide/vue'
@@ -21,6 +24,8 @@ const props = withDefaults(defineProps<{ compact?: boolean }>(), { compact: fals
 const ai = useAiAssistant()
 const toast = useMessage()
 const scrollArea = ref<HTMLElement | null>(null)
+const imageInput = ref<HTMLInputElement | null>(null)
+const releaseImageComposer = ai.retainImageComposer()
 const statements = reactive<Record<string, string>>({})
 const signed = reactive<Record<string, boolean>>({})
 const reinforcedConfirmed = reactive<Record<string, boolean>>({})
@@ -62,6 +67,8 @@ const visibleDrafts = computed(() => {
   for (const draft of ai.conversationDrafts.value) drafts.set(draft.id, draft)
   return [...drafts.values()]
 })
+const canSend = computed(() =>
+  Boolean(ai.composerDraft.value.trim() || ai.stagedImages.value.length))
 
 const requirementLabels: Record<AiWriteDraft['requirement'], string> = {
   preview_confirmation: '预览确认',
@@ -94,7 +101,7 @@ function closeFullModal() {
 
 async function send(value = ai.composerDraft.value) {
   const normalized = value.trim()
-  if (!normalized || ai.busy.value) return
+  if ((!normalized && !ai.stagedImages.value.length) || ai.busy.value) return
   if (ai.composerDisabledReason.value) {
     toast.error(ai.composerDisabledReason.value)
     return
@@ -107,6 +114,30 @@ async function send(value = ai.composerDraft.value) {
     await ai.send(normalized)
   } catch (error) {
     toast.error(error instanceof Error ? error.message : '无法开始 AI 会话')
+  }
+}
+
+function openImagePicker() {
+  imageInput.value?.click()
+}
+
+function selectImages(event: Event) {
+  const input = event.target as HTMLInputElement
+  const files = Array.from(input.files ?? [])
+  input.value = ''
+  if (!files.length) return
+  try {
+    ai.stageImages(files)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法暂存图片')
+  }
+}
+
+function selectVisionModel(profileId: string | null) {
+  try {
+    ai.selectVisionModel(profileId ?? undefined)
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法选择视觉模型')
   }
 }
 
@@ -241,6 +272,8 @@ watch(() => ai.messages.value.length, async () => {
   await nextTick()
   scrollArea.value?.scrollTo({ top: scrollArea.value.scrollHeight, behavior: 'smooth' })
 })
+
+onUnmounted(releaseImageComposer)
 </script>
 
 <template>
@@ -295,6 +328,14 @@ watch(() => ai.messages.value.length, async () => {
         </div>
         <div class="bubble" :class="{ pending: entry.pending, error: entry.error }">
           <p>{{ entry.content }}</p>
+          <div v-if="entry.images?.length" class="message-images" aria-label="本轮图片证据">
+            <img
+              v-for="image in entry.images"
+              :key="image.id"
+              :src="image.previewHref"
+              :alt="`本轮图片：${image.fileName}`"
+            />
+          </div>
           <div v-if="entry.citations?.length" class="citations" aria-label="数据引用">
             <template v-for="citation in entry.citations" :key="`${citation.entityType}-${citation.entityId}`">
               <router-link v-if="citation.route" :to="citation.route">{{ citation.label }}</router-link>
@@ -310,6 +351,30 @@ watch(() => ai.messages.value.length, async () => {
             <div class="tool-list">
               <span v-for="run in entry.toolRuns" :key="run.toolRunId">
                 {{ run.tool }} · {{ run.outcome === 'read' ? '只读' : '写入草稿' }}
+              </span>
+            </div>
+          </details>
+          <details
+            v-if="entry.trace?.stages?.length || entry.trace?.imageEvidence?.length"
+            class="tool-trace"
+          >
+            <summary>
+              <ChevronDown :size="14" />
+              视觉与最终模型 Trace
+              <small>{{ entry.trace.imageEvidence?.length ?? 0 }} 张证据</small>
+            </summary>
+            <div class="tool-list">
+              <span v-for="stage in entry.trace.stages ?? []" :key="`${stage.profileId}-${stage.purpose}`">
+                {{ stage.purpose === 'vision_and_final'
+                  ? '直接视觉'
+                  : stage.purpose === 'vision_observation'
+                    ? '视觉观察'
+                    : '最终回答' }}
+                · v{{ stage.profileVersion }}
+                · {{ stage.totalTokens }} tokens
+              </span>
+              <span v-for="evidence in entry.trace.imageEvidence ?? []" :key="evidence.imageId">
+                图片 {{ evidence.displayOrder + 1 }} · SHA {{ evidence.sha256.slice(0, 12) }}
               </span>
             </div>
           </details>
@@ -404,6 +469,72 @@ watch(() => ai.messages.value.length, async () => {
     </div>
 
     <div class="composer">
+      <section
+        v-if="ai.stagedImages.value.length"
+        class="image-staging"
+        aria-label="待发送图片"
+      >
+        <div class="image-staging-heading">
+          <span><ImagePlus :size="15" />暂存图片 {{ ai.stagedImages.value.length }}/8</span>
+          <small>仅发送成功后清空</small>
+        </div>
+        <div class="staged-image-list">
+          <article v-for="image in ai.stagedImages.value" :key="image.localId">
+            <img :src="image.previewUrl" :alt="`待发送图片：${image.file.name}`" />
+            <div>
+              <strong>{{ image.file.name }}</strong>
+              <small v-if="image.status === 'uploading'">正在上传…</small>
+              <small v-else-if="image.status === 'ready'">已安全暂存</small>
+              <small v-else-if="image.status === 'error'" class="image-error">
+                {{ image.error }}
+              </small>
+              <small v-else>{{ (image.file.size / 1048576).toFixed(1) }} MiB</small>
+            </div>
+            <button
+              type="button"
+              :aria-label="`移除图片 ${image.file.name}`"
+              :disabled="ai.busy.value"
+              @click="ai.removeStagedImage(image.localId)"
+            >
+              <Trash2 :size="15" />
+            </button>
+          </article>
+        </div>
+        <div class="vision-route">
+          <template v-if="ai.visionRoute.value === 'direct'">
+            <ScanSearch :size="15" />
+            <span>
+              当前对话模型支持视觉，将直接读取图片并回答。
+            </span>
+          </template>
+          <template v-else>
+            <label for="chat-vision-model">
+              <ScanSearch :size="15" />
+              <span>视觉中转模型</span>
+            </label>
+            <n-select
+              id="chat-vision-model"
+              size="small"
+              :value="ai.selectedVisionModelProfileId.value ?? null"
+              :options="ai.visionModelOptions.value"
+              :disabled="ai.busy.value"
+              clearable
+              placeholder="必须明确选择"
+              aria-label="聊天图片视觉中转模型"
+              @update:value="selectVisionModel"
+            />
+            <small>视觉模型只生成受控观察，最终回答仍由当前对话模型完成。</small>
+          </template>
+        </div>
+      </section>
+      <p
+        v-if="ai.imageStageError.value"
+        class="image-stage-error"
+        role="alert"
+        aria-live="assertive"
+      >
+        {{ ai.imageStageError.value }}
+      </p>
       <div class="suggestions">
         <button
           v-for="item in suggestions"
@@ -423,6 +554,25 @@ watch(() => ai.messages.value.length, async () => {
         <span>{{ ai.composerDisabledReason.value }}</span>
       </div>
       <div class="input-wrap">
+        <input
+          ref="imageInput"
+          class="visually-hidden"
+          type="file"
+          multiple
+          accept="image/jpeg,image/png,image/webp,image/gif"
+          aria-label="选择最多八张聊天图片"
+          @change="selectImages"
+        />
+        <n-button
+          quaternary
+          circle
+          :disabled="ai.busy.value || Boolean(ai.conversationReadOnlyReason.value)"
+          aria-label="添加聊天图片"
+          data-testid="ai-image-picker"
+          @click="openImagePicker"
+        >
+          <template #icon><ImagePlus :size="18" /></template>
+        </n-button>
         <textarea
           v-model="ai.composerDraft.value"
           data-testid="ai-composer-input"
@@ -434,7 +584,7 @@ watch(() => ai.messages.value.length, async () => {
         <n-button
           type="primary"
           circle
-          :disabled="!ai.composerDraft.value.trim() || ai.busy.value || Boolean(ai.composerDisabledReason.value)"
+          :disabled="!canSend || ai.busy.value || Boolean(ai.composerDisabledReason.value)"
           aria-label="发送"
           data-testid="ai-composer-send"
           @click="send()"
@@ -530,21 +680,26 @@ watch(() => ai.messages.value.length, async () => {
 .message { display: flex; align-items: flex-start; gap: 10px; max-width: 760px; margin: 0 auto 16px; }.message.user { flex-direction: row-reverse; }
 .avatar { display: grid; flex: 0 0 30px; width: 30px; height: 30px; place-items: center; border: 1px solid var(--muri-border); border-radius: 50%; color: var(--muri-primary); background: white; }.user .avatar { color: var(--muri-text-secondary); }
 .bubble { max-width: min(82%, 640px); padding: 10px 13px; border: 1px solid var(--muri-border); border-radius: 4px 12px 12px; background: var(--muri-surface-muted); line-height: 1.65; }.user .bubble { border-color: #c8deef; border-radius: 12px 4px 12px 12px; background: var(--muri-primary-soft); }.bubble.error { border-color: #efd0d0; color: var(--muri-danger); background: #fff7f7; }.bubble.pending { color: var(--muri-text-secondary); animation: soft-pulse 1.3s ease-in-out infinite; }.bubble p { margin: 0; white-space: pre-wrap; }
+.message-images { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 6px; margin-top: 9px; }.message-images img { width: 100%; height: 112px; border: 1px solid var(--muri-border); border-radius: 7px; object-fit: cover; }
 .citations { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }.citations a, .citations span { padding: 3px 8px; border-radius: 999px; color: var(--muri-primary); background: white; font-size: 12px; }
 .tool-trace { margin-top: 9px; border-top: 1px solid var(--muri-border); padding-top: 7px; }.tool-trace summary { display: flex; align-items: center; gap: 5px; color: var(--muri-text-tertiary); cursor: pointer; font-size: 11px; list-style: none; }.tool-trace summary small { margin-left: auto; }.tool-trace[open] summary svg { transform: rotate(180deg); }.tool-list { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }.tool-list span { padding: 3px 6px; border-radius: 4px; background: white; color: var(--muri-text-secondary); font-family: ui-monospace, monospace; font-size: 10px; }
 .draft-section { max-width: 760px; margin: 22px auto 0; }.draft-section-title { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; color: var(--muri-text); font-weight: 650; }.draft-section-title svg { color: var(--muri-primary); }
 .draft-card { margin-bottom: 10px; padding: 13px; border: 1px solid #c8deef; border-radius: 9px; background: #fbfdff; }.draft-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }.draft-card header > div { display: flex; flex-direction: column; }.draft-card header span { color: var(--muri-text-tertiary); font-size: 11px; }.diff-list { margin: 11px 0; border: 1px solid var(--muri-border); border-radius: 6px; overflow: hidden; }.diff-row { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(80px, 1fr) 18px minmax(80px, 1fr); gap: 6px; align-items: center; padding: 7px 9px; border-bottom: 1px solid var(--muri-border); font-size: 11px; }.diff-row:last-child { border-bottom: 0; }.diff-row code { overflow: hidden; color: var(--muri-text-secondary); text-overflow: ellipsis; }.diff-row .before { color: var(--muri-danger); text-decoration: line-through; }.diff-row .after { color: var(--muri-success); }.arrow { color: var(--muri-text-tertiary); text-align: center; }
 .signature-box { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }.draft-actions { display: flex; gap: 8px; margin-top: 10px; }
 .composer { padding: 12px 18px 16px; border-top: 1px solid var(--muri-border); background: white; }.suggestions { display: flex; gap: 7px; max-width: 760px; margin: 0 auto 8px; overflow-x: auto; scrollbar-width: none; }.suggestions button { flex: 0 0 auto; padding: 5px 9px; border: 1px solid var(--muri-border); border-radius: 999px; color: var(--muri-text-secondary); background: white; cursor: pointer; transition: border-color var(--muri-transition-fast), color var(--muri-transition-fast); }.suggestions button:hover { border-color: var(--muri-primary); color: var(--muri-primary); }
+.image-staging { display: grid; max-width: 760px; gap: 8px; margin: 0 auto 10px; padding: 10px; border: 1px solid var(--muri-border); border-radius: 9px; background: var(--muri-surface-muted); }.image-staging-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: var(--muri-text-secondary); font-size: 11px; }.image-staging-heading > span { display: flex; align-items: center; gap: 5px; color: var(--muri-text); font-weight: 650; }.image-staging-heading svg { color: var(--muri-primary); }.image-staging-heading small { color: var(--muri-text-tertiary); }
+.staged-image-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 7px; }.staged-image-list article { display: grid; min-width: 0; grid-template-columns: 46px minmax(0, 1fr) 30px; align-items: center; gap: 7px; padding: 6px; border: 1px solid var(--muri-border); border-radius: 7px; background: white; }.staged-image-list img { width: 46px; height: 46px; border-radius: 5px; object-fit: cover; }.staged-image-list article > div { display: flex; min-width: 0; flex-direction: column; }.staged-image-list strong, .staged-image-list small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.staged-image-list strong { color: var(--muri-text); font-size: 11px; }.staged-image-list small { color: var(--muri-text-tertiary); font-size: 10px; }.staged-image-list small.image-error { color: var(--muri-danger); }.staged-image-list button { display: grid; width: 30px; height: 30px; padding: 0; place-items: center; border: 0; border-radius: 6px; color: var(--muri-text-tertiary); background: transparent; cursor: pointer; transition: color var(--muri-transition-fast), background var(--muri-transition-fast); }.staged-image-list button:hover { color: var(--muri-danger); background: #fff1f1; }.staged-image-list button:focus-visible { outline: 3px solid rgba(15, 95, 170, .22); outline-offset: 1px; }.staged-image-list button:disabled { cursor: wait; opacity: .55; }
+.vision-route { display: grid; grid-template-columns: auto minmax(160px, 260px) minmax(150px, 1fr); align-items: center; gap: 7px; color: var(--muri-text-secondary); font-size: 11px; }.vision-route > svg { color: var(--muri-primary); }.vision-route > label { display: flex; align-items: center; gap: 5px; color: var(--muri-text); font-weight: 600; }.vision-route > label svg { color: var(--muri-primary); }.vision-route > small { color: var(--muri-text-tertiary); line-height: 1.45; }.image-stage-error { max-width: 760px; margin: 0 auto 8px; color: var(--muri-danger); font-size: 11px; }
 .suggestions button:focus-visible { outline: 3px solid rgba(15, 95, 170, .2); outline-offset: 1px; }.suggestions button:disabled { color: var(--muri-text-tertiary); background: var(--muri-surface-muted); cursor: not-allowed; opacity: .7; }
 .composer-blocked { display: flex; max-width: 760px; min-width: 0; align-items: flex-start; gap: 6px; margin: 0 auto 8px; padding: 7px 9px; border: 1px solid #efd8b7; border-radius: 7px; color: #8a5515; background: #fffaf2; font-size: 11px; line-height: 1.45; }.composer-blocked svg { flex: 0 0 auto; margin-top: 1px; }
 .input-wrap { display: flex; align-items: flex-end; gap: 8px; max-width: 760px; margin: 0 auto; padding: 8px; border: 1px solid var(--muri-border-strong); border-radius: 10px; transition: border-color var(--muri-transition-fast), box-shadow var(--muri-transition-fast); }.input-wrap:focus-within { border-color: var(--muri-primary); box-shadow: 0 0 0 3px rgba(15, 95, 170, 0.1); }textarea { flex: 1; min-height: 42px; max-height: 130px; padding: 3px 5px; resize: none; border: 0; outline: 0; color: var(--muri-text); background: transparent; line-height: 1.5; }.safety-note { display: flex; align-items: center; justify-content: center; gap: 5px; margin-top: 7px; color: var(--muri-text-tertiary); font-size: 11px; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .compact .message-list { padding: 16px 14px; }.compact .composer { padding: 10px 12px 12px; }.compact .suggestions { max-width: 100%; }
 .autonomy-modal { width: min(520px, calc(100vw - 28px)); }.autonomy-boundary-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }.autonomy-boundary-list span { padding: 4px 8px; border-radius: 999px; color: var(--muri-primary); background: var(--muri-primary-soft); font-size: 12px; }.autonomy-modal :deep(.n-checkbox) { margin-top: 14px; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .native-confirmation-note { display: flex; align-items: flex-start; gap: 6px; margin: 0 0 2px; color: var(--muri-text-secondary); font-size: 12px; line-height: 1.5; }.native-confirmation-note svg { flex: 0 0 auto; margin-top: 2px; color: var(--muri-primary); }
 .switch-boundaries { display: grid; gap: 7px; margin: 14px 0 0; padding-left: 22px; color: var(--muri-text-secondary); line-height: 1.55; }
 @keyframes soft-pulse { 50% { opacity: 0.55; } }
-@media (max-width: 700px) { .conversation-controls { grid-template-columns: minmax(0, 1fr) minmax(104px, .48fr); }.mode-status { grid-column: 1 / -1; }.diff-row { grid-template-columns: 1fr 18px 1fr; }.diff-row code { grid-column: 1 / -1; }.draft-card { padding: 11px; } }
-@media (max-width: 430px) { .message-list { padding: 14px 10px; }.context-strip { padding: 9px; }.conversation-controls { grid-template-columns: minmax(0, 1fr); }.mode-status { grid-column: auto; }.composer { padding-inline: 10px; }.safety-note { align-items: flex-start; text-align: center; }.bubble { max-width: calc(100% - 40px); overflow-wrap: anywhere; } }
+@media (max-width: 700px) { .conversation-controls { grid-template-columns: minmax(0, 1fr) minmax(104px, .48fr); }.mode-status { grid-column: 1 / -1; }.diff-row { grid-template-columns: 1fr 18px 1fr; }.diff-row code { grid-column: 1 / -1; }.draft-card { padding: 11px; }.vision-route { grid-template-columns: auto minmax(0, 1fr); }.vision-route > small { grid-column: 1 / -1; } }
+@media (max-width: 430px) { .message-list { padding: 14px 10px; }.context-strip { padding: 9px; }.conversation-controls { grid-template-columns: minmax(0, 1fr); }.mode-status { grid-column: auto; }.composer { padding-inline: 10px; }.safety-note { align-items: flex-start; text-align: center; }.bubble { max-width: calc(100% - 40px); overflow-wrap: anywhere; }.staged-image-list { grid-template-columns: minmax(0, 1fr); }.image-staging-heading { align-items: flex-start; flex-direction: column; }.message-images { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (prefers-reduced-motion: reduce) { .bubble.pending { animation: none; }.tool-trace summary svg { transition: none; } }
 </style>

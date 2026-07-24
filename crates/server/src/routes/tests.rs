@@ -5,6 +5,7 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use http_body_util::BodyExt;
 use muriarc_core::{
     Actor, AiScope, Animal, AnimalEvent, AnimalEventKind, Attachment, AuditContext, Cage,
@@ -2582,7 +2583,11 @@ async fn server_measurement_import_uses_experiment_project_and_creates_drafts() 
 #[tokio::test]
 async fn private_ai_images_are_owner_scoped_and_admin_bearer_requires_a_view_session() {
     let fixture = Fixture::new(None).await;
-    let content = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01";
+    let content = STANDARD
+        .decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        )
+        .unwrap();
     let upload = fixture
         .app
         .clone()
@@ -2592,7 +2597,7 @@ async fn private_ai_images_are_owner_scoped_and_admin_bearer_requires_a_view_ses
                 .uri("/api/v1/ai/images/upload?file_name=private.png&media_type=image%2Fpng")
                 .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
                 .header(header::CONTENT_TYPE, "image/png")
-                .body(Body::from(content.as_slice()))
+                .body(Body::from(content.clone()))
                 .unwrap(),
         )
         .await

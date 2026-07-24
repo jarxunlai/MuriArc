@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::{Attachment, Observation, ObservationValueRecord, RecordMeta};
+use crate::{
+    AiModelPurpose, Attachment, Observation, ObservationSubjectType, ObservationValueData,
+    ObservationValueRecord, RecordMeta,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +142,95 @@ pub enum AiExtractionStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiObservationDataCell {
+    pub definition_id: Uuid,
+    pub subject_type: ObservationSubjectType,
+    pub subject_id: Uuid,
+}
+
+impl AiObservationDataCell {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.definition_id.is_nil() || self.subject_id.is_nil() {
+            Err("extraction data cell identifiers must not be nil")
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn matches(&self, observation: &Observation) -> bool {
+        self.definition_id == observation.definition_id
+            && self.subject_type == observation.subject_type
+            && self.subject_id == observation.subject_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiExtractionEvidence {
+    pub display_order: i32,
+    pub private_image_id: Uuid,
+    pub private_attachment_id: Uuid,
+    pub promoted_attachment_id: Option<Uuid>,
+    pub original_sha256: String,
+    pub sanitized_sha256: String,
+    pub meta: RecordMeta,
+}
+
+impl AiExtractionEvidence {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.display_order < 0
+            || self.private_image_id.is_nil()
+            || self.private_attachment_id.is_nil()
+            || self
+                .promoted_attachment_id
+                .is_some_and(|value| value.is_nil())
+            || self
+                .promoted_attachment_id
+                .is_some_and(|value| value != self.private_attachment_id)
+            || !is_sha256(&self.original_sha256)
+            || !is_sha256(&self.sanitized_sha256)
+            || self.meta.deleted_at.is_some()
+            || self.meta.revision < 1
+        {
+            Err("AI extraction evidence is invalid")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiExtractionModelTrace {
+    pub profile_id: Uuid,
+    pub profile_version: i64,
+    pub purpose: AiModelPurpose,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub provider_request_id: Option<String>,
+    pub trace: Value,
+}
+
+impl AiExtractionModelTrace {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.profile_id.is_nil()
+            || self.profile_version < 1
+            || self.purpose != AiModelPurpose::Vision
+            || self.total_tokens < self.input_tokens.saturating_add(self.output_tokens)
+            || self
+                .provider_request_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 256)
+            || !self.trace.is_object()
+            || serde_json::to_vec(&self.trace).map_or(true, |encoded| encoded.len() > 16 * 1024)
+        {
+            Err("AI extraction model trace is invalid")
+        } else {
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiExtractionItem {
     pub observation: Observation,
@@ -152,6 +244,11 @@ impl AiExtractionItem {
     pub fn validate(&self) -> Result<(), &'static str> {
         if !self.confidence.is_finite() || !(0.0..=1.0).contains(&self.confidence) {
             return Err("extraction confidence must be between zero and one");
+        }
+        if self.source_label.as_ref().is_some_and(|label| {
+            label.trim().is_empty() || label.len() > 512 || label.chars().any(char::is_control)
+        }) {
+            return Err("extraction source label is invalid");
         }
         self.observation
             .validate()
@@ -180,6 +277,12 @@ pub struct AiExtractionDraft {
     pub provider: String,
     pub model: String,
     pub tool_run_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_cell: Option<AiObservationDataCell>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<AiExtractionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_trace: Option<AiExtractionModelTrace>,
     pub status: AiExtractionStatus,
     pub items: Vec<AiExtractionItem>,
     pub error_code: Option<String>,
@@ -196,13 +299,63 @@ impl AiExtractionDraft {
             || self.experiment_event_id.is_nil()
             || self.private_image_id.is_nil()
             || self.attachment_id.is_nil()
-            || self.image_sha256.len() != 64
+            || !is_sha256(&self.image_sha256)
             || self.provider.trim().is_empty()
+            || self.provider.len() > 128
             || self.model.trim().is_empty()
+            || self.model.len() > 256
             || self.items.is_empty()
             || self.items.len() > 500
         {
             return Err("AI extraction draft metadata is invalid");
+        }
+        let uses_versioned_evidence =
+            self.data_cell.is_some() || !self.evidence.is_empty() || self.model_trace.is_some();
+        if uses_versioned_evidence {
+            let cell = self
+                .data_cell
+                .as_ref()
+                .ok_or("AI extraction data cell is required")?;
+            let trace = self
+                .model_trace
+                .as_ref()
+                .ok_or("AI extraction model trace is required")?;
+            cell.validate()?;
+            trace.validate()?;
+            if self.evidence.is_empty() || self.evidence.len() > 8 {
+                return Err("AI extraction evidence count must be between one and eight");
+            }
+            let mut private_images = std::collections::BTreeSet::new();
+            let mut private_attachments = std::collections::BTreeSet::new();
+            for (index, evidence) in self.evidence.iter().enumerate() {
+                evidence.validate()?;
+                if evidence.display_order != index as i32
+                    || !private_images.insert(evidence.private_image_id)
+                    || !private_attachments.insert(evidence.private_attachment_id)
+                {
+                    return Err("AI extraction evidence order and identifiers must be unique");
+                }
+            }
+            let first = &self.evidence[0];
+            if (
+                self.private_image_id,
+                self.attachment_id,
+                &self.image_sha256,
+            ) != (
+                first.private_image_id,
+                first.private_attachment_id,
+                &first.original_sha256,
+            ) {
+                return Err("legacy extraction image fields must match first evidence");
+            }
+            if self.items.len() > 20 {
+                return Err("AI extraction candidate count is too large");
+            }
+            for item in &self.items {
+                if !cell.matches(&item.observation) {
+                    return Err("AI extraction candidate changed its bound data cell");
+                }
+            }
         }
         for item in &self.items {
             item.validate()?;
@@ -219,9 +372,71 @@ impl AiExtractionDraft {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiExtractionApprovalSelection {
+    pub item_index: usize,
+    pub value: ObservationValueData,
+    pub notes: Option<String>,
+}
+
+impl AiExtractionApprovalSelection {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if matches!(self.value, ObservationValueData::Number(value) if !value.is_finite())
+            || self.notes.as_ref().is_some_and(|value| value.len() > 4_000)
+        {
+            Err("AI extraction approval edit is invalid")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiExtractionApprovalInput {
+    pub expected_revision: i64,
+    pub selections: Vec<AiExtractionApprovalSelection>,
+}
+
+impl AiExtractionApprovalInput {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.expected_revision < 1 || self.selections.is_empty() || self.selections.len() > 20 {
+            return Err("AI extraction approval metadata is invalid");
+        }
+        let mut indexes = std::collections::BTreeSet::new();
+        for selection in &self.selections {
+            selection.validate()?;
+            if !indexes.insert(selection.item_index) {
+                return Err("AI extraction approval indexes must be unique");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiExtractionRejectionInput {
+    pub expected_revision: i64,
+}
+
+impl AiExtractionRejectionInput {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.expected_revision < 1 {
+            Err("AI extraction rejection revision is invalid")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppliedAiExtraction {
     pub draft: AiExtractionDraft,
     pub observations: Vec<Observation>,
+    pub attachments: Vec<Attachment>,
+    pub links: Vec<AttachmentLink>,
+}
+
+fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -314,10 +529,15 @@ pub trait WorkspaceStore: Send + Sync {
     async fn apply_ai_extraction_draft(
         &self,
         id: Uuid,
-        expected_revision: i64,
-        selected_indexes: &[usize],
+        approval: &AiExtractionApprovalInput,
         audit: &crate::AuditContext,
     ) -> crate::StoreResult<AppliedAiExtraction>;
+    async fn reject_ai_extraction_draft(
+        &self,
+        id: Uuid,
+        rejection: &AiExtractionRejectionInput,
+        audit: &crate::AuditContext,
+    ) -> crate::StoreResult<AiExtractionDraft>;
     /// Records a workspace boundary operation that does not otherwise mutate a
     /// domain row (for example entering an administrator-only private view).
     async fn record_workspace_operation(

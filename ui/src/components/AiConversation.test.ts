@@ -1,5 +1,15 @@
 import { flushPromises, mount } from '@vue/test-utils'
-import { create, NAlert, NButton, NCheckbox, NInput, NModal, NSelect, NTag } from 'naive-ui'
+import {
+  create,
+  NAlert,
+  NButton,
+  NCheckbox,
+  NInput,
+  NModal,
+  NProgress,
+  NSelect,
+  NTag,
+} from 'naive-ui'
 import { computed, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -42,6 +52,12 @@ function assistantFixture(mode: 'local' | 'remote' = 'local') {
   const conversationId = ref<string | undefined>('conversation-1')
   const requestedMode = ref<'ask' | 'auto' | 'full'>('ask')
   const composerDraft = ref('')
+  const stagedImages = ref<Array<{
+    localId: string
+    file: File
+    previewUrl: string
+    status: 'staged'
+  }>>([])
   const disabledReason = ref<string>()
   const autonomy = ref<AiAutonomyView>({
     mode: 'ask',
@@ -56,6 +72,8 @@ function assistantFixture(mode: 'local' | 'remote' = 'local') {
     pendingDrafts: ref<AiWriteDraft[]>([]),
     conversationDrafts,
     composerDraft,
+    stagedImages,
+    imageStageError: ref<string>(),
     contextTitle: ref('实验数据'),
     selectedProject: computed(() => ({ id: 'project-1', name: 'DEMO' })),
     conversationId,
@@ -64,6 +82,11 @@ function assistantFixture(mode: 'local' | 'remote' = 'local') {
       { label: '主对话模型 · model-primary', value: 'profile-1', disabled: false },
       { label: '备用模型 · model-secondary', value: 'profile-2', disabled: false },
     ]),
+    selectedVisionModelProfileId: ref<string | undefined>('vision-profile-1'),
+    visionModelOptions: computed(() => [
+      { label: '视觉模型 · vision-model', value: 'vision-profile-1' },
+    ]),
+    visionRoute: computed(() => stagedImages.value.length ? 'relay' : 'none'),
     loadingModels: ref(false),
     requestedMode,
     autonomy,
@@ -83,6 +106,10 @@ function assistantFixture(mode: 'local' | 'remote' = 'local') {
     updateAutonomy: vi.fn(),
     modelSwitchNeedsConfirmation: vi.fn(() => false),
     selectModel: vi.fn(),
+    selectVisionModel: vi.fn(),
+    stageImages: vi.fn(),
+    removeStagedImage: vi.fn(),
+    retainImageComposer: vi.fn(() => () => undefined),
     decideDraft: vi.fn().mockResolvedValue({
       draft: { ...conversationDrafts.value[0], status: 'applied', revision: 3 },
       jobId: 'job-1',
@@ -91,7 +118,9 @@ function assistantFixture(mode: 'local' | 'remote' = 'local') {
   }
 }
 
-const naive = create({ components: [NAlert, NButton, NCheckbox, NInput, NModal, NSelect, NTag] })
+const naive = create({
+  components: [NAlert, NButton, NCheckbox, NInput, NModal, NProgress, NSelect, NTag],
+})
 
 async function fillStatementAndCheckbox(wrapper: ReturnType<typeof mount>) {
   await wrapper

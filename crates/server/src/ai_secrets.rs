@@ -187,6 +187,9 @@ pub struct ResolvedAiProvider {
     pub api_key: Option<SensitiveSecret>,
     pub runtime: AssistantRuntimeConfig,
     pub model_profile: AiModelProfileBinding,
+    /// Capability of this exact immutable profile version, not the current
+    /// mutable profile projection.
+    pub supports_vision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3226,6 +3229,7 @@ mod postgres {
                 api_key,
                 runtime,
                 model_profile: binding,
+                supports_vision,
             })
         }
     }

@@ -1,7 +1,7 @@
 use super::{
     ApiJson, ApiPath, ApiQuery, CollectionResponse, ItemResponse,
-    ai_api::{provider_api_error, provider_resolve_error},
-    attachment_files::{open_verified, remove_installed_object, write_object},
+    ai_api::provider_api_error,
+    attachment_files::{open_verified, remove_installed_object},
     collection, item, scope, store,
 };
 use crate::{
@@ -15,28 +15,30 @@ use axum::{
     response::Response,
     routing::{delete, get, post},
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
+use futures_util::TryStreamExt;
 use muriarc_ai::{
-    AiProvider, ChatMessage, CompletionRequest, ProviderCredentials, VisionImageInput,
-    estimate_completion_input_tokens,
+    DataCellVisionCandidate, DataCellVisionExtractionError, DataCellVisionExtractionRequest,
+    MAX_SANITIZED_VISION_INPUT_BYTES, MAX_VISION_TOTAL_BASE64_BYTES, PreparedAssistantImage,
+    ProviderCredentials, extract_data_cell_vision, sanitize_vision_input,
 };
 use muriarc_core::{
-    AiExtractionDraft, AiExtractionItem, AiExtractionStatus, AppliedAiExtraction, Attachment,
+    AiExtractionApprovalInput, AiExtractionApprovalSelection, AiExtractionDraft,
+    AiExtractionEvidence, AiExtractionItem, AiExtractionModelTrace, AiExtractionRejectionInput,
+    AiExtractionStatus, AiModelPurpose, AiObservationDataCell, AppliedAiExtraction, Attachment,
     AttachmentDerivative, AuditAction, DerivativeKind, DerivativeStatus, EntityType, Observation,
-    ObservationDefinition, ObservationSubjectType, ObservationValueData, ObservationValueRecord,
+    ObservationSubjectType, ObservationValueData, ObservationValueRecord, ParticipationFilter,
     Permission, PrivateAiImage, PrivateImageFilter, PrivateImageStats, PrivateImageStatus,
     RecordMeta, StoreError,
 };
 use muriarc_data::{
-    AttachmentContentKind, AttachmentFiles, AttachmentInspectionError, MAX_ATTACHMENT_BYTES,
+    AttachmentContentKind, AttachmentFileError, AttachmentFiles, AttachmentInspectionError,
     inspect_attachment,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
-use tokio_util::io::ReaderStream;
+use std::{collections::BTreeSet, io, sync::Arc};
+use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
-const MAX_AI_INPUT_BYTES: usize = 10 * 1024 * 1024;
 
 pub(super) fn router() -> Router<AppState> {
     let upload = Router::new()
@@ -56,7 +58,8 @@ pub(super) fn router() -> Router<AppState> {
                 get(list_extractions).post(create_extraction),
             )
             .route("/ai/extractions/{id}", get(get_extraction))
-            .route("/ai/extractions/{id}/approve", post(approve_extraction)),
+            .route("/ai/extractions/{id}/approve", post(approve_extraction))
+            .route("/ai/extractions/{id}/reject", post(reject_extraction)),
     )
 }
 #[derive(Debug, Serialize)]
@@ -104,18 +107,21 @@ async fn upload(
     body: Body,
 ) -> Result<(StatusCode, Json<ItemResponse<PrivateImageView>>), ApiError> {
     ensure_human(&p, &m)?;
-    if headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some_and(|v| v > MAX_ATTACHMENT_BYTES)
-    {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "payload_too_large",
-            "image must not exceed 100 MiB",
-        )
-        .with_request_id(m.request_id));
+    if let Some(value) = headers.get(header::CONTENT_LENGTH) {
+        let size = value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                ApiError::validation("Content-Length is invalid")
+                    .with_request_id(m.request_id.clone())
+            })?;
+        if size > MAX_SANITIZED_VISION_INPUT_BYTES as u64 {
+            return Err(image_upload_too_large(&m));
+        }
+        if size == 0 {
+            return Err(image_upload_invalid(&m));
+        }
     }
     let file_name = valid_file_name(q.file_name, &m)?;
     preflight_upload_conversation(&state, &p, &m, q.conversation_id).await?;
@@ -128,22 +134,27 @@ async fn upload(
     });
     let root = attachment_root(&state, &m)?;
     let attachment_id = Uuid::new_v4();
-    let object = write_object(root.as_ref(), attachment_id, body)
+    let stream = body
+        .into_data_stream()
+        .map_err(|error| io::Error::other(error.to_string()));
+    let files = AttachmentFiles::with_limit(root.as_ref(), MAX_SANITIZED_VISION_INPUT_BYTES as u64);
+    let object = files
+        .write_reader(attachment_id, StreamReader::new(stream))
         .await
-        .map_err(|e| {
-            ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "image_upload_failed",
-                e.to_string(),
-            )
-            .with_request_id(m.request_id.clone())
-        })?;
+        .map_err(|error| image_upload_storage_error(error, &m))?;
+    if object.size_bytes == 0 {
+        remove_installed_object(root.as_ref(), &object).await.ok();
+        return Err(image_upload_invalid(&m));
+    }
     let inspection =
         match inspect_attachment(&object.absolute_path, &file_name, declared.as_deref()).await {
             Ok(v)
-                if !matches!(
+                if matches!(
                     v.kind,
-                    AttachmentContentKind::Opaque | AttachmentContentKind::Pdf
+                    AttachmentContentKind::Jpeg
+                        | AttachmentContentKind::Png
+                        | AttachmentContentKind::Webp
+                        | AttachmentContentKind::Gif
                 ) =>
             {
                 v
@@ -152,8 +163,8 @@ async fn upload(
                 remove_installed_object(root.as_ref(), &object).await.ok();
                 return Err(ApiError::new(
                     StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                    "image_required",
-                    "private AI space accepts supported images only",
+                    "image_media_type_unsupported",
+                    "private AI space accepts JPEG, PNG, WebP, or GIF images only",
                 )
                 .with_request_id(m.request_id));
             }
@@ -162,6 +173,26 @@ async fn upload(
                 return Err(inspection_error(e, &m));
             }
         };
+    let original = match tokio::fs::read(&object.absolute_path).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            remove_installed_object(root.as_ref(), &object).await.ok();
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "image_upload_failed",
+                "the uploaded image could not be validated",
+            )
+            .with_request_id(m.request_id));
+        }
+    };
+    let media_type = inspection
+        .media_type
+        .as_deref()
+        .ok_or_else(|| image_upload_invalid(&m))?;
+    if sanitize_vision_input(media_type, &original).is_err() {
+        remove_installed_object(root.as_ref(), &object).await.ok();
+        return Err(image_upload_invalid(&m));
+    }
     let now = Utc::now();
     let image_id = Uuid::new_v4();
     let a = Attachment {
@@ -305,14 +336,7 @@ async fn image_content(
             .with_request_id(m.request_id));
         }
     }
-    if image.status == PrivateImageStatus::Expired {
-        return Err(ApiError::new(
-            StatusCode::GONE,
-            "image_expired",
-            "private image retention expired",
-        )
-        .with_request_id(m.request_id));
-    }
+    ensure_private_image_readable(image.status, &m)?;
     let a = store(state.store.get_attachment(image.attachment_id), &m).await?;
     let object = open_verified(attachment_root(&state, &m)?.as_ref(), &a)
         .await
@@ -353,6 +377,30 @@ async fn image_content(
     );
     Ok(r)
 }
+
+fn ensure_private_image_readable(
+    status: PrivateImageStatus,
+    metadata: &RequestMetadata,
+) -> Result<(), ApiError> {
+    match status {
+        PrivateImageStatus::Active
+        | PrivateImageStatus::PendingApproval
+        | PrivateImageStatus::Archived => Ok(()),
+        PrivateImageStatus::Expired => Err(ApiError::new(
+            StatusCode::GONE,
+            "image_expired",
+            "private image retention expired",
+        )
+        .with_request_id(metadata.request_id.clone())),
+        PrivateImageStatus::Processing | PrivateImageStatus::Failed => Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "image_unavailable",
+            "private image content is not available in its current state",
+        )
+        .with_request_id(metadata.request_id.clone())),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArchiveInput {
@@ -508,29 +556,255 @@ async fn exit_admin_view(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(super) async fn prepare_assistant_images(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    metadata: &RequestMetadata,
+    conversation_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    image_ids: &[Uuid],
+) -> Result<Vec<PreparedAssistantImage>, ApiError> {
+    Ok(prepare_private_images(
+        state,
+        principal,
+        metadata,
+        conversation_id,
+        project_id,
+        image_ids,
+    )
+    .await?
+    .into_iter()
+    .map(|image| image.provider)
+    .collect())
+}
+
+#[derive(Debug)]
+struct PreparedPrivateImage {
+    provider: PreparedAssistantImage,
+    image: PrivateAiImage,
+    attachment: Attachment,
+}
+
+async fn prepare_private_images(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    metadata: &RequestMetadata,
+    conversation_id: Option<Uuid>,
+    project_id: Option<Uuid>,
+    image_ids: &[Uuid],
+) -> Result<Vec<PreparedPrivateImage>, ApiError> {
+    if image_ids.is_empty()
+        || image_ids.len() > muriarc_ai::MAX_VISION_IMAGES
+        || image_ids.iter().any(Uuid::is_nil)
+        || image_ids.iter().copied().collect::<BTreeSet<_>>().len() != image_ids.len()
+    {
+        return Err(image_evidence_invalid(metadata));
+    }
+    let mut prepared = Vec::with_capacity(image_ids.len());
+    let mut total_base64_bytes = 0_usize;
+    for image_id in image_ids {
+        let image = state
+            .store
+            .get_private_ai_image(*image_id)
+            .await
+            .map_err(|error| image_evidence_store_error(error, metadata))?;
+        if image.lab_id != principal.lab_id
+            || image.user_id != principal.user_id
+            || image.status != PrivateImageStatus::Active
+            || image
+                .conversation_id
+                .is_some_and(|bound| Some(bound) != conversation_id)
+            || image
+                .project_id
+                .is_some_and(|bound| Some(bound) != project_id)
+        {
+            return Err(image_evidence_invalid(metadata));
+        }
+        let attachment = state
+            .store
+            .get_attachment(image.attachment_id)
+            .await
+            .map_err(|error| image_evidence_store_error(error, metadata))?;
+        if attachment.lab_id != principal.lab_id
+            || attachment.entity_type != "ai_private_image"
+            || attachment.entity_id != image.id
+        {
+            return Err(image_evidence_invalid(metadata));
+        }
+        let media_type = attachment
+            .media_type
+            .as_deref()
+            .ok_or_else(|| image_evidence_invalid(metadata))?;
+        let bytes = ai_input_copy(state, principal, metadata, &attachment).await?;
+        let sanitized = sanitize_vision_input(media_type, &bytes)
+            .map_err(|_| image_evidence_invalid(metadata))?;
+        let provider = sanitized
+            .prepared_image(image.id)
+            .map_err(|_| image_evidence_invalid(metadata))?;
+        total_base64_bytes = total_base64_bytes
+            .checked_add(provider.provider_input().data_base64.len())
+            .ok_or_else(|| image_evidence_invalid(metadata))?;
+        if total_base64_bytes > MAX_VISION_TOTAL_BASE64_BYTES {
+            return Err(image_evidence_invalid(metadata));
+        }
+        prepared.push(PreparedPrivateImage {
+            provider,
+            image,
+            attachment,
+        });
+    }
+    Ok(prepared)
+}
+
+fn image_evidence_store_error(error: StoreError, metadata: &RequestMetadata) -> ApiError {
+    match error {
+        StoreError::NotFound { .. } => image_evidence_invalid(metadata),
+        error => ApiError::from_store(error).with_request_id(metadata.request_id.clone()),
+    }
+}
+
+fn image_evidence_invalid(metadata: &RequestMetadata) -> ApiError {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "image_evidence_invalid",
+        "one or more images are unavailable, unsafe, or outside the current conversation scope",
+    )
+    .with_request_id(metadata.request_id.clone())
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateExtractionInput {
-    private_image_id: Uuid,
+    #[serde(default)]
+    image_ids: Vec<Uuid>,
+    #[serde(default, alias = "private_image_id")]
+    private_image_id: Option<Uuid>,
     project_id: Uuid,
     experiment_id: Uuid,
     experiment_event_id: Uuid,
+    current_data_cell: ExtractionDataCellInput,
+    #[serde(default)]
+    vision_model_profile_id: Option<Uuid>,
 }
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireExtraction {
-    items: Vec<WireItem>,
+
+impl CreateExtractionInput {
+    fn normalized_image_ids(&self) -> Option<Vec<Uuid>> {
+        match (self.image_ids.is_empty(), self.private_image_id) {
+            (false, None) => Some(self.image_ids.clone()),
+            (true, Some(image_id)) => Some(vec![image_id]),
+            _ => None,
+        }
+    }
 }
+
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireItem {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExtractionDataCellInput {
     definition_id: Uuid,
     subject_type: ObservationSubjectType,
     subject_id: Uuid,
-    value: ObservationValueData,
-    confidence: f64,
-    source_label: Option<String>,
 }
+
+#[allow(clippy::too_many_arguments)]
+fn build_extraction_item(
+    candidate: DataCellVisionCandidate,
+    lab_id: Uuid,
+    user_id: Uuid,
+    project_id: Uuid,
+    experiment_id: Uuid,
+    experiment_event_id: Uuid,
+    data_cell: &AiObservationDataCell,
+    now: chrono::DateTime<Utc>,
+    metadata: &RequestMetadata,
+) -> Result<AiExtractionItem, ApiError> {
+    let (candidate_value, confidence, source_label) = candidate.into_parts();
+    let observation = Observation::new(
+        lab_id,
+        project_id,
+        experiment_id,
+        experiment_event_id,
+        data_cell.definition_id,
+        data_cell.subject_type,
+        data_cell.subject_id,
+        now,
+    )
+    .map_err(|_| invalid_vision("invalid observation", metadata))?;
+    let mut value = ObservationValueRecord::new(observation.id, 1, candidate_value, now, now)
+        .map_err(|_| invalid_vision("invalid value", metadata))?;
+    value.recorded_by = Some(user_id);
+    value.notes = Some("AI visual extraction; pending human approval".into());
+    let item = AiExtractionItem {
+        observation,
+        value,
+        confidence,
+        selected: false,
+        source_label,
+    };
+    item.validate()
+        .map_err(|_| invalid_vision("candidate is invalid", metadata))?;
+    Ok(item)
+}
+
+async fn validate_extraction_data_cell_scope(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    metadata: &RequestMetadata,
+    project_id: Uuid,
+    experiment_id: Uuid,
+    cell: &AiObservationDataCell,
+) -> Result<(), ApiError> {
+    let valid = match cell.subject_type {
+        ObservationSubjectType::Experiment => cell.subject_id == experiment_id,
+        ObservationSubjectType::Animal => !state
+            .store
+            .list_participations(&ParticipationFilter {
+                project_id,
+                experiment_id: Some(experiment_id),
+                animal_id: Some(cell.subject_id),
+                cohort_id: None,
+            })
+            .await
+            .map_err(|error| {
+                ApiError::from_store(error).with_request_id(metadata.request_id.clone())
+            })?
+            .is_empty(),
+        ObservationSubjectType::Sample => {
+            let sample = state
+                .store
+                .get_sample(cell.subject_id)
+                .await
+                .map_err(|error| data_cell_store_error(error, metadata))?;
+            (sample.lab_id, sample.project_id, sample.experiment_id)
+                == (principal.lab_id, project_id, Some(experiment_id))
+        }
+        ObservationSubjectType::Artifact => {
+            let attachment = state
+                .store
+                .get_attachment(cell.subject_id)
+                .await
+                .map_err(|error| data_cell_store_error(error, metadata))?;
+            (attachment.lab_id, attachment.project_id) == (principal.lab_id, Some(project_id))
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(data_cell_invalid(metadata))
+    }
+}
+
+fn data_cell_store_error(error: StoreError, metadata: &RequestMetadata) -> ApiError {
+    match error {
+        StoreError::NotFound { .. } => data_cell_invalid(metadata),
+        error => ApiError::from_store(error).with_request_id(metadata.request_id.clone()),
+    }
+}
+
+fn data_cell_invalid(metadata: &RequestMetadata) -> ApiError {
+    ApiError::validation("currentDataCell is outside the selected experiment scope")
+        .with_request_id(metadata.request_id.clone())
+}
+
 async fn create_extraction(
     State(state): State<AppState>,
     p: AuthPrincipal,
@@ -538,6 +812,17 @@ async fn create_extraction(
     ApiJson(q): ApiJson<CreateExtractionInput>,
 ) -> Result<(StatusCode, Json<ItemResponse<AiExtractionDraft>>), ApiError> {
     ensure_human(&p, &m)?;
+    let image_ids = q
+        .normalized_image_ids()
+        .ok_or_else(|| image_evidence_invalid(&m))?;
+    let data_cell = AiObservationDataCell {
+        definition_id: q.current_data_cell.definition_id,
+        subject_type: q.current_data_cell.subject_type,
+        subject_id: q.current_data_cell.subject_id,
+    };
+    data_cell.validate().map_err(|_| {
+        ApiError::validation("currentDataCell is invalid").with_request_id(m.request_id.clone())
+    })?;
     let experiment = scope::experiment_with_permission(
         &state,
         &p,
@@ -557,157 +842,100 @@ async fn create_extraction(
             ApiError::not_found("experiment event was not found").with_request_id(m.request_id)
         );
     }
-    let image = store(state.store.get_private_ai_image(q.private_image_id), &m).await?;
-    if image.lab_id != p.lab_id || image.user_id != p.user_id {
-        return Err(
-            ApiError::not_found("private image was not found").with_request_id(m.request_id)
-        );
-    }
-    if matches!(
-        image.status,
-        PrivateImageStatus::Processing
-            | PrivateImageStatus::PendingApproval
-            | PrivateImageStatus::Expired
-    ) {
-        return Err(
-            ApiError::conflict("private image is busy or expired").with_request_id(m.request_id)
-        );
-    }
-    let a = store(state.store.get_attachment(image.attachment_id), &m).await?;
     let defs = store(
         state.store.list_observation_definitions(q.experiment_id),
         &m,
     )
     .await?;
-    if defs.is_empty() {
+    let definition = defs
+        .iter()
+        .find(|definition| definition.id == data_cell.definition_id)
+        .ok_or_else(|| {
+            ApiError::validation("currentDataCell references an unknown observation definition")
+                .with_request_id(m.request_id.clone())
+        })?;
+    if data_cell.subject_type == ObservationSubjectType::Experiment
+        && data_cell.subject_id != q.experiment_id
+    {
         return Err(
-            ApiError::validation("experiment has no observation definitions")
+            ApiError::validation("currentDataCell experiment subject is invalid")
                 .with_request_id(m.request_id),
         );
     }
-    let bytes = ai_input_copy(&state, &p, &m, &a, q.project_id).await?;
-    if bytes.len() > MAX_AI_INPUT_BYTES {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "vision_image_too_large",
-            "derived AI input must not exceed 10 MiB",
-        )
-        .with_request_id(m.request_id));
-    }
-    let media_type = a
-        .media_type
-        .clone()
-        .filter(|v| v.starts_with("image/"))
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "vision_image_required",
-                "visual extraction requires an image",
-            )
-            .with_request_id(m.request_id.clone())
-        })?;
-    let schema=defs.iter().map(|d|serde_json::json!({"definition_id":d.id,"key":d.key,"label":d.label,"value_type":d.value_type,"unit":d.unit,"categories":d.categories})).collect::<Vec<_>>();
-    let prompt = format!(
-        "Extract only clearly visible cells mapped to these definitions: {}. Return strict JSON {{\"items\":[{{\"definition_id\":\"uuid\",\"subject_type\":\"experiment|animal|sample|artifact\",\"subject_id\":\"uuid\",\"value\":{{\"type\":\"number|text|boolean|date|category|json\",\"value\":...}},\"confidence\":0.0,\"source_label\":\"visible label\"}}]}}. Do not invent values. Experiment subject id: {}.",
-        serde_json::to_string(&schema)
-            .map_err(|_| ApiError::internal().with_request_id(m.request_id.clone()))?,
-        q.experiment_id
-    );
+    validate_extraction_data_cell_scope(&state, &p, &m, q.project_id, q.experiment_id, &data_cell)
+        .await?;
+    let images =
+        prepare_private_images(&state, &p, &m, None, Some(q.project_id), &image_ids).await?;
+    let resolved =
+        super::ai_api::resolve_turn_vision_provider(&state, &p, q.vision_model_profile_id, &m)
+            .await?;
     let ResolvedAiProvider {
         provider,
         api_key,
         runtime,
-        ..
-    } = state
-        .ai_providers
-        .resolve_vision(p.user_id)
-        .await
-        .map_err(|error| provider_resolve_error(error, &m))?;
-    let provider_id = provider.provider_id().to_owned();
-    let model = provider.model().to_owned();
+        model_profile,
+        supports_vision,
+    } = resolved;
+    if !supports_vision {
+        return Err(super::ai_api::vision_model_unavailable(&m));
+    }
     let credentials = match api_key.as_ref() {
         Some(s) => ProviderCredentials::bearer(s.as_str())
             .map_err(|_| ApiError::internal().with_request_id(m.request_id.clone()))?,
         None => ProviderCredentials::none(),
     };
-    let mut request = CompletionRequest::new(vec![ChatMessage::user_with_images(
-        prompt,
-        vec![VisionImageInput {
-            media_type,
-            data_base64: STANDARD.encode(bytes),
-        }],
-    )]);
-    request.temperature = Some(runtime.temperature);
-    request.max_output_tokens = Some(runtime.max_output_tokens);
-    let estimated_input_tokens = estimate_completion_input_tokens(&request);
-    if estimated_input_tokens > u64::from(runtime.max_input_tokens) {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "context_exceeded",
-            "the image and extraction prompt exceed the configured input token budget",
-        )
-        .with_details(serde_json::json!({
-            "estimatedInputTokens": estimated_input_tokens,
-            "inputTokenCountIsEstimate": true,
-            "maxInputTokens": runtime.max_input_tokens,
-            "currentInputTruncated": false,
-        }))
-        .with_request_id(m.request_id));
-    }
-    let response = provider
-        .complete(request, credentials)
-        .await
-        .map_err(|error| provider_api_error(error, &m))?;
-    let raw = response
-        .content
-        .ok_or_else(|| invalid_vision("provider returned no structured result", &m))?;
-    let wire: WireExtraction = serde_json::from_str(strip_json_fence(&raw))
-        .map_err(|_| invalid_vision("provider result is not valid extraction JSON", &m))?;
-    if wire.items.is_empty() || wire.items.len() > 500 {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "vision_result_empty",
-            "no reviewable values were extracted",
-        )
-        .with_request_id(m.request_id));
-    }
-    let map: HashMap<Uuid, &ObservationDefinition> = defs.iter().map(|d| (d.id, d)).collect();
+    let provider_images = images
+        .iter()
+        .map(|image| image.provider.clone())
+        .collect::<Vec<_>>();
+    let extraction = extract_data_cell_vision(
+        &provider,
+        credentials,
+        DataCellVisionExtractionRequest {
+            model_profile,
+            runtime,
+            definition,
+            images: &provider_images,
+        },
+    )
+    .await
+    .map_err(|error| data_cell_extraction_error(error, &m))?;
+    let muriarc_ai::DataCellVisionExtraction {
+        candidate,
+        model_profile,
+        provider_id,
+        model,
+        provider_request_id,
+        usage,
+        estimated_input_tokens,
+    } = extraction;
     let now = Utc::now();
-    let mut items = Vec::new();
-    for src in wire.items {
-        let def = map
-            .get(&src.definition_id)
-            .ok_or_else(|| invalid_vision("unknown observation definition", &m))?;
-        def.validate_value(&src.value)
-            .map_err(|_| invalid_vision("value type mismatch", &m))?;
-        if src.subject_type == ObservationSubjectType::Experiment
-            && src.subject_id != q.experiment_id
-        {
-            return Err(invalid_vision("invalid experiment subject", &m));
-        }
-        let observation = Observation::new(
-            p.lab_id,
-            q.project_id,
-            q.experiment_id,
-            q.experiment_event_id,
-            src.definition_id,
-            src.subject_type,
-            src.subject_id,
-            now,
-        )
-        .map_err(|_| invalid_vision("invalid observation", &m))?;
-        let mut value = ObservationValueRecord::new(observation.id, 1, src.value, now, now)
-            .map_err(|_| invalid_vision("invalid value", &m))?;
-        value.recorded_by = Some(p.user_id);
-        value.notes = Some("AI visual extraction; pending human approval".into());
-        items.push(AiExtractionItem {
-            observation,
-            value,
-            confidence: src.confidence,
-            selected: true,
-            source_label: src.source_label,
-        });
-    }
+    let candidate_item = build_extraction_item(
+        candidate,
+        p.lab_id,
+        p.user_id,
+        q.project_id,
+        q.experiment_id,
+        q.experiment_event_id,
+        &data_cell,
+        now,
+        &m,
+    )?;
+    let items = vec![candidate_item];
+    let evidence = images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| AiExtractionEvidence {
+            display_order: i32::try_from(index).unwrap_or(i32::MAX),
+            private_image_id: image.image.id,
+            private_attachment_id: image.attachment.id,
+            promoted_attachment_id: None,
+            original_sha256: image.attachment.sha256.clone(),
+            sanitized_sha256: image.provider.evidence().sanitized_sha256.clone(),
+            meta: RecordMeta::new(now),
+        })
+        .collect::<Vec<_>>();
+    let first_evidence = evidence.first().ok_or_else(|| image_evidence_invalid(&m))?;
     let draft = AiExtractionDraft {
         id: Uuid::new_v4(),
         lab_id: p.lab_id,
@@ -715,12 +943,29 @@ async fn create_extraction(
         project_id: q.project_id,
         experiment_id: q.experiment_id,
         experiment_event_id: q.experiment_event_id,
-        private_image_id: image.id,
-        attachment_id: a.id,
-        image_sha256: a.sha256,
+        private_image_id: first_evidence.private_image_id,
+        attachment_id: first_evidence.private_attachment_id,
+        image_sha256: first_evidence.original_sha256.clone(),
         provider: provider_id,
         model,
         tool_run_id: None,
+        data_cell: Some(data_cell),
+        evidence,
+        model_trace: Some(AiExtractionModelTrace {
+            profile_id: model_profile.profile_id,
+            profile_version: model_profile.profile_version,
+            purpose: AiModelPurpose::Vision,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            provider_request_id,
+            trace: serde_json::json!({
+                "purpose": "vision",
+                "imageCount": image_ids.len(),
+                "estimatedInputTokens": estimated_input_tokens,
+                "inputTokenCountIsEstimate": true,
+            }),
+        }),
         status: AiExtractionStatus::PendingApproval,
         items,
         error_code: None,
@@ -778,10 +1023,21 @@ async fn get_extraction(
     Ok(item(d, &m))
 }
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ApproveInput {
     expected_revision: i64,
+    #[serde(default)]
+    selections: Vec<ApproveSelectionInput>,
+    #[serde(default, alias = "selected_indexes")]
     selected_indexes: Vec<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApproveSelectionInput {
+    item_index: usize,
+    value: ObservationValueData,
+    notes: Option<String>,
 }
 async fn approve_extraction(
     State(state): State<AppState>,
@@ -797,25 +1053,107 @@ async fn approve_extraction(
             ApiError::not_found("extraction draft was not found").with_request_id(m.request_id)
         );
     }
-    scope::project_with_permission(
-        &state,
-        &p,
-        &m,
-        d.project_id,
+    for permission in [
         Permission::WriteMeasurementDraft,
-    )
-    .await?;
+        Permission::SignMeasurement,
+        Permission::WriteAttachment,
+    ] {
+        scope::project_with_permission(&state, &p, &m, d.project_id, permission).await?;
+    }
+    let selections = match (q.selections.is_empty(), q.selected_indexes.is_empty()) {
+        (false, true) => q
+            .selections
+            .into_iter()
+            .map(|selection| AiExtractionApprovalSelection {
+                item_index: selection.item_index,
+                value: selection.value,
+                notes: selection.notes,
+            })
+            .collect(),
+        // Compatibility for already-persisted legacy drafts only. Versioned
+        // data-cell drafts require an explicit human-edited value payload.
+        (true, false) if d.data_cell.is_none() => q
+            .selected_indexes
+            .into_iter()
+            .map(|item_index| {
+                let item = d.items.get(item_index).ok_or_else(|| {
+                    ApiError::validation("selected extraction item is out of range")
+                        .with_request_id(m.request_id.clone())
+                })?;
+                Ok(AiExtractionApprovalSelection {
+                    item_index,
+                    value: item.value.value.clone(),
+                    notes: item.value.notes.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?,
+        _ => {
+            return Err(ApiError::validation(
+                "provide exactly one extraction approval selection format",
+            )
+            .with_request_id(m.request_id));
+        }
+    };
+    let approval = AiExtractionApprovalInput {
+        expected_revision: q.expected_revision,
+        selections,
+    };
+    approval.validate().map_err(|_| {
+        ApiError::validation("extraction approval is invalid").with_request_id(m.request_id.clone())
+    })?;
     let v = store(
-        state.store.apply_ai_extraction_draft(
-            id,
-            q.expected_revision,
-            &q.selected_indexes,
-            &p.audit_context(&m),
-        ),
+        state
+            .store
+            .apply_ai_extraction_draft(id, &approval, &p.audit_context(&m)),
         &m,
     )
     .await?;
     Ok(item(v, &m))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RejectInput {
+    expected_revision: i64,
+}
+
+async fn reject_extraction(
+    State(state): State<AppState>,
+    p: AuthPrincipal,
+    m: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(q): ApiJson<RejectInput>,
+) -> Result<Json<ItemResponse<AiExtractionDraft>>, ApiError> {
+    ensure_human(&p, &m)?;
+    let draft = store(state.store.get_ai_extraction_draft(id), &m).await?;
+    if draft.lab_id != p.lab_id || draft.user_id != p.user_id {
+        return Err(
+            ApiError::not_found("extraction draft was not found").with_request_id(m.request_id)
+        );
+    }
+    scope::project_with_permission(
+        &state,
+        &p,
+        &m,
+        draft.project_id,
+        Permission::WriteMeasurementDraft,
+    )
+    .await?;
+    let rejection = AiExtractionRejectionInput {
+        expected_revision: q.expected_revision,
+    };
+    rejection.validate().map_err(|_| {
+        ApiError::validation("extraction rejection is invalid")
+            .with_request_id(m.request_id.clone())
+    })?;
+    let rejected = store(
+        state
+            .store
+            .reject_ai_extraction_draft(id, &rejection, &p.audit_context(&m)),
+        &m,
+    )
+    .await?;
+    Ok(item(rejected, &m))
 }
 
 async fn ai_input_copy(
@@ -823,7 +1161,6 @@ async fn ai_input_copy(
     p: &AuthPrincipal,
     m: &RequestMetadata,
     a: &Attachment,
-    project: Uuid,
 ) -> Result<Vec<u8>, ApiError> {
     let files = AttachmentFiles::new(attachment_root(state, m)?.as_ref());
     if let Some(d) = store(state.store.list_attachment_derivatives(a.id), m)
@@ -859,14 +1196,15 @@ async fn ai_input_copy(
     let original = files.read_verified_bytes(a).await.map_err(|_| {
         ApiError::conflict("source image integrity failed").with_request_id(m.request_id.clone())
     })?;
-    let prepared = if a.media_type.as_deref() == Some("image/jpeg") {
-        strip_jpeg_exif(&original)
-    } else {
-        original
-    };
-    if prepared.len() > MAX_AI_INPUT_BYTES {
-        return Ok(prepared);
-    }
+    let media_type = a
+        .media_type
+        .as_deref()
+        .ok_or_else(|| image_evidence_invalid(m))?;
+    let prepared = sanitize_vision_input(media_type, &original)
+        .map_err(|_| image_evidence_invalid(m))?
+        .bytes()
+        .to_vec();
+    debug_assert!(prepared.len() <= MAX_SANITIZED_VISION_INPUT_BYTES);
     let id = Uuid::new_v4();
     let object = files
         .write_bytes(id, &prepared)
@@ -875,7 +1213,9 @@ async fn ai_input_copy(
     let d = AttachmentDerivative {
         id,
         lab_id: p.lab_id,
-        project_id: Some(project),
+        // A derived copy of a private image is not project data until the
+        // separate human approval transaction promotes the evidence.
+        project_id: None,
         attachment_id: a.id,
         kind: DerivativeKind::AiInput,
         media_type: a.media_type.clone(),
@@ -896,44 +1236,69 @@ async fn ai_input_copy(
     }
     Ok(prepared)
 }
-fn strip_jpeg_exif(bytes: &[u8]) -> Vec<u8> {
-    if !bytes.starts_with(&[0xff, 0xd8]) {
-        return bytes.to_vec();
+fn data_cell_extraction_error(
+    error: DataCellVisionExtractionError,
+    metadata: &RequestMetadata,
+) -> ApiError {
+    match error {
+        DataCellVisionExtractionError::Provider(error) => provider_api_error(error, metadata),
+        DataCellVisionExtractionError::ContextExceeded {
+            estimated_input_tokens,
+            max_input_tokens,
+        } => ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "context_exceeded",
+            "the image and extraction prompt exceed the configured input token budget",
+        )
+        .with_details(serde_json::json!({
+            "estimatedInputTokens": estimated_input_tokens,
+            "inputTokenCountIsEstimate": true,
+            "maxInputTokens": max_input_tokens,
+            "currentInputTruncated": false,
+        }))
+        .with_request_id(metadata.request_id.clone()),
+        DataCellVisionExtractionError::InvalidImageEvidence => image_evidence_invalid(metadata),
+        DataCellVisionExtractionError::InvalidResponse => invalid_vision(
+            "provider returned an invalid data-cell extraction candidate",
+            metadata,
+        ),
+        DataCellVisionExtractionError::InvalidRequest => {
+            ApiError::internal().with_request_id(metadata.request_id.clone())
+        }
     }
-    let mut out = bytes[..2].to_vec();
-    let mut i = 2;
-    while i + 4 <= bytes.len() {
-        if bytes[i] != 0xff {
-            out.extend_from_slice(&bytes[i..]);
-            break;
-        }
-        let marker = bytes[i + 1];
-        if marker == 0xda || marker == 0xd9 {
-            out.extend_from_slice(&bytes[i..]);
-            break;
-        }
-        let n = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
-        if n < 2 || i + n + 2 > bytes.len() {
-            return bytes.to_vec();
-        }
-        if marker != 0xe1 {
-            out.extend_from_slice(&bytes[i..i + n + 2])
-        }
-        i += n + 2
-    }
-    out
 }
-fn strip_json_fence(v: &str) -> &str {
-    let v = v.trim();
-    v.strip_prefix("```json")
-        .or_else(|| v.strip_prefix("```"))
-        .and_then(|v| v.strip_suffix("```"))
-        .map(str::trim)
-        .unwrap_or(v)
-}
+
 fn invalid_vision(msg: &'static str, m: &RequestMetadata) -> ApiError {
     ApiError::new(StatusCode::BAD_GATEWAY, "vision_response_invalid", msg)
         .with_request_id(m.request_id.clone())
+}
+fn image_upload_too_large(m: &RequestMetadata) -> ApiError {
+    ApiError::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "payload_too_large",
+        "image must not exceed 10 MiB",
+    )
+    .with_request_id(m.request_id.clone())
+}
+fn image_upload_invalid(m: &RequestMetadata) -> ApiError {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "image_invalid",
+        "image is empty, malformed, or exceeds safe image dimensions",
+    )
+    .with_request_id(m.request_id.clone())
+}
+fn image_upload_storage_error(error: AttachmentFileError, m: &RequestMetadata) -> ApiError {
+    if matches!(error, AttachmentFileError::TooLarge) {
+        image_upload_too_large(m)
+    } else {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "image_upload_failed",
+            "the image upload could not be stored",
+        )
+        .with_request_id(m.request_id.clone())
+    }
 }
 fn valid_file_name(v: String, m: &RequestMetadata) -> Result<String, ApiError> {
     let v = v.trim();
@@ -995,14 +1360,694 @@ fn ensure_admin(p: &AuthPrincipal, m: &RequestMetadata) -> Result<(), ApiError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{StaticTokenAuthenticator, StoreJobRepository};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use muriarc_core::{
+        AuditContext, Experiment, ExperimentEvent, Lab, LabRole, MuriArcStore,
+        ObservationDefinition, ObservationPolicy, ObservationValueType, Project, ProjectRole, User,
+        WorkspaceStore, WriteSource,
+    };
+    use muriarc_data::DataFiles;
+    use muriarc_store_sqlite::SqliteStore;
+    use tempfile::TempDir;
+
+    fn jpeg_with_exif() -> Vec<u8> {
+        let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe1, 0, 6, b'E', b'x', b'i', b'f'];
+        jpeg.extend_from_slice(&[0xff, 0xc0, 0x00, 0x0b, 8, 0, 1, 0, 1, 1, 1, 0x11, 0]);
+        jpeg.extend_from_slice(&[0xff, 0xda, 0x00, 0x08, 1, 1, 0, 0, 63, 0]);
+        jpeg.extend_from_slice(&[0x11, 0xff, 0x00, 0x22, 0xff, 0xd9]);
+        jpeg
+    }
+
+    fn valid_png() -> Vec<u8> {
+        STANDARD
+            .decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            )
+            .unwrap()
+    }
+
+    struct ImageFixture {
+        _temp: TempDir,
+        state: AppState,
+        store: Arc<SqliteStore>,
+        principal: AuthPrincipal,
+        metadata: RequestMetadata,
+        project_id: Uuid,
+        experiment_id: Uuid,
+        experiment_event_id: Uuid,
+        definition_id: Uuid,
+        image_id: Uuid,
+        attachment_id: Uuid,
+    }
+
+    impl ImageFixture {
+        async fn new(media_type: &str, bytes: &[u8]) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let attachment_root = temp.path().join("attachments");
+            let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+            store.migrate().await.unwrap();
+            let now = Utc::now();
+            let bootstrap = AuditContext::system(WriteSource::Migration);
+            let lab = Lab::new("AI image route test", now).unwrap();
+            store.create_lab(&lab, &bootstrap).await.unwrap();
+            let user = User::new(lab.id, "image-route@example.test", "Image tester", now).unwrap();
+            store.create_user(&user, &bootstrap).await.unwrap();
+            let project = Project::new(lab.id, "Image route project", now).unwrap();
+            store.create_project(&project, &bootstrap).await.unwrap();
+            let experiment =
+                Experiment::new(lab.id, project.id, "Image route experiment", now).unwrap();
+            store
+                .create_experiment(&experiment, &bootstrap)
+                .await
+                .unwrap();
+            let event = ExperimentEvent::new(
+                lab.id,
+                project.id,
+                experiment.id,
+                "current_cell",
+                "Current cell",
+                now,
+                now,
+            )
+            .unwrap();
+            store
+                .create_experiment_event(&event, &bootstrap)
+                .await
+                .unwrap();
+            let definition = ObservationDefinition::new(
+                lab.id,
+                project.id,
+                experiment.id,
+                "visual_text",
+                "Visual text",
+                ObservationValueType::Text,
+                ObservationPolicy::Versioned,
+                now,
+            )
+            .unwrap();
+            store
+                .create_observation_definition(&definition, &bootstrap)
+                .await
+                .unwrap();
+            let principal = AuthPrincipal::human(
+                user.id,
+                user.display_name.clone(),
+                lab.id,
+                [LabRole::LabAdmin],
+            );
+            let metadata = RequestMetadata {
+                request_id: "image-route-test".to_owned(),
+                reason: Some("verify private AI evidence".to_owned()),
+            };
+            let attachment_id = Uuid::new_v4();
+            let image_id = Uuid::new_v4();
+            let files = AttachmentFiles::new(&attachment_root);
+            let object = files.write_bytes(attachment_id, bytes).await.unwrap();
+            let attachment = Attachment {
+                id: attachment_id,
+                lab_id: lab.id,
+                project_id: None,
+                entity_type: "ai_private_image".to_owned(),
+                entity_id: image_id,
+                file_name: "evidence.bin".to_owned(),
+                media_type: Some(media_type.to_owned()),
+                relative_path: object.relative_path,
+                size_bytes: object.size_bytes,
+                sha256: object.sha256,
+                version: 1,
+                meta: RecordMeta::new(now),
+            };
+            let image = PrivateAiImage {
+                id: image_id,
+                lab_id: lab.id,
+                user_id: user.id,
+                conversation_id: None,
+                attachment_id,
+                project_id: None,
+                status: PrivateImageStatus::Active,
+                last_activity_at: now,
+                expires_at: now + Duration::days(1),
+                archived_at: None,
+                meta: RecordMeta::new(now),
+            };
+            store
+                .create_private_ai_image(&attachment, &image, &principal.audit_context(&metadata))
+                .await
+                .unwrap();
+            let authenticator = StaticTokenAuthenticator::new([(
+                "image-route-token".to_owned(),
+                principal.clone(),
+            )])
+            .unwrap();
+            let state = AppState::new(
+                store.clone(),
+                Arc::new(authenticator),
+                Arc::new(StoreJobRepository::new(store.clone())),
+            )
+            .with_data_storage(DataFiles::new(temp.path().join("data")), attachment_root);
+            Self {
+                _temp: temp,
+                state,
+                store,
+                principal,
+                metadata,
+                project_id: project.id,
+                experiment_id: experiment.id,
+                experiment_event_id: event.id,
+                definition_id: definition.id,
+                image_id,
+                attachment_id,
+            }
+        }
+    }
+
+    async fn own_image_count(fixture: &ImageFixture) -> usize {
+        fixture
+            .store
+            .list_private_ai_images(&PrivateImageFilter {
+                lab_id: fixture.principal.lab_id,
+                user_id: Some(fixture.principal.user_id),
+                conversation_id: None,
+                project_id: None,
+                status: None,
+            })
+            .await
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn upload_enforces_the_same_ten_mib_limit_from_header_and_stream() {
+        let fixture = ImageFixture::new("image/png", &valid_png()).await;
+        let before = own_image_count(&fixture).await;
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("10485761"));
+        let header_error = upload(
+            State(fixture.state.clone()),
+            fixture.principal.clone(),
+            fixture.metadata.clone(),
+            ApiQuery(UploadQuery {
+                file_name: "large.png".to_owned(),
+                media_type: Some("image/png".to_owned()),
+                conversation_id: None,
+            }),
+            headers,
+            Body::from("not-read"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(header_error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let stream_error = upload(
+            State(fixture.state.clone()),
+            fixture.principal.clone(),
+            fixture.metadata.clone(),
+            ApiQuery(UploadQuery {
+                file_name: "large.png".to_owned(),
+                media_type: Some("image/png".to_owned()),
+                conversation_id: None,
+            }),
+            HeaderMap::new(),
+            Body::from(vec![0_u8; MAX_SANITIZED_VISION_INPUT_BYTES + 1]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stream_error.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(own_image_count(&fixture).await, before);
+    }
+
+    #[tokio::test]
+    async fn upload_accepts_strict_portable_images_and_rejects_bmp_or_malformed_png() {
+        let png = valid_png();
+        sanitize_vision_input("image/png", &png).unwrap();
+        let fixture = ImageFixture::new("image/png", &png).await;
+        let before = own_image_count(&fixture).await;
+        let (status, response) = upload(
+            State(fixture.state.clone()),
+            fixture.principal.clone(),
+            fixture.metadata.clone(),
+            ApiQuery(UploadQuery {
+                file_name: "portable.png".to_owned(),
+                media_type: Some("image/png".to_owned()),
+                conversation_id: None,
+            }),
+            HeaderMap::new(),
+            Body::from(png),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(response.0.data.image.status, PrivateImageStatus::Active);
+        assert_eq!(own_image_count(&fixture).await, before + 1);
+
+        let bmp_error = upload(
+            State(fixture.state.clone()),
+            fixture.principal.clone(),
+            fixture.metadata.clone(),
+            ApiQuery(UploadQuery {
+                file_name: "unsupported.bmp".to_owned(),
+                media_type: Some("image/bmp".to_owned()),
+                conversation_id: None,
+            }),
+            HeaderMap::new(),
+            Body::from("BMprivate"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(bmp_error.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let malformed_error = upload(
+            State(fixture.state.clone()),
+            fixture.principal.clone(),
+            fixture.metadata.clone(),
+            ApiQuery(UploadQuery {
+                file_name: "malformed.png".to_owned(),
+                media_type: Some("image/png".to_owned()),
+                conversation_id: None,
+            }),
+            HeaderMap::new(),
+            Body::from(b"\x89PNG\r\n\x1a\n".as_slice()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(malformed_error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(own_image_count(&fixture).await, before + 1);
+    }
+
+    #[tokio::test]
+    async fn owner_can_read_archived_private_image_content() {
+        let png = valid_png();
+        let fixture = ImageFixture::new("image/png", &png).await;
+        let current = fixture
+            .store
+            .get_private_ai_image(fixture.image_id)
+            .await
+            .unwrap();
+        fixture
+            .store
+            .archive_private_ai_image(
+                fixture.image_id,
+                fixture.project_id,
+                current.meta.revision,
+                Utc::now(),
+                &fixture.principal.audit_context(&fixture.metadata),
+            )
+            .await
+            .unwrap();
+
+        let response = image_content(
+            State(fixture.state.clone()),
+            fixture.principal.clone(),
+            AuthenticationMethod::Bearer,
+            fixture.metadata.clone(),
+            ApiPath(fixture.image_id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/png"
+        );
+    }
+
     #[test]
-    fn strips_exif() {
-        let b = [
-            &[0xff, 0xd8][..],
-            &[0xff, 0xe1, 0, 6, b'E', b'x', b'i', b'f'][..],
-            &[0xff, 0xda, 0, 2, 1, 2][..],
-        ]
-        .concat();
-        assert!(!strip_jpeg_exif(&b).windows(4).any(|x| x == b"Exif"))
+    fn server_private_image_read_policy_matches_desktop_status_contract() {
+        let metadata = RequestMetadata {
+            request_id: "status-contract".to_owned(),
+            reason: None,
+        };
+        for status in [
+            PrivateImageStatus::Active,
+            PrivateImageStatus::PendingApproval,
+            PrivateImageStatus::Archived,
+        ] {
+            assert!(ensure_private_image_readable(status, &metadata).is_ok());
+        }
+        for status in [PrivateImageStatus::Processing, PrivateImageStatus::Failed] {
+            assert_eq!(
+                ensure_private_image_readable(status, &metadata)
+                    .unwrap_err()
+                    .status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        assert_eq!(
+            ensure_private_image_readable(PrivateImageStatus::Expired, &metadata)
+                .unwrap_err()
+                .status(),
+            StatusCode::GONE
+        );
+    }
+
+    #[test]
+    fn shared_sanitizer_strips_exif() {
+        let b = jpeg_with_exif();
+        let sanitized = sanitize_vision_input("image/jpeg", &b).unwrap();
+        assert!(!sanitized.bytes().windows(4).any(|window| window == b"Exif"));
+    }
+
+    #[test]
+    fn shared_extraction_candidate_leaves_the_server_draft_item_unselected() {
+        let metadata = RequestMetadata {
+            request_id: "candidate-parser-test".to_owned(),
+            reason: None,
+        };
+        let now = Utc::now();
+        let lab_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let experiment_id = Uuid::new_v4();
+        let event_id = Uuid::new_v4();
+        let definition = ObservationDefinition::new(
+            lab_id,
+            project_id,
+            experiment_id,
+            "visual_text",
+            "Visual text",
+            ObservationValueType::Text,
+            ObservationPolicy::Versioned,
+            now,
+        )
+        .unwrap();
+        let data_cell = AiObservationDataCell {
+            definition_id: definition.id,
+            subject_type: ObservationSubjectType::Experiment,
+            subject_id: experiment_id,
+        };
+        let candidate = DataCellVisionCandidate::new(
+            &definition,
+            ObservationValueData::Text("candidate".to_owned()),
+            0.8,
+            Some("visible".to_owned()),
+        )
+        .unwrap();
+        let item = build_extraction_item(
+            candidate,
+            lab_id,
+            user_id,
+            project_id,
+            experiment_id,
+            event_id,
+            &data_cell,
+            now,
+            &metadata,
+        )
+        .unwrap();
+        assert!(
+            !item.selected,
+            "a model candidate must remain unselected until human approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn sanitized_private_derivative_stays_outside_project_scope_before_approval() {
+        let jpeg = jpeg_with_exif();
+        let fixture = ImageFixture::new("image/jpeg", &jpeg).await;
+        let prepared = prepare_private_images(
+            &fixture.state,
+            &fixture.principal,
+            &fixture.metadata,
+            None,
+            Some(fixture.project_id),
+            &[fixture.image_id],
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            prepared[0].provider.evidence().sanitized_sha256,
+            prepared[0].attachment.sha256,
+            "EXIF removal must be reflected in the immutable evidence hash"
+        );
+        let derivatives = fixture
+            .store
+            .list_attachment_derivatives(fixture.attachment_id)
+            .await
+            .unwrap();
+        assert_eq!(derivatives.len(), 1);
+        assert_eq!(derivatives[0].kind, DerivativeKind::AiInput);
+        assert_eq!(
+            derivatives[0].project_id, None,
+            "an unapproved private derivative must remain outside project/snapshot scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_permission_denial_leaves_the_draft_unchanged() {
+        let fixture = ImageFixture::new("image/png", b"private-image").await;
+        let now = Utc::now();
+        let observation = Observation::new(
+            fixture.principal.lab_id,
+            fixture.project_id,
+            fixture.experiment_id,
+            fixture.experiment_event_id,
+            fixture.definition_id,
+            ObservationSubjectType::Experiment,
+            fixture.experiment_id,
+            now,
+        )
+        .unwrap();
+        let mut value = ObservationValueRecord::new(
+            observation.id,
+            1,
+            ObservationValueData::Text("candidate".to_owned()),
+            now,
+            now,
+        )
+        .unwrap();
+        value.recorded_by = Some(fixture.principal.user_id);
+        let attachment = fixture
+            .store
+            .get_attachment(fixture.attachment_id)
+            .await
+            .unwrap();
+        let draft = AiExtractionDraft {
+            id: Uuid::new_v4(),
+            lab_id: fixture.principal.lab_id,
+            user_id: fixture.principal.user_id,
+            project_id: fixture.project_id,
+            experiment_id: fixture.experiment_id,
+            experiment_event_id: fixture.experiment_event_id,
+            private_image_id: fixture.image_id,
+            attachment_id: fixture.attachment_id,
+            image_sha256: attachment.sha256,
+            provider: "permission-test".to_owned(),
+            model: "permission-test-model".to_owned(),
+            tool_run_id: None,
+            data_cell: None,
+            evidence: Vec::new(),
+            model_trace: None,
+            status: AiExtractionStatus::PendingApproval,
+            items: vec![AiExtractionItem {
+                observation,
+                value,
+                confidence: 0.8,
+                selected: false,
+                source_label: None,
+            }],
+            error_code: None,
+            meta: RecordMeta::new(now),
+        };
+        fixture
+            .store
+            .create_ai_extraction_draft(&draft, &fixture.principal.audit_context(&fixture.metadata))
+            .await
+            .unwrap();
+
+        let viewer = AuthPrincipal::human(
+            fixture.principal.user_id,
+            "Extraction viewer",
+            fixture.principal.lab_id,
+            [],
+        )
+        .with_project_role(fixture.project_id, ProjectRole::Viewer);
+        let error = approve_extraction(
+            State(fixture.state.clone()),
+            viewer,
+            fixture.metadata.clone(),
+            ApiPath(draft.id),
+            ApiJson(ApproveInput {
+                expected_revision: draft.meta.revision,
+                selections: vec![ApproveSelectionInput {
+                    item_index: 0,
+                    value: ObservationValueData::Text("approved".to_owned()),
+                    notes: Some("human review".to_owned()),
+                }],
+                selected_indexes: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+
+        let unchanged = fixture
+            .store
+            .get_ai_extraction_draft(draft.id)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.status, AiExtractionStatus::PendingApproval);
+        assert_eq!(unchanged.meta.revision, draft.meta.revision);
+        assert!(
+            unchanged.items.iter().all(|item| !item.selected),
+            "permission denial must not select or apply a candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn human_owner_can_reject_pending_extraction_without_provider_access() {
+        let fixture = ImageFixture::new("image/png", &valid_png()).await;
+        let now = Utc::now();
+        let observation = Observation::new(
+            fixture.principal.lab_id,
+            fixture.project_id,
+            fixture.experiment_id,
+            fixture.experiment_event_id,
+            fixture.definition_id,
+            ObservationSubjectType::Experiment,
+            fixture.experiment_id,
+            now,
+        )
+        .unwrap();
+        let mut value = ObservationValueRecord::new(
+            observation.id,
+            1,
+            ObservationValueData::Text("candidate".to_owned()),
+            now,
+            now,
+        )
+        .unwrap();
+        value.recorded_by = Some(fixture.principal.user_id);
+        let attachment = fixture
+            .store
+            .get_attachment(fixture.attachment_id)
+            .await
+            .unwrap();
+        let draft = AiExtractionDraft {
+            id: Uuid::new_v4(),
+            lab_id: fixture.principal.lab_id,
+            user_id: fixture.principal.user_id,
+            project_id: fixture.project_id,
+            experiment_id: fixture.experiment_id,
+            experiment_event_id: fixture.experiment_event_id,
+            private_image_id: fixture.image_id,
+            attachment_id: fixture.attachment_id,
+            image_sha256: attachment.sha256,
+            provider: "must-not-run".to_owned(),
+            model: "must-not-run".to_owned(),
+            tool_run_id: None,
+            data_cell: None,
+            evidence: Vec::new(),
+            model_trace: None,
+            status: AiExtractionStatus::PendingApproval,
+            items: vec![AiExtractionItem {
+                observation,
+                value,
+                confidence: 0.8,
+                selected: false,
+                source_label: None,
+            }],
+            error_code: None,
+            meta: RecordMeta::new(now),
+        };
+        fixture
+            .store
+            .create_ai_extraction_draft(&draft, &fixture.principal.audit_context(&fixture.metadata))
+            .await
+            .unwrap();
+
+        let rejected = reject_extraction(
+            State(fixture.state.clone()),
+            fixture.principal.clone(),
+            fixture.metadata.clone(),
+            ApiPath(draft.id),
+            ApiJson(RejectInput {
+                expected_revision: draft.meta.revision,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rejected.0.data.status, AiExtractionStatus::Rejected);
+        assert_eq!(
+            fixture
+                .store
+                .get_ai_extraction_draft(draft.id)
+                .await
+                .unwrap()
+                .status,
+            AiExtractionStatus::Rejected
+        );
+    }
+
+    #[tokio::test]
+    async fn nonportable_media_and_cross_scope_cells_fail_in_pre_provider_validation() {
+        let fixture = ImageFixture::new("image/bmp", b"BMprivate-image").await;
+        let media_error = prepare_private_images(
+            &fixture.state,
+            &fixture.principal,
+            &fixture.metadata,
+            None,
+            Some(fixture.project_id),
+            &[fixture.image_id],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(media_error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            fixture
+                .store
+                .list_attachment_derivatives(fixture.attachment_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "unsupported media must fail before sanitization or Provider preparation"
+        );
+
+        let cell_error = create_extraction(
+            State(fixture.state.clone()),
+            fixture.principal.clone(),
+            fixture.metadata.clone(),
+            ApiJson(CreateExtractionInput {
+                image_ids: vec![fixture.image_id],
+                private_image_id: None,
+                project_id: fixture.project_id,
+                experiment_id: fixture.experiment_id,
+                experiment_event_id: fixture.experiment_event_id,
+                current_data_cell: ExtractionDataCellInput {
+                    definition_id: fixture.definition_id,
+                    subject_type: ObservationSubjectType::Artifact,
+                    subject_id: fixture.attachment_id,
+                },
+                vision_model_profile_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(cell_error.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            fixture
+                .store
+                .list_attachment_derivatives(fixture.attachment_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "cross-scope cells must fail before image preparation or Provider resolution"
+        );
+        assert!(
+            validate_extraction_data_cell_scope(
+                &fixture.state,
+                &fixture.principal,
+                &fixture.metadata,
+                fixture.project_id,
+                fixture.experiment_id,
+                &AiObservationDataCell {
+                    definition_id: fixture.definition_id,
+                    subject_type: ObservationSubjectType::Artifact,
+                    subject_id: fixture.attachment_id,
+                },
+            )
+            .await
+            .is_err()
+        );
     }
 }

@@ -1,9 +1,11 @@
 use chrono::Utc;
 use muriarc_core::{
     Actor, ActorType, AiActionCategory, AiAutonomyGrant, AiAutonomyMode, AiConversationMessage,
-    AiConversationMessageRole, AiOperationStore, Animal, Approval, ApprovalDecision, AuditAction,
-    AuditContext, AuditFilter, EntityType, Lab, Measurement, MeasurementValue, MuriArcStore,
-    Project, RecordMeta, Sex, StoreError, ToolRun, ToolRunStatus, User, WriteSource,
+    AiConversationMessageRole, AiExtractionApprovalInput, AiExtractionApprovalSelection,
+    AiExtractionRejectionInput, AiExtractionStatus, AiOperationStore, Animal, Approval,
+    ApprovalDecision, AuditAction, AuditContext, AuditFilter, EntityType, Lab, Measurement,
+    MeasurementValue, MuriArcStore, ObservationValueData, PrivateImageStatus, Project, RecordMeta,
+    Sex, StoreError, ToolRun, ToolRunStatus, User, WorkspaceStore, WriteSource,
     store_contract::{
         run_ai_conversation_contract, run_ai_model_profile_contract,
         run_research_extensions_contract, run_store_contract,
@@ -11,7 +13,203 @@ use muriarc_core::{
 };
 use muriarc_store_postgres::PostgresStore;
 use serde_json::json;
+use sqlx::Row;
 use uuid::Uuid;
+
+async fn assert_corrupted_second_evidence_rolls_back(
+    store: &PostgresStore,
+    provider: &str,
+    approval: bool,
+) {
+    let draft_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ai_extraction_drafts
+         WHERE provider=$1 AND status='pending_approval'
+         ORDER BY created_at DESC,id DESC LIMIT 1",
+    )
+    .bind(provider)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let draft = store.get_ai_extraction_draft(draft_id).await.unwrap();
+    assert_eq!(draft.evidence.len(), 2);
+    let first = &draft.evidence[0];
+    let second = &draft.evidence[1];
+    sqlx::query(
+        "UPDATE ai_private_images
+         SET status='active',updated_at=updated_at + interval '1 second',
+             revision=revision+1
+         WHERE id=$1",
+    )
+    .bind(second.private_image_id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let request_id = format!("{provider}-atomicity");
+    let observation_id = draft.items[0].observation.id;
+    let before_counts: (i64, i64, i64, i64) = (
+        sqlx::query_scalar("SELECT count(*) FROM observations WHERE id=$1")
+            .bind(observation_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM attachment_links WHERE attachment_id IN ($1, $2)")
+            .bind(first.private_attachment_id)
+            .bind(second.private_attachment_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM audit_entries WHERE request_id=$1")
+            .bind(&request_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM provenance WHERE request_id=$1")
+            .bind(&request_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+    );
+    let first_image_before =
+        sqlx::query("SELECT project_id,status,revision FROM ai_private_images WHERE id=$1")
+            .bind(first.private_image_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    let first_attachment_before = sqlx::query(
+        "SELECT project_id,entity_type,entity_id,revision FROM attachments WHERE id=$1",
+    )
+    .bind(first.private_attachment_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+
+    let audit = AuditContext {
+        actor: Actor::human(draft.user_id, "Atomicity owner"),
+        source: WriteSource::Web,
+        request_id: Some(request_id.clone()),
+        reason: Some("second evidence corruption must roll back".to_owned()),
+    };
+    let result = if approval {
+        store
+            .apply_ai_extraction_draft(
+                draft.id,
+                &AiExtractionApprovalInput {
+                    expected_revision: draft.meta.revision,
+                    selections: vec![AiExtractionApprovalSelection {
+                        item_index: 0,
+                        value: ObservationValueData::Number(9.0),
+                        notes: Some("must roll back".to_owned()),
+                    }],
+                },
+                &audit,
+            )
+            .await
+            .map(|_| ())
+    } else {
+        store
+            .reject_ai_extraction_draft(
+                draft.id,
+                &AiExtractionRejectionInput {
+                    expected_revision: draft.meta.revision,
+                },
+                &audit,
+            )
+            .await
+            .map(|_| ())
+    };
+    assert!(matches!(result, Err(StoreError::Conflict(_))));
+
+    let after_counts: (i64, i64, i64, i64) = (
+        sqlx::query_scalar("SELECT count(*) FROM observations WHERE id=$1")
+            .bind(observation_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM attachment_links WHERE attachment_id IN ($1, $2)")
+            .bind(first.private_attachment_id)
+            .bind(second.private_attachment_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM audit_entries WHERE request_id=$1")
+            .bind(&request_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+        sqlx::query_scalar("SELECT count(*) FROM provenance WHERE request_id=$1")
+            .bind(&request_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap(),
+    );
+    assert_eq!(after_counts, before_counts);
+    assert!(matches!(
+        store.get_observation(draft.items[0].observation.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    let first_image_after =
+        sqlx::query("SELECT project_id,status,revision FROM ai_private_images WHERE id=$1")
+            .bind(first.private_image_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        first_image_after.get::<Option<Uuid>, _>("project_id"),
+        first_image_before.get::<Option<Uuid>, _>("project_id")
+    );
+    assert_eq!(
+        first_image_after.get::<String, _>("status"),
+        first_image_before.get::<String, _>("status")
+    );
+    assert_eq!(
+        first_image_after.get::<i64, _>("revision"),
+        first_image_before.get::<i64, _>("revision")
+    );
+    assert_eq!(
+        first_image_after.get::<String, _>("status"),
+        "pending_approval"
+    );
+    let first_attachment_after = sqlx::query(
+        "SELECT project_id,entity_type,entity_id,revision FROM attachments WHERE id=$1",
+    )
+    .bind(first.private_attachment_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        first_attachment_after.get::<Option<Uuid>, _>("project_id"),
+        first_attachment_before.get::<Option<Uuid>, _>("project_id")
+    );
+    assert_eq!(
+        first_attachment_after.get::<String, _>("entity_type"),
+        first_attachment_before.get::<String, _>("entity_type")
+    );
+    assert_eq!(
+        first_attachment_after.get::<Uuid, _>("entity_id"),
+        first_attachment_before.get::<Uuid, _>("entity_id")
+    );
+    assert_eq!(
+        first_attachment_after.get::<i64, _>("revision"),
+        first_attachment_before.get::<i64, _>("revision")
+    );
+    let persisted = store.get_ai_extraction_draft(draft.id).await.unwrap();
+    assert_eq!(persisted.status, AiExtractionStatus::PendingApproval);
+    assert_eq!(persisted.meta.revision, draft.meta.revision);
+    assert!(
+        persisted.evidence.iter().all(
+            |evidence| evidence.promoted_attachment_id.is_none() && evidence.meta.revision == 1
+        )
+    );
+    assert_eq!(
+        store
+            .get_private_ai_image(first.private_image_id)
+            .await
+            .unwrap()
+            .status,
+        PrivateImageStatus::PendingApproval
+    );
+}
 
 #[tokio::test]
 async fn postgres_store_obeys_shared_contract_when_configured() {
@@ -370,6 +568,8 @@ async fn postgres_store_obeys_research_extensions_contract_when_configured() {
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
     run_research_extensions_contract(&store).await;
+    assert_corrupted_second_evidence_rolls_back(&store, "contract-atomic-approval", true).await;
+    assert_corrupted_second_evidence_rolls_back(&store, "contract-atomic-rejection", false).await;
 }
 
 #[tokio::test]

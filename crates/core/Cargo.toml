@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
-test-support = []
+test-support = ["dep:tokio"]
 
 [dependencies]
 async-trait.workspace = true
@@ -16,4 +16,5 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
 uuid.workspace = true

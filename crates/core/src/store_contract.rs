@@ -33,6 +33,177 @@ async fn assign_project_animal(
     assignment
 }
 
+async fn create_phase4_contract_definition<S>(
+    store: &S,
+    lab_id: uuid::Uuid,
+    project_id: uuid::Uuid,
+    experiment_id: uuid::Uuid,
+    key: &str,
+    audit: &AuditContext,
+    now: chrono::DateTime<Utc>,
+) -> ObservationDefinition
+where
+    S: MuriArcStore + ?Sized,
+{
+    let mut definition = ObservationDefinition::new(
+        lab_id,
+        project_id,
+        experiment_id,
+        key,
+        key.replace('_', " "),
+        ObservationValueType::Number,
+        ObservationPolicy::Versioned,
+        now,
+    )
+    .unwrap();
+    definition.unit = Some("g".to_owned());
+    definition.validate().unwrap();
+    store
+        .create_observation_definition(&definition, audit)
+        .await
+        .unwrap();
+    definition
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_phase4_contract_draft<S>(
+    store: &S,
+    lab_id: uuid::Uuid,
+    project_id: uuid::Uuid,
+    experiment_id: uuid::Uuid,
+    event_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    definition: &ObservationDefinition,
+    profile: &AiModelProfile,
+    profile_version: &AiModelProfileVersion,
+    provider: &str,
+    image_count: usize,
+    audit: &AuditContext,
+    now: chrono::DateTime<Utc>,
+) -> (AiExtractionDraft, Vec<Attachment>, Vec<PrivateAiImage>)
+where
+    S: MuriArcStore + ?Sized,
+{
+    let observation = Observation::new(
+        lab_id,
+        project_id,
+        experiment_id,
+        event_id,
+        definition.id,
+        ObservationSubjectType::Experiment,
+        experiment_id,
+        now,
+    )
+    .unwrap();
+    let value = ObservationValueRecord::new(
+        observation.id,
+        1,
+        ObservationValueData::Number(1.0),
+        now,
+        now,
+    )
+    .unwrap();
+    let mut attachments = Vec::with_capacity(image_count);
+    let mut images = Vec::with_capacity(image_count);
+    let mut evidence = Vec::with_capacity(image_count);
+    for display_order in 0..image_count {
+        let image_id = uuid::Uuid::new_v4();
+        let original_sha256 = if display_order % 2 == 0 {
+            "3".repeat(64)
+        } else {
+            "4".repeat(64)
+        };
+        let sanitized_sha256 = if display_order % 2 == 0 {
+            "5".repeat(64)
+        } else {
+            "6".repeat(64)
+        };
+        let attachment = Attachment {
+            id: uuid::Uuid::new_v4(),
+            lab_id,
+            project_id: None,
+            entity_type: "ai_private_image".to_owned(),
+            entity_id: image_id,
+            file_name: format!("{provider}-{display_order}.png"),
+            media_type: Some("image/png".to_owned()),
+            relative_path: format!("ai-private/{}.png", uuid::Uuid::new_v4()),
+            size_bytes: 64,
+            sha256: original_sha256.clone(),
+            version: 1,
+            meta: RecordMeta::new(now),
+        };
+        let image = PrivateAiImage {
+            id: image_id,
+            lab_id,
+            user_id,
+            conversation_id: None,
+            attachment_id: attachment.id,
+            project_id: None,
+            status: PrivateImageStatus::Active,
+            last_activity_at: now,
+            expires_at: now + Duration::days(30),
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_private_ai_image(&attachment, &image, audit)
+            .await
+            .unwrap();
+        evidence.push(AiExtractionEvidence {
+            display_order: display_order as i32,
+            private_image_id: image.id,
+            private_attachment_id: attachment.id,
+            promoted_attachment_id: None,
+            original_sha256,
+            sanitized_sha256,
+            meta: RecordMeta::new(now),
+        });
+        attachments.push(attachment);
+        images.push(image);
+    }
+    let draft = AiExtractionDraft {
+        id: uuid::Uuid::new_v4(),
+        lab_id,
+        user_id,
+        project_id,
+        experiment_id,
+        experiment_event_id: event_id,
+        private_image_id: evidence[0].private_image_id,
+        attachment_id: evidence[0].private_attachment_id,
+        image_sha256: evidence[0].original_sha256.clone(),
+        provider: provider.to_owned(),
+        model: profile_version.model_id.clone(),
+        tool_run_id: None,
+        data_cell: Some(AiObservationDataCell {
+            definition_id: definition.id,
+            subject_type: ObservationSubjectType::Experiment,
+            subject_id: experiment_id,
+        }),
+        evidence,
+        model_trace: Some(AiExtractionModelTrace {
+            profile_id: profile.id,
+            profile_version: profile_version.version,
+            purpose: AiModelPurpose::Vision,
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            provider_request_id: Some(format!("{provider}-request")),
+            trace: serde_json::json!({"route": provider}),
+        }),
+        status: AiExtractionStatus::PendingApproval,
+        items: vec![AiExtractionItem {
+            observation,
+            value,
+            confidence: 0.8,
+            selected: false,
+            source_label: Some(provider.to_owned()),
+        }],
+        error_code: None,
+        meta: RecordMeta::new(now),
+    };
+    (draft, attachments, images)
+}
+
 fn initial_ask_grant(conversation: &AiConversation, now: chrono::DateTime<Utc>) -> AiAutonomyGrant {
     AiAutonomyGrant {
         id: uuid::Uuid::new_v4(),
@@ -1107,7 +1278,10 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
 
 /// Runs the shared Genetics v2, Breeding and Observation persistence contract.
 /// The target store may already be migrated, but must be connected to a test database.
-pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
+pub async fn run_research_extensions_contract<S>(store: &S)
+where
+    S: MuriArcStore + AiModelProfileStore,
+{
     store.migrate().await.expect("migration succeeds");
     let now = contract_now();
     let setup_audit = AuditContext::system(WriteSource::Migration);
@@ -1813,6 +1987,9 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         provider: "contract-provider".to_owned(),
         model: "contract-vision".to_owned(),
         tool_run_id: None,
+        data_cell: None,
+        evidence: Vec::new(),
+        model_trace: None,
         status: AiExtractionStatus::PendingApproval,
         items: vec![AiExtractionItem {
             observation: overwrite_observation.clone(),
@@ -1832,8 +2009,14 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         store
             .apply_ai_extraction_draft(
                 overwrite_draft.id,
-                overwrite_draft.meta.revision,
-                &[0],
+                &AiExtractionApprovalInput {
+                    expected_revision: overwrite_draft.meta.revision,
+                    selections: vec![AiExtractionApprovalSelection {
+                        item_index: 0,
+                        value: ObservationValueData::Number(99.0),
+                        notes: None,
+                    }],
+                },
                 &human_audit,
             )
             .await,
@@ -1851,6 +2034,25 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         store.get_observation(overwrite_observation.id).await,
         Err(StoreError::NotFound { .. })
     ));
+    let rejected_legacy = store
+        .reject_ai_extraction_draft(
+            overwrite_draft.id,
+            &AiExtractionRejectionInput {
+                expected_revision: overwrite_draft.meta.revision,
+            },
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected_legacy.status, AiExtractionStatus::Rejected);
+    assert_eq!(
+        store
+            .get_private_ai_image(private_image.id)
+            .await
+            .unwrap()
+            .status,
+        PrivateImageStatus::Active
+    );
 
     let completed_experiment =
         Experiment::new(lab.id, project.id, "Closed AI write contract", now).unwrap();
@@ -1965,6 +2167,9 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         provider: "contract-provider".to_owned(),
         model: "contract-vision".to_owned(),
         tool_run_id: None,
+        data_cell: None,
+        evidence: Vec::new(),
+        model_trace: None,
         status: AiExtractionStatus::PendingApproval,
         items: vec![AiExtractionItem {
             observation: closed_observation.clone(),
@@ -1984,8 +2189,14 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         store
             .apply_ai_extraction_draft(
                 closed_draft.id,
-                closed_draft.meta.revision,
-                &[0],
+                &AiExtractionApprovalInput {
+                    expected_revision: closed_draft.meta.revision,
+                    selections: vec![AiExtractionApprovalSelection {
+                        item_index: 0,
+                        value: ObservationValueData::Number(1.0),
+                        notes: None,
+                    }],
+                },
                 &human_audit,
             )
             .await,
@@ -2003,6 +2214,880 @@ pub async fn run_research_extensions_contract(store: &dyn MuriArcStore) {
         store.get_observation(closed_observation.id).await,
         Err(StoreError::NotFound { .. })
     ));
+
+    // Phase 4 extraction drafts are bound to one explicit data cell, exact
+    // vision profile version, and one-to-eight ordered image evidence records.
+    // Approval may edit only the candidate value/notes and promotes every
+    // private image together with the observation in one transaction.
+    let vision_profile = AiModelProfile {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        name: "Research extraction vision".to_owned(),
+        current_version: 1,
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    let vision_version = AiModelProfileVersion {
+        profile_id: vision_profile.id,
+        version: 1,
+        protocol: AiProviderProtocol::OpenaiResponses,
+        transport: AiProviderTransport::OpenAiCompatible,
+        base_url: "https://vision.contract.test/v1".to_owned(),
+        normalized_base_url: "https://vision.contract.test/v1".to_owned(),
+        model_id: "contract-vision-v1".to_owned(),
+        supports_vision: true,
+        context_window_tokens: 16_384,
+        max_input_tokens: 8_192,
+        max_output_tokens: 1_024,
+        history_token_budget: 4_096,
+        history_turns: 8,
+        temperature: 0.0,
+        timeout_ms: 30_000,
+        created_at: now,
+    };
+    store
+        .create_ai_model_profile(&vision_profile, &vision_version, &human_audit)
+        .await
+        .unwrap();
+
+    let extraction_observation = Observation::new(
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        definition.id,
+        ObservationSubjectType::Experiment,
+        experiment.id,
+        now,
+    )
+    .unwrap();
+    let extraction_value = ObservationValueRecord::new(
+        extraction_observation.id,
+        1,
+        ObservationValueData::Number(23.0),
+        now,
+        now,
+    )
+    .unwrap();
+    let mut evidence = Vec::new();
+    let mut extraction_images = Vec::new();
+    let mut extraction_attachments = Vec::new();
+    for (display_order, (original, sanitized)) in [
+        ("d".repeat(64), "e".repeat(64)),
+        ("f".repeat(64), "a".repeat(64)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_ne!(
+            original, sanitized,
+            "the test must cover original and sanitized hash divergence"
+        );
+        let private_image_id = uuid::Uuid::new_v4();
+        let attachment = Attachment {
+            id: uuid::Uuid::new_v4(),
+            lab_id: lab.id,
+            project_id: None,
+            entity_type: "ai_private_image".to_owned(),
+            entity_id: private_image_id,
+            file_name: format!("extraction-{display_order}.png"),
+            media_type: Some("image/png".to_owned()),
+            relative_path: format!("ai-private/{}.png", uuid::Uuid::new_v4()),
+            size_bytes: 64,
+            sha256: original.clone(),
+            version: 1,
+            meta: RecordMeta::new(now),
+        };
+        let image = PrivateAiImage {
+            id: private_image_id,
+            lab_id: lab.id,
+            user_id: user.id,
+            conversation_id: None,
+            attachment_id: attachment.id,
+            project_id: None,
+            status: PrivateImageStatus::Active,
+            last_activity_at: now,
+            expires_at: now + Duration::days(30),
+            archived_at: None,
+            meta: RecordMeta::new(now),
+        };
+        store
+            .create_private_ai_image(&attachment, &image, &human_audit)
+            .await
+            .unwrap();
+        evidence.push(AiExtractionEvidence {
+            display_order: display_order as i32,
+            private_image_id,
+            private_attachment_id: attachment.id,
+            promoted_attachment_id: None,
+            original_sha256: original,
+            sanitized_sha256: sanitized,
+            meta: RecordMeta::new(now),
+        });
+        extraction_images.push(image);
+        extraction_attachments.push(attachment);
+    }
+    let extraction_draft = AiExtractionDraft {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        project_id: project.id,
+        experiment_id: experiment.id,
+        experiment_event_id: event.id,
+        private_image_id: evidence[0].private_image_id,
+        attachment_id: evidence[0].private_attachment_id,
+        image_sha256: evidence[0].original_sha256.clone(),
+        provider: "contract-provider".to_owned(),
+        model: vision_version.model_id.clone(),
+        tool_run_id: None,
+        data_cell: Some(AiObservationDataCell {
+            definition_id: definition.id,
+            subject_type: ObservationSubjectType::Experiment,
+            subject_id: experiment.id,
+        }),
+        evidence: evidence.clone(),
+        model_trace: Some(AiExtractionModelTrace {
+            profile_id: vision_profile.id,
+            profile_version: vision_version.version,
+            purpose: AiModelPurpose::Vision,
+            input_tokens: 120,
+            output_tokens: 30,
+            total_tokens: 150,
+            provider_request_id: Some("vision-contract-request".to_owned()),
+            trace: serde_json::json!({"route": "direct_vision"}),
+        }),
+        status: AiExtractionStatus::PendingApproval,
+        items: vec![AiExtractionItem {
+            observation: extraction_observation.clone(),
+            value: extraction_value,
+            confidence: 0.91,
+            selected: false,
+            source_label: Some("experiment body weight".to_owned()),
+        }],
+        error_code: None,
+        meta: RecordMeta::new(now),
+    };
+    for invalid_source_label in [
+        " \t ".to_owned(),
+        "contains\u{0000}control".to_owned(),
+        "x".repeat(513),
+    ] {
+        let mut invalid_item = extraction_draft.items[0].clone();
+        invalid_item.source_label = Some(invalid_source_label);
+        assert!(
+            invalid_item.validate().is_err(),
+            "blank, oversized, and control-character source labels must be rejected"
+        );
+    }
+    store
+        .create_ai_extraction_draft(&extraction_draft, &human_audit)
+        .await
+        .unwrap();
+    let persisted_draft = store
+        .get_ai_extraction_draft(extraction_draft.id)
+        .await
+        .unwrap();
+    assert_eq!(persisted_draft.evidence, evidence);
+    assert_eq!(persisted_draft.model_trace, extraction_draft.model_trace);
+    for private_entity_id in std::iter::once(extraction_draft.id)
+        .chain(extraction_images.iter().map(|image| image.id))
+        .chain(
+            extraction_attachments
+                .iter()
+                .map(|attachment| attachment.id),
+        )
+    {
+        assert!(
+            store
+                .list_audit_entries(&AuditFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_id: Some(private_entity_id),
+                })
+                .await
+                .unwrap()
+                .iter()
+                .all(|entry| entry.project_id.is_none()),
+            "unapproved AI extraction audit records must remain private scoped"
+        );
+        assert!(
+            store
+                .list_provenance(&ProvenanceFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_type: None,
+                    entity_id: Some(private_entity_id),
+                    source: None,
+                })
+                .await
+                .unwrap()
+                .iter()
+                .all(|record| record.project_id.is_none()),
+            "unapproved AI extraction provenance must remain private scoped"
+        );
+    }
+
+    let ai_approval = AuditContext {
+        actor: Actor {
+            actor_type: ActorType::Ai,
+            user_id: Some(user.id),
+            display_name: "Untrusted model".to_owned(),
+        },
+        source: WriteSource::Ai,
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        reason: Some("models cannot approve research data".to_owned()),
+    };
+    let edited_approval = AiExtractionApprovalInput {
+        expected_revision: extraction_draft.meta.revision,
+        selections: vec![AiExtractionApprovalSelection {
+            item_index: 0,
+            value: ObservationValueData::Number(23.75),
+            notes: Some("researcher corrected decimal".to_owned()),
+        }],
+    };
+    let other_approver = User::new(
+        lab.id,
+        format!("{}@research-contract.test", uuid::Uuid::new_v4()),
+        "Other researcher",
+        now,
+    )
+    .unwrap();
+    store
+        .create_user(&other_approver, &setup_audit)
+        .await
+        .unwrap();
+    let other_human_audit = AuditContext {
+        actor: Actor::human(other_approver.id, other_approver.display_name.clone()),
+        source: WriteSource::Web,
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        reason: Some("cross-owner approval must fail".to_owned()),
+    };
+    assert!(matches!(
+        store
+            .apply_ai_extraction_draft(extraction_draft.id, &edited_approval, &other_human_audit,)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store.get_observation(extraction_observation.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    let cross_owner_rejected = store
+        .get_ai_extraction_draft(extraction_draft.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        cross_owner_rejected.status,
+        AiExtractionStatus::PendingApproval
+    );
+    assert!(
+        cross_owner_rejected
+            .evidence
+            .iter()
+            .all(|item| item.promoted_attachment_id.is_none())
+    );
+    for image in &extraction_images {
+        let private_image = store.get_private_ai_image(image.id).await.unwrap();
+        assert_eq!(private_image.project_id, None);
+        assert_eq!(private_image.status, PrivateImageStatus::PendingApproval);
+    }
+    assert!(matches!(
+        store
+            .apply_ai_extraction_draft(extraction_draft.id, &edited_approval, &ai_approval)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    for attachment in &extraction_attachments {
+        assert!(attachment.project_id.is_none());
+        assert!(
+            store
+                .list_project_attachments(lab.id, project.id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|record| record.id != attachment.id)
+        );
+    }
+
+    let applied = store
+        .apply_ai_extraction_draft(extraction_draft.id, &edited_approval, &human_audit)
+        .await
+        .unwrap();
+    assert_eq!(applied.observations.len(), 1);
+    assert_eq!(applied.observations[0].id, extraction_observation.id);
+    assert_eq!(applied.attachments.len(), 2);
+    assert_eq!(applied.links.len(), 2);
+    assert!(applied.attachments.iter().all(|attachment| {
+        attachment.project_id == Some(project.id)
+            && attachment.entity_type == "observation"
+            && attachment.entity_id == extraction_observation.id
+    }));
+    assert!(applied.links.iter().all(|link| {
+        link.target_type == AttachmentLinkTarget::DataCell
+            && link.target_id == extraction_observation.id
+    }));
+    assert!(
+        applied
+            .draft
+            .evidence
+            .iter()
+            .all(|item| item.promoted_attachment_id == Some(item.private_attachment_id))
+    );
+    let approved_value = store
+        .get_observation_value(applied.draft.items[0].value.id)
+        .await
+        .unwrap();
+    assert_eq!(approved_value.value, ObservationValueData::Number(23.75));
+    assert_eq!(
+        approved_value.notes.as_deref(),
+        Some("researcher corrected decimal")
+    );
+    for image in &extraction_images {
+        let promoted = store.get_private_ai_image(image.id).await.unwrap();
+        assert_eq!(promoted.project_id, Some(project.id));
+        assert_eq!(promoted.status, PrivateImageStatus::Archived);
+    }
+    for formal_entity_id in std::iter::once(extraction_observation.id)
+        .chain(std::iter::once(approved_value.id))
+        .chain(applied.attachments.iter().map(|attachment| attachment.id))
+    {
+        assert!(
+            store
+                .list_audit_entries(&AuditFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_id: Some(formal_entity_id),
+                })
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.project_id == Some(project.id)),
+            "approved formal records must gain project-scoped audit evidence"
+        );
+        assert!(
+            store
+                .list_provenance(&ProvenanceFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_type: None,
+                    entity_id: Some(formal_entity_id),
+                    source: None,
+                })
+                .await
+                .unwrap()
+                .iter()
+                .any(|record| record.project_id == Some(project.id)),
+            "approved formal records must gain project-scoped provenance"
+        );
+    }
+
+    // A concurrent write after draft creation must make approval fail without
+    // promoting the image, creating links, or resolving the draft.
+    let mut conflict_definition = ObservationDefinition::new(
+        lab.id,
+        project.id,
+        experiment.id,
+        "conflicting_ai_cell",
+        "Conflicting AI cell",
+        ObservationValueType::Number,
+        ObservationPolicy::Versioned,
+        now,
+    )
+    .unwrap();
+    conflict_definition.unit = Some("g".to_owned());
+    conflict_definition.validate().unwrap();
+    store
+        .create_observation_definition(&conflict_definition, &human_audit)
+        .await
+        .unwrap();
+    let conflict_image_id = uuid::Uuid::new_v4();
+    let conflict_attachment = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: None,
+        entity_type: "ai_private_image".to_owned(),
+        entity_id: conflict_image_id,
+        file_name: "conflict.png".to_owned(),
+        media_type: Some("image/png".to_owned()),
+        relative_path: format!("ai-private/{}.png", uuid::Uuid::new_v4()),
+        size_bytes: 32,
+        sha256: "1".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    let conflict_image = PrivateAiImage {
+        id: conflict_image_id,
+        lab_id: lab.id,
+        user_id: user.id,
+        conversation_id: None,
+        attachment_id: conflict_attachment.id,
+        project_id: None,
+        status: PrivateImageStatus::Active,
+        last_activity_at: now,
+        expires_at: now + Duration::days(30),
+        archived_at: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_private_ai_image(&conflict_attachment, &conflict_image, &human_audit)
+        .await
+        .unwrap();
+    let conflict_observation = Observation::new(
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        conflict_definition.id,
+        ObservationSubjectType::Experiment,
+        experiment.id,
+        now,
+    )
+    .unwrap();
+    let conflict_value = ObservationValueRecord::new(
+        conflict_observation.id,
+        1,
+        ObservationValueData::Number(1.0),
+        now,
+        now,
+    )
+    .unwrap();
+    let conflict_draft = AiExtractionDraft {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        user_id: user.id,
+        project_id: project.id,
+        experiment_id: experiment.id,
+        experiment_event_id: event.id,
+        private_image_id: conflict_image.id,
+        attachment_id: conflict_attachment.id,
+        image_sha256: conflict_attachment.sha256.clone(),
+        provider: "contract-provider".to_owned(),
+        model: vision_version.model_id.clone(),
+        tool_run_id: None,
+        data_cell: Some(AiObservationDataCell {
+            definition_id: conflict_definition.id,
+            subject_type: ObservationSubjectType::Experiment,
+            subject_id: experiment.id,
+        }),
+        evidence: vec![AiExtractionEvidence {
+            display_order: 0,
+            private_image_id: conflict_image.id,
+            private_attachment_id: conflict_attachment.id,
+            promoted_attachment_id: None,
+            original_sha256: conflict_attachment.sha256.clone(),
+            sanitized_sha256: "2".repeat(64),
+            meta: RecordMeta::new(now),
+        }],
+        model_trace: Some(AiExtractionModelTrace {
+            profile_id: vision_profile.id,
+            profile_version: 1,
+            purpose: AiModelPurpose::Vision,
+            input_tokens: 10,
+            output_tokens: 5,
+            total_tokens: 15,
+            provider_request_id: None,
+            trace: serde_json::json!({"route": "direct_vision"}),
+        }),
+        status: AiExtractionStatus::PendingApproval,
+        items: vec![AiExtractionItem {
+            observation: conflict_observation.clone(),
+            value: conflict_value,
+            confidence: 0.8,
+            selected: false,
+            source_label: None,
+        }],
+        error_code: None,
+        meta: RecordMeta::new(now),
+    };
+    store
+        .create_ai_extraction_draft(&conflict_draft, &human_audit)
+        .await
+        .unwrap();
+    let mut competing_value = ObservationValueRecord::new(
+        conflict_observation.id,
+        1,
+        ObservationValueData::Number(2.0),
+        now,
+        now,
+    )
+    .unwrap();
+    competing_value.recorded_by = Some(user.id);
+    store
+        .create_observation(&conflict_observation, &competing_value, &human_audit)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .apply_ai_extraction_draft(
+                conflict_draft.id,
+                &AiExtractionApprovalInput {
+                    expected_revision: 1,
+                    selections: vec![AiExtractionApprovalSelection {
+                        item_index: 0,
+                        value: ObservationValueData::Number(3.0),
+                        notes: None,
+                    }],
+                },
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let rolled_back_draft = store
+        .get_ai_extraction_draft(conflict_draft.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        rolled_back_draft.status,
+        AiExtractionStatus::PendingApproval
+    );
+    assert_eq!(rolled_back_draft.evidence[0].promoted_attachment_id, None);
+    assert_eq!(
+        store
+            .get_private_ai_image(conflict_image.id)
+            .await
+            .unwrap()
+            .status,
+        PrivateImageStatus::PendingApproval
+    );
+    assert!(
+        store
+            .list_project_attachments(lab.id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|attachment| attachment.id != conflict_attachment.id)
+    );
+
+    // Rejecting a multi-image candidate is owner-scoped and restores every
+    // private image without publishing any project-scoped audit material.
+    let rejection_definition = create_phase4_contract_definition(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        "ai_rejection_restore",
+        &human_audit,
+        now,
+    )
+    .await;
+    let (rejection_draft, rejection_attachments, rejection_images) = prepare_phase4_contract_draft(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        user.id,
+        &rejection_definition,
+        &vision_profile,
+        &vision_version,
+        "contract-rejection-restore",
+        2,
+        &human_audit,
+        now,
+    )
+    .await;
+    store
+        .create_ai_extraction_draft(&rejection_draft, &human_audit)
+        .await
+        .unwrap();
+    let rejection = AiExtractionRejectionInput {
+        expected_revision: rejection_draft.meta.revision,
+    };
+    assert!(matches!(
+        store
+            .reject_ai_extraction_draft(rejection_draft.id, &rejection, &other_human_audit)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store
+            .reject_ai_extraction_draft(rejection_draft.id, &rejection, &ai_approval)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    for image in &rejection_images {
+        assert_eq!(
+            store.get_private_ai_image(image.id).await.unwrap().status,
+            PrivateImageStatus::PendingApproval
+        );
+    }
+    let rejected = store
+        .reject_ai_extraction_draft(rejection_draft.id, &rejection, &human_audit)
+        .await
+        .unwrap();
+    assert_eq!(rejected.status, AiExtractionStatus::Rejected);
+    assert_eq!(rejected.meta.revision, rejection_draft.meta.revision + 1);
+    assert!(rejected.evidence.iter().all(|evidence| {
+        evidence.promoted_attachment_id.is_none() && evidence.meta.revision == 1
+    }));
+    for image in &rejection_images {
+        let restored = store.get_private_ai_image(image.id).await.unwrap();
+        assert_eq!(restored.status, PrivateImageStatus::Active);
+        assert_eq!(restored.project_id, None);
+        assert!(restored.expires_at > now);
+    }
+    assert!(
+        store
+            .list_project_attachments(lab.id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|attachment| rejection_attachments
+                .iter()
+                .all(|private| private.id != attachment.id))
+    );
+    for private_entity_id in std::iter::once(rejected.id)
+        .chain(rejection_images.iter().map(|image| image.id))
+        .chain(rejection_attachments.iter().map(|attachment| attachment.id))
+    {
+        assert!(
+            store
+                .list_audit_entries(&AuditFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_id: Some(private_entity_id),
+                })
+                .await
+                .unwrap()
+                .iter()
+                .all(|entry| entry.project_id.is_none())
+        );
+        assert!(
+            store
+                .list_provenance(&ProvenanceFilter {
+                    lab_id: lab.id,
+                    project_id: None,
+                    entity_type: None,
+                    entity_id: Some(private_entity_id),
+                    source: None,
+                })
+                .await
+                .unwrap()
+                .iter()
+                .all(|record| record.project_id.is_none())
+        );
+    }
+    assert!(matches!(
+        store
+            .reject_ai_extraction_draft(
+                rejected.id,
+                &AiExtractionRejectionInput {
+                    expected_revision: rejected.meta.revision,
+                },
+                &human_audit,
+            )
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    // One user can have only one unresolved candidate for an exact data cell.
+    // Rejecting the winner releases the partial unique constraint for recovery.
+    let uniqueness_definition = create_phase4_contract_definition(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        "ai_unresolved_uniqueness",
+        &human_audit,
+        now,
+    )
+    .await;
+    let (first_unresolved, _, first_unresolved_images) = prepare_phase4_contract_draft(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        user.id,
+        &uniqueness_definition,
+        &vision_profile,
+        &vision_version,
+        "contract-unresolved-first",
+        1,
+        &human_audit,
+        now,
+    )
+    .await;
+    let (duplicate_unresolved, _, duplicate_unresolved_images) = prepare_phase4_contract_draft(
+        store,
+        lab.id,
+        project.id,
+        experiment.id,
+        event.id,
+        user.id,
+        &uniqueness_definition,
+        &vision_profile,
+        &vision_version,
+        "contract-unresolved-duplicate",
+        1,
+        &human_audit,
+        now,
+    )
+    .await;
+    let (first_create, duplicate_create) = tokio::join!(
+        store.create_ai_extraction_draft(&first_unresolved, &human_audit),
+        store.create_ai_extraction_draft(&duplicate_unresolved, &human_audit),
+    );
+    assert_ne!(
+        first_create.is_ok(),
+        duplicate_create.is_ok(),
+        "concurrent writes for one unresolved data cell must have exactly one winner"
+    );
+    let losing_create = if first_create.is_ok() {
+        &duplicate_create
+    } else {
+        &first_create
+    };
+    assert!(matches!(losing_create, Err(StoreError::Conflict(_))));
+    let (winner, winner_images, loser, loser_images) = if first_create.is_ok() {
+        (
+            &first_unresolved,
+            &first_unresolved_images,
+            &duplicate_unresolved,
+            &duplicate_unresolved_images,
+        )
+    } else {
+        (
+            &duplicate_unresolved,
+            &duplicate_unresolved_images,
+            &first_unresolved,
+            &first_unresolved_images,
+        )
+    };
+    assert_eq!(
+        store
+            .get_private_ai_image(winner_images[0].id)
+            .await
+            .unwrap()
+            .status,
+        PrivateImageStatus::PendingApproval
+    );
+    assert_eq!(
+        store
+            .get_private_ai_image(loser_images[0].id)
+            .await
+            .unwrap()
+            .status,
+        PrivateImageStatus::Active
+    );
+    let winner_rejected = store
+        .reject_ai_extraction_draft(
+            winner.id,
+            &AiExtractionRejectionInput {
+                expected_revision: winner.meta.revision,
+            },
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(winner_rejected.status, AiExtractionStatus::Rejected);
+    store
+        .create_ai_extraction_draft(loser, &human_audit)
+        .await
+        .unwrap();
+    let loser_rejected = store
+        .reject_ai_extraction_draft(
+            loser.id,
+            &AiExtractionRejectionInput {
+                expected_revision: loser.meta.revision,
+            },
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(loser_rejected.status, AiExtractionStatus::Rejected);
+
+    // A manual soft archive remains private-scoped and never promotes its
+    // attachment into the project library.
+    let archive_source = store
+        .get_private_ai_image(duplicate_unresolved_images[0].id)
+        .await
+        .unwrap();
+    let archived_private = store
+        .archive_private_ai_image(
+            archive_source.id,
+            project.id,
+            archive_source.meta.revision,
+            Utc::now(),
+            &human_audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_private.status, PrivateImageStatus::Archived);
+    assert!(
+        store
+            .list_project_attachments(lab.id, project.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|attachment| attachment.id != archived_private.attachment_id)
+    );
+    assert!(
+        store
+            .list_audit_entries(&AuditFilter {
+                lab_id: lab.id,
+                project_id: None,
+                entity_id: Some(archived_private.id),
+            })
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| entry.project_id.is_none())
+    );
+    assert!(
+        store
+            .list_provenance(&ProvenanceFilter {
+                lab_id: lab.id,
+                project_id: None,
+                entity_type: Some(EntityType::AiPrivateImage),
+                entity_id: Some(archived_private.id),
+                source: None,
+            })
+            .await
+            .unwrap()
+            .iter()
+            .all(|record| record.project_id.is_none())
+    );
+
+    // Adapter-specific contract tests deliberately corrupt the second image in
+    // these drafts to verify that approval/rejection roll back the first image.
+    for (definition_key, provider) in [
+        ("ai_atomic_approval_fixture", "contract-atomic-approval"),
+        ("ai_atomic_rejection_fixture", "contract-atomic-rejection"),
+    ] {
+        let definition = create_phase4_contract_definition(
+            store,
+            lab.id,
+            project.id,
+            experiment.id,
+            definition_key,
+            &human_audit,
+            now,
+        )
+        .await;
+        let (draft, _, _) = prepare_phase4_contract_draft(
+            store,
+            lab.id,
+            project.id,
+            experiment.id,
+            event.id,
+            user.id,
+            &definition,
+            &vision_profile,
+            &vision_version,
+            provider,
+            2,
+            &human_audit,
+            now,
+        )
+        .await;
+        store
+            .create_ai_extraction_draft(&draft, &human_audit)
+            .await
+            .unwrap();
+    }
 
     let retired = store
         .retire_breeding_pair(pair.id, pair.meta.revision, next_time, &human_audit)

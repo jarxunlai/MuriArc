@@ -946,6 +946,7 @@ impl SettingsService {
             provider,
             api_key,
             runtime,
+            supports_vision: version.supports_vision,
         })
     }
 
@@ -1947,6 +1948,7 @@ pub(crate) struct ResolvedAiProvider {
     pub(crate) provider: BuiltinProvider,
     pub(crate) api_key: Option<AiSecret>,
     pub(crate) runtime: AssistantRuntimeConfig,
+    pub(crate) supports_vision: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

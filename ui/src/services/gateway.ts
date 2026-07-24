@@ -429,24 +429,109 @@ export interface LibraryRecord {
   status: string
 }
 export interface PrivateImageRecord {
-  image: { id: string; project_id?: string; status: string; expires_at: string; meta: { revision: number } }
+  image: {
+    id: string
+    conversation_id?: string
+    project_id?: string
+    status: string
+    expires_at: string
+    meta: { revision: number }
+  }
   fileName: string
   mediaType?: string
   sizeBytes: number
   sha256: string
-  contentHref: string
-  previewHref: string
+  contentHref?: string
+  previewHref?: string
   retentionDays: number
 }
+
+export interface AiObservationDataCell {
+  definitionId: string
+  subjectType: ObservationSubjectType
+  subjectId: string
+}
+
+export interface AiExtractionEvidence {
+  displayOrder: number
+  privateImageId: string
+  privateAttachmentId: string
+  promotedAttachmentId?: string
+  originalSha256: string
+  sanitizedSha256: string
+}
+
+export interface AiExtractionModelTrace {
+  profileId: string
+  profileVersion: number
+  purpose: string
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  providerRequestId?: string
+  trace?: Record<string, unknown>
+}
+
+export interface AiExtractionCandidate {
+  itemIndex: number
+  confidence: number
+  selected: boolean
+  sourceLabel?: string
+  value: ObservationValueData
+  notes?: string
+}
+
 export interface AiExtractionRecord {
   id: string
-  project_id: string
-  experiment_id: string
-  experiment_event_id: string
-  private_image_id: string
+  projectId: string
+  experimentId: string
+  experimentEventId: string
+  currentDataCell?: AiObservationDataCell
   status: string
-  items: Array<{ confidence: number; selected: boolean; source_label?: string; observation: { definition_id: string; subject_type: string; subject_id: string }; value: { value: unknown } }>
-  meta: { revision: number }
+  candidates: AiExtractionCandidate[]
+  evidence: AiExtractionEvidence[]
+  modelTrace?: AiExtractionModelTrace
+  revision: number
+}
+
+export interface CreateAiExtractionInput {
+  imageIds: string[]
+  projectId: string
+  experimentId: string
+  experimentEventId: string
+  currentDataCell: AiObservationDataCell
+  visionModelProfileId?: string
+}
+
+export interface ApproveAiExtractionInput {
+  expectedRevision: number
+  selections: Array<{
+    itemIndex: number
+    value: ObservationValueData
+    notes?: string
+  }>
+}
+
+export interface RejectAiExtractionInput {
+  expectedRevision: number
+}
+
+export interface AppliedAiExtraction {
+  draft: AiExtractionRecord
+  observations: Observation[]
+  attachments: Array<{
+    id: string
+    fileName: string
+    sha256: string
+    mediaType?: string
+  }>
+  links: Array<{
+    id: string
+    attachmentId: string
+    targetType: string
+    targetId: string
+    projectId: string
+  }>
 }
 export interface AiDiagnostics {
   runtimeConfigured: boolean
@@ -754,12 +839,14 @@ export interface MuriArcGateway {
   previewTechnicalLogCleanup?(): Promise<TechnicalLogCleanupPreview>
   cleanupTechnicalLogs?(input: { expectedPolicyRevision: number; expectedEligibleRows: number }): Promise<TechnicalLogCleanupPreview>
   listLibrary?(projectId: string, experimentId?: string): Promise<LibraryRecord[]>
-  listPrivateImages?(): Promise<PrivateImageRecord[]>
+  listPrivateImages?(conversationId?: string, projectId?: string): Promise<PrivateImageRecord[]>
   uploadPrivateImage?(file: File, conversationId?: string): Promise<PrivateImageRecord>
+  readPrivateImage?(id: string): Promise<Blob>
   archivePrivateImage?(id: string, projectId: string, expectedRevision: number): Promise<PrivateImageRecord>
   listAiExtractions?(projectId?: string): Promise<AiExtractionRecord[]>
-  createAiExtraction?(input: { private_image_id: string; project_id: string; experiment_id: string; experiment_event_id: string }): Promise<AiExtractionRecord>
-  approveAiExtraction?(id: string, expectedRevision: number, selectedIndexes: number[]): Promise<AiExtractionRecord>
+  createAiExtraction?(input: CreateAiExtractionInput): Promise<AiExtractionRecord>
+  approveAiExtraction?(id: string, input: ApproveAiExtractionInput): Promise<AppliedAiExtraction>
+  rejectAiExtraction?(id: string, input: RejectAiExtractionInput): Promise<AiExtractionRecord>
   startAiConversation(input: StartAiConversationInput): Promise<StartAiConversationResponse>
   aiTurn(input: AiTurnInput): Promise<AiTurnResponse>
   listAiConversations(projectId?: string, limit?: number): Promise<AiConversationSummary[]>
@@ -1137,6 +1224,54 @@ export class LocalTauriGateway implements MuriArcGateway {
     return this.call<AiModelDefaultsView>('save_ai_model_defaults', { input })
   }
   async listAiProviderPresets() { return structuredClone(builtinAiProviderPresets) }
+  listPrivateImages(conversationId?: string, projectId?: string) {
+    return this.call<PrivateImageRecord[]>('list_private_ai_images', {
+      conversationId,
+      projectId,
+    })
+  }
+  async uploadPrivateImage(file: File, conversationId?: string) {
+    const bytes = Array.from(new Uint8Array(await file.arrayBuffer()))
+    return this.call<PrivateImageRecord>('upload_private_ai_image', {
+      input: {
+        fileName: file.name,
+        mediaType: file.type || undefined,
+        conversationId,
+        bytes,
+      },
+    })
+  }
+  async readPrivateImage(id: string): Promise<Blob> {
+    const result = await this.call<{ mediaType?: string; bytes: number[] }>(
+      'read_private_ai_image',
+      { id },
+    )
+    const bytes = Uint8Array.from(result.bytes)
+    return new Blob([bytes.buffer], {
+      type: result.mediaType ?? 'application/octet-stream',
+    })
+  }
+  archivePrivateImage(id: string, projectId: string, expectedRevision: number) {
+    return this.call<PrivateImageRecord>('archive_private_ai_image', {
+      id,
+      input: { projectId, expectedRevision },
+    })
+  }
+  async listAiExtractions(projectId?: string) {
+    const response = await this.call<unknown[]>('list_ai_extractions', { projectId })
+    return response.map(mapAiExtraction)
+  }
+  async createAiExtraction(input: CreateAiExtractionInput) {
+    return mapAiExtraction(await this.call<unknown>('create_ai_extraction', { input }))
+  }
+  async approveAiExtraction(id: string, input: ApproveAiExtractionInput) {
+    return mapAppliedAiExtraction(
+      await this.call<unknown>('approve_ai_extraction', { id, input }),
+    )
+  }
+  async rejectAiExtraction(id: string, input: RejectAiExtractionInput) {
+    return mapAiExtraction(await this.call<unknown>('reject_ai_extraction', { id, input }))
+  }
   async startAiConversation(input: StartAiConversationInput) {
     if (input.requestedMode === 'full') {
       await this.call<void>('declare_ai_full_startup')
@@ -1715,6 +1850,24 @@ interface RawAiTurnResponse {
       trimmedHistoryTurns: number
       trimReasons?: string[]
     }
+    modelCalls?: Array<{
+      purpose: 'final_answer' | 'vision_and_final' | 'vision_observation'
+      modelProfileId: string
+      modelProfileVersion: number
+      providerId: string
+      model: string
+      usage: {
+        provider_calls: number
+        tool_calls: number
+        input_tokens: number
+        output_tokens: number
+        total_tokens: number
+      }
+    }>
+    imageEvidence?: Array<{
+      imageId: string
+      sanitizedSha256: string
+    }>
   }
   autonomy?: AiAutonomyView
 }
@@ -3094,8 +3247,15 @@ export class RemoteHttpGateway implements MuriArcGateway {
     }))
   }
 
-  async listPrivateImages(): Promise<PrivateImageRecord[]> {
-    return (await this.request<ApiCollection<PrivateImageRecord>>('/ai/images')).data
+  async listPrivateImages(
+    conversationId?: string,
+    projectId?: string,
+  ): Promise<PrivateImageRecord[]> {
+    const query = new URLSearchParams()
+    if (conversationId) query.set('conversation_id', conversationId)
+    if (projectId) query.set('project_id', projectId)
+    const suffix = query.size ? `?${query.toString()}` : ''
+    return (await this.request<ApiCollection<PrivateImageRecord>>(`/ai/images${suffix}`)).data
   }
   async uploadPrivateImage(file: File, conversationId?: string): Promise<PrivateImageRecord> {
     const query = new URLSearchParams({ file_name: file.name, media_type: file.type || 'application/octet-stream' })
@@ -3103,22 +3263,43 @@ export class RemoteHttpGateway implements MuriArcGateway {
     return (await this.request<ApiItem<PrivateImageRecord>>('/ai/images/upload?' + query.toString(),
       { method: 'POST', body: file }, { contentType: file.type || 'application/octet-stream' })).data
   }
+  async readPrivateImage(id: string): Promise<Blob> {
+    const response = await this.send(
+      `/ai/images/${encodeURIComponent(id)}/content`,
+      {},
+      { accept: 'application/octet-stream' },
+    )
+    return response.blob()
+  }
   async archivePrivateImage(id: string, projectId: string, expectedRevision: number) {
     return (await this.request<ApiItem<PrivateImageRecord>>('/ai/images/' + encodeURIComponent(id) + '/archive',
       { method: 'POST', body: JSON.stringify({ project_id: projectId, expected_revision: expectedRevision }) })).data
   }
   async listAiExtractions(projectId?: string): Promise<AiExtractionRecord[]> {
     const suffix = projectId ? '?project_id=' + encodeURIComponent(projectId) : ''
-    return (await this.request<ApiCollection<AiExtractionRecord>>('/ai/extractions' + suffix)).data
+    const response = await this.request<ApiCollection<unknown>>('/ai/extractions' + suffix)
+    return response.data.map(mapAiExtraction)
   }
-  async createAiExtraction(input: { private_image_id: string; project_id: string; experiment_id: string; experiment_event_id: string }): Promise<AiExtractionRecord> {
-    return (await this.request<ApiItem<AiExtractionRecord>>('/ai/extractions',
-      { method: 'POST', body: JSON.stringify(input) })).data
+  async createAiExtraction(input: CreateAiExtractionInput): Promise<AiExtractionRecord> {
+    const response = await this.request<ApiItem<unknown>>('/ai/extractions', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    })
+    return mapAiExtraction(response.data)
   }
-  async approveAiExtraction(id: string, expectedRevision: number, selectedIndexes: number[]) {
-    const response = await this.request<ApiItem<{ draft: AiExtractionRecord }>>('/ai/extractions/' + encodeURIComponent(id) + '/approve',
-      { method: 'POST', body: JSON.stringify({ expected_revision: expectedRevision, selected_indexes: selectedIndexes }) })
-    return response.data.draft
+  async approveAiExtraction(id: string, input: ApproveAiExtractionInput) {
+    const response = await this.request<ApiItem<unknown>>(
+      `/ai/extractions/${encodeURIComponent(id)}/approve`,
+      { method: 'POST', body: JSON.stringify(input) },
+    )
+    return mapAppliedAiExtraction(response.data)
+  }
+  async rejectAiExtraction(id: string, input: RejectAiExtractionInput) {
+    const response = await this.request<ApiItem<unknown>>(
+      `/ai/extractions/${encodeURIComponent(id)}/reject`,
+      { method: 'POST', body: JSON.stringify(input) },
+    )
+    return mapAiExtraction(response.data)
   }
   async testAiSettings() {
     return (await this.request<ApiItem<{ ok: boolean; latencyMs: number; errorCode?: string }>>('/ai/settings/test', { method: 'POST' })).data
@@ -3407,6 +3588,20 @@ function mapAiTurn(raw: RawAiTurnResponse): AiTurnResponse {
         trimmedHistoryTurns: raw.trace.context?.trimmedHistoryTurns ?? 0,
         trimReasons: raw.trace.context?.trimReasons ?? [],
       },
+      stages: raw.trace.modelCalls?.map((call) => ({
+        profileId: call.modelProfileId,
+        profileVersion: call.modelProfileVersion,
+        purpose: call.purpose,
+        modelId: call.model,
+        inputTokens: call.usage.input_tokens,
+        outputTokens: call.usage.output_tokens,
+        totalTokens: call.usage.total_tokens,
+      })) ?? [],
+      imageEvidence: raw.trace.imageEvidence?.map((evidence, displayOrder) => ({
+        imageId: evidence.imageId,
+        sha256: evidence.sanitizedSha256,
+        displayOrder,
+      })) ?? [],
     },
     autonomy: raw.autonomy ?? defaultAiAutonomy(),
   }
@@ -4050,6 +4245,150 @@ function mapAttachment(raw: RawAttachment): AttachmentMetadata {
   }
 }
 
+function valueRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {}
+}
+
+function stringField(
+  value: Record<string, unknown>,
+  camelCase: string,
+  snakeCase: string,
+): string {
+  const field = value[camelCase] ?? value[snakeCase]
+  return typeof field === 'string' ? field : ''
+}
+
+function numberField(
+  value: Record<string, unknown>,
+  camelCase: string,
+  snakeCase: string,
+): number {
+  const field = value[camelCase] ?? value[snakeCase]
+  return typeof field === 'number' ? field : 0
+}
+
+function mapAiExtraction(raw: unknown): AiExtractionRecord {
+  const entry = valueRecord(raw)
+  const items = Array.isArray(entry.candidates)
+    ? entry.candidates
+    : Array.isArray(entry.items) ? entry.items : []
+  const candidates = items.map((candidate, itemIndex): AiExtractionCandidate => {
+    const item = valueRecord(candidate)
+    const storedValue = valueRecord(item.value)
+    const normalizedValue = typeof storedValue.type === 'string'
+      ? item.value
+      : storedValue.value
+    return {
+      itemIndex: typeof item.itemIndex === 'number'
+        ? item.itemIndex
+        : typeof item.item_index === 'number' ? item.item_index : itemIndex,
+      confidence: typeof item.confidence === 'number' ? item.confidence : 0,
+      selected: item.selected !== false,
+      sourceLabel: typeof (item.sourceLabel ?? item.source_label) === 'string'
+        ? String(item.sourceLabel ?? item.source_label)
+        : undefined,
+      value: normalizedValue as ObservationValueData,
+      notes: typeof storedValue.notes === 'string' ? storedValue.notes : undefined,
+    }
+  })
+
+  const storedCell = valueRecord(entry.currentDataCell ?? entry.current_data_cell)
+  const firstObservation = valueRecord(valueRecord(items[0]).observation)
+  const definitionId = stringField(storedCell, 'definitionId', 'definition_id')
+    || stringField(firstObservation, 'definitionId', 'definition_id')
+  const subjectType = stringField(storedCell, 'subjectType', 'subject_type')
+    || stringField(firstObservation, 'subjectType', 'subject_type')
+  const subjectId = stringField(storedCell, 'subjectId', 'subject_id')
+    || stringField(firstObservation, 'subjectId', 'subject_id')
+  const currentDataCell = definitionId && subjectType && subjectId
+    ? {
+        definitionId,
+        subjectType: subjectType as ObservationSubjectType,
+        subjectId,
+      }
+    : undefined
+
+  const storedEvidence = Array.isArray(entry.evidence) ? entry.evidence : []
+  const evidence = storedEvidence.map((rawEvidence): AiExtractionEvidence => {
+    const item = valueRecord(rawEvidence)
+    return {
+      displayOrder: numberField(item, 'displayOrder', 'display_order'),
+      privateImageId: stringField(item, 'privateImageId', 'private_image_id'),
+      privateAttachmentId: stringField(item, 'privateAttachmentId', 'private_attachment_id'),
+      promotedAttachmentId: stringField(item, 'promotedAttachmentId', 'promoted_attachment_id')
+        || undefined,
+      originalSha256: stringField(item, 'originalSha256', 'original_sha256'),
+      sanitizedSha256: stringField(item, 'sanitizedSha256', 'sanitized_sha256'),
+    }
+  })
+  const storedTrace = valueRecord(entry.modelTrace ?? entry.model_trace)
+  const profileId = stringField(storedTrace, 'profileId', 'profile_id')
+  const modelTrace = profileId
+    ? {
+        profileId,
+        profileVersion: numberField(storedTrace, 'profileVersion', 'profile_version'),
+        purpose: stringField(storedTrace, 'purpose', 'purpose'),
+        inputTokens: numberField(storedTrace, 'inputTokens', 'input_tokens'),
+        outputTokens: numberField(storedTrace, 'outputTokens', 'output_tokens'),
+        totalTokens: numberField(storedTrace, 'totalTokens', 'total_tokens'),
+        providerRequestId:
+          stringField(storedTrace, 'providerRequestId', 'provider_request_id') || undefined,
+        trace: valueRecord(storedTrace.trace),
+      }
+    : undefined
+  const meta = valueRecord(entry.meta)
+  return {
+    id: stringField(entry, 'id', 'id'),
+    projectId: stringField(entry, 'projectId', 'project_id'),
+    experimentId: stringField(entry, 'experimentId', 'experiment_id'),
+    experimentEventId: stringField(entry, 'experimentEventId', 'experiment_event_id'),
+    currentDataCell,
+    status: stringField(entry, 'status', 'status'),
+    candidates,
+    evidence,
+    modelTrace,
+    revision: typeof entry.revision === 'number'
+      ? entry.revision
+      : typeof meta.revision === 'number' ? meta.revision : 0,
+  }
+}
+
+function mapAppliedAiExtraction(raw: unknown): AppliedAiExtraction {
+  const entry = valueRecord(raw)
+  const observations = Array.isArray(entry.observations)
+    ? entry.observations.map((item) => mapObservation(item as RawObservation))
+    : []
+  const attachments = Array.isArray(entry.attachments)
+    ? entry.attachments.map((rawAttachment) => {
+        const item = valueRecord(rawAttachment)
+        return {
+          id: stringField(item, 'id', 'id'),
+          fileName: stringField(item, 'fileName', 'file_name'),
+          sha256: stringField(item, 'sha256', 'sha256'),
+          mediaType: stringField(item, 'mediaType', 'media_type') || undefined,
+        }
+      })
+    : []
+  const links = Array.isArray(entry.links)
+    ? entry.links.map((rawLink) => {
+        const item = valueRecord(rawLink)
+        return {
+          id: stringField(item, 'id', 'id'),
+          attachmentId: stringField(item, 'attachmentId', 'attachment_id'),
+          targetType: stringField(item, 'targetType', 'target_type'),
+          targetId: stringField(item, 'targetId', 'target_id'),
+          projectId: stringField(item, 'projectId', 'project_id'),
+        }
+      })
+    : []
+  return {
+    draft: mapAiExtraction(entry.draft),
+    observations,
+    attachments,
+    links,
+  }
+}
+
 const clone = <T>(value: T): T => structuredClone(value)
 
 class DemoDomainStore {
@@ -4317,6 +4656,9 @@ export class DemoGateway implements MuriArcGateway {
   private readonly store = new DemoDomainStore()
   private readonly aiConversations = new Map<string, AiConversationDetail>()
   private readonly aiConversationAutonomy = new Map<string, AiAutonomyView>()
+  private readonly privateImages: PrivateImageRecord[] = []
+  private readonly privateImageFiles = new Map<string, Blob>()
+  private readonly aiExtractions: AiExtractionRecord[] = []
 
   private setDemoArchive<T extends {
     id: string
@@ -5350,6 +5692,255 @@ export class DemoGateway implements MuriArcGateway {
     endpoint.revision += 1
     return clone(endpoint)
   }
+  async listPrivateImages(conversationId?: string, projectId?: string) {
+    await pause(20)
+    return clone(this.privateImages.filter((entry) =>
+      (!conversationId || entry.image.conversation_id === conversationId)
+      && (!projectId || entry.image.project_id === projectId)))
+  }
+  async uploadPrivateImage(file: File, conversationId?: string) {
+    await pause(20)
+    const conversation = conversationId ? this.aiConversations.get(conversationId) : undefined
+    if (conversationId && !conversation) throw new Error('AI 会话不存在')
+    const id = crypto.randomUUID()
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    const pseudoHash = [...bytes.slice(0, 32)]
+      .map((value) => value.toString(16).padStart(2, '0'))
+      .join('')
+      .padEnd(64, '0')
+    const now = new Date()
+    const record: PrivateImageRecord = {
+      image: {
+        id,
+        conversation_id: conversationId,
+        project_id: conversation?.conversation.projectId,
+        status: 'active',
+        expires_at: new Date(now.getTime() + 30 * 86_400_000).toISOString(),
+        meta: { revision: 1 },
+      },
+      fileName: file.name,
+      mediaType: file.type || undefined,
+      sizeBytes: file.size,
+      sha256: pseudoHash,
+      contentHref: '',
+      previewHref: '',
+      retentionDays: 30,
+    }
+    this.privateImages.push(record)
+    this.privateImageFiles.set(id, file.slice(0, file.size, file.type))
+    return clone(record)
+  }
+  async readPrivateImage(id: string) {
+    await pause(10)
+    const file = this.privateImageFiles.get(id)
+    if (!file) throw new Error('私人图片不存在')
+    return file.slice(0, file.size, file.type)
+  }
+  async archivePrivateImage(id: string, projectId: string, expectedRevision: number) {
+    await pause(20)
+    const entry = this.privateImages.find((candidate) => candidate.image.id === id)
+    if (!entry
+      || entry.image.project_id !== projectId
+      || entry.image.meta.revision !== expectedRevision) {
+      throw new Error('私人图片已变化，请刷新后重试')
+    }
+    entry.image.status = 'archived'
+    entry.image.meta.revision += 1
+    return clone(entry)
+  }
+  async listAiExtractions(projectId?: string) {
+    await pause(20)
+    return clone(this.aiExtractions.filter((entry) => !projectId || entry.projectId === projectId))
+  }
+  async createAiExtraction(input: CreateAiExtractionInput): Promise<AiExtractionRecord> {
+    await pause(40)
+    if (input.imageIds.length < 1 || input.imageIds.length > 8
+      || new Set(input.imageIds).size !== input.imageIds.length) {
+      throw new Error('请选择 1–8 张不重复的图片')
+    }
+    const images = input.imageIds.map((id) =>
+      this.privateImages.find((entry) => entry.image.id === id
+        && entry.image.status === 'active'))
+    if (images.some((entry) => !entry)) throw new Error('图片证据不存在或当前不可用')
+    const definition = this.store.observationDefinitions.find((entry) =>
+      entry.id === input.currentDataCell.definitionId
+      && entry.experimentId === input.experimentId)
+    if (!definition) throw new Error('当前数据单元的数据列不存在')
+    if (this.store.observations.some((entry) =>
+      entry.experimentId === input.experimentId
+      && entry.experimentEventId === input.experimentEventId
+      && entry.definitionId === input.currentDataCell.definitionId
+      && entry.subjectType === input.currentDataCell.subjectType
+      && entry.subjectId === input.currentDataCell.subjectId)) {
+      throw new Error('当前数据单元已有正式值，AI 候选不能覆盖')
+    }
+    const profileId = input.visionModelProfileId
+      ?? this.store.aiModelDefaults.defaultVisionProfileId
+    const profile = this.store.aiModelProfiles.find((entry) =>
+      entry.id === profileId && entry.supportsVision && !entry.archivedAt)
+    if (!profile) throw new Error('请明确选择一个可用的视觉模型')
+    const value: ObservationValueData = definition.valueType === 'number'
+      ? { type: 'number', value: 0 }
+      : definition.valueType === 'text'
+        ? { type: 'text', value: '演示识别候选' }
+        : definition.valueType === 'boolean'
+          ? { type: 'boolean', value: false }
+          : definition.valueType === 'date'
+            ? { type: 'date', value: new Date().toISOString().slice(0, 10) }
+            : definition.valueType === 'category'
+              ? { type: 'category', value: definition.categories[0] ?? '' }
+              : { type: 'json', value: {} }
+    const draft: AiExtractionRecord = {
+      id: crypto.randomUUID(),
+      projectId: input.projectId,
+      experimentId: input.experimentId,
+      experimentEventId: input.experimentEventId,
+      currentDataCell: clone(input.currentDataCell),
+      status: 'pending_approval',
+      candidates: [{
+        itemIndex: 0,
+        confidence: 0.82,
+        selected: false,
+        sourceLabel: definition.label,
+        value,
+        notes: '浏览器演示候选；尚未写入正式数据',
+      }],
+      evidence: images.map((entry, displayOrder) => ({
+        displayOrder,
+        privateImageId: entry!.image.id,
+        privateAttachmentId: entry!.image.id,
+        originalSha256: entry!.sha256,
+        sanitizedSha256: entry!.sha256,
+      })),
+      modelTrace: {
+        profileId: profile.id,
+        profileVersion: profile.currentVersion,
+        purpose: 'vision',
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+      },
+      revision: 1,
+    }
+    for (const image of images) {
+      image!.image.status = 'pending_approval'
+      image!.image.meta.revision += 1
+    }
+    this.aiExtractions.unshift(draft)
+    return clone(draft)
+  }
+  async approveAiExtraction(
+    id: string,
+    input: ApproveAiExtractionInput,
+  ): Promise<AppliedAiExtraction> {
+    await pause(30)
+    const draft = this.aiExtractions.find((entry) => entry.id === id)
+    if (!draft || draft.revision !== input.expectedRevision
+      || draft.status !== 'pending_approval') {
+      throw new Error('AI 候选已变化，请刷新后重试')
+    }
+    if (!draft.currentDataCell || input.selections.length !== 1) {
+      throw new Error('当前数据单元必须且只能批准一个候选')
+    }
+    const selection = input.selections[0]
+    const candidate = draft.candidates.find((entry) =>
+      entry.itemIndex === selection?.itemIndex)
+    const definition = this.store.observationDefinitions.find((entry) =>
+      entry.id === draft.currentDataCell?.definitionId)
+    if (!candidate || !definition) throw new Error('AI 候选绑定无效')
+    assertDemoObservationValue(definition, selection.value)
+    const evidenceImages = draft.evidence.map((evidence) => {
+      const image = this.privateImages.find((entry) =>
+        entry.image.id === evidence.privateImageId)
+      if (!image || image.image.status !== 'pending_approval') {
+        throw new Error('AI 图片证据已变化，请刷新后重试')
+      }
+      return image
+    })
+    const now = new Date().toISOString()
+    const observation: Observation = {
+      id: crypto.randomUUID(),
+      projectId: draft.projectId,
+      experimentId: draft.experimentId,
+      experimentEventId: draft.experimentEventId,
+      definitionId: draft.currentDataCell.definitionId,
+      subjectType: draft.currentDataCell.subjectType,
+      subjectId: draft.currentDataCell.subjectId,
+      context: { source: 'ai_image_extraction' },
+      currentValueVersion: 1,
+      revision: 1,
+    }
+    const valueRecord: ObservationValueRecord = {
+      id: crypto.randomUUID(),
+      observationId: observation.id,
+      version: 1,
+      value: clone(selection.value),
+      recordedAt: now,
+      notes: selection.notes?.trim() || undefined,
+      revision: 1,
+    }
+    this.store.observations.push(observation)
+    this.store.observationValues.push(valueRecord)
+    candidate.selected = true
+    candidate.value = clone(selection.value)
+    candidate.notes = selection.notes?.trim() || undefined
+    const attachments = draft.evidence.map((evidence, index) => {
+      const image = evidenceImages[index]!
+      const promotedAttachmentId = crypto.randomUUID()
+      evidence.promotedAttachmentId = promotedAttachmentId
+      image.image.status = 'archived'
+      image.image.project_id = draft.projectId
+      image.image.meta.revision += 1
+      return {
+        id: promotedAttachmentId,
+        fileName: image.fileName,
+        sha256: image.sha256,
+        mediaType: image.mediaType,
+      }
+    })
+    const links = attachments.map((attachment) => ({
+      id: crypto.randomUUID(),
+      attachmentId: attachment.id,
+      targetType: draft.currentDataCell!.subjectType,
+      targetId: draft.currentDataCell!.subjectId,
+      projectId: draft.projectId,
+    }))
+    draft.status = 'approved'
+    draft.revision += 1
+    return {
+      draft: clone(draft),
+      observations: [clone(observation)],
+      attachments: clone(attachments),
+      links: clone(links),
+    }
+  }
+  async rejectAiExtraction(
+    id: string,
+    input: RejectAiExtractionInput,
+  ): Promise<AiExtractionRecord> {
+    await pause(20)
+    const draft = this.aiExtractions.find((entry) => entry.id === id)
+    if (!draft || draft.revision !== input.expectedRevision
+      || draft.status !== 'pending_approval') {
+      throw new Error('AI 候选已变化，请刷新后重试')
+    }
+    for (const evidence of draft.evidence) {
+      const image = this.privateImages.find((entry) =>
+        entry.image.id === evidence.privateImageId)
+      if (!image || image.image.status !== 'pending_approval') {
+        throw new Error('AI 图片证据已变化，请刷新后重试')
+      }
+    }
+    for (const evidence of draft.evidence) {
+      const image = this.privateImages.find((entry) =>
+        entry.image.id === evidence.privateImageId)!
+      image.image.status = 'active'
+      image.image.meta.revision += 1
+    }
+    draft.status = 'rejected'
+    draft.revision += 1
+    return clone(draft)
+  }
   async startAiConversation(
     input: StartAiConversationInput,
   ): Promise<StartAiConversationResponse> {
@@ -5386,6 +5977,30 @@ export class DemoGateway implements MuriArcGateway {
   async aiTurn(input: AiTurnInput): Promise<AiTurnResponse> {
     await pause(80)
     const conversationId = input.conversationId ?? crypto.randomUUID()
+    const detail = this.aiConversations.get(conversationId)
+    if (input.conversationId && !detail) throw new Error('AI 会话不存在')
+    const imageIds = input.imageIds ?? []
+    if (imageIds.length > 8 || new Set(imageIds).size !== imageIds.length) {
+      throw new Error('每轮最多使用 8 张不重复的图片')
+    }
+    const imageEvidence = imageIds.map((id, displayOrder) => {
+      const image = this.privateImages.find((entry) =>
+        entry.image.id === id
+        && entry.image.conversation_id === conversationId
+        && entry.image.status === 'active')
+      if (!image) throw new Error('图片证据不存在或不属于当前会话')
+      return { imageId: id, sha256: image.sha256, displayOrder }
+    })
+    const conversationProfile = this.store.aiModelProfiles.find((profile) =>
+      profile.id === detail?.conversation.modelProfileId)
+    let visionProfile: AiModelProfileView | undefined
+    if (imageIds.length && !conversationProfile?.supportsVision) {
+      const profileId = input.visionModelProfileId
+        ?? this.store.aiModelDefaults.defaultVisionProfileId
+      visionProfile = this.store.aiModelProfiles.find((profile) =>
+        profile.id === profileId && profile.supportsVision && !profile.archivedAt)
+      if (!visionProfile) throw new Error('请明确选择一个可用的视觉模型')
+    }
     const now = new Date().toISOString()
     const citation = {
       entityType: 'animal' as const,
@@ -5395,7 +6010,9 @@ export class DemoGateway implements MuriArcGateway {
     }
     const response: AiTurnResponse = {
       conversationId,
-      content: '演示数据中有 1 只动物的基因型仍待确认。浏览器演示不会读取正式数据库，也不会创建写入草稿。',
+      content: imageIds.length
+        ? `已按${visionProfile ? '视觉中转' : '当前模型直接视觉'}路径读取 ${imageIds.length} 张演示图片。浏览器演示不会调用真实 Provider。`
+        : '演示数据中有 1 只动物的基因型仍待确认。浏览器演示不会读取正式数据库，也不会创建写入草稿。',
       citations: [citation],
       toolRuns: [{
         toolRunId: crypto.randomUUID(), providerCallId: 'demo-call', tool: 'animal_search',
@@ -5412,12 +6029,45 @@ export class DemoGateway implements MuriArcGateway {
           trimmedHistoryTurns: 0,
           trimReasons: [],
         },
+        stages: imageIds.length
+          ? visionProfile
+            ? [
+                {
+                  profileId: visionProfile.id,
+                  profileVersion: visionProfile.currentVersion,
+                  purpose: 'vision_observation',
+                  modelId: visionProfile.modelId,
+                  inputTokens: 0,
+                  outputTokens: 0,
+                  totalTokens: 0,
+                },
+                {
+                  profileId: conversationProfile?.id ?? '',
+                  profileVersion: conversationProfile?.currentVersion ?? 0,
+                  purpose: 'final_answer',
+                  modelId: conversationProfile?.modelId,
+                  inputTokens: 0,
+                  outputTokens: 0,
+                  totalTokens: 0,
+                },
+              ]
+            : [{
+                profileId: conversationProfile?.id ?? '',
+                profileVersion: conversationProfile?.currentVersion ?? 0,
+                purpose: 'vision_and_final',
+                modelId: conversationProfile?.modelId,
+                inputTokens: 0,
+                outputTokens: 0,
+                totalTokens: 0,
+              }]
+          : [],
+        imageEvidence,
       },
       autonomy: clone(this.aiConversationAutonomy.get(conversationId) ?? defaultAiAutonomy()),
     }
-    let detail = this.aiConversations.get(conversationId)
-    if (!detail) {
-      detail = {
+    let conversationDetail = detail
+    if (!conversationDetail) {
+      conversationDetail = {
         conversation: {
           id: conversationId,
           projectId: input.projectId,
@@ -5429,31 +6079,31 @@ export class DemoGateway implements MuriArcGateway {
         },
         messages: [],
       }
-      this.aiConversations.set(conversationId, detail)
+      this.aiConversations.set(conversationId, conversationDetail)
       this.aiConversationAutonomy.set(conversationId, defaultAiAutonomy())
     }
-    if (!detail.messages.length && detail.conversation.title === '新会话') {
-      detail.conversation.title = input.message.trim().slice(0, 80) || '新会话'
+    if (!conversationDetail.messages.length && conversationDetail.conversation.title === '新会话') {
+      conversationDetail.conversation.title = input.message.trim().slice(0, 80) || '新会话'
     }
-    detail.messages.push(
+    conversationDetail.messages.push(
       {
         id: crypto.randomUUID(),
-        sequence: detail.messages.length + 1,
+        sequence: conversationDetail.messages.length + 1,
         role: 'user',
         content: input.message,
         createdAt: now,
       },
       {
         id: crypto.randomUUID(),
-        sequence: detail.messages.length + 2,
+        sequence: conversationDetail.messages.length + 2,
         role: 'assistant',
         content: response.content,
         response: clone(response),
         createdAt: now,
       },
     )
-    detail.conversation.updatedAt = now
-    detail.conversation.revision += 1
+    conversationDetail.conversation.updatedAt = now
+    conversationDetail.conversation.revision += 1
     return clone(response)
   }
   async getAiAutonomy(conversationId: string) {

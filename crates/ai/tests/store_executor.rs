@@ -5,7 +5,7 @@ use chrono::Utc;
 use muriarc_ai::{
     AiDataAccessContext, AiDataApplyResult, AiDataToolBackend, Citation, DomainToolExecutor,
     DomainToolOutput, DomainToolRequest, StoreDomainToolExecutor, StoreToolAccessContext,
-    ToolExecutionError, ToolName, WriteDraft,
+    ToolExecutionError, ToolName, ToolScope, WriteDraft,
 };
 use muriarc_core::{
     AiImportResolution, Animal, AnimalEvent, AnimalEventKind, Attachment, AuditFilter, Cage,
@@ -341,6 +341,25 @@ async fn aggregate_model_tools_execute_bounded_reads_with_citations() {
         !supported.contains(&ToolName::AnimalSearch),
         "legacy read names must not be advertised to the model"
     );
+
+    let explicit_compatibility = fixture.executor.additional_explicit_tools();
+    assert_eq!(
+        explicit_compatibility,
+        vec![
+            ToolName::AnimalSearch,
+            ToolName::AnimalTimeline,
+            ToolName::CageList,
+            ToolName::ProjectList,
+            ToolName::ExperimentStatus,
+            ToolName::MeasurementQuery,
+            ToolName::SampleInventory,
+        ]
+    );
+    for tool in explicit_compatibility {
+        assert_eq!(tool.required_scopes(), &[ToolScope::Read], "{tool:?}");
+        assert!(!tool.is_draft_only(), "{tool:?}");
+        assert!(!supported.contains(&tool), "{tool:?}");
+    }
 
     let calls = [
         (

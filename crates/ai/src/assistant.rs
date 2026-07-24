@@ -308,6 +308,18 @@ pub trait DomainToolExecutor: Send + Sync {
             .collect()
     }
 
+    /// Declares additional compatibility tools that may be exposed only when
+    /// the authoritative current user explicitly requests one by its exact
+    /// name. These tools stay out of the ordinary model-visible surface.
+    ///
+    /// Implementations must return only tools that `execute` can handle with
+    /// the same fail-closed authorization and domain checks as normally
+    /// advertised tools. The assistant still intersects this list with the
+    /// actor's [`AccessGrant`] and exposes at most the one validated target.
+    fn additional_explicit_tools(&self) -> Vec<ToolName> {
+        Vec::new()
+    }
+
     async fn execute(
         &self,
         request: DomainToolRequest,
@@ -610,15 +622,40 @@ where
         validate_history_structure(&request.history)?;
 
         let supported_tools = self.executor.supported_tools();
-        let tools = fixed_tool_definitions()
-            .into_iter()
+        let additional_explicit_tools = self.executor.additional_explicit_tools();
+        let definitions = fixed_tool_definitions();
+        let mut tools = definitions
+            .iter()
             .filter(|definition| {
                 ToolName::from_wire_name(&definition.name).is_some_and(|tool| {
                     supported_tools.contains(&tool) && access.authorize(tool).is_ok()
                 })
             })
+            .cloned()
             .collect::<Vec<_>>();
-        let grounding_tool = explicitly_requested_visible_tool(&request.message, &tools);
+        let explicit_candidates = definitions
+            .into_iter()
+            .filter(|definition| {
+                ToolName::from_wire_name(&definition.name).is_some_and(|tool| {
+                    (supported_tools.contains(&tool) || additional_explicit_tools.contains(&tool))
+                        && access.authorize(tool).is_ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        let grounding_tool =
+            explicitly_requested_visible_tool(&request.message, &explicit_candidates);
+        let mut dispatchable_tools = supported_tools.clone();
+        if let Some(tool) = grounding_tool
+            && !supported_tools.contains(&tool)
+        {
+            let definition = explicit_candidates
+                .iter()
+                .find(|definition| definition.name == tool.as_str())
+                .expect("grounding tool came from the explicit candidate set")
+                .clone();
+            tools.push(definition);
+            dispatchable_tools.push(tool);
+        }
         let mut required_tool = grounding_tool;
         let mut grounding_attempt = 1_u8;
         let mut grounding_retry_used = false;
@@ -785,7 +822,7 @@ where
             let prepared = prepare_calls(
                 response.tool_calls,
                 access,
-                &supported_tools,
+                &dispatchable_tools,
                 &mut seen_call_ids,
                 self.limits,
             )?;

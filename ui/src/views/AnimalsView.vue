@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, h, onMounted, reactive, ref, watch } from 'vue'
-import { Download, Filter, Plus, Search, Upload } from '@lucide/vue'
+import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { Download, FileImage, Filter, Link2, Plus, Search, Upload } from '@lucide/vue'
 import { NButton, NTag, type DataTableColumns, useMessage } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import type {
@@ -12,6 +12,7 @@ import type {
   GeneAllele,
   GeneLocus,
   GenotypeDefinition,
+  GenotypingBatch,
   GenotypingRecord,
   GenotypingState,
   PedigreeRelation,
@@ -19,7 +20,7 @@ import type {
   ProjectSummary,
 } from '@/domain/models'
 import { currentGenotypingRecords } from '@/domain/genetics'
-import { gateway } from '@/services/gateway'
+import { gateway, type AttachmentMetadata } from '@/services/gateway'
 import {
   canManageBreeding,
   canManageProjectAnimals,
@@ -57,6 +58,9 @@ const geneAlleles = ref<GeneAllele[]>([])
 const genotypes = ref<AnimalGenotype[]>([])
 const genotypeDefinitions = ref<GenotypeDefinition[]>([])
 const genotypingRecords = ref<GenotypingRecord[]>([])
+const genotypingBatchesByRecord = ref(new Map<string, GenotypingBatch>())
+const genotypingBatchAttachments = ref(new Map<string, AttachmentMetadata[]>())
+const genotypingBatchImageUrls = ref(new Map<string, string>())
 const attachmentUploading = ref(false)
 const attachmentDownloadingId = ref<string | null>(null)
 const attachmentProjectId = ref<string | null>(null)
@@ -171,6 +175,7 @@ const currentGenotypeRows = computed(() => currentGenotypingRecords(genotypingRe
     definitionLabel: genotypeDefinitions.value.find(
       (definition) => definition.id === record.genotypeDefinitionId,
     )?.name ?? record.genotypeDefinitionId,
+    sourceBatch: genotypingBatchesByRecord.value.get(record.id),
   })))
 const filtered = computed(() => {
   const query = search.value.trim().toLowerCase()
@@ -225,6 +230,54 @@ function pedigreeLabel(relation: PedigreeRelation) {
   return relation.parentType === 'father' ? '父本' : relation.parentType === 'mother' ? '母本' : '父母'
 }
 
+function clearGenotypingBatchEvidence() {
+  for (const url of genotypingBatchImageUrls.value.values()) URL.revokeObjectURL(url)
+  genotypingBatchesByRecord.value = new Map()
+  genotypingBatchAttachments.value = new Map()
+  genotypingBatchImageUrls.value = new Map()
+}
+
+async function loadGenotypingBatchEvidence(records: GenotypingRecord[]) {
+  clearGenotypingBatchEvidence()
+  if (!gateway.getGenotypingBatchForRecord) return
+  const batches = new Map<string, GenotypingBatch>()
+  const pairs = await Promise.all(records.map(async (record) => ({
+    recordId: record.id,
+    batch: await gateway.getGenotypingBatchForRecord?.(record.id, projectId.value),
+  })))
+  for (const pair of pairs) if (pair.batch) batches.set(pair.recordId, pair.batch)
+  genotypingBatchesByRecord.value = batches
+  if (!gateway.listAttachments) return
+  const unique = new Map([...batches.values()].map((item) => [item.id, item]))
+  const attachmentPairs = await Promise.all([...unique.values()].map(async (item) => ({
+    batch: item,
+    attachments: await gateway.listAttachments?.({
+      entityType: 'genotyping_batch',
+      entityId: item.id,
+      projectId: item.projectId,
+    }) ?? [],
+  })))
+  genotypingBatchAttachments.value = new Map(attachmentPairs.map((item) => [item.batch.id, item.attachments]))
+  if (!gateway.downloadAttachment) return
+  const urls = new Map<string, string>()
+  await Promise.all(attachmentPairs.flatMap((item) => item.attachments
+    .filter((attachment) => attachment.mediaType?.startsWith('image/'))
+    .map(async (attachment) => {
+      try {
+        const blob = await gateway.downloadAttachment?.(attachment.id)
+        if (blob) urls.set(attachment.id, URL.createObjectURL(blob))
+      } catch {
+        // The batch link and explicit download remain available if thumbnail creation fails.
+      }
+    })))
+  genotypingBatchImageUrls.value = urls
+}
+
+function batchGelAttachments(batchId: string) {
+  return (genotypingBatchAttachments.value.get(batchId) ?? [])
+    .filter((attachment) => attachment.mediaType?.startsWith('image/'))
+}
+
 async function loadGenetics(animalId: string) {
   geneticsLoading.value = true
   try {
@@ -244,6 +297,7 @@ async function loadGenetics(animalId: string) {
     genotypes.value = rows
     genotypeDefinitions.value = definitions
     genotypingRecords.value = recordRows
+    await loadGenotypingBatchEvidence(recordRows)
   } finally {
     geneticsLoading.value = false
   }
@@ -256,6 +310,7 @@ async function hydrateSelected(animal: Animal, resetTab = true) {
   geneAlleles.value = []
   genotypes.value = []
   genotypingRecords.value = []
+  clearGenotypingBatchEvidence()
   detailError.value = ''
   if (resetTab) detailTab.value = 'timeline'
   detailLoading.value = true
@@ -638,6 +693,7 @@ watch(projectBatchId, () => {
   if (showProjectBatch.value) void loadProjectBatchPreview()
 })
 onMounted(load)
+onBeforeUnmount(clearGenotypingBatchEvidence)
 </script>
 
 <template>
@@ -818,6 +874,17 @@ onMounted(load)
                       <n-tag size="small" :type="genotypingStateMeta[record.state].type" :bordered="false">{{ genotypingStateMeta[record.state].label }}</n-tag>
                     </header>
                     <dl><dt>方法</dt><dd>{{ record.method || '未记录' }}</dd><dt>备注</dt><dd>{{ record.notes || '无' }}</dd></dl>
+                    <section v-if="record.sourceBatch" class="batch-provenance">
+                      <header><Link2 :size="15" /><span><strong>来源批次 {{ record.sourceBatch.batchNumber }}</strong><small>{{ formatDateTime(record.sourceBatch.assessedAt) }} · {{ record.sourceBatch.previewRowCount ?? 0 }} 条记录</small></span><n-tag size="tiny" type="success" :bordered="false">已溯源</n-tag></header>
+                      <div v-if="batchGelAttachments(record.sourceBatch.id).length" class="batch-gels">
+                        <button v-for="attachment in batchGelAttachments(record.sourceBatch.id)" :key="attachment.id" type="button" @click="downloadAttachment(attachment.id, attachment.fileName)">
+                          <img v-if="genotypingBatchImageUrls.get(attachment.id)" :src="genotypingBatchImageUrls.get(attachment.id)" :alt="attachment.fileName" />
+                          <span v-else><FileImage :size="20" /></span>
+                          <small>{{ attachment.fileName }}</small>
+                        </button>
+                      </div>
+                      <small v-else>批次附件中暂未读取到胶图。</small>
+                    </section>
                     <small>revision {{ record.revision }}</small>
                   </article>
                 </div>
@@ -986,6 +1053,7 @@ onMounted(load)
 .record-card dt { color: var(--muri-text-tertiary); }
 .record-card dd { margin: 0; overflow: hidden; text-overflow: ellipsis; }
 .record-card > small { display: block; margin-top: 8px; color: var(--muri-text-tertiary); }
+.batch-provenance { margin-top: 9px; padding: 9px; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }.batch-provenance > header { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 7px; }.batch-provenance > header svg { color: var(--muri-primary); }.batch-provenance > header span { display: flex; min-width: 0; flex-direction: column; }.batch-provenance > header small,.batch-provenance > small { color: var(--muri-text-tertiary); font-size: 10px; }.batch-gels { display: flex; overflow-x: auto; gap: 7px; margin-top: 8px; }.batch-gels button { display: flex; width: 105px; min-width: 105px; padding: 0; overflow: hidden; border: 1px solid var(--muri-border); border-radius: 6px; background: white; cursor: pointer; flex-direction: column; }.batch-gels img,.batch-gels button > span { display: grid; width: 100%; height: 65px; place-items: center; object-fit: cover; color: var(--muri-text-tertiary); background: var(--muri-surface-muted); }.batch-gels small { width: 100%; padding: 5px 6px; overflow: hidden; color: var(--muri-text-secondary); font-size: 9px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .legacy-genotypes { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--muri-border); }
 .legacy-genotypes > header { display: flex; flex-direction: column; margin-bottom: 9px; }
 .legacy-genotypes > header span { margin-top: 2px; color: var(--muri-text-tertiary); font-size: 11px; }

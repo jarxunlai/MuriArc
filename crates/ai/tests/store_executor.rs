@@ -7,9 +7,16 @@ use muriarc_ai::{
     DomainToolOutput, DomainToolRequest, StoreDomainToolExecutor, StoreToolAccessContext,
     ToolExecutionError, ToolName, ToolScope, WriteDraft,
 };
+use muriarc_application::{
+    CommitGenotypingBatchCommand, CreateAlleleCommand, CreateGeneLocusCommand,
+    CreateGenotypeComponentInput, CreateGenotypeDefinitionCommand, CreateGenotypingBatchCommand,
+    SetGenotypingBatchPreviewCommand, commit_genotyping_batch, create_allele, create_gene_locus,
+    create_genotype_definition, create_genotyping_batch, set_genotyping_batch_preview,
+};
 use muriarc_core::{
     AiImportResolution, Animal, AnimalEvent, AnimalEventKind, Attachment, AuditFilter, Cage,
-    Cohort, EntityType, Experiment, ExperimentEvent, ExperimentTemplateVersion, Measurement,
+    Cohort, EntityType, Experiment, ExperimentEvent, ExperimentTemplateVersion,
+    GenotypeComponentMode, GenotypingBatchRecordInput, GenotypingState, Measurement,
     MeasurementValue, MuriArcStore, Observation, ObservationDefinition, ObservationPolicy,
     ObservationSubjectType, ObservationValueData, ObservationValueRecord, ObservationValueType,
     Participation, Project, ProjectAnimalAssignmentFilter, ProjectAnimalAssignmentRemoval,
@@ -71,6 +78,7 @@ struct Fixture {
     animal_id: Uuid,
     hidden_animal_id: Uuid,
     foreign_animal_id: Uuid,
+    genotype_definition_id: Uuid,
     lab_event_id: Uuid,
     allowed_event_id: Uuid,
     forbidden_event_id: Uuid,
@@ -112,6 +120,51 @@ async fn fixture() -> Fixture {
     store.create_animal(&animal, &audit).await.unwrap();
     store.create_animal(&hidden_animal, &audit).await.unwrap();
     store.create_animal(&foreign_animal, &audit).await.unwrap();
+
+    let locus = create_gene_locus(
+        store.as_ref(),
+        CreateGeneLocusCommand {
+            lab_id: lab.id,
+            symbol: "Cre".to_owned(),
+            description: None,
+            now,
+        },
+        &audit,
+    )
+    .await
+    .unwrap();
+    let allele = create_allele(
+        store.as_ref(),
+        CreateAlleleCommand {
+            locus_id: locus.id,
+            symbol: "+".to_owned(),
+            description: None,
+            is_wild_type: true,
+            now,
+        },
+        &audit,
+    )
+    .await
+    .unwrap();
+    let genotype_definition = create_genotype_definition(
+        store.as_ref(),
+        CreateGenotypeDefinitionCommand {
+            lab_id: lab.id,
+            name: "Cre positive".to_owned(),
+            description: None,
+            components: vec![CreateGenotypeComponentInput {
+                locus_id: locus.id,
+                allele_1_id: allele.id,
+                allele_2_id: None,
+                mode: GenotypeComponentMode::Hemizygous,
+                display_order: 0,
+            }],
+            now,
+        },
+        &audit,
+    )
+    .await
+    .unwrap();
 
     let experiment = Experiment::new(lab.id, allowed_project.id, "Allowed study", now).unwrap();
     let forbidden_experiment =
@@ -271,6 +324,7 @@ async fn fixture() -> Fixture {
         animal_id: animal.id,
         hidden_animal_id: hidden_animal.id,
         foreign_animal_id: foreign_animal.id,
+        genotype_definition_id: genotype_definition.id,
         lab_event_id: lab_event.id,
         allowed_event_id: allowed_event.id,
         forbidden_event_id: forbidden_event.id,
@@ -278,6 +332,157 @@ async fn fixture() -> Fixture {
         observation_id: observation.id,
         cohort_id: cohort.id,
     }
+}
+
+#[tokio::test]
+async fn genotyping_query_exposes_safe_batch_and_gel_evidence_without_write_capabilities() {
+    let fixture = fixture().await;
+    let now = Utc::now();
+    let audit = AuditContext::system(WriteSource::Api);
+    let batch = create_genotyping_batch(
+        fixture.store.as_ref(),
+        CreateGenotypingBatchCommand {
+            lab_id: fixture.lab_id,
+            project_id: Some(fixture.allowed_project_id),
+            batch_number: "PCR-20260725-AI".to_owned(),
+            genotype_definition_id: fixture.genotype_definition_id,
+            assessed_at: now,
+            method: Some("PCR".to_owned()),
+            notes: Some("traceable gel evidence".to_owned()),
+            created_by: None,
+            now,
+        },
+        &audit,
+    )
+    .await
+    .unwrap();
+    let source_attachment = Attachment {
+        id: Uuid::new_v4(),
+        lab_id: fixture.lab_id,
+        project_id: Some(fixture.allowed_project_id),
+        entity_type: EntityType::GenotypingBatch.as_str().to_owned(),
+        entity_id: batch.id,
+        file_name: "results.csv".to_owned(),
+        media_type: Some("text/csv".to_owned()),
+        relative_path: "private/source/results.csv".to_owned(),
+        size_bytes: 128,
+        sha256: "a".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    let gel_attachment = Attachment {
+        id: Uuid::new_v4(),
+        lab_id: fixture.lab_id,
+        project_id: Some(fixture.allowed_project_id),
+        entity_type: EntityType::GenotypingBatch.as_str().to_owned(),
+        entity_id: batch.id,
+        file_name: "gel-01.png".to_owned(),
+        media_type: Some("image/png".to_owned()),
+        relative_path: "private/gels/gel-01.png".to_owned(),
+        size_bytes: 4_096,
+        sha256: "b".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    fixture
+        .store
+        .create_attachment(&source_attachment, &audit)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .create_attachment(&gel_attachment, &audit)
+        .await
+        .unwrap();
+    let previewed = set_genotyping_batch_preview(
+        fixture.store.as_ref(),
+        SetGenotypingBatchPreviewCommand {
+            batch_id: batch.id,
+            expected_revision: batch.meta.revision,
+            source_attachment_id: source_attachment.id,
+            preview_hash: "c".repeat(64),
+            row_count: 1,
+            now,
+        },
+        &audit,
+    )
+    .await
+    .unwrap();
+    let receipt = commit_genotyping_batch(
+        fixture.store.as_ref(),
+        CommitGenotypingBatchCommand {
+            batch_id: batch.id,
+            expected_revision: previewed.meta.revision,
+            preview_hash: "c".repeat(64),
+            rows: vec![GenotypingBatchRecordInput {
+                animal_id: fixture.animal_id,
+                state: GenotypingState::Confirmed,
+                notes: Some("confirmed from gel lane".to_owned()),
+            }],
+            now,
+        },
+        &audit,
+    )
+    .await
+    .unwrap();
+
+    let (data, citations) = read_output(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::GenotypingQuery,
+                json!({
+                    "project_id": fixture.allowed_project_id,
+                    "animal_id": fixture.animal_id,
+                    "state": "confirmed"
+                }),
+            ))
+            .await
+            .unwrap(),
+    );
+    let items = data["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["record"]["id"], receipt.records[0].id.to_string());
+    assert_eq!(items[0]["source_batch"]["id"], batch.id.to_string());
+    assert_eq!(items[0]["source_batch"]["batch_number"], "PCR-20260725-AI");
+    let gels = items[0]["source_batch"]["gel_attachments"]
+        .as_array()
+        .unwrap();
+    assert_eq!(gels.len(), 1);
+    assert_eq!(gels[0]["id"], gel_attachment.id.to_string());
+    assert_eq!(gels[0]["file_name"], "gel-01.png");
+
+    let serialized = serde_json::to_string(&data).unwrap();
+    for hidden in [
+        "relative_path",
+        "sha256",
+        "preview_hash",
+        "source_attachment_id",
+        "created_by",
+        "private/source/results.csv",
+        "private/gels/gel-01.png",
+    ] {
+        assert!(!serialized.contains(hidden), "{hidden} leaked");
+    }
+    for (entity_type, entity_id) in [
+        (EntityType::GenotypingRecord, receipt.records[0].id),
+        (EntityType::GenotypingBatch, batch.id),
+        (EntityType::Attachment, gel_attachment.id),
+    ] {
+        assert!(citations.iter().any(|citation| {
+            citation.entity_type == entity_type && citation.entity_id == entity_id
+        }));
+    }
+    assert!(!citations.iter().any(|citation| {
+        citation.entity_type == EntityType::Attachment && citation.entity_id == source_attachment.id
+    }));
+    assert!(
+        fixture
+            .executor
+            .supported_tools()
+            .iter()
+            .all(|tool| !tool.is_draft_only() && *tool != ToolName::ImportPreview)
+    );
 }
 
 fn request(tool: ToolName, arguments: Value) -> DomainToolRequest {

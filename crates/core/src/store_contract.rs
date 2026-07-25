@@ -10,6 +10,370 @@ fn contract_now() -> chrono::DateTime<Utc> {
         .expect("the current UTC timestamp is representable")
 }
 
+/// Verifies the transactional and traceability invariants for gel-backed
+/// genotyping batches against any Store adapter.
+pub async fn run_genotyping_batch_contract<S>(store: &S)
+where
+    S: MuriArcStore,
+{
+    store.migrate().await.expect("migration succeeds");
+    let now = contract_now();
+    let setup = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new(format!("Genotyping batch {}", uuid::Uuid::new_v4()), now).unwrap();
+    store.create_lab(&lab, &setup).await.unwrap();
+    let user = User::new(
+        lab.id,
+        format!("{}@genotyping-batch.test", uuid::Uuid::new_v4()),
+        "Batch operator",
+        now,
+    )
+    .unwrap();
+    store.create_user(&user, &setup).await.unwrap();
+    let audit = AuditContext {
+        actor: Actor::human(user.id, user.display_name.clone()),
+        source: WriteSource::Web,
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        reason: Some("shared genotyping batch contract".to_owned()),
+    };
+    let project = Project::new(lab.id, "Genotyping project", now).unwrap();
+    store.create_project(&project, &audit).await.unwrap();
+    let animal = Animal::new_mouse(lab.id, "GB-001", Sex::Unknown, now).unwrap();
+    let unassigned = Animal::new_mouse(lab.id, "GB-UNASSIGNED", Sex::Unknown, now).unwrap();
+    store.create_animal(&animal, &audit).await.unwrap();
+    store.create_animal(&unassigned, &audit).await.unwrap();
+    let assignment = ProjectAnimalAssignment::new(
+        lab.id,
+        project.id,
+        animal.id,
+        Some(user.id),
+        Some("genotyping batch contract".to_owned()),
+        now,
+    );
+    store
+        .assign_animals_to_project(std::slice::from_ref(&assignment), &audit)
+        .await
+        .unwrap();
+
+    let locus = GeneLocus {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        symbol: format!("Gb{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+        description: None,
+        meta: RecordMeta::new(now),
+    };
+    store.create_gene_locus(&locus, &audit).await.unwrap();
+    let wild_type = Allele {
+        id: uuid::Uuid::new_v4(),
+        locus_id: locus.id,
+        symbol: "+".to_owned(),
+        description: None,
+        is_wild_type: true,
+        meta: RecordMeta::new(now),
+    };
+    let mutant = Allele {
+        id: uuid::Uuid::new_v4(),
+        locus_id: locus.id,
+        symbol: "mut".to_owned(),
+        description: None,
+        is_wild_type: false,
+        meta: RecordMeta::new(now),
+    };
+    store.create_allele(&wild_type, &audit).await.unwrap();
+    store.create_allele(&mutant, &audit).await.unwrap();
+    let mut definition =
+        GenotypeDefinition::new(lab.id, format!("GB {}", uuid::Uuid::new_v4()), now).unwrap();
+    definition
+        .replace_components(vec![
+            GenotypeComponent::new(
+                definition.id,
+                locus.id,
+                wild_type.id,
+                Some(mutant.id),
+                GenotypeComponentMode::Diploid,
+                0,
+                now,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+    store
+        .create_genotype_definition(&definition, &audit)
+        .await
+        .unwrap();
+
+    let mut batch = GenotypingBatch::new(
+        lab.id,
+        Some(project.id),
+        format!("PCR-{}", uuid::Uuid::new_v4()),
+        definition.id,
+        now,
+        Some(user.id),
+        now,
+    )
+    .unwrap();
+    batch.method = Some("PCR gel electrophoresis".to_owned());
+    batch.notes = Some("contract batch".to_owned());
+    store.create_genotyping_batch(&batch, &audit).await.unwrap();
+    assert_eq!(store.get_genotyping_batch(batch.id).await.unwrap(), batch);
+
+    let source = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        entity_type: "genotyping_batch".to_owned(),
+        entity_id: batch.id,
+        file_name: "results.csv".to_owned(),
+        media_type: Some("text/csv".to_owned()),
+        relative_path: format!("attachments/{}", uuid::Uuid::new_v4()),
+        size_bytes: 128,
+        sha256: "a".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    store.create_attachment(&source, &audit).await.unwrap();
+    let preview = GenotypingBatchPreview {
+        source_attachment_id: source.id,
+        preview_hash: "b".repeat(64),
+        row_count: 1,
+    };
+    batch = store
+        .set_genotyping_batch_preview(batch.id, batch.meta.revision, &preview, now, &audit)
+        .await
+        .unwrap();
+    assert_eq!(batch.meta.revision, 2);
+
+    let mut record = GenotypingRecord::new(
+        lab.id,
+        animal.id,
+        definition.id,
+        GenotypingState::Confirmed,
+        Some(batch.assessed_at),
+        now,
+    )
+    .unwrap();
+    record.project_id = Some(project.id);
+    record.method = batch.method.clone();
+    record.notes = Some("lane 1".to_owned());
+    let commit = GenotypingBatchCommit {
+        batch_id: batch.id,
+        expected_revision: batch.meta.revision,
+        preview_hash: preview.preview_hash.clone(),
+        records: vec![record.clone()],
+        committed_at: now,
+    };
+    assert!(matches!(
+        store.commit_genotyping_batch(&commit, &audit).await,
+        Err(StoreError::Validation(message)) if message.contains("gel image")
+    ));
+    assert!(matches!(
+        store.get_genotyping_record(record.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    assert_eq!(
+        store.get_genotyping_batch(batch.id).await.unwrap().status,
+        GenotypingBatchStatus::Draft
+    );
+
+    let gel = Attachment {
+        id: uuid::Uuid::new_v4(),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        entity_type: "genotyping_batch".to_owned(),
+        entity_id: batch.id,
+        file_name: "gel-01.png".to_owned(),
+        media_type: Some("image/png".to_owned()),
+        relative_path: format!("attachments/{}", uuid::Uuid::new_v4()),
+        size_bytes: 256,
+        sha256: "c".repeat(64),
+        version: 1,
+        meta: RecordMeta::new(now),
+    };
+    store.create_attachment(&gel, &audit).await.unwrap();
+    let disposable_gel = Attachment {
+        id: uuid::Uuid::new_v4(),
+        file_name: "gel-duplicate.png".to_owned(),
+        relative_path: format!("attachments/{}", uuid::Uuid::new_v4()),
+        ..gel.clone()
+    };
+    store
+        .create_attachment(&disposable_gel, &audit)
+        .await
+        .unwrap();
+    let deleted = store
+        .soft_delete_attachment(disposable_gel.id, disposable_gel.meta.revision, now, &audit)
+        .await
+        .unwrap();
+    assert_eq!(deleted.meta.deleted_at, Some(now));
+    assert!(matches!(
+        store.get_attachment(disposable_gel.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+    let receipt = store
+        .commit_genotyping_batch(&commit, &audit)
+        .await
+        .unwrap();
+    assert_eq!(receipt.batch.status, GenotypingBatchStatus::Committed);
+    assert_eq!(receipt.batch.meta.revision, 3);
+    assert_eq!(receipt.records, vec![record.clone()]);
+    assert_eq!(
+        store.list_genotyping_batch_records(batch.id).await.unwrap(),
+        vec![record.clone()]
+    );
+    assert_eq!(
+        store
+            .find_genotyping_batch_for_record(record.id)
+            .await
+            .unwrap()
+            .map(|batch| batch.id),
+        Some(batch.id)
+    );
+    let overviews = store
+        .list_current_genotyping_record_overviews(
+            &CurrentGenotypingRecordFilter {
+                lab_id: lab.id,
+                project_id: Some(project.id),
+                animal_id: Some(animal.id),
+                state: Some(GenotypingState::Confirmed),
+            },
+            0,
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(overviews.len(), 1);
+    let evidence = overviews[0]
+        .source_batch
+        .as_ref()
+        .expect("batch-created current record exposes safe evidence metadata");
+    assert_eq!(evidence.id, batch.id);
+    assert_eq!(evidence.batch_number, batch.batch_number);
+    assert_eq!(evidence.status, GenotypingBatchStatus::Committed);
+    assert_eq!(evidence.gel_attachments.len(), 1);
+    assert_eq!(evidence.gel_attachments[0].id, gel.id);
+    assert_eq!(evidence.gel_attachments[0].file_name, gel.file_name);
+    assert!(
+        evidence
+            .gel_attachments
+            .iter()
+            .all(|attachment| attachment.id != source.id),
+        "the original result table is not model-facing gel evidence"
+    );
+    assert!(matches!(
+        store.commit_genotyping_batch(&commit, &audit).await,
+        Err(StoreError::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .soft_delete_attachment(gel.id, gel.meta.revision, now, &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+
+    let mut invalid_batch = GenotypingBatch::new(
+        lab.id,
+        Some(project.id),
+        format!("PCR-{}", uuid::Uuid::new_v4()),
+        definition.id,
+        now,
+        Some(user.id),
+        now,
+    )
+    .unwrap();
+    invalid_batch.method = Some("PCR gel electrophoresis".to_owned());
+    store
+        .create_genotyping_batch(&invalid_batch, &audit)
+        .await
+        .unwrap();
+    let invalid_source = Attachment {
+        id: uuid::Uuid::new_v4(),
+        entity_id: invalid_batch.id,
+        file_name: "invalid-results.csv".to_owned(),
+        relative_path: format!("attachments/{}", uuid::Uuid::new_v4()),
+        ..source.clone()
+    };
+    let invalid_gel = Attachment {
+        id: uuid::Uuid::new_v4(),
+        entity_id: invalid_batch.id,
+        file_name: "invalid-gel.png".to_owned(),
+        relative_path: format!("attachments/{}", uuid::Uuid::new_v4()),
+        ..gel.clone()
+    };
+    store
+        .create_attachment(&invalid_source, &audit)
+        .await
+        .unwrap();
+    store.create_attachment(&invalid_gel, &audit).await.unwrap();
+    invalid_batch = store
+        .set_genotyping_batch_preview(
+            invalid_batch.id,
+            invalid_batch.meta.revision,
+            &GenotypingBatchPreview {
+                source_attachment_id: invalid_source.id,
+                preview_hash: "d".repeat(64),
+                row_count: 1,
+            },
+            now,
+            &audit,
+        )
+        .await
+        .unwrap();
+    let mut invalid_record = GenotypingRecord::new(
+        lab.id,
+        unassigned.id,
+        definition.id,
+        GenotypingState::Rejected,
+        Some(invalid_batch.assessed_at),
+        now,
+    )
+    .unwrap();
+    invalid_record.project_id = Some(project.id);
+    invalid_record.method = invalid_batch.method.clone();
+    assert!(matches!(
+        store
+            .commit_genotyping_batch(
+                &GenotypingBatchCommit {
+                    batch_id: invalid_batch.id,
+                    expected_revision: invalid_batch.meta.revision,
+                    preview_hash: "d".repeat(64),
+                    records: vec![invalid_record.clone()],
+                    committed_at: now,
+                },
+                &audit,
+            )
+            .await,
+        Err(StoreError::Validation(message)) if message.contains("not assigned")
+    ));
+    assert!(matches!(
+        store.get_genotyping_record(invalid_record.id).await,
+        Err(StoreError::NotFound { .. })
+    ));
+
+    let batch_audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_id: Some(batch.id),
+        })
+        .await
+        .unwrap();
+    assert!(
+        batch_audits
+            .iter()
+            .any(|entry| entry.entity_type == EntityType::GenotypingBatch)
+    );
+    let batch_provenance = store
+        .list_provenance(&ProvenanceFilter {
+            lab_id: lab.id,
+            project_id: Some(project.id),
+            entity_type: Some(EntityType::GenotypingBatch),
+            entity_id: Some(batch.id),
+            source: None,
+        })
+        .await
+        .unwrap();
+    assert!(batch_provenance.len() >= 3);
+}
+
 async fn create_ai_contract_model_binding<S>(
     store: &S,
     lab_id: uuid::Uuid,

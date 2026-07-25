@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Animal, GenotypingRecord, GenotypingState};
+use crate::{Animal, GenotypingBatchStatus, GenotypingRecord, GenotypingState};
 
 /// Project membership attached to an animal through an experiment
 /// participation. This is deliberately a compact read model rather than a
@@ -45,10 +45,40 @@ pub struct AnimalOverview {
 /// filter: for every animal and genotype definition, only the latest
 /// non-deleted, non-voided record is eligible.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenotypingEvidenceAttachment {
+    pub id: Uuid,
+    pub file_name: String,
+    pub media_type: Option<String>,
+    pub size_bytes: i64,
+    pub version: i32,
+    pub revision: i64,
+}
+
+/// Safe, read-only evidence projection for one batch-created genotype fact.
+///
+/// Storage paths, content hashes, the original result-table attachment and
+/// human account identifiers are deliberately excluded. Callers may use the
+/// opaque attachment id with an authorized download endpoint, but the model
+/// only receives bounded metadata about gel images.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenotypingBatchEvidence {
+    pub id: Uuid,
+    pub batch_number: String,
+    pub status: GenotypingBatchStatus,
+    pub assessed_at: DateTime<Utc>,
+    pub method: Option<String>,
+    pub notes: Option<String>,
+    pub revision: i64,
+    pub gel_attachments: Vec<GenotypingEvidenceAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentGenotypingRecordOverview {
     pub record: GenotypingRecord,
     pub animal_display_id: String,
     pub genotype_definition_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_batch: Option<GenotypingBatchEvidence>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

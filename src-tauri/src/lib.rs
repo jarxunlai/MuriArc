@@ -10,6 +10,7 @@ mod ai_sources;
 mod animal_details;
 mod application;
 mod data;
+mod genotyping_batches;
 mod model_profiles;
 mod research_extensions;
 mod settings;
@@ -42,6 +43,11 @@ use data::{
     CreateDataExportInput, CreateDataSnapshotInput, DataArtifactView, DeleteAttachmentInput,
     DesktopDataError, DesktopDataState, ImportReceiptView, PreviewDataImportInput,
     RemapDataImportInput, UploadAttachmentInput,
+};
+use genotyping_batches::{
+    CancelGenotypingBatchInput, CommitGenotypingBatchInput, CreateGenotypingBatchInput,
+    GenotypingBatchDetailView, GenotypingBatchPreviewInput, GenotypingBatchPreviewView,
+    GenotypingBatchTemplateView, ListGenotypingBatchesInput,
 };
 use model_profiles::{
     AiModelDefaultsView, AiModelProfileView, AiModelValidationResult, SaveAiModelDefaultsInput,
@@ -1378,6 +1384,90 @@ async fn delete_attachment(
     state.delete_attachment(input).await.map_err(Into::into)
 }
 
+#[tauri::command]
+async fn list_genotyping_batches(
+    state: tauri::State<'_, DesktopDataState>,
+    input: ListGenotypingBatchesInput,
+) -> CommandResult<Vec<muriarc_core::GenotypingBatch>> {
+    state
+        .list_genotyping_batches(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn get_genotyping_batch(
+    state: tauri::State<'_, DesktopDataState>,
+    batch_id: uuid::Uuid,
+) -> CommandResult<GenotypingBatchDetailView> {
+    state
+        .get_genotyping_batch(batch_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn get_genotyping_batch_for_record(
+    state: tauri::State<'_, DesktopDataState>,
+    record_id: uuid::Uuid,
+) -> CommandResult<Option<muriarc_core::GenotypingBatch>> {
+    state
+        .get_genotyping_batch_for_record(record_id)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn create_genotyping_batch(
+    state: tauri::State<'_, DesktopDataState>,
+    input: CreateGenotypingBatchInput,
+) -> CommandResult<muriarc_core::GenotypingBatch> {
+    state
+        .create_genotyping_batch(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn preview_genotyping_batch(
+    state: tauri::State<'_, DesktopDataState>,
+    input: GenotypingBatchPreviewInput,
+) -> CommandResult<GenotypingBatchPreviewView> {
+    state
+        .preview_genotyping_batch(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn commit_genotyping_batch(
+    state: tauri::State<'_, DesktopDataState>,
+    input: CommitGenotypingBatchInput,
+) -> CommandResult<muriarc_core::GenotypingBatchReceipt> {
+    state
+        .commit_genotyping_batch(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn cancel_genotyping_batch(
+    state: tauri::State<'_, DesktopDataState>,
+    input: CancelGenotypingBatchInput,
+) -> CommandResult<muriarc_core::GenotypingBatch> {
+    state
+        .cancel_genotyping_batch(input)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+fn get_genotyping_batch_template(
+    state: tauri::State<'_, DesktopDataState>,
+) -> GenotypingBatchTemplateView {
+    state.genotyping_batch_template()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1449,6 +1539,14 @@ pub fn run() {
             create_genotyping_record,
             void_genotyping_record,
             correct_genotyping_record,
+            list_genotyping_batches,
+            get_genotyping_batch,
+            get_genotyping_batch_for_record,
+            create_genotyping_batch,
+            preview_genotyping_batch,
+            commit_genotyping_batch,
+            cancel_genotyping_batch,
+            get_genotyping_batch_template,
             list_breeding_lines,
             create_breeding_line,
             list_colonies_v2,

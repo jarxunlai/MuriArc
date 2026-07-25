@@ -418,6 +418,46 @@ pub trait MuriArcStore: crate::WorkspaceStore + crate::AiOperationStore + Send +
         audit: &AuditContext,
     ) -> StoreResult<(crate::GenotypingRecord, crate::GenotypingRecord)>;
 
+    async fn create_genotyping_batch(
+        &self,
+        batch: &crate::GenotypingBatch,
+        audit: &AuditContext,
+    ) -> StoreResult<()>;
+    async fn get_genotyping_batch(&self, id: Uuid) -> StoreResult<crate::GenotypingBatch>;
+    async fn list_genotyping_batches(
+        &self,
+        filter: &crate::GenotypingBatchFilter,
+    ) -> StoreResult<Vec<crate::GenotypingBatch>>;
+    async fn set_genotyping_batch_preview(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        preview: &crate::GenotypingBatchPreview,
+        updated_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::GenotypingBatch>;
+    async fn commit_genotyping_batch(
+        &self,
+        commit: &crate::GenotypingBatchCommit,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::GenotypingBatchReceipt>;
+    async fn cancel_genotyping_batch(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        reason: &str,
+        cancelled_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<crate::GenotypingBatch>;
+    async fn list_genotyping_batch_records(
+        &self,
+        batch_id: Uuid,
+    ) -> StoreResult<Vec<crate::GenotypingRecord>>;
+    async fn find_genotyping_batch_for_record(
+        &self,
+        record_id: Uuid,
+    ) -> StoreResult<Option<crate::GenotypingBatch>>;
+
     async fn create_breeding_line(
         &self,
         line: &crate::BreedingLine,

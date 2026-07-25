@@ -50,6 +50,7 @@ pub(super) fn router() -> Router<AppState> {
 enum AttachmentTarget {
     Project,
     Animal,
+    GenotypingBatch,
     Experiment,
     Measurement,
     Sample,
@@ -60,6 +61,7 @@ impl AttachmentTarget {
         match self {
             Self::Project => "project",
             Self::Animal => "animal",
+            Self::GenotypingBatch => "genotyping_batch",
             Self::Experiment => "experiment",
             Self::Measurement => "measurement",
             Self::Sample => "sample",
@@ -70,6 +72,7 @@ impl AttachmentTarget {
         match value {
             "project" => Some(Self::Project),
             "animal" => Some(Self::Animal),
+            "genotyping_batch" => Some(Self::GenotypingBatch),
             "experiment" => Some(Self::Experiment),
             "measurement" => Some(Self::Measurement),
             "sample" => Some(Self::Sample),
@@ -485,6 +488,36 @@ async fn authorize_target(
             )
             .await?;
             Ok(requested_project_id)
+        }
+        AttachmentTarget::GenotypingBatch => {
+            let batch = store(state.store.get_genotyping_batch(entity_id), metadata).await?;
+            ensure_lab(batch.lab_id, principal, metadata)?;
+            if requested_project_id != batch.project_id {
+                return Err(ApiError::not_found("attachment target was not found")
+                    .with_request_id(metadata.request_id.clone()));
+            }
+            let required_permission = if permission == Permission::WriteAttachment {
+                Permission::ManageBreeding
+            } else {
+                permission
+            };
+            scope::optional_project_permission(
+                state,
+                principal,
+                metadata,
+                batch.project_id,
+                required_permission,
+            )
+            .await?;
+            if permission == Permission::WriteAttachment
+                && batch.status != muriarc_core::GenotypingBatchStatus::Draft
+            {
+                return Err(ApiError::conflict(
+                    "attachments can only be changed while the genotyping batch is a draft",
+                )
+                .with_request_id(metadata.request_id.clone()));
+            }
+            Ok(batch.project_id)
         }
         AttachmentTarget::Experiment => {
             let experiment = scope::experiment_with_permission(

@@ -1,5 +1,6 @@
 mod ai_models;
 mod ai_operations;
+mod genotyping_batches;
 mod workspace;
 
 use std::{
@@ -5431,7 +5432,8 @@ impl MuriArcStore for SqliteStore {
             .fetch_all(&self.pool)
             .await
             .map_err(map_sqlx)?;
-        rows.iter()
+        let mut items = rows
+            .iter()
             .map(|row| {
                 Ok(CurrentGenotypingRecordOverview {
                     record: genotyping_record_from_row(row)?,
@@ -5439,9 +5441,17 @@ impl MuriArcStore for SqliteStore {
                     genotype_definition_name: row
                         .try_get("genotype_definition_name")
                         .map_err(map_sqlx)?,
+                    source_batch: None,
                 })
             })
-            .collect()
+            .collect::<StoreResult<Vec<_>>>()?;
+        let record_ids = items.iter().map(|item| item.record.id).collect::<Vec<_>>();
+        let mut evidence =
+            genotyping_batches::evidence_for_records(&self.pool, &record_ids).await?;
+        for item in &mut items {
+            item.source_batch = evidence.remove(&item.record.id);
+        }
+        Ok(items)
     }
 
     async fn void_genotyping_record(
@@ -5666,6 +5676,85 @@ impl MuriArcStore for SqliteStore {
         append_derived_animal_event_tx(&mut tx, &event, &operation_audit).await?;
         tx.commit().await.map_err(map_sqlx)?;
         Ok((voided, replacement.clone()))
+    }
+
+    async fn create_genotyping_batch(
+        &self,
+        batch: &GenotypingBatch,
+        audit: &AuditContext,
+    ) -> StoreResult<()> {
+        genotyping_batches::create(&self.pool, batch, audit).await
+    }
+
+    async fn get_genotyping_batch(&self, id: Uuid) -> StoreResult<GenotypingBatch> {
+        genotyping_batches::get(&self.pool, id).await
+    }
+
+    async fn list_genotyping_batches(
+        &self,
+        filter: &GenotypingBatchFilter,
+    ) -> StoreResult<Vec<GenotypingBatch>> {
+        genotyping_batches::list(&self.pool, filter).await
+    }
+
+    async fn set_genotyping_batch_preview(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        preview: &GenotypingBatchPreview,
+        updated_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<GenotypingBatch> {
+        genotyping_batches::set_preview(
+            &self.pool,
+            id,
+            expected_revision,
+            preview,
+            updated_at,
+            audit,
+        )
+        .await
+    }
+
+    async fn commit_genotyping_batch(
+        &self,
+        commit: &GenotypingBatchCommit,
+        audit: &AuditContext,
+    ) -> StoreResult<GenotypingBatchReceipt> {
+        genotyping_batches::commit(&self.pool, commit, audit).await
+    }
+
+    async fn cancel_genotyping_batch(
+        &self,
+        id: Uuid,
+        expected_revision: i64,
+        reason: &str,
+        cancelled_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<GenotypingBatch> {
+        genotyping_batches::cancel(
+            &self.pool,
+            id,
+            expected_revision,
+            reason,
+            cancelled_at,
+            audit,
+        )
+        .await
+    }
+
+    async fn list_genotyping_batch_records(
+        &self,
+        batch_id: Uuid,
+    ) -> StoreResult<Vec<GenotypingRecord>> {
+        genotyping_batches::list_records(&self.pool, batch_id).await
+    }
+
+    async fn find_genotyping_batch_for_record(
+        &self,
+        record_id: Uuid,
+    ) -> StoreResult<Option<GenotypingBatch>> {
+        genotyping_batches::find_for_record(&self.pool, record_id).await
     }
 
     async fn create_breeding_line(
@@ -7297,13 +7386,42 @@ impl MuriArcStore for SqliteStore {
                 "attachment revision changed before deletion".to_owned(),
             ));
         }
-        if attachment.entity_type != "project"
-            || attachment.project_id != Some(attachment.entity_id)
-        {
-            return Err(StoreError::Conflict(
-                "attachments linked to research records must be unlinked before deletion"
-                    .to_owned(),
-            ));
+        let is_project_library_attachment = attachment.entity_type == "project"
+            && attachment.project_id == Some(attachment.entity_id);
+        if !is_project_library_attachment {
+            if attachment.entity_type != "genotyping_batch" {
+                return Err(StoreError::Conflict(
+                    "attachments linked to research records must be unlinked before deletion"
+                        .to_owned(),
+                ));
+            }
+            let batch_row = sqlx::query(
+                "SELECT lab_id, project_id, status FROM genotyping_batches WHERE id = ? AND deleted_at IS NULL",
+            )
+            .bind(attachment.entity_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or(StoreError::NotFound {
+                entity: "genotyping_batch",
+                id: attachment.entity_id,
+            })?;
+            let batch_lab_id = uuid(batch_row.try_get("lab_id").map_err(map_sqlx)?)?;
+            let batch_project_id =
+                optional_uuid(batch_row.try_get("project_id").map_err(map_sqlx)?)?;
+            let batch_status: GenotypingBatchStatus =
+                decode(batch_row.try_get("status").map_err(map_sqlx)?)?;
+            if batch_lab_id != attachment.lab_id || batch_project_id != attachment.project_id {
+                return Err(StoreError::Conflict(
+                    "genotyping batch attachment scope changed before deletion".to_owned(),
+                ));
+            }
+            if batch_status != GenotypingBatchStatus::Draft {
+                return Err(StoreError::Conflict(
+                    "genotyping batch attachments are immutable after commit or cancellation"
+                        .to_owned(),
+                ));
+            }
         }
         let link_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM attachment_links WHERE attachment_id = ? AND deleted_at IS NULL",

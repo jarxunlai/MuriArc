@@ -417,6 +417,7 @@ const fn entity_label(entity_type: EntityType) -> &'static str {
         EntityType::Genotype => "基因型",
         EntityType::GenotypeDefinition => "基因型定义",
         EntityType::GenotypingRecord => "基因检测记录",
+        EntityType::GenotypingBatch => "基因鉴定批次",
         EntityType::BreedingLine => "繁育品系",
         EntityType::Colony => "繁育群体",
         EntityType::BreedingPair => "繁育配对",

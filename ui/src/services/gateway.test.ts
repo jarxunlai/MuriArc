@@ -228,6 +228,208 @@ describe('MuriArc gateway selection', () => {
     ])
   })
 
+  it('maps genotyping batch Tauri DTOs and keeps project scope out of local mutations', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const meta = {
+      created_at: '2026-07-25T08:00:00Z',
+      updated_at: '2026-07-25T08:00:00Z',
+      deleted_at: null,
+      revision: 1,
+    }
+    const rawBatch = {
+      id: 'batch-1',
+      lab_id: 'lab-1',
+      project_id: 'project-1',
+      batch_number: 'PCR-20260725-01',
+      genotype_definition_id: 'definition-1',
+      assessed_at: '2026-07-25T08:00:00Z',
+      method: 'PCR gel electrophoresis',
+      notes: null,
+      status: 'draft',
+      created_by: 'user-1',
+      source_attachment_id: null,
+      preview_hash: null,
+      preview_row_count: null,
+      committed_at: null,
+      cancelled_at: null,
+      cancel_reason: null,
+      meta,
+    }
+    const rawRecord = {
+      id: 'record-1',
+      lab_id: 'lab-1',
+      project_id: 'project-1',
+      animal_id: 'animal-1',
+      genotype_definition_id: 'definition-1',
+      state: 'confirmed',
+      assessed_at: '2026-07-25T08:00:00Z',
+      method: 'PCR gel electrophoresis',
+      notes: 'lane 1',
+      supersedes_record_id: null,
+      voided_at: null,
+      void_reason: null,
+      meta,
+    }
+    const previewHash = 'a'.repeat(64)
+    const previewResult = {
+      batch: {
+        ...rawBatch,
+        source_attachment_id: 'attachment-source',
+        preview_hash: previewHash,
+        preview_row_count: 1,
+        meta: { ...meta, revision: 2 },
+      },
+      preview: {
+        total_rows: 1,
+        accepted_rows: [{
+          source_row: 2,
+          animal_id: 'animal-1',
+          display_id: 'M-001',
+          state: 'confirmed',
+          notes: 'lane 1',
+        }],
+        issues: [],
+        preview_hash: previewHash,
+      },
+    }
+    const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      calls.push([command, args])
+      switch (command) {
+        case 'list_genotyping_batches': return [rawBatch] as T
+        case 'get_genotyping_batch': return { batch: rawBatch, records: [rawRecord] } as T
+        case 'get_genotyping_batch_for_record': return rawBatch as T
+        case 'create_genotyping_batch': return rawBatch as T
+        case 'preview_genotyping_batch': return previewResult as T
+        case 'commit_genotyping_batch':
+          return {
+            batch: {
+              ...previewResult.batch,
+              status: 'committed',
+              committed_at: '2026-07-25T08:05:00Z',
+              meta: { ...meta, revision: 3 },
+            },
+            records: [rawRecord],
+          } as T
+        case 'cancel_genotyping_batch':
+          return {
+            ...rawBatch,
+            status: 'cancelled',
+            cancelled_at: '2026-07-25T08:06:00Z',
+            cancel_reason: 'duplicate batch',
+            meta: { ...meta, revision: 2 },
+          } as T
+        case 'get_genotyping_batch_template':
+          return {
+            fileName: 'muriarc-genotyping-batch-template.csv',
+            mediaType: 'text/csv',
+            bytes: [97, 44, 98],
+          } as T
+        default: throw new Error(`unexpected command: ${command}`)
+      }
+    }
+    const gateway = new LocalTauriGateway(invokeCommand)
+
+    const batches = await gateway.listGenotypingBatches!('project-1', 'draft')
+    const detail = await gateway.getGenotypingBatch!('batch-1', 'project-1')
+    const origin = await gateway.getGenotypingBatchForRecord!('record-1', 'project-1')
+    await gateway.createGenotypingBatch!({
+      projectId: 'project-1',
+      batchNumber: 'PCR-20260725-01',
+      genotypeDefinitionId: 'definition-1',
+      assessedAt: '2026-07-25T08:00:00Z',
+      method: 'PCR gel electrophoresis',
+      notes: 'screening litter 7',
+    })
+    const preview = await gateway.previewGenotypingBatch!({
+      projectId: 'project-1',
+      batchId: 'batch-1',
+      expectedRevision: 1,
+      sourceAttachmentId: 'attachment-source',
+    })
+    const receipt = await gateway.commitGenotypingBatch!({
+      projectId: 'project-1',
+      batchId: 'batch-1',
+      expectedRevision: 2,
+      previewHash,
+    })
+    const cancelled = await gateway.cancelGenotypingBatch!({
+      projectId: 'project-1',
+      batchId: 'batch-2',
+      expectedRevision: 1,
+      reason: 'duplicate batch',
+    })
+    const template = await gateway.downloadGenotypingBatchTemplate!()
+
+    expect(batches[0]).toEqual(expect.objectContaining({
+      id: 'batch-1',
+      projectId: 'project-1',
+      batchNumber: 'PCR-20260725-01',
+      genotypeDefinitionId: 'definition-1',
+      createdBy: 'user-1',
+      revision: 1,
+    }))
+    expect(detail.records[0]).toEqual(expect.objectContaining({
+      id: 'record-1',
+      animalId: 'animal-1',
+      genotypeDefinitionId: 'definition-1',
+    }))
+    expect(origin?.id).toBe('batch-1')
+    expect(preview.preview.acceptedRows[0]).toEqual(expect.objectContaining({
+      sourceRow: 2,
+      animalId: 'animal-1',
+      displayId: 'M-001',
+    }))
+    expect(receipt.batch.status).toBe('committed')
+    expect(receipt.records).toHaveLength(1)
+    expect(cancelled).toEqual(expect.objectContaining({
+      status: 'cancelled',
+      cancelReason: 'duplicate batch',
+    }))
+    expect(template).toEqual(expect.objectContaining({ size: 3, type: 'text/csv' }))
+    expect(calls).toContainEqual([
+      'list_genotyping_batches',
+      { input: { projectId: 'project-1', status: 'draft' } },
+    ])
+    expect(calls).toContainEqual([
+      'get_genotyping_batch_for_record',
+      { recordId: 'record-1' },
+    ])
+    expect(calls).toContainEqual([
+      'preview_genotyping_batch',
+      {
+        input: {
+          batchId: 'batch-1',
+          expectedRevision: 1,
+          sourceAttachmentId: 'attachment-source',
+        },
+      },
+    ])
+    expect(calls).toContainEqual([
+      'commit_genotyping_batch',
+      {
+        input: {
+          batchId: 'batch-1',
+          expectedRevision: 2,
+          previewHash,
+        },
+      },
+    ])
+    expect(calls).toContainEqual([
+      'cancel_genotyping_batch',
+      {
+        input: {
+          batchId: 'batch-2',
+          expectedRevision: 1,
+          reason: 'duplicate batch',
+        },
+      },
+    ])
+    const localMutationCalls = calls.filter(([command]) =>
+      ['preview_genotyping_batch', 'commit_genotyping_batch', 'cancel_genotyping_batch']
+        .includes(command))
+    expect(JSON.stringify(localMutationCalls)).not.toContain('projectId')
+  })
+
   it('uses typed settings commands without returning stored API keys', async () => {
     const calls: Array<[string, Record<string, unknown> | undefined]> = []
     const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
@@ -1271,11 +1473,258 @@ describe('MuriArc gateway selection', () => {
     })
   })
 
+  it('uses Server genotyping batch routes with snake_case DTOs and mapped receipts', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const meta = {
+      created_at: '2026-07-25T08:00:00Z',
+      updated_at: '2026-07-25T08:00:00Z',
+      deleted_at: null,
+      revision: 1,
+    }
+    const rawBatch = {
+      id: 'batch-1',
+      lab_id: 'lab-1',
+      project_id: 'project-1',
+      batch_number: 'PCR-20260725-01',
+      genotype_definition_id: 'definition-1',
+      assessed_at: '2026-07-25T08:00:00Z',
+      method: 'PCR gel electrophoresis',
+      notes: 'screening litter 7',
+      status: 'draft',
+      created_by: 'user-1',
+      source_attachment_id: null,
+      preview_hash: null,
+      preview_row_count: null,
+      committed_at: null,
+      cancelled_at: null,
+      cancel_reason: null,
+      meta,
+    }
+    const rawRecord = {
+      id: 'record-1',
+      lab_id: 'lab-1',
+      project_id: 'project-1',
+      animal_id: 'animal-1',
+      genotype_definition_id: 'definition-1',
+      state: 'confirmed',
+      assessed_at: '2026-07-25T08:00:00Z',
+      method: 'PCR gel electrophoresis',
+      notes: 'lane 1',
+      supersedes_record_id: null,
+      voided_at: null,
+      void_reason: null,
+      meta,
+    }
+    const previewHash = 'b'.repeat(64)
+    const previewResult = {
+      batch: {
+        ...rawBatch,
+        source_attachment_id: 'attachment-source',
+        preview_hash: previewHash,
+        preview_row_count: 1,
+        meta: { ...meta, revision: 2 },
+      },
+      preview: {
+        total_rows: 1,
+        accepted_rows: [{
+          source_row: 2,
+          animal_id: 'animal-1',
+          display_id: 'M-001',
+          state: 'confirmed',
+          notes: 'lane 1',
+        }],
+        issues: [],
+        preview_hash: previewHash,
+      },
+    }
+    const committed = {
+      batch: {
+        ...previewResult.batch,
+        status: 'committed',
+        committed_at: '2026-07-25T08:05:00Z',
+        meta: { ...meta, revision: 3 },
+      },
+      records: [rawRecord],
+    }
+    const cancelled = {
+      ...rawBatch,
+      id: 'batch-2',
+      status: 'cancelled',
+      cancelled_at: '2026-07-25T08:06:00Z',
+      cancel_reason: 'duplicate batch',
+      meta: { ...meta, revision: 2 },
+    }
+    const jsonResponse = (data: unknown, status = 200) =>
+      new Response(JSON.stringify({ data, request_id: 'req-batch' }), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      const parsed = new URL(url)
+      const path = parsed.pathname.replace('/api/v1', '')
+      const method = init?.method ?? 'GET'
+      if (path === '/auth/login') {
+        return jsonResponse({
+          user: {
+            id: 'user-1',
+            lab_id: 'lab-1',
+            display_name: 'Animal manager',
+            lab_roles: ['animal_manager'],
+            project_roles: [],
+            authentication: 'session',
+          },
+          csrf_token: 'csrf-genotyping-batch',
+          expires_at: '2026-07-25T18:00:00Z',
+        })
+      }
+      if (path === '/genotyping-batches/template.csv') {
+        return new Response('display_id,state,notes\n', {
+          status: 200,
+          headers: { 'Content-Type': 'text/csv' },
+        })
+      }
+      if (path === '/genotyping-batches' && method === 'GET') {
+        return new Response(JSON.stringify({
+          data: [rawBatch], count: 1, request_id: 'req-list',
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (path === '/genotyping-batches/batch-1' && method === 'GET') {
+        return jsonResponse({ batch: rawBatch, records: [rawRecord] })
+      }
+      if (path === '/genotyping-records/record-1/batch') {
+        return jsonResponse(rawBatch)
+      }
+      if (path === '/genotyping-batches' && method === 'POST') {
+        return jsonResponse(rawBatch, 201)
+      }
+      if (path === '/genotyping-batches/batch-1/preview') {
+        return jsonResponse(previewResult)
+      }
+      if (path === '/genotyping-batches/batch-1/commit') {
+        return jsonResponse(committed)
+      }
+      if (path === '/genotyping-batches/batch-2/cancel') {
+        return jsonResponse(cancelled)
+      }
+      throw new Error(`unexpected request: ${method} ${path}`)
+    }) as unknown as typeof fetch
+    const gateway = new RemoteHttpGateway({
+      baseUrl: 'https://lab.example/api/v1',
+      fetch: fetchRequest,
+    })
+    await gateway.login({ email: 'manager@example.org', password: 'not-retained' })
+
+    const batches = await gateway.listGenotypingBatches!('project-1', 'draft')
+    const detail = await gateway.getGenotypingBatch!('batch-1', 'project-1')
+    const origin = await gateway.getGenotypingBatchForRecord!('record-1', 'project-1')
+    await gateway.createGenotypingBatch!({
+      projectId: 'project-1',
+      batchNumber: 'PCR-20260725-01',
+      genotypeDefinitionId: 'definition-1',
+      assessedAt: '2026-07-25T08:00:00Z',
+      method: 'PCR gel electrophoresis',
+      notes: 'screening litter 7',
+    })
+    const preview = await gateway.previewGenotypingBatch!({
+      projectId: 'project-1',
+      batchId: 'batch-1',
+      expectedRevision: 1,
+      sourceAttachmentId: 'attachment-source',
+    })
+    const receipt = await gateway.commitGenotypingBatch!({
+      projectId: 'project-1',
+      batchId: 'batch-1',
+      expectedRevision: 2,
+      previewHash,
+    })
+    const cancelledBatch = await gateway.cancelGenotypingBatch!({
+      projectId: 'project-1',
+      batchId: 'batch-2',
+      expectedRevision: 1,
+      reason: 'duplicate batch',
+    })
+    const template = await gateway.downloadGenotypingBatchTemplate!()
+
+    expect(batches[0]).toEqual(expect.objectContaining({
+      projectId: 'project-1',
+      batchNumber: 'PCR-20260725-01',
+      genotypeDefinitionId: 'definition-1',
+    }))
+    expect(detail.records[0]).toEqual(expect.objectContaining({
+      projectId: 'project-1',
+      animalId: 'animal-1',
+    }))
+    expect(origin?.id).toBe('batch-1')
+    expect(preview.preview).toEqual(expect.objectContaining({
+      totalRows: 1,
+      previewHash,
+    }))
+    expect(receipt).toEqual(expect.objectContaining({
+      batch: expect.objectContaining({ status: 'committed', revision: 3 }),
+      records: [expect.objectContaining({ id: 'record-1' })],
+    }))
+    expect(cancelledBatch.cancelReason).toBe('duplicate batch')
+    expect(template.type).toContain('text/csv')
+    expect(template.size).toBe('display_id,state,notes\n'.length)
+
+    const batchRequests = requests.filter(({ url }) => url.includes('/genotyping-'))
+    const listRequest = batchRequests.find(({ url }) =>
+      new URL(url).pathname.endsWith('/genotyping-batches')
+      && new URL(url).searchParams.get('limit') === '100')!
+    expect(new URL(listRequest.url).searchParams.get('project_id')).toBe('project-1')
+    expect(new URL(listRequest.url).searchParams.get('status')).toBe('draft')
+    const recordLookup = batchRequests.find(({ url }) =>
+      new URL(url).pathname.endsWith('/genotyping-records/record-1/batch'))!
+    expect(new URL(recordLookup.url).searchParams.get('project_id')).toBe('project-1')
+
+    const findMutation = (suffix: string) => batchRequests.find(({ url, init }) =>
+      new URL(url).pathname.endsWith(suffix) && init?.method === 'POST')!
+    const create = findMutation('/genotyping-batches')
+    expect(JSON.parse(String(create.init?.body))).toEqual({
+      project_id: 'project-1',
+      batch_number: 'PCR-20260725-01',
+      genotype_definition_id: 'definition-1',
+      assessed_at: '2026-07-25T08:00:00Z',
+      method: 'PCR gel electrophoresis',
+      notes: 'screening litter 7',
+    })
+    expect(JSON.parse(String(findMutation('/batch-1/preview').init?.body))).toEqual({
+      project_id: 'project-1',
+      expected_revision: 1,
+      source_attachment_id: 'attachment-source',
+    })
+    expect(JSON.parse(String(findMutation('/batch-1/commit').init?.body))).toEqual({
+      project_id: 'project-1',
+      expected_revision: 2,
+      preview_hash: previewHash,
+    })
+    expect(JSON.parse(String(findMutation('/batch-2/cancel').init?.body))).toEqual({
+      project_id: 'project-1',
+      expected_revision: 1,
+      reason: 'duplicate batch',
+    })
+    for (const request of [
+      create,
+      findMutation('/batch-1/preview'),
+      findMutation('/batch-1/commit'),
+      findMutation('/batch-2/cancel'),
+    ]) {
+      expect(new Headers(request.init?.headers).get('X-CSRF-Token'))
+        .toBe('csrf-genotyping-batch')
+    }
+  })
+
   it('streams attachment bytes without accepting client paths, hashes, or sizes', async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = []
     const attachment = {
-      id: 'attachment-1', project_id: 'project-1', entity_type: 'animal', entity_id: 'animal-1',
-      file_name: 'weight.csv', media_type: 'text/csv', size_bytes: 7, sha256: 'a'.repeat(64),
+      id: 'attachment-1', project_id: 'project-1',
+      entity_type: 'genotyping_batch', entity_id: 'batch-1',
+      file_name: 'results.csv', media_type: 'text/csv', size_bytes: 7, sha256: 'a'.repeat(64),
       version: 1, content_href: '/api/v1/attachments/attachment-1/content',
       meta: { created_at: '2026-07-19T01:00:00Z', revision: 3 },
     }
@@ -1310,11 +1759,11 @@ describe('MuriArc gateway selection', () => {
     const content = new Blob(['a,b\n1,2'], { type: 'text/csv' })
 
     const uploaded = await gateway.uploadAttachment({
-      entityType: 'animal', entityId: 'animal-1', projectId: 'project-1',
-      fileName: 'weight.csv', mediaType: 'text/csv', content,
+      entityType: 'genotyping_batch', entityId: 'batch-1', projectId: 'project-1',
+      fileName: 'results.csv', mediaType: 'text/csv', content,
     })
     const listed = await gateway.listAttachments({
-      entityType: 'animal', entityId: 'animal-1', projectId: 'project-1',
+      entityType: 'genotyping_batch', entityId: 'batch-1', projectId: 'project-1',
     })
     const downloaded = await gateway.downloadAttachment('attachment-1')
     await gateway.deleteAttachment({
@@ -1329,7 +1778,9 @@ describe('MuriArc gateway selection', () => {
     expect(downloaded).toEqual(expect.objectContaining({ size: 7, type: 'text/csv' }))
     const upload = requests.find((request) => request.url.includes('/attachments/upload?'))!
     const uploadUrl = new URL(upload.url)
-    expect(uploadUrl.searchParams.get('file_name')).toBe('weight.csv')
+    expect(uploadUrl.searchParams.get('entity_type')).toBe('genotyping_batch')
+    expect(uploadUrl.searchParams.get('entity_id')).toBe('batch-1')
+    expect(uploadUrl.searchParams.get('file_name')).toBe('results.csv')
     expect(uploadUrl.searchParams.has('relative_path')).toBe(false)
     expect(uploadUrl.searchParams.has('sha256')).toBe(false)
     expect(uploadUrl.searchParams.has('size_bytes')).toBe(false)

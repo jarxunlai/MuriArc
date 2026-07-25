@@ -813,12 +813,16 @@ async fn get_genotyping_record(
 ) -> Result<Json<ItemResponse<GenotypingRecord>>, ApiError> {
     let record = store(state.store.get_genotyping_record(id), &metadata).await?;
     ensure_lab(record.lab_id, &principal, &metadata)?;
+    if query.project_id.is_some() && query.project_id != record.project_id {
+        return Err(ApiError::not_found("genotyping record was not found")
+            .with_request_id(metadata.request_id));
+    }
     scope::animal_with_permission(
         &state,
         &principal,
         &metadata,
         record.animal_id,
-        query.project_id.or(record.project_id),
+        record.project_id,
         Permission::ReadAnimal,
     )
     .await?;

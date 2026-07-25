@@ -37,6 +37,9 @@ SQLite 与 PostgreSQL 按相同顺序应用以下共享业务迁移：
    补充实验室级 AI runtime 配置。
 6. `0017_workspace_assets_multimodal.sql`：新增 Attachment link/derivative、私有 AI 图片和
    提取草稿等 Workspace 资产关系。
+7. Desktop/SQLite `0030_genotyping_batches.sql` 与 Server/PostgreSQL
+   `0032_genotyping_batches.sql`：新增 `genotyping_batches` 与 `genotyping_batch_records`
+   关系表。迁移只建结构，不从既有单条鉴定记录或附件猜测批次归属。
 
 这些迁移不从旧自由文本或旧单基因 Genotype 猜测 Genetics v2 定义，也不自动创建配对、
 交配事件或 Observation。需要转换的历史数据必须通过单独、可复核、带 provenance 的迁移

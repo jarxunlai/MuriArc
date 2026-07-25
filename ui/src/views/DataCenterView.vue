@@ -19,6 +19,7 @@ import {
   canCreateSnapshot,
   canExportData,
   canImportData,
+  canManageBreeding,
   currentProjectId,
   hasLabRegistryAccess,
 } from '@/services/projectContext'
@@ -30,6 +31,7 @@ import {
   type EditableImportMapping,
 } from '@/services/importMapping'
 import PageHeader from '@/components/PageHeader.vue'
+import GenotypingBatchImport from '@/components/GenotypingBatchImport.vue'
 
 const message = useMessage()
 const route = useRoute()
@@ -54,18 +56,23 @@ const registeredAtRange = ref<[number, number] | null>(null)
 const assessedAtRange = ref<[number, number] | null>(null)
 const genotypeDefinitions = ref<Array<{ label: string; value: string }>>([])
 const animalDataMode = computed(() => route.meta.animalData === true)
+const animalWorkflow = ref<'registration' | 'genotyping'>('registration')
 const animalImportAllowed = computed(() => gateway.mode === 'local' || hasLabRegistryAccess())
 const importAllowed = computed(() => (gateway.mode === 'local' || canImportData())
   && (!animalDataMode.value || animalImportAllowed.value))
 const exportAllowed = computed(() => gateway.mode === 'local' || canExportData())
 const snapshotAllowed = computed(() => gateway.mode === 'local' || canCreateSnapshot())
+const genotypingBatchAllowed = computed(() => gateway.mode === 'local' || canManageBreeding())
+const showingGenotypingBatch = computed(() => animalDataMode.value
+  && genotypingBatchAllowed.value
+  && animalWorkflow.value === 'genotyping')
 const importKind = ref<ImportKind>(animalImportAllowed.value ? 'animal' : 'measurement')
 const selectedExperimentId = ref<string>()
 const stepLabels = ['选择文件', '识别字段', '检查与预览', '事务写入']
 const supportsXlsxTemplates = computed(() => dataGateway.animalImportTemplateFormats.includes('xlsx'))
 const pageTitle = computed(() => animalDataMode.value ? '动物数据' : '数据中心')
 const pageDescription = computed(() => animalDataMode.value
-  ? '批量登记动物、查看生产 schema 与模板，并按条件生成不含 UUID 的业务导出。'
+  ? '批量登记动物，或将一批基因鉴定结果与胶图证据绑定后原子写入并全程溯源。'
   : '导入实验测量、查看任务历史并创建完整业务归档快照。')
 const jobStatusMeta: Record<DataJob['status'], { label: string; type: 'default' | 'info' | 'warning' | 'success' | 'error' }> = {
   queued: { label: '排队中', type: 'default' },
@@ -349,13 +356,24 @@ onMounted(async () => {
         <n-button v-if="exportAllowed" secondary :loading="busy" @click="showExport = true">
           <template #icon><Download :size="17" /></template>配置动物导出
         </n-button>
-        <n-button v-if="importAllowed" type="primary" :disabled="busy" @click="resetImport()">
+        <n-button v-if="importAllowed && !showingGenotypingBatch" type="primary" :disabled="busy" @click="resetImport()">
           <template #icon><Plus :size="17" /></template>新建导入
         </n-button>
       </template>
     </PageHeader>
 
-    <section class="data-layout" :class="{ compact: !importAllowed }">
+    <section v-if="animalDataMode && genotypingBatchAllowed" class="workflow-switch surface" aria-label="动物数据录入类型">
+      <button type="button" :class="{ active: animalWorkflow === 'registration' }" @click="animalWorkflow = 'registration'">
+        <FileSpreadsheet :size="19" /><span><strong>动物登记</strong><small>批量创建动物与基础档案</small></span>
+      </button>
+      <button type="button" :class="{ active: animalWorkflow === 'genotyping' }" @click="animalWorkflow = 'genotyping'">
+        <UploadCloud :size="19" /><span><strong>基因鉴定批次</strong><small>结果表 + 多张胶图 + 批次溯源</small></span>
+      </button>
+    </section>
+
+    <GenotypingBatchImport v-if="showingGenotypingBatch" :project-id="currentProjectId" />
+
+    <section v-else class="data-layout" :class="{ compact: !importAllowed }">
       <div v-if="importAllowed" class="import-panel surface">
         <header>
           <div><UploadCloud :size="19" /><div><strong>{{ importTitle }}</strong><span>CSV / XLSX · 最大 32 MiB</span></div></div>
@@ -519,7 +537,7 @@ onMounted(async () => {
       <template #footer><div class="export-actions"><n-button @click="showExport = false">取消</n-button><n-button type="primary" :loading="busy" @click="createExport">生成并下载</n-button></div></template>
     </n-modal>
 
-    <section class="jobs-section">
+    <section v-if="!showingGenotypingBatch" class="jobs-section">
       <header><div><h2>最近任务</h2><span>导入、导出与快照</span></div><n-button quaternary circle :loading="loading" @click="refreshJobs"><template #icon><RefreshCw :size="16" /></template></n-button></header>
       <n-spin :show="loading">
         <div class="job-list surface">
@@ -536,6 +554,10 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.workflow-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin-bottom: 13px; overflow: hidden; background: var(--muri-border); }
+.workflow-switch button { display: flex; min-width: 0; align-items: center; gap: 9px; padding: 12px 14px; border: 0; color: var(--muri-text-secondary); background: var(--muri-surface); cursor: pointer; text-align: left; }
+.workflow-switch button.active { color: var(--muri-primary); background: var(--muri-primary-soft); }
+.workflow-switch button > span { display: flex; min-width: 0; flex-direction: column; }.workflow-switch small { color: var(--muri-text-tertiary); font-size: 10px; }
 .data-layout { display: grid; grid-template-columns: minmax(0, 1fr) 280px; align-items: start; gap: 13px; }
 .data-layout.compact { grid-template-columns: minmax(0, 560px); }
 .import-panel { overflow: hidden; }.import-panel > header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--muri-border); }.import-panel > header > div { display: flex; align-items: center; gap: 10px; }.import-panel > header svg { color: var(--muri-primary); }.import-panel > header div div { display: flex; flex-direction: column; }.import-panel > header span { color: var(--muri-text-tertiary); font-size: 11px; }.import-panel > header button { border: 0; color: var(--muri-primary); background: transparent; cursor: pointer; font-size: 12px; }.import-panel > header button:disabled { opacity: .5; }
@@ -563,5 +585,5 @@ onMounted(async () => {
 .export-dialog { width: min(820px, calc(100vw - 28px)); }.export-dialog .n-alert { margin-bottom: 14px; }.export-grid, .tag-filter-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }.field-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }.export-actions { display: flex; justify-content: flex-end; gap: 8px; }
 @media (max-width: 1180px) { .data-layout,.data-layout.compact { grid-template-columns: 1fr; } }
 @media (max-width: 760px) { .import-resources { align-items: stretch; flex-direction: column; }.resource-actions { justify-content: flex-start; }.resource-note { text-align: left; } }
-@media (max-width: 600px) { .steps { padding-bottom: 13px; }.steps span { display: none; }.steps li:not(:last-child)::after { right: calc(-50% + 16px); left: calc(50% + 16px); }.mobile-step-label { display: block; }.import-selection { grid-template-columns: 1fr; }.resource-actions { display: grid; grid-template-columns: 1fr 1fr; }.resource-actions > :first-child { grid-column: 1 / -1; }.drop-zone { min-height: 220px; text-align: center; }.mapping-table > div { grid-template-columns: 1fr 1fr 70px; padding: 0 7px; }.job-list article { grid-template-columns: 32px 1fr auto; }.export-grid, .tag-filter-grid, .field-grid { grid-template-columns: 1fr; } }
+@media (max-width: 600px) { .workflow-switch { grid-template-columns: 1fr; }.steps { padding-bottom: 13px; }.steps span { display: none; }.steps li:not(:last-child)::after { right: calc(-50% + 16px); left: calc(50% + 16px); }.mobile-step-label { display: block; }.import-selection { grid-template-columns: 1fr; }.resource-actions { display: grid; grid-template-columns: 1fr 1fr; }.resource-actions > :first-child { grid-column: 1 / -1; }.drop-zone { min-height: 220px; text-align: center; }.mapping-table > div { grid-template-columns: 1fr 1fr 70px; padding: 0 7px; }.job-list article { grid-template-columns: 32px 1fr auto; }.export-grid, .tag-filter-grid, .field-grid { grid-template-columns: 1fr; } }
 </style>

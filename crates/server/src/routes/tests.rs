@@ -11,11 +11,13 @@ use muriarc_ai::SOURCE_IMPORT_JOB_BINDING_KEY;
 use muriarc_core::{
     Actor, ActorType, AiConversation, AiConversationMessage, AiConversationMessageRole,
     AiModelProfile, AiModelProfileBinding, AiModelProfileStore, AiModelProfileVersion,
-    AiOperationStore, AiScope, Animal, AnimalEvent, AnimalEventKind, Approval, ApprovalDecision,
-    Attachment, AuditContext, Cage, EntityType, Experiment, ExperimentTemplateVersion,
-    FieldValueType, Job, JobKind, JobStatus, Lab, LabRole, Measurement, MeasurementFilter,
-    MeasurementValue, MuriArcStore, ParentType, Participation, Pedigree, Project,
-    ProjectAnimalAssignment, ProjectRole, ProvenanceFilter, ProvenanceSource, RecordMeta,
+    AiOperationStore, AiScope, Allele, Animal, AnimalEvent, AnimalEventKind, Approval,
+    ApprovalDecision, Attachment, AuditContext, Cage, EntityType, Experiment,
+    ExperimentTemplateVersion, FieldValueType, GeneLocus, GenotypeComponent, GenotypeComponentMode,
+    GenotypeDefinition, GenotypingBatch, GenotypingBatchCommit, GenotypingBatchPreview,
+    GenotypingRecord, GenotypingState, Job, JobKind, JobStatus, Lab, LabRole, Measurement,
+    MeasurementFilter, MeasurementValue, MuriArcStore, ParentType, Participation, Pedigree,
+    Project, ProjectAnimalAssignment, ProjectRole, ProvenanceFilter, ProvenanceSource, RecordMeta,
     RecordStatus, Sample, Sex, TemplateField, ToolRun, ToolRunStatus, User, WorkspaceStore,
     WriteSource,
 };
@@ -2121,6 +2123,371 @@ async fn genetics_and_attachment_binary_routes_validate_content_and_audit_writes
         .await
         .unwrap();
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn genotyping_batch_attachments_require_breeding_permission_and_preserve_record_scope() {
+    let fixture = Fixture::new(None).await;
+    let now = chrono::Utc::now();
+    let audit = AuditContext::system(WriteSource::Migration);
+    let animal = Animal::new_mouse(fixture.lab_id, "GB-REST-001", Sex::Female, now).unwrap();
+    fixture.store.create_animal(&animal, &audit).await.unwrap();
+
+    let alternate_project =
+        Project::new(fixture.lab_id, "Alternate genotyping scope", now).unwrap();
+    fixture
+        .store
+        .create_project(&alternate_project, &audit)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .assign_animals_to_project(
+            &[ProjectAnimalAssignment::new(
+                fixture.lab_id,
+                fixture.project_id,
+                animal.id,
+                Some(fixture.user_id),
+                Some("genotyping batch route test".to_owned()),
+                now,
+            )],
+            &audit,
+        )
+        .await
+        .unwrap();
+    fixture
+        .store
+        .assign_animals_to_project(
+            &[ProjectAnimalAssignment::new(
+                fixture.lab_id,
+                alternate_project.id,
+                animal.id,
+                Some(fixture.user_id),
+                Some("cross-scope lookup regression".to_owned()),
+                now,
+            )],
+            &audit,
+        )
+        .await
+        .unwrap();
+
+    let locus = GeneLocus {
+        id: Uuid::new_v4(),
+        lab_id: fixture.lab_id,
+        symbol: format!("Gb{}", &Uuid::new_v4().simple().to_string()[..8]),
+        description: None,
+        meta: RecordMeta::new(now),
+    };
+    fixture
+        .store
+        .create_gene_locus(&locus, &audit)
+        .await
+        .unwrap();
+    let wild_type = Allele {
+        id: Uuid::new_v4(),
+        locus_id: locus.id,
+        symbol: "+".to_owned(),
+        description: None,
+        is_wild_type: true,
+        meta: RecordMeta::new(now),
+    };
+    let mutant = Allele {
+        id: Uuid::new_v4(),
+        locus_id: locus.id,
+        symbol: "mut".to_owned(),
+        description: None,
+        is_wild_type: false,
+        meta: RecordMeta::new(now),
+    };
+    fixture
+        .store
+        .create_allele(&wild_type, &audit)
+        .await
+        .unwrap();
+    fixture.store.create_allele(&mutant, &audit).await.unwrap();
+    let mut definition =
+        GenotypeDefinition::new(fixture.lab_id, "Route batch definition", now).unwrap();
+    definition
+        .replace_components(vec![
+            GenotypeComponent::new(
+                definition.id,
+                locus.id,
+                wild_type.id,
+                Some(mutant.id),
+                GenotypeComponentMode::Diploid,
+                0,
+                now,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+    fixture
+        .store
+        .create_genotype_definition(&definition, &audit)
+        .await
+        .unwrap();
+
+    let mut batch = GenotypingBatch::new(
+        fixture.lab_id,
+        Some(fixture.project_id),
+        "PCR-REST-20260725-01",
+        definition.id,
+        now,
+        Some(fixture.user_id),
+        now,
+    )
+    .unwrap();
+    batch.method = Some("PCR gel electrophoresis".to_owned());
+    fixture
+        .store
+        .create_genotyping_batch(&batch, &audit)
+        .await
+        .unwrap();
+
+    let csv = format!(
+        "display_id,state,notes\n{},confirmed,lane 1\n",
+        animal.display_id
+    );
+    let source_uri = format!(
+        "/api/v1/attachments/upload?entity_type=genotyping_batch&entity_id={}&project_id={}&file_name=results.csv&media_type=text%2Fcsv",
+        batch.id, fixture.project_id
+    );
+    let editor_upload = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&source_uri)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {PROJECT_EDITOR_TOKEN}"),
+                )
+                .body(Body::from(csv.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(editor_upload.status(), StatusCode::FORBIDDEN);
+
+    let source_upload = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&source_uri)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {ANIMAL_MANAGER_TOKEN}"),
+                )
+                .body(Body::from(csv))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(source_upload.status(), StatusCode::CREATED);
+    let source_data = response_json(source_upload).await["data"].clone();
+    let source_id: Uuid = serde_json::from_value(source_data["id"].clone()).unwrap();
+
+    let gel = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01";
+    let gel_uri = format!(
+        "/api/v1/attachments/upload?entity_type=genotyping_batch&entity_id={}&project_id={}&file_name=gel-01.png&media_type=image%2Fpng",
+        batch.id, fixture.project_id
+    );
+    let gel_upload = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&gel_uri)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {ANIMAL_MANAGER_TOKEN}"),
+                )
+                .body(Body::from(gel.as_slice()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(gel_upload.status(), StatusCode::CREATED);
+    let gel_data = response_json(gel_upload).await["data"].clone();
+    let gel_id: Uuid = serde_json::from_value(gel_data["id"].clone()).unwrap();
+    let gel_revision = gel_data["meta"]["revision"].as_i64().unwrap();
+
+    let disposable_uri = format!(
+        "/api/v1/attachments/upload?entity_type=genotyping_batch&entity_id={}&project_id={}&file_name=gel-disposable.png&media_type=image%2Fpng",
+        batch.id, fixture.project_id
+    );
+    let disposable_upload = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(&disposable_uri)
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {ANIMAL_MANAGER_TOKEN}"),
+                )
+                .body(Body::from(gel.as_slice()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(disposable_upload.status(), StatusCode::CREATED);
+    let disposable_data = response_json(disposable_upload).await["data"].clone();
+    let disposable_id: Uuid = serde_json::from_value(disposable_data["id"].clone()).unwrap();
+    let disposable_revision = disposable_data["meta"]["revision"].as_i64().unwrap();
+
+    let editor_delete = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::DELETE,
+            &format!("/api/v1/attachments/{disposable_id}"),
+            PROJECT_EDITOR_TOKEN,
+            json!({
+                "expected_revision": disposable_revision,
+                "reason": "project editor must not mutate batch evidence"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(editor_delete.status(), StatusCode::FORBIDDEN);
+
+    let manager_delete = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::DELETE,
+            &format!("/api/v1/attachments/{disposable_id}"),
+            ANIMAL_MANAGER_TOKEN,
+            json!({
+                "expected_revision": disposable_revision,
+                "reason": "remove duplicate gel image"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(manager_delete.status(), StatusCode::OK);
+
+    let preview = GenotypingBatchPreview {
+        source_attachment_id: source_id,
+        preview_hash: "a".repeat(64),
+        row_count: 1,
+    };
+    batch = fixture
+        .store
+        .set_genotyping_batch_preview(batch.id, batch.meta.revision, &preview, now, &audit)
+        .await
+        .unwrap();
+    let mut record = GenotypingRecord::new(
+        fixture.lab_id,
+        animal.id,
+        definition.id,
+        GenotypingState::Confirmed,
+        Some(batch.assessed_at),
+        now,
+    )
+    .unwrap();
+    record.project_id = Some(fixture.project_id);
+    record.method = batch.method.clone();
+    let receipt = fixture
+        .store
+        .commit_genotyping_batch(
+            &GenotypingBatchCommit {
+                batch_id: batch.id,
+                expected_revision: batch.meta.revision,
+                preview_hash: preview.preview_hash,
+                records: vec![record.clone()],
+                committed_at: now,
+            },
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt.batch.status,
+        muriarc_core::GenotypingBatchStatus::Committed
+    );
+
+    let committed_upload = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/attachments/upload?entity_type=genotyping_batch&entity_id={}&project_id={}&file_name=late-gel.png&media_type=image%2Fpng",
+                    batch.id, fixture.project_id
+                ))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {ANIMAL_MANAGER_TOKEN}"),
+                )
+                .body(Body::from(gel.as_slice()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(committed_upload.status(), StatusCode::CONFLICT);
+
+    let committed_delete = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::DELETE,
+            &format!("/api/v1/attachments/{gel_id}"),
+            ANIMAL_MANAGER_TOKEN,
+            json!({
+                "expected_revision": gel_revision,
+                "reason": "must be immutable after commit"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(committed_delete.status(), StatusCode::CONFLICT);
+
+    let visible_lookup = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::GET,
+            &format!(
+                "/api/v1/genotyping-records/{}/batch?project_id={}",
+                record.id, fixture.project_id
+            ),
+            PROJECT_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(visible_lookup.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(visible_lookup).await["data"]["id"],
+        json!(batch.id)
+    );
+
+    for uri in [
+        format!(
+            "/api/v1/genotyping-records/{}?project_id={}",
+            record.id, alternate_project.id
+        ),
+        format!(
+            "/api/v1/genotyping-records/{}/batch?project_id={}",
+            record.id, alternate_project.id
+        ),
+    ] {
+        let wrong_scope = fixture
+            .app
+            .clone()
+            .oneshot(fixture.request(Method::GET, &uri, HUMAN_TOKEN, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(wrong_scope.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
 }
 
 #[tokio::test]

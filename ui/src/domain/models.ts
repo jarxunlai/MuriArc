@@ -182,7 +182,7 @@ export interface PedigreeRelation {
 export interface AnimalAttachment {
   id: string
   projectId?: string
-  entityType: 'project' | 'animal' | 'experiment' | 'measurement' | 'sample'
+  entityType: 'project' | 'animal' | 'genotyping_batch' | 'experiment' | 'measurement' | 'sample'
   entityId: string
   fileName: string
   mediaType?: string
@@ -284,6 +284,67 @@ export interface GenotypingRecord {
   revision: number
   createdAt: string
   updatedAt: string
+}
+
+export type GenotypingBatchStatus = 'draft' | 'committed' | 'cancelled'
+
+export interface GenotypingBatch {
+  id: string
+  projectId?: string
+  batchNumber: string
+  genotypeDefinitionId: string
+  assessedAt: string
+  method?: string
+  notes?: string
+  status: GenotypingBatchStatus
+  createdBy?: string
+  sourceAttachmentId?: string
+  previewHash?: string
+  previewRowCount?: number
+  committedAt?: string
+  cancelledAt?: string
+  cancelReason?: string
+  revision: number
+  createdAt: string
+  updatedAt: string
+}
+
+export interface GenotypingImportIssue {
+  row?: number
+  field?: string
+  severity: 'warning' | 'error'
+  code: string
+  message: string
+}
+
+export interface GenotypingImportRow {
+  sourceRow: number
+  animalId: string
+  displayId: string
+  state: GenotypingState
+  notes?: string
+}
+
+export interface GenotypingImportPreview {
+  totalRows: number
+  acceptedRows: GenotypingImportRow[]
+  issues: GenotypingImportIssue[]
+  previewHash: string
+}
+
+export interface GenotypingBatchPreviewResult {
+  batch: GenotypingBatch
+  preview: GenotypingImportPreview
+}
+
+export interface GenotypingBatchDetail {
+  batch: GenotypingBatch
+  records: GenotypingRecord[]
+}
+
+export interface GenotypingBatchReceipt {
+  batch: GenotypingBatch
+  records: GenotypingRecord[]
 }
 
 export interface BreedingLine {

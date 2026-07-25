@@ -9335,8 +9335,8 @@ mod tests {
                 .expect("direct merged migration ledger must be readable");
         assert_eq!(
             direct_upgrade_ledger,
-            (31, Some(31)),
-            "the direct current-main to merged PostgreSQL upgrade must end at 0031"
+            (32, Some(32)),
+            "the direct current-main to merged PostgreSQL upgrade must end at 0032"
         );
 
         let profile_count: i64 = sqlx::query_scalar("SELECT count(*) FROM ai_model_profiles")
@@ -9794,8 +9794,8 @@ mod tests {
                 .expect("merged PostgreSQL migration ledger must be readable");
         assert_eq!(
             merged_stack_ledger,
-            (31, Some(31)),
-            "the merged PostgreSQL migration set must end at 0031"
+            (32, Some(32)),
+            "the merged PostgreSQL migration set must end at 0032"
         );
         type MergedStackConversationRow = (
             String,

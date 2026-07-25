@@ -12,6 +12,14 @@ External clients ── REST or MCP + scoped token ─────────�
 
 Desktop 与 Server 共享核心领域模型、主要业务用例和同一套响应式前端。Desktop 提供无密码的个人本地工作流：每次 WebView 会话先显示“进入本地空间”，`sessionStorage` 只避免刷新重复，不能充当安全锁，也不创建认证表。Server 额外提供认证、用户治理、项目权限与共享部署能力。部署差异明确收敛在 transport、认证、凭据管理、密钥和 Store adapter，不在 Vue 页面复制领域规则。
 
+Desktop 启动时先由 `StorageRootState` 解析 OS application data 中的 locator，并在任何 SQLite
+pool、附件服务或 AI 设置服务初始化前完成 pending migration。config root 只保存
+`storage-location.json`、`storage-migration.json` 等定位控制信息；active data root 统一
+保存 SQLite、附件、数据产物与非敏感 AI 配置。Vue 只能通过原生 folder picker 获得一次性
+selection token，不能把任意路径作为迁移命令输入。迁移以 SQLite 完整性检查、WAL checkpoint、
+staging 文件树 SHA-256 和目标只读复检为切换门禁；失败、自定义磁盘缺失或 metadata 无效均
+fail closed，不创建空库。OS keyring 凭据和 WebView cache 不属于 data root。
+
 ## Application services
 
 `crates/application` 位于 transport 与 `core` 之间，负责用例级输入规范化、领域对象构造和持久化意图编排。Tauri/Axum 只负责 DTO、传输格式、身份认证和权限门禁；`core` 继续保持对 transport、SQLx adapter 与模型 Provider 的零依赖。首个共享纵向切片为 `CreateAnimal`，后续用例按相同边界逐步迁移，而不是一次性拆解现有 Store。
@@ -142,7 +150,7 @@ Environment Root 不是新增的领域角色枚举，而是“配置声明的唯
 
 ## Deployment
 
-- Desktop：Windows Tauri WebView 安装包为正式本地交付目标；SQLite 和附件目录位于 OS application data，密钥位于 OS keyring。Desktop 不通过 VNC/noVNC、浏览器远程桌面或 Server Docker 交付。
+- Desktop：Windows Tauri WebView 安装包为正式本地交付目标；SQLite、附件、数据产物和非敏感 AI 配置位于同一个 active data root（默认是 OS application data，可由用户选择本机固定磁盘上的独立空目录），密钥位于 OS keyring。Desktop 不通过 VNC/noVNC、浏览器远程桌面或 Server Docker 交付。
 - Server：PostgreSQL、附件 volume、加密 secret store；Axum 位于 HTTPS reverse proxy 后。
 - V1 不做 Local Web、本地 Axum+SQLite 浏览器服务，也不做 Desktop 与 Server 的实时同步。当前 snapshot 用于版本化完整业务归档、离线留存与
   完整性校验，不提供自动合并、导入或恢复入口；CSV/XLSX Export 也不能替代部署备份。

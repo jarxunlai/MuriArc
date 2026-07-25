@@ -2689,6 +2689,7 @@ dependencies = [
  "muriarc-store-sqlite",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tauri",
  "tauri-build",
@@ -2697,6 +2698,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

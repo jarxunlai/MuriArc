@@ -12,7 +12,7 @@ MuriArc 是面向个人研究者和共享实验室的实验动物研究管理平
 
 ## 运行形态
 
-- **Desktop**：Tauri v2 + SQLite，面向个人用户；正式本地交付为 Windows Tauri WebView 安装包，不通过 VNC/noVNC 或浏览器远程桌面部署。每次启动显示无密码“进入本地空间”，它只确认实验室和操作者、不是安全锁，进入后可完全离线使用。
+- **Desktop**：Tauri v2 + SQLite，面向个人用户；正式本地交付为 Windows Tauri WebView 安装包，不通过 VNC/noVNC 或浏览器远程桌面部署。每次启动显示无密码“进入本地空间”，它只确认实验室和操作者、不是安全锁，进入后可完全离线使用。数据库、附件、数据产物和非敏感 AI 配置使用同一个本地数据根，用户可从设置中选择本机固定磁盘上的独立空目录并在重启前安全迁移；API Key 始终保留在 OS keyring。
 - **Server**：Axum + PostgreSQL + 响应式 Web，面向一个实验室内的多用户、多项目协作。
 - **AI**：每位用户可建立多个版本化模型档案，自由填写模型 ID，并分别使用 OpenAI Chat
   Completions、OpenAI Responses 或 Anthropic Messages 协议；档案密钥独立保存，未配置密钥

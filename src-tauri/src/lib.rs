@@ -13,6 +13,7 @@ mod data;
 mod model_profiles;
 mod research_extensions;
 mod settings;
+mod storage_root;
 
 use ai::{
     DesktopAiError, DesktopAiState, DesktopAutonomyInput, DesktopConversationStartInput,
@@ -63,6 +64,10 @@ use research_extensions::{
     ReviseObservationInput, VoidGenotypingRecordInput,
 };
 use settings::{AiSettingsView, SaveAiSettingsInput, SettingsService};
+use storage_root::{
+    LocalStorageSelection, LocalStorageStatus, RequestStorageMigrationInput,
+    StorageMigrationRequestResult, StorageRootError, StorageRootState,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +114,15 @@ impl From<DesktopDataError> for CommandError {
     }
 }
 
+impl From<StorageRootError> for CommandError {
+    fn from(error: StorageRootError) -> Self {
+        Self {
+            code: error.code(),
+            message: error.safe_message().to_owned(),
+        }
+    }
+}
+
 type CommandResult<T> = Result<T, CommandError>;
 
 #[tauri::command]
@@ -118,6 +132,111 @@ fn app_context() -> AppContext {
         mode: "local",
         api_version: "v1",
     }
+}
+
+#[tauri::command]
+fn get_local_storage_status(
+    state: tauri::State<'_, StorageRootState>,
+) -> CommandResult<LocalStorageStatus> {
+    state.status().map_err(Into::into)
+}
+
+#[tauri::command]
+async fn choose_local_storage_directory(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, StorageRootState>,
+) -> CommandResult<Option<LocalStorageSelection>> {
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择 MuriArc 本地数据目录")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|_| StorageRootError::DialogUnavailable)?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let path = selected
+        .into_path()
+        .map_err(|_| StorageRootError::DialogUnavailable)?;
+    state.select_target(path).map(Some).map_err(Into::into)
+}
+
+#[tauri::command]
+async fn request_local_storage_migration(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, StorageRootState>,
+    input: RequestStorageMigrationInput,
+) -> CommandResult<StorageMigrationRequestResult> {
+    let target = state.selected_target(&input.selection_token)?;
+    let target_display = target.to_string_lossy().into_owned();
+    let confirmed = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .message(format!(
+                "MuriArc 将在下次完全退出并重新启动时，把数据库、附件、数据产物和非敏感 AI 配置复制到：\n\n{target_display}\n\n校验成功后才会切换，旧目录不会自动删除。API Key 仍保存在系统安全存储中。"
+            ))
+            .title("确认迁移本地数据")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "确认并等待重启".to_owned(),
+                "取消".to_owned(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .map_err(|_| StorageRootError::DialogUnavailable)?;
+    if !confirmed {
+        return Ok(StorageMigrationRequestResult {
+            scheduled: false,
+            requires_restart: false,
+            target_data_root: target.to_string_lossy().into_owned(),
+        });
+    }
+    state
+        .schedule_selected(&input.selection_token)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+async fn request_restore_default_storage(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, StorageRootState>,
+) -> CommandResult<StorageMigrationRequestResult> {
+    let status = state.status()?;
+    if !status.uses_custom_root {
+        return state.schedule_default().map_err(Into::into);
+    }
+    let default_display = status.default_data_root.clone();
+    let dialog_path = default_display.clone();
+    let confirmed = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .message(format!(
+                "MuriArc 将在下次完全退出并重新启动时，把当前完整数据复制回默认目录：\n\n{dialog_path}\n\n默认目录中的旧 MuriArc 数据会先保留到 storage-backups，当前自定义目录不会自动删除。"
+            ))
+            .title("确认恢复默认数据目录")
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                "确认并等待重启".to_owned(),
+                "取消".to_owned(),
+            ))
+            .blocking_show()
+    })
+    .await
+    .map_err(|_| StorageRootError::DialogUnavailable)?;
+    if !confirmed {
+        return Ok(StorageMigrationRequestResult {
+            scheduled: false,
+            requires_restart: false,
+            target_data_root: default_display,
+        });
+    }
+    state.schedule_default().map_err(Into::into)
+}
+
+#[tauri::command]
+fn open_local_storage_directory(state: tauri::State<'_, StorageRootState>) -> CommandResult<()> {
+    state.open_active_root().map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1264,17 +1383,25 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let app_data_dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&app_data_dir)?;
-            let database_path = app_data_dir.join("muriarc.sqlite3");
-            let settings = SettingsService::for_app_data(&app_data_dir);
+            let config_root = app.path().app_data_dir()?;
+            let executable = std::env::current_exe()?;
+            let install_root = executable.parent().ok_or_else(|| {
+                std::io::Error::other("desktop executable has no installation directory")
+            })?;
+            let storage_state = tauri::async_runtime::block_on(StorageRootState::initialize(
+                &config_root,
+                install_root,
+            ))?;
+            let active_data_root = storage_state.active_root().to_path_buf();
+            let database_path = active_data_root.join("muriarc.sqlite3");
+            let settings = SettingsService::for_app_data(&active_data_root);
             let state = tauri::async_runtime::block_on(DesktopState::initialize_with_settings(
                 &database_path,
                 settings.clone(),
             ))?;
             let data_state = tauri::async_runtime::block_on(DesktopDataState::initialize(
                 &database_path,
-                &app_data_dir,
+                &active_data_root,
             ))?;
             let ai_state = tauri::async_runtime::block_on(DesktopAiState::initialize(
                 data_state.clone(),
@@ -1283,10 +1410,16 @@ pub fn run() {
             app.manage(state);
             app.manage(data_state);
             app.manage(ai_state);
+            app.manage(storage_state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_context,
+            get_local_storage_status,
+            choose_local_storage_directory,
+            request_local_storage_migration,
+            request_restore_default_storage,
+            open_local_storage_directory,
             list_cages,
             create_cage,
             create_animal,
@@ -1430,5 +1563,15 @@ mod tests {
         )));
         assert_eq!(error.code, "storage_error");
         assert!(!error.message.contains("private details"));
+    }
+
+    #[test]
+    fn storage_root_errors_do_not_expose_paths_to_the_frontend() {
+        let error = CommandError::from(StorageRootError::Io(std::io::Error::other(
+            "D:\\private-lab\\muriarc.sqlite3",
+        )));
+        assert_eq!(error.code, "storage_error");
+        assert!(!error.message.contains("private-lab"));
+        assert!(!error.message.contains("muriarc.sqlite3"));
     }
 }

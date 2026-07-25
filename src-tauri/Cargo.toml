@@ -28,6 +28,8 @@ muriarc-importer = { path = "../crates/importer" }
 muriarc-store-sqlite = { path = "../crates/store-sqlite" }
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.10.9"
+sqlx = { workspace = true, features = ["sqlite"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2.7.2"
 tempfile = "3.23.0"
@@ -37,6 +39,10 @@ zeroize = "1.9.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6.3", features = ["windows-native"] }
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Storage_FileSystem",
+  "Win32_System_WindowsProgramming",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", features = ["apple-native"] }
@@ -48,5 +54,4 @@ keyring = { version = "3.6.3", features = ["linux-native"] }
 
 [dev-dependencies]
 muriarc-snapshot = { path = "../crates/snapshot" }
-sqlx = { workspace = true, features = ["sqlite"] }
 tokio.workspace = true

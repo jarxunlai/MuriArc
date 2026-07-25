@@ -9011,13 +9011,13 @@ mod tests {
         let expected_migration_count = i64::try_from(MIGRATOR.iter().count()).unwrap();
         let latest_migration_version = MIGRATOR.iter().map(|migration| migration.version).max();
         assert_eq!(
-            expected_migration_count, 31,
-            "the merged PostgreSQL migration set must contain versions 0001 through 0031"
+            expected_migration_count, 32,
+            "the merged PostgreSQL migration set must contain versions 0001 through 0032"
         );
         assert_eq!(
             latest_migration_version,
-            Some(31),
-            "the merged PostgreSQL migration set must end at 0031"
+            Some(32),
+            "the merged PostgreSQL migration set must end at 0032"
         );
         assert_eq!(
             fresh_versions,

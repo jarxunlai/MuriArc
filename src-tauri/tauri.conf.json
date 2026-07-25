@@ -32,7 +32,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "category": "Science",
+    "category": "Medical",
     "shortDescription": "Animal research management",
     "longDescription": "MuriArc connects animal lifecycle management with experiment data and controlled AI assistance.",
     "icon": [

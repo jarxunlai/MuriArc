@@ -3059,6 +3059,372 @@ mod postgres {
             .ok_or(AiProviderStoreError::Storage)
         }
 
+        /// Copies the deployment Root's credential-free local conversation
+        /// profile into a newly created or reactivated account.
+        ///
+        /// The copy is deliberately narrow: cloud transports, credentials,
+        /// vision profiles, unapproved endpoints, and ambiguous pre-existing
+        /// target settings are never inherited. The resulting rows are owned
+        /// by `target_user_id`, so later changes remain isolated per user.
+        pub(crate) async fn inherit_environment_root_local_default(
+            transaction: &mut Transaction<'_, Postgres>,
+            lab_id: Uuid,
+            environment_root_user_id: Uuid,
+            target_user_id: Uuid,
+            audit: &AuditContext,
+        ) -> Result<bool, AiProviderStoreError> {
+            let actor_user_id = audit.actor.user_id.ok_or(AiProviderStoreError::Storage)?;
+            if environment_root_user_id == target_user_id {
+                return Ok(false);
+            }
+            let target_is_unconfigured: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM users target
+                    WHERE target.id = $1
+                      AND target.lab_id = $2
+                      AND target.deleted_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ai_provider_settings settings
+                          WHERE settings.user_id = target.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ai_model_profiles profile
+                          WHERE profile.user_id = target.id
+                            AND profile.deleted_at IS NULL
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ai_user_model_defaults defaults
+                          WHERE defaults.user_id = target.id
+                            AND defaults.deleted_at IS NULL
+                      )
+                )",
+            )
+            .bind(target_user_id)
+            .bind(lab_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            if !target_is_unconfigured {
+                return Ok(false);
+            }
+
+            let source = sqlx::query(
+                "SELECT settings.provider_config, settings.provider_preset_id,
+                        settings.context_window_tokens,
+                        settings.max_input_tokens, settings.max_output_tokens,
+                        settings.history_token_budget, settings.history_turns,
+                        settings.temperature, settings.timeout_ms,
+                        version.protocol, version.transport, version.base_url,
+                        version.normalized_base_url, version.model_id,
+                        version.context_window_tokens AS profile_context_window_tokens,
+                        version.max_input_tokens AS profile_max_input_tokens,
+                        version.max_output_tokens AS profile_max_output_tokens,
+                        version.history_token_budget AS profile_history_token_budget,
+                        version.history_turns AS profile_history_turns,
+                        version.temperature AS profile_temperature,
+                        version.timeout_ms AS profile_timeout_ms
+                 FROM users root
+                 JOIN ai_provider_settings settings
+                   ON settings.user_id = root.id
+                  AND settings.enabled = TRUE
+                  AND settings.secret_key_version IS NULL
+                  AND settings.secret_nonce IS NULL
+                  AND settings.secret_ciphertext IS NULL
+                  AND settings.supports_vision = FALSE
+                  AND settings.provider_config->>'kind' = 'local_http'
+                 JOIN ai_user_model_defaults defaults
+                   ON defaults.user_id = root.id
+                  AND defaults.deleted_at IS NULL
+                 JOIN ai_model_profiles profile
+                   ON profile.id = defaults.default_conversation_profile_id
+                  AND profile.user_id = root.id
+                  AND profile.lab_id = root.lab_id
+                  AND profile.archived_at IS NULL
+                  AND profile.deleted_at IS NULL
+                 JOIN ai_model_profile_versions version
+                   ON version.profile_id = profile.id
+                  AND version.version = profile.current_version
+                  AND version.transport = 'local_http'
+                  AND version.supports_vision = FALSE
+                 JOIN ai_provider_endpoints endpoint
+                   ON endpoint.lab_id = root.lab_id
+                  AND endpoint.protocol = version.protocol
+                  AND endpoint.normalized_base_url = version.normalized_base_url
+                  AND endpoint.enabled = TRUE
+                 WHERE root.id = $1
+                   AND root.lab_id = $2
+                   AND root.status = 'active'
+                   AND root.deleted_at IS NULL
+                   AND settings.provider_config->>'model' = version.model_id
+                   AND rtrim(settings.provider_config->>'base_url', '/') =
+                       version.normalized_base_url
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM ai_model_profile_secrets secret
+                       WHERE secret.profile_id = profile.id
+                         AND secret.profile_version = version.version
+                   )
+                 LIMIT 1",
+            )
+            .bind(environment_root_user_id)
+            .bind(lab_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            let Some(source) = source else {
+                return Ok(false);
+            };
+
+            let profile_id = Uuid::new_v4();
+            let now = Utc::now();
+            sqlx::query(
+                "INSERT INTO ai_provider_settings (
+                    user_id, enabled, provider_config, provider_preset_id,
+                    secret_key_version, secret_nonce, secret_ciphertext,
+                    supports_vision, vision_model,
+                    context_window_tokens, max_input_tokens, max_output_tokens,
+                    history_token_budget, history_turns, temperature, timeout_ms,
+                    created_at, updated_at, revision
+                 ) VALUES (
+                    $1, TRUE, $2, $3, NULL, NULL, NULL, FALSE, NULL,
+                    $4, $5, $6, $7, $8, $9, $10, $11, $11, 1
+                 )",
+            )
+            .bind(target_user_id)
+            .bind(
+                source
+                    .try_get::<Value, _>("provider_config")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<String, _>("provider_preset_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("context_window_tokens")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("max_input_tokens")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("max_output_tokens")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("history_token_budget")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i32, _>("history_turns")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<f64, _>("temperature")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("timeout_ms")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(now)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+
+            sqlx::query(
+                "INSERT INTO ai_model_profiles (
+                    id, lab_id, user_id, name, current_version,
+                    created_at, updated_at, archived_at, deleted_at, revision
+                 ) VALUES (
+                    $1, $2, $3, 'Managed local default', 1,
+                    $4, $4, NULL, NULL, 1
+                 )",
+            )
+            .bind(profile_id)
+            .bind(lab_id)
+            .bind(target_user_id)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            sqlx::query(
+                "INSERT INTO ai_model_profile_versions (
+                    profile_id, version, protocol, transport, base_url,
+                    normalized_base_url, model_id, supports_vision,
+                    context_window_tokens, max_input_tokens, max_output_tokens,
+                    history_token_budget, history_turns, temperature, timeout_ms,
+                    created_at
+                 ) VALUES (
+                    $1, 1, $2, $3, $4, $5, $6, FALSE,
+                    $7, $8, $9, $10, $11, $12, $13, $14
+                 )",
+            )
+            .bind(profile_id)
+            .bind(
+                source
+                    .try_get::<String, _>("protocol")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<String, _>("transport")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<String, _>("base_url")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<String, _>("normalized_base_url")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<String, _>("model_id")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("profile_context_window_tokens")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("profile_max_input_tokens")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("profile_max_output_tokens")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("profile_history_token_budget")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i32, _>("profile_history_turns")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<f64, _>("profile_temperature")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(
+                source
+                    .try_get::<i64, _>("profile_timeout_ms")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+            )
+            .bind(now)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+            sqlx::query(
+                "INSERT INTO ai_user_model_defaults (
+                    user_id, default_conversation_profile_id,
+                    default_vision_profile_id, created_at, updated_at,
+                    deleted_at, revision
+                 ) VALUES ($1, $2, NULL, $3, $3, NULL, 1)",
+            )
+            .bind(target_user_id)
+            .bind(profile_id)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?;
+
+            for (entity_type, entity_id, after) in [
+                (
+                    "ai_provider_settings",
+                    target_user_id,
+                    json!({
+                        "configured": true,
+                        "enabled": true,
+                        "credential_present": false,
+                        "managed_local_default": true,
+                        "revision": 1,
+                    }),
+                ),
+                (
+                    "ai_model_profile",
+                    profile_id,
+                    json!({
+                        "name": "Managed local default",
+                        "current_version": 1,
+                        "transport": "local_http",
+                        "base_url_present": true,
+                        "model_id_present": true,
+                        "supports_vision": false,
+                        "credential_present": false,
+                        "managed_local_default": true,
+                        "revision": 1,
+                    }),
+                ),
+                (
+                    "ai_user_model_defaults",
+                    target_user_id,
+                    json!({
+                        "default_conversation_profile_id": profile_id,
+                        "default_vision_profile_id": null,
+                        "managed_local_default": true,
+                        "revision": 1,
+                    }),
+                ),
+            ] {
+                sqlx::query(
+                    "INSERT INTO audit_entries (
+                        id, lab_id, project_id, entity_type, entity_id, action,
+                        actor_type, actor_user_id, actor_display_name, source,
+                        request_id, reason, before_json, after_json, occurred_at,
+                        operation_code, operation_version, operation_params_json
+                     ) VALUES (
+                        $1,$2,NULL,$3,$4,'create','human',$5,$6,$7,$8,$9,
+                        NULL,$10,$11,'ai.managed_local_default.inherited',1,$12
+                     )",
+                )
+                .bind(Uuid::new_v4())
+                .bind(lab_id)
+                .bind(entity_type)
+                .bind(entity_id)
+                .bind(actor_user_id)
+                .bind(&audit.actor.display_name)
+                .bind(write_source_name(audit.source))
+                .bind(&audit.request_id)
+                .bind(
+                    audit
+                        .reason
+                        .as_deref()
+                        .unwrap_or("managed local AI default inherited"),
+                )
+                .bind(after)
+                .bind(now)
+                .bind(json!({
+                    "credential_material": "absent",
+                    "source_profile_owner": "environment_root",
+                }))
+                .execute(&mut **transaction)
+                .await
+                .map_err(|_| AiProviderStoreError::Storage)?;
+            }
+            Ok(true)
+        }
+
         fn view(
             row: &sqlx::postgres::PgRow,
         ) -> Result<AiProviderSettingsView, AiProviderStoreError> {

@@ -1485,12 +1485,15 @@ async fn execution_context_with_autonomy(
     let max_mode = if principal.is_external_ai() {
         AiAutonomyMode::Ask
     } else {
-        state
+        let lab_settings = state
             .ai_providers
             .get_lab_settings(principal.lab_id)
             .await
-            .map_err(|error| provider_settings_error(error, metadata))?
-            .max_autonomy_mode
+            .map_err(|error| provider_settings_error(error, metadata))?;
+        if !lab_settings.enabled {
+            return Err(lab_ai_disabled(metadata));
+        }
+        lab_settings.max_autonomy_mode
     };
     Ok(execution_context(state, principal, metadata)
         .await?
@@ -1510,6 +1513,15 @@ fn ai_disabled(metadata: &RequestMetadata) -> ApiError {
         StatusCode::SERVICE_UNAVAILABLE,
         "ai_runtime_not_configured",
         "the AI runtime is not configured for this deployment",
+    )
+    .with_request_id(metadata.request_id.clone())
+}
+
+fn lab_ai_disabled(metadata: &RequestMetadata) -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "ai_disabled",
+        "AI is disabled by laboratory policy",
     )
     .with_request_id(metadata.request_id.clone())
 }
@@ -1646,11 +1658,7 @@ fn provider_settings_error(error: AiProviderStoreError, metadata: &RequestMetada
             "unsupported_ai_provider_protocol",
             error.to_string(),
         ),
-        AiProviderStoreError::LabDisabled => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ai_lab_disabled",
-            "AI is disabled by laboratory policy",
-        ),
+        AiProviderStoreError::LabDisabled => return lab_ai_disabled(metadata),
         AiProviderStoreError::Disabled => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "ai_user_disabled",
@@ -2583,6 +2591,7 @@ mod tests {
         vision_profile_id: Option<Uuid>,
         vision_base_url: Option<String>,
         max_mode: AiAutonomyMode,
+        lab_enabled: AtomicBool,
         archived: AtomicBool,
         resolve_calls: AtomicUsize,
         default_resolve_failure: AtomicUsize,
@@ -2604,6 +2613,7 @@ mod tests {
                 vision_profile_id: None,
                 vision_base_url: None,
                 max_mode,
+                lab_enabled: AtomicBool::new(true),
                 archived: AtomicBool::new(false),
                 resolve_calls: AtomicUsize::new(0),
                 default_resolve_failure: AtomicUsize::new(0),
@@ -2685,6 +2695,10 @@ mod tests {
                 other => panic!("unsupported default resolution test error: {other:?}"),
             };
             self.default_resolve_failure.store(code, Ordering::SeqCst);
+        }
+
+        fn disable_lab(&self) {
+            self.lab_enabled.store(false, Ordering::SeqCst);
         }
 
         fn resolved(
@@ -2811,7 +2825,7 @@ mod tests {
             _lab_id: Uuid,
         ) -> Result<AiLabSettingsView, AiProviderStoreError> {
             Ok(AiLabSettingsView {
-                enabled: true,
+                enabled: self.lab_enabled.load(Ordering::SeqCst),
                 custom_url_approval_required: true,
                 configured_user_count: 1,
                 enabled_user_count: 1,
@@ -4320,7 +4334,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_turn_preserves_disabled_and_unconfigured_provider_errors() {
         for (error, expected_code) in [
-            (AiProviderStoreError::LabDisabled, "ai_lab_disabled"),
+            (AiProviderStoreError::LabDisabled, "ai_disabled"),
             (
                 AiProviderStoreError::NotConfigured,
                 "ai_runtime_not_configured",
@@ -4352,6 +4366,30 @@ mod tests {
                 .unwrap();
             assert_eq!(response_json(listed).await["count"], 0);
         }
+    }
+
+    #[tokio::test]
+    async fn lab_disable_blocks_legacy_turn_before_default_provider_resolution() {
+        let fixture = ConversationFixture::new(false, AiAutonomyMode::Full).await;
+        fixture.providers.disable_lab();
+
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({"message": "The provider must not be resolved"})),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "ai_disabled"
+        );
+        assert_eq!(fixture.providers.resolve_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

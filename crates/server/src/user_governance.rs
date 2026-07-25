@@ -14,7 +14,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    AuthPrincipal, AuthenticationMethod, RequestMetadata, hash_password,
+    AuthPrincipal, AuthenticationMethod, PostgresAiProviderStore, RequestMetadata, hash_password,
     persistent_auth::verify_password,
 };
 
@@ -336,6 +336,16 @@ impl PostgresUserGovernance {
             });
         }
 
+        PostgresAiProviderStore::inherit_environment_root_local_default(
+            &mut transaction,
+            self.lab_id,
+            self.environment_root_user_id,
+            user.id,
+            &context.actor.audit_context(context.metadata),
+        )
+        .await
+        .map_err(|_| UserGovernanceError::Unavailable)?;
+
         transaction.commit().await.map_err(database)?;
         project_memberships.sort_by(|left, right| {
             left.project_name
@@ -411,6 +421,17 @@ impl PostgresUserGovernance {
             now,
         )
         .await?;
+        if status == UserStatus::Active {
+            PostgresAiProviderStore::inherit_environment_root_local_default(
+                &mut transaction,
+                self.lab_id,
+                self.environment_root_user_id,
+                user.id,
+                &context.actor.audit_context(context.metadata),
+            )
+            .await
+            .map_err(|_| UserGovernanceError::Unavailable)?;
+        }
         if status == UserStatus::Suspended {
             revoke_user_authentication(&mut transaction, context, user.id, "user_suspended", now)
                 .await?;
@@ -1688,6 +1709,10 @@ mod tests {
     use chrono::Duration;
     use muriarc_core::{AuditContext, MuriArcStore, Permission, Project, WriteSource};
 
+    use crate::{
+        AiMasterKey, SaveAiProviderEndpointInput, SaveAiProviderSettingsInput, UserAiProviderStore,
+    };
+
     use super::*;
 
     #[test]
@@ -1825,6 +1850,44 @@ mod tests {
         let audit = AuditContext::system(WriteSource::Migration);
         let project = Project::new(bootstrap.lab_id, "Governance project", Utc::now()).unwrap();
         store.create_project(&project, &audit).await.unwrap();
+        let ai_providers = PostgresAiProviderStore::new(
+            store.as_ref().clone(),
+            AiMasterKey::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", 1).unwrap(),
+        );
+        let admin_audit = admin.audit_context(&metadata);
+        ai_providers
+            .save_provider_endpoint(
+                bootstrap.lab_id,
+                None,
+                serde_json::from_value::<SaveAiProviderEndpointInput>(serde_json::json!({
+                    "providerKind": "local_http",
+                    "protocol": "openai_chat_completions",
+                    "label": "Managed local test endpoint",
+                    "baseUrl": "http://127.0.0.1:11434/v1",
+                    "enabled": true
+                }))
+                .unwrap(),
+                &admin_audit,
+            )
+            .await
+            .unwrap();
+        ai_providers
+            .save(
+                bootstrap.user_id,
+                serde_json::from_value::<SaveAiProviderSettingsInput>(serde_json::json!({
+                    "enabled": true,
+                    "providerKind": "local_http",
+                    "providerPresetId": "managed-local",
+                    "model": "managed-local-model",
+                    "baseUrl": "http://127.0.0.1:11434/v1",
+                    "supportsVision": false,
+                    "visionModel": null
+                }))
+                .unwrap(),
+                &admin_audit,
+            )
+            .await
+            .unwrap();
 
         let credentialless = User::new(
             bootstrap.lab_id,
@@ -1856,7 +1919,7 @@ mod tests {
         assert_eq!(credentialless_view.credential_revision, 0);
         assert!(credentialless_view.must_change_password);
         let credentialless_password = format!("legacy-reset-{}", Uuid::new_v4());
-        let credentialless_view = service
+        let mut credentialless_view = service
             .reset_user_password(
                 &admin_context,
                 credentialless.id,
@@ -1870,6 +1933,32 @@ mod tests {
         let (credentialless_principal, _, _) =
             login_session(&auth, &credentialless_view.email, &credentialless_password).await;
         assert!(credentialless_principal.must_change_password());
+        credentialless_view = service
+            .set_user_status(
+                &admin_context,
+                credentialless.id,
+                credentialless_view.revision,
+                UserStatus::Suspended,
+            )
+            .await
+            .unwrap();
+        credentialless_view = service
+            .set_user_status(
+                &admin_context,
+                credentialless.id,
+                credentialless_view.revision,
+                UserStatus::Active,
+            )
+            .await
+            .unwrap();
+        assert_eq!(credentialless_view.status, UserStatus::Active);
+        let reactivated_settings = ai_providers.get(credentialless.id).await.unwrap();
+        assert_eq!(
+            reactivated_settings.provider_kind,
+            muriarc_ai::ProviderKind::LocalHttp
+        );
+        assert_eq!(reactivated_settings.model, "managed-local-model");
+        assert!(!reactivated_settings.has_key);
 
         let wrong = SensitivePassword::new("definitely-the-wrong-password");
         let wrong_context = context(&admin, admin_method, &metadata, &wrong);
@@ -1911,6 +2000,28 @@ mod tests {
         assert_eq!(managed.email, managed_email);
         assert_eq!(managed.lab_role, Some(LabRole::AnimalManager));
         assert_eq!(managed.project_memberships.len(), 1);
+        let inherited = ai_providers.get(managed.id).await.unwrap();
+        assert!(inherited.enabled);
+        assert_eq!(inherited.provider_kind, muriarc_ai::ProviderKind::LocalHttp);
+        assert_eq!(inherited.model, "managed-local-model");
+        assert_eq!(inherited.base_url, "http://127.0.0.1:11434/v1");
+        assert!(!inherited.has_key);
+        let inherited_defaults = ai_providers.get_model_defaults(managed.id).await.unwrap();
+        let inherited_profile_id = inherited_defaults
+            .default_conversation_profile_id
+            .expect("managed local conversation profile must be inherited");
+        assert_eq!(inherited_defaults.default_vision_profile_id, None);
+        let inherited_profile = ai_providers
+            .get_model_profile(managed.id, inherited_profile_id)
+            .await
+            .unwrap();
+        assert_eq!(inherited_profile.name, "Managed local default");
+        assert_eq!(
+            inherited_profile.transport,
+            muriarc_core::AiProviderTransport::LocalHttp
+        );
+        assert_eq!(inherited_profile.model_id, "managed-local-model");
+        assert!(!inherited_profile.has_key);
 
         let project_only_password = format!("project-only-password-{}", Uuid::new_v4());
         let project_only_email = format!("project-only-{}@example.org", Uuid::new_v4());

@@ -99,6 +99,8 @@ Server 每次启动在单事务中核对身份、LabAdmin membership 与凭据�
 ## 数据安全
 
 - 数据库、附件、密钥、快照和旧库副本不进入 Git。
+- 安全升级由独立 muriarcctl 和共享 Upgrade Engine 编排；Server 不持有 Docker/systemd/DDL
+  权限，未实际恢复验证完整备份、未完成 Candidate 七层验证时不得激活。
 - 旧数据库只以只读方式扫描；迁移目标始终是新文件。
 - 大附件存文件库，数据库只保存元数据和 SHA-256。
 - Server 所有正式写入均记录操作者、来源、revision 与审计事件。

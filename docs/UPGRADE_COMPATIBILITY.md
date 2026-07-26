@@ -91,7 +91,10 @@ controller may atomically return to the prior generation. Once
 forward fix or an explicit restore operation that records operator confirmation
 of possible data loss.
 
-The Upgrade Engine, immutable release fixtures, deployment drivers, signed
-Desktop updater, and Cloudflare profile build on this contract in their
-dedicated feature branches. They must not duplicate or weaken these checks.
-
+The shared Upgrade Engine and independent muriarcctl now implement the fixed
+transition/evidence model, three-lock protocol, hash-chained Journal,
+PostgreSQL fencing primitives, TUF-compatible metadata validation, and fixed
+Bootstrap Protocol described in [UPGRADE_ENGINE.md](UPGRADE_ENGINE.md).
+Immutable release fixtures, concrete deployment drivers, signed Desktop
+updater, and Cloudflare profile build on these ports in their dedicated feature
+branches. They must not duplicate or weaken these checks.

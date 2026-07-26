@@ -154,7 +154,10 @@ Environment Root 不是新增的领域角色枚举，而是“配置声明的唯
 ## Deployment
 
 升级不是 Server 子命令。长期运行进程只有业务权限；独立控制面拥有备份、DDL、Candidate 和
-切换权限。两套数据库共享强类型 ReleaseIdentity、Persistent Data Registry 和兼容报告，细节见
+切换权限。共享 muriarc-upgrade crate 固定证据驱动状态机，muriarcctl 负责本机管理员入口；
+Native、Compose 与 Desktop 只实现 Driver。三重锁、Write Lease fencing、实际恢复验证、
+Candidate 七层验证与首次写入降级边界见 [UPGRADE_ENGINE.md](UPGRADE_ENGINE.md)。
+两套数据库共享强类型 ReleaseIdentity、Persistent Data Registry 和兼容报告，细节见
 [UPGRADE_COMPATIBILITY.md](UPGRADE_COMPATIBILITY.md)。
 
 - Desktop：Windows Tauri WebView 安装包为正式本地交付目标；SQLite、附件、数据产物和非敏感 AI 配置位于同一个 active data root（默认是 OS application data，可由用户选择本机固定磁盘上的独立空目录），密钥位于 OS keyring。Desktop 不通过 VNC/noVNC、浏览器远程桌面或 Server Docker 交付。

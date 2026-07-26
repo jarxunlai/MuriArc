@@ -1,49 +1,50 @@
-# Feature Spec: MuriArc 永久数据兼容基础
+# Feature Spec: Upgrade Engine 与 muriarcctl 控制面
 
-> 此分支建立 1.0 前必须冻结的兼容契约；升级控制器、交付 Driver 与历史 Fixture 在后续分支实现。
+> 本分支基于永久兼容 Foundation，建立所有 Native、Compose 与 Desktop Driver 共用的升级状态机；不在长期运行的 Server 内复制升级规则。
 
 ## 分支信息
 
 | 项目 | 值 |
 |---|---|
-| 分支名称 | `feature/server-upgrade-data-compatibility` |
-| 基于提交 | `origin/main@ce223d819129de2d9fad6cbee2a691304c97a53d` |
-| Worktree 路径 | `/home/ljx/Github/animal_lab-server-upgrade-data-compatibility` |
+| 分支名称 | `feature/upgrade-engine-control-plane` |
+| 基于提交 | `feature/server-upgrade-data-compatibility@13bd246` |
+| Worktree 路径 | `/home/ljx/Github/animal_lab-upgrade-engine-control-plane` |
 | 建立日期 | `2026-07-26` |
 
 ## 目标
 
-从 `preview_epoch_0` 建立可验证的版本、Epoch、Backend State、Gateway Contract、Generation、
-Persistent Data Registry 和 migration checksum 基础，使 Server/Desktop 普通启动能够拒绝错误
-数据库、缺失 generation、密钥或附件恢复集合，而不再静默把旧库原地改造成最新版。
+提供独立、可恢复、fail-closed 的 Upgrade Engine 与 `muriarcctl`。引擎必须在迁移前冻结写入、创建联合恢复集合并实际恢复验证，在隔离 Candidate 上完成迁移与七层验证后才允许原子切换；新版首次写入后禁止自动降级。
 
 ## 实现范围
 
-- [x] 建立应用版本、Data Epoch、Backend State Digest、Gateway revision 和只追加 Release Catalog。
-- [x] 建立代码化 Persistent Data Registry、M0-M3/UI 影响分类和未知值保留 decoder。
-- [x] 为 SQLite/PostgreSQL 增加 deployment state、generation、upgrade operation、write lease 和首次写入标记。
-- [x] 为两套 Store 增加 compiled/applied migration 精确核对、generation adoption 和恢复集合 inventory。
-- [x] Server/Desktop 普通启动改为 fail-closed 核对；仅保留显式预发布 bootstrap 入口。
-- [x] 已有密文但 Master Key 缺失、已有附件但根目录缺失、generation manifest 不一致时阻断。
-- [x] 建立 migration checksum 清单与门禁，补充双后端兼容 contract tests。
-- [x] 更新架构、安全、迁移和 1.0 兼容契约文档。
+- [x] 新增共享 `muriarc-upgrade` crate，定义固定 phase/state machine、Journal、Driver/Store ports、错误码和恢复语义。
+- [x] 实现宿主机独占锁、PostgreSQL advisory session lock、持久化 running operation 与 fencing Write Lease 三重互斥。
+- [x] 实现 PostgreSQL 控制面：创建/恢复 operation、Drain、撤销 Lease、Candidate generation、原子激活、新 Lease 与首次写入降级屏障。
+- [x] 将联合备份、实际恢复验证、Candidate 迁移、七层验证、只读激活验证建模为不可跳过的 typed evidence；缺证据不得进入下一 phase。
+- [x] 实现目标失败时的 pre-write 自动回退；检测 `first_write_at` 后只允许 forward-fix 或显式恢复确认。
+- [x] 实现只追加 JSONL Journal、幂等 resume、恢复点保留与显式 prune 安全约束。
+- [x] 实现 TUF-compatible Root/Timestamp/Snapshot/Targets metadata 校验骨架，包括阈值签名、过期、冻结、rollback 与 artifact digest/length 验证。
+- [x] 实现固定 Bootstrap Protocol：旧 ctl 验证目标 controller 协议和制品后 re-exec，不接受未签名或降级目标。
+- [x] 新增独立 Rust 二进制 `muriarcctl`，提供 install/doctor/status/update/upgrade/backup/verify/recovery 命令树；尚无 Driver/权限时必须报告前置条件而非假成功。
+- [x] 为状态转移、锁竞争、备份未恢复、Candidate 验证失败、断点 resume、首次写入后拒绝回退、TUF 攻击与 CLI 契约添加测试和文档。
 
 ## 验收标准
 
-- 未执行升级控制面的普通进程不能修改 schema 或 deployment identity。
-- migration 被修改、缺少或额外出现时，兼容核对必须失败并给出稳定问题 code。
-- 数据库 generation 与 data-root manifest 不一致时，Server/Desktop 不开放业务入口。
-- 有 AI 密文却没有正确 Master Key、或有附件 metadata 却没有附件目录时不能生成替代状态。
-- SQLite/PostgreSQL 使用同一核心兼容类型和相同判定语义。
+- 任意 phase 失败都保留可诊断 Journal；重跑不会重复越过已完成但未验证的边界。
+- 未持有 host/advisory/persistent 三重锁时不能进入 Drain；未有 verified restore 时不能迁移 Candidate；七层验证不完整时不能激活。
+- 激活前失败可恢复旧 generation；激活后且尚无首写可自动回退；存在首写则引擎拒绝自动降级。
+- Engine 不直接依赖 systemd、Docker、Tauri UI 或具体 Provider；Driver 不可绕过 Engine transition guard。
+- `muriarc-server` 不获得 Docker socket、systemd 或 DDL 权限；升级 CLI 不暴露 raw migration 或跳过验证参数。
+- CLI JSON 输出稳定且不泄露密码、API key、Token、Cookie、数据库 URL 或 Journal 中的秘密。
 
 ## 技术约束
 
-- `core` 不依赖 Tauri、Axum、SQLx 或 Provider；Store adapter 负责读取各自 migration ledger。
-- migration 只追加；既有 SQL 由仓库内 checksum manifest 保护。
-- 不把数据库、附件、密钥、真实用户数据或恢复点加入 Git。
-- 兼容失败必须 fail closed；不得提供跳过备份、校验、Epoch 或 Digest 的普通 force 参数。
+- 已发布 migration 仍只追加；本分支只能为控制面需要追加新 migration 并更新 checksum manifest。
+- `core` 不依赖 SQLx/CLI/Driver；升级控制 Store 与业务 Store 权限和连接明确分离。
+- Candidate 禁止外部 Provider、后台 Job/Cleanup、真实用户流量和附件写入。
+- 备份必须覆盖 PostgreSQL/SQLite、附件、配置、密钥、AI 状态和 generation manifest；默认保留最后验证恢复点。
+- 不把数据库、备份、密钥、TUF 私钥、运行 Journal 或真实数据加入 Git。
 
 ## 跨分支备注
 
-本分支先合并。`feature/upgrade-engine-control-plane` 与 `feature/release-fixtures-gates`
-以这里的公共类型和数据库状态表为基础；交付、Desktop 与 Cloudflare 分支不得复制兼容判定。
+本分支先于 `feature/release-fixtures-gates` 和交付 Driver 合并。Native/Compose、Desktop 只实现 Driver；历史 Fixture/Verifier 提供七层验证器，不得复制状态机或绕过证据门禁。

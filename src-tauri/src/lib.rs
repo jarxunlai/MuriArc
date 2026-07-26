@@ -1,6 +1,8 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_updater::UpdaterExt;
 
 mod ai;
 mod ai_data_tools;
@@ -10,6 +12,7 @@ mod ai_sources;
 mod animal_details;
 mod application;
 mod data;
+mod desktop_upgrade;
 mod genotyping_batches;
 mod model_profiles;
 mod research_extensions;
@@ -45,6 +48,7 @@ use data::{
     DesktopDataError, DesktopDataState, ImportReceiptView, PreviewDataImportInput,
     RemapDataImportInput, UploadAttachmentInput,
 };
+use desktop_upgrade::{DesktopUpgradeError, VerifiedDesktopUpdate};
 use genotyping_batches::{
     CancelGenotypingBatchInput, CommitGenotypingBatchInput, CreateGenotypingBatchInput,
     GenotypingBatchDetailView, GenotypingBatchPreviewInput, GenotypingBatchPreviewView,
@@ -130,6 +134,15 @@ impl From<StorageRootError> for CommandError {
     }
 }
 
+impl From<DesktopUpgradeError> for CommandError {
+    fn from(error: DesktopUpgradeError) -> Self {
+        Self {
+            code: error.code(),
+            message: error.safe_message().to_owned(),
+        }
+    }
+}
+
 type CommandResult<T> = Result<T, CommandError>;
 
 #[tauri::command]
@@ -139,6 +152,204 @@ fn app_context() -> AppContext {
         mode: "local",
         api_version: "v1",
     }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopUpdateView {
+    available: bool,
+    current_version: String,
+    target_version: Option<String>,
+    migration_class: Option<String>,
+    artifact_size_bytes: Option<u64>,
+    space: Option<desktop_upgrade::DesktopUpgradeSpace>,
+    requires_restart: bool,
+    requires_verified_recovery: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplyDesktopUpdateInput {
+    version: String,
+    maintenance_class: String,
+    confirm_verified_recovery: bool,
+}
+
+fn migration_class_name(class: muriarc_core::MigrationClass) -> &'static str {
+    match class {
+        muriarc_core::MigrationClass::M0 => "m0",
+        muriarc_core::MigrationClass::M1 => "m1",
+        muriarc_core::MigrationClass::M2 => "m2",
+        muriarc_core::MigrationClass::M3 => "m3",
+    }
+}
+
+fn ensure_desktop_updater_configured() -> Result<(), CommandError> {
+    if env!("MURIARC_DESKTOP_UPDATER_PUBLIC_KEY")
+        == "MURIARC_DESKTOP_UPDATER_PUBLIC_KEY_NOT_CONFIGURED"
+    {
+        return Err(CommandError {
+            code: "desktop_updater_unconfigured",
+            message: "当前构建没有正式 Desktop 更新签名公钥，不能检查或安装更新".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_desktop_update(app: tauri::AppHandle) -> CommandResult<DesktopUpdateView> {
+    ensure_desktop_updater_configured()?;
+    let current_version = app.package_info().version.to_string();
+    let update = app
+        .updater()
+        .map_err(|_| CommandError {
+            code: "desktop_update_check_failed",
+            message: "无法初始化安全更新检查".to_owned(),
+        })?
+        .check()
+        .await
+        .map_err(|_| CommandError {
+            code: "desktop_update_check_failed",
+            message: "无法获取或验证 Desktop 更新元数据".to_owned(),
+        })?;
+    let Some(update) = update else {
+        return Ok(DesktopUpdateView {
+            available: false,
+            current_version,
+            target_version: None,
+            migration_class: None,
+            artifact_size_bytes: None,
+            space: None,
+            requires_restart: false,
+            requires_verified_recovery: false,
+        });
+    };
+    let (manifest, artifact_name, _manifest_signature) = desktop_upgrade::parse_update_metadata(
+        &update.raw_json,
+        env!("MURIARC_DESKTOP_UPDATER_PUBLIC_KEY"),
+    )?;
+    if update.version != manifest.application_version.as_str() {
+        return Err(DesktopUpgradeError::TargetInvalid.into());
+    }
+    let artifact = manifest
+        .artifacts
+        .get(&artifact_name)
+        .ok_or(DesktopUpgradeError::TargetInvalid)?;
+    let config_root = app.path().app_data_dir().map_err(|_| CommandError {
+        code: "desktop_upgrade_storage_error",
+        message: "无法定位 Desktop 数据控制目录".to_owned(),
+    })?;
+    let source_executable = std::env::current_exe().map_err(|_| CommandError {
+        code: "desktop_update_binary_recovery_invalid",
+        message: "无法读取当前程序，不能建立旧版本恢复副本".to_owned(),
+    })?;
+    let space = desktop_upgrade::upgrade_space_preflight(
+        &config_root,
+        &source_executable,
+        artifact.size_bytes,
+    )?;
+    Ok(DesktopUpdateView {
+        available: true,
+        current_version,
+        target_version: Some(update.version),
+        migration_class: Some(migration_class_name(manifest.migration_class).to_owned()),
+        artifact_size_bytes: Some(artifact.size_bytes),
+        space: Some(space),
+        requires_restart: true,
+        requires_verified_recovery: true,
+    })
+}
+
+#[tauri::command]
+async fn apply_desktop_update(
+    app: tauri::AppHandle,
+    input: ApplyDesktopUpdateInput,
+) -> CommandResult<()> {
+    ensure_desktop_updater_configured()?;
+    if !cfg!(target_os = "windows") {
+        return Err(DesktopUpgradeError::UnsupportedPlatform.into());
+    }
+    let updater = app.updater().map_err(|_| CommandError {
+        code: "desktop_update_install_failed",
+        message: "无法初始化安全更新安装器".to_owned(),
+    })?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|_| CommandError {
+            code: "desktop_update_check_failed",
+            message: "无法获取或验证 Desktop 更新元数据".to_owned(),
+        })?
+        .ok_or_else(|| CommandError {
+            code: "desktop_update_not_available",
+            message: "当前没有可安装的更新".to_owned(),
+        })?;
+    if input.version.trim() != update.version {
+        return Err(DesktopUpgradeError::TargetInvalid.into());
+    }
+    let (manifest, artifact_name, manifest_signature) = desktop_upgrade::parse_update_metadata(
+        &update.raw_json,
+        env!("MURIARC_DESKTOP_UPDATER_PUBLIC_KEY"),
+    )?;
+    if update.version != manifest.application_version.as_str() {
+        return Err(DesktopUpgradeError::TargetInvalid.into());
+    }
+    if !input.confirm_verified_recovery
+        || input.maintenance_class != migration_class_name(manifest.migration_class)
+    {
+        return Err(CommandError {
+            code: "desktop_update_confirmation_required",
+            message: "必须确认维护等级和完整恢复验证后才能安装更新".to_owned(),
+        });
+    }
+    let bytes = update
+        .download(|_, _| {}, || {})
+        .await
+        .map_err(|_| CommandError {
+            code: "desktop_update_signature_invalid",
+            message: "更新包下载失败或签名验证未通过，未安装任何内容".to_owned(),
+        })?;
+    let artifact_size_bytes =
+        u64::try_from(bytes.len()).map_err(|_| DesktopUpgradeError::TargetInvalid)?;
+    let artifact_sha256 = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let config_root = app.path().app_data_dir().map_err(|_| CommandError {
+        code: "desktop_upgrade_storage_error",
+        message: "无法定位 Desktop 数据控制目录".to_owned(),
+    })?;
+    let current_executable = std::env::current_exe().map_err(|_| CommandError {
+        code: "desktop_update_binary_recovery_invalid",
+        message: "无法读取当前程序，不能建立旧版本恢复副本".to_owned(),
+    })?;
+    let space = desktop_upgrade::upgrade_space_preflight(
+        &config_root,
+        &current_executable,
+        artifact_size_bytes,
+    )?;
+    if !space.sufficient {
+        return Err(DesktopUpgradeError::InsufficientSpace.into());
+    }
+    let operation_id = desktop_upgrade::schedule_verified_update(
+        &config_root,
+        &current_executable,
+        VerifiedDesktopUpdate {
+            version: update.version.clone(),
+            updater_target: update.target.clone(),
+            artifact_name,
+            artifact_sha256,
+            artifact_size_bytes,
+            release_manifest: manifest,
+            release_manifest_signature: manifest_signature,
+        },
+    )
+    .await?;
+    if update.install(&bytes).is_err() {
+        let _ = desktop_upgrade::cancel_scheduled_update(&config_root, operation_id);
+        return Err(CommandError {
+            code: "desktop_update_install_failed",
+            message: "签名更新包未能启动安装，原数据和当前版本保持不变".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1473,8 +1684,29 @@ fn get_genotyping_batch_template(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(env!("MURIARC_DESKTOP_UPDATER_PUBLIC_KEY"))
+                .build(),
+        )
         .setup(|app| {
             let config_root = app.path().app_data_dir()?;
+            if desktop_upgrade::delegate_to_binary_fallback(&config_root)? {
+                std::process::exit(0);
+            }
+            if let Err(upgrade_error) = tauri::async_runtime::block_on(
+                desktop_upgrade::resume_pending_upgrade(&config_root),
+            ) {
+                if cfg!(target_os = "windows") {
+                    if let Ok(executable) = tauri::async_runtime::block_on(
+                        desktop_upgrade::activate_binary_fallback_after_failure(&config_root),
+                    ) {
+                        let _ = std::process::Command::new(executable).spawn();
+                        std::process::exit(0);
+                    }
+                }
+                return Err(Box::<dyn std::error::Error>::from(upgrade_error));
+            }
             let executable = std::env::current_exe()?;
             let install_root = executable.parent().ok_or_else(|| {
                 std::io::Error::other("desktop executable has no installation directory")
@@ -1510,6 +1742,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_context,
+            check_desktop_update,
+            apply_desktop_update,
             get_local_storage_status,
             choose_local_storage_directory,
             request_local_storage_migration,

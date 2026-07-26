@@ -122,8 +122,27 @@ where
     }
 
     pub async fn run(&self, target: VerifiedRelease) -> Result<UpgradeSnapshot, UpgradeError> {
+        self.run_with_operation_id(Uuid::new_v4(), target).await
+    }
+
+    /// Starts an upgrade using an operation identifier that was allocated by a
+    /// trusted installer handshake before the target binary was activated.
+    ///
+    /// Desktop updaters need this boundary because the old executable must
+    /// persist the signed target intent and its verified fallback executable
+    /// before the platform installer replaces it. Native and Compose callers
+    /// normally use [`Self::run`].
+    pub async fn run_with_operation_id(
+        &self,
+        operation_id: Uuid,
+        target: VerifiedRelease,
+    ) -> Result<UpgradeSnapshot, UpgradeError> {
         target.validate_for_controller()?;
-        let operation_id = Uuid::new_v4();
+        if operation_id.is_nil() {
+            return Err(UpgradeError::Prerequisite {
+                message: "upgrade operation id must be non-nil".to_owned(),
+            });
+        }
         let _host_lock = HostUpgradeLock::acquire(&self.state_root, operation_id)?;
         let _backend_lock = self.driver.acquire_backend_lock(operation_id).await?;
         let source = self.driver.current_generation().await?;
@@ -847,6 +866,27 @@ mod tests {
         assert!(completed.evidence.write_lease.is_some());
         assert!(!driver.state.lock().await.recovered);
         assert!(HostUpgradeLock::inspect(root.path()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn installer_supplied_operation_id_is_preserved_and_nil_is_rejected() {
+        let driver = Arc::new(FakeDriver::new());
+        let root = tempfile::tempdir().unwrap();
+        let engine = UpgradeEngine::new(driver, root.path());
+        let operation_id = Uuid::new_v4();
+        let completed = engine
+            .run_with_operation_id(operation_id, target())
+            .await
+            .unwrap();
+        assert_eq!(completed.operation_id, operation_id);
+
+        let driver = Arc::new(FakeDriver::new());
+        let root = tempfile::tempdir().unwrap();
+        let engine = UpgradeEngine::new(driver, root.path());
+        assert!(matches!(
+            engine.run_with_operation_id(Uuid::nil(), target()).await,
+            Err(UpgradeError::Prerequisite { .. })
+        ));
     }
 
     #[tokio::test]

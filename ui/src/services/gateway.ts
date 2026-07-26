@@ -792,6 +792,25 @@ export interface StorageMigrationRequestResult {
   targetDataRoot: string
 }
 
+export interface DesktopUpgradeSpace {
+  dataFreeBytes: number
+  dataRequiredBytes: number
+  controlFreeBytes: number
+  controlRequiredBytes: number
+  sufficient: boolean
+}
+
+export interface DesktopUpdateStatus {
+  available: boolean
+  currentVersion: string
+  targetVersion?: string
+  migrationClass?: 'm0' | 'm1' | 'm2' | 'm3'
+  artifactSizeBytes?: number
+  space?: DesktopUpgradeSpace
+  requiresRestart: boolean
+  requiresVerifiedRecovery: boolean
+}
+
 export interface MuriArcGateway {
   readonly mode: GatewayMode
   readonly displayName: string
@@ -888,6 +907,12 @@ export interface MuriArcGateway {
   requestLocalStorageMigration?(selectionToken: string): Promise<StorageMigrationRequestResult>
   requestRestoreDefaultStorage?(): Promise<StorageMigrationRequestResult>
   openLocalStorageDirectory?(): Promise<void>
+  checkDesktopUpdate?(): Promise<DesktopUpdateStatus>
+  applyDesktopUpdate?(input: {
+    version: string
+    maintenanceClass: 'm0' | 'm1' | 'm2' | 'm3'
+    confirmVerifiedRecovery: boolean
+  }): Promise<void>
   getAiSettings?(): Promise<AiSettings>
   saveAiSettings?(input: SaveAiSettingsInput): Promise<AiSettings>
   clearAiApiKey?(): Promise<AiSettings>
@@ -1025,6 +1050,16 @@ export class LocalTauriGateway implements MuriArcGateway {
   }
   openLocalStorageDirectory() {
     return this.call<void>('open_local_storage_directory')
+  }
+  checkDesktopUpdate() {
+    return this.call<DesktopUpdateStatus>('check_desktop_update')
+  }
+  applyDesktopUpdate(input: {
+    version: string
+    maintenanceClass: 'm0' | 'm1' | 'm2' | 'm3'
+    confirmVerifiedRecovery: boolean
+  }) {
+    return this.call<void>('apply_desktop_update', { input })
   }
 
   listCages(_context?: AnimalAccessContext) { return this.call<Cage[]>('list_cages') }

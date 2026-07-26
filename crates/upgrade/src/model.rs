@@ -99,6 +99,39 @@ pub struct VerifiedRelease {
 }
 
 impl VerifiedRelease {
+    /// Builds the common controller target after a platform-specific updater
+    /// has authenticated both the release manifest and the exact artifact.
+    ///
+    /// TUF-backed Native/Compose updates are constructed by the TUF client.
+    /// Tauri Desktop uses its independent Minisign trust root and has no TUF
+    /// timestamp role, so the caller supplies the already verified artifact
+    /// identity and the short-lived time until which this check result may be
+    /// consumed. The controller still revalidates the manifest, digest, size,
+    /// protocol range, and this expiry before touching user data.
+    pub fn from_verified_platform_artifact(
+        manifest: ReleaseManifest,
+        target_name: impl Into<String>,
+        target_length: u64,
+        target_digest: impl Into<String>,
+        verification_expires_at: DateTime<Utc>,
+    ) -> Result<Self, UpgradeError> {
+        let release = Self {
+            manifest,
+            target_name: target_name.into(),
+            target_length,
+            target_digest: target_digest.into(),
+            metadata_versions: TrustedMetadataVersions {
+                root: 0,
+                timestamp: 0,
+                snapshot: 0,
+                targets: 0,
+            },
+            metadata_expires_at: verification_expires_at,
+        };
+        release.validate_for_controller()?;
+        Ok(release)
+    }
+
     pub fn validate_for_controller(&self) -> Result<(), UpgradeError> {
         self.manifest
             .validate()

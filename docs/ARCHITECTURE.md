@@ -160,7 +160,7 @@ Candidate 七层验证与首次写入降级边界见 [UPGRADE_ENGINE.md](UPGRADE
 两套数据库共享强类型 ReleaseIdentity、Persistent Data Registry 和兼容报告，细节见
 [UPGRADE_COMPATIBILITY.md](UPGRADE_COMPATIBILITY.md)。
 
-- Desktop：Windows Tauri WebView 安装包为正式本地交付目标；SQLite、附件、数据产物和非敏感 AI 配置位于同一个 active data root（默认是 OS application data，可由用户选择本机固定磁盘上的独立空目录），密钥位于 OS keyring。Desktop 不通过 VNC/noVNC、浏览器远程桌面或 Server Docker 交付。
+- Desktop：Windows Tauri WebView 安装包为正式本地交付目标；SQLite、附件、数据产物、非敏感 AI 配置和 generation manifest 位于同一个 active data root（默认是 OS application data，可由用户选择本机固定磁盘上的独立空目录），密钥位于 OS keyring。签名 updater 先保存旧 executable 的大小与 SHA-256，再写 intent；目标程序在任何业务 pool 打开前完成 recovery 实际恢复、Candidate migration/verification、Write Lease 和 locator 原子切换。Candidate 首次写入前若目标启动失败，会切回 source locator 并委托已验证的旧 executable；失败版本不得直接打开旧库。Desktop 不通过 VNC/noVNC、浏览器远程桌面或 Server Docker 交付。
 - Server：PostgreSQL、附件 volume、加密 secret store；Axum 位于 HTTPS reverse proxy 后。
 - V1 不做 Local Web、本地 Axum+SQLite 浏览器服务，也不做 Desktop 与 Server 的实时同步。当前 snapshot 用于版本化完整业务归档、离线留存与
   完整性校验，不提供自动合并、导入或恢复入口；CSV/XLSX Export 也不能替代部署备份。

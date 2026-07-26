@@ -95,6 +95,13 @@ The shared Upgrade Engine and independent muriarcctl now implement the fixed
 transition/evidence model, three-lock protocol, hash-chained Journal,
 PostgreSQL fencing primitives, TUF-compatible metadata validation, and fixed
 Bootstrap Protocol described in [UPGRADE_ENGINE.md](UPGRADE_ENGINE.md).
-Immutable release fixtures, concrete deployment drivers, signed Desktop
-updater, and Cloudflare profile build on these ports in their dedicated feature
-branches. They must not duplicate or weaken these checks.
+Immutable release fixtures and Native/Compose delivery drivers build on these ports. The Desktop
+driver now implements the shared `UpgradeDriver` contract and runs through `UpgradeEngine`, using
+the same Host lock, persistent SQLite operation state and hash-chained engine Journal, Tauri
+signature verification, isolated recovery/Candidate copies, attachment/AI/Audit inventory,
+transactional continue-write proof, atomic locator activation and the first-write rollback boundary.
+It also preserves the exact old executable with a pinned size and SHA-256 before installer launch.
+A target-startup failure before first write restores the source locator and delegates to that verified
+old executable; the failed installed version must never open an incompatible source database.
+Cloudflare profile and final 1.0 physical RC remain separate release layers and must not duplicate or
+weaken these checks.

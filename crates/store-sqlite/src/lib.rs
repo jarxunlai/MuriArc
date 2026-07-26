@@ -78,6 +78,36 @@ impl SqliteStore {
         Self::connect("sqlite::memory:").await
     }
 
+    /// DDL primitive reserved for an updater-created, isolated Desktop
+    /// Candidate. Ordinary Desktop startup must only inspect compatibility.
+    pub async fn apply_upgrade_migrations(&self) -> StoreResult<()> {
+        MIGRATOR
+            .run(&self.pool)
+            .await
+            .map_err(|error| StoreError::Database(error.to_string()))
+    }
+
+    pub async fn prepare_upgraded_candidate(
+        &self,
+        source_generation_id: Uuid,
+        candidate_generation_id: Uuid,
+    ) -> StoreResult<DeploymentState> {
+        upgrade_compatibility::prepare_upgraded_candidate(
+            &self.pool,
+            source_generation_id,
+            candidate_generation_id,
+        )
+        .await
+    }
+
+    pub async fn open_candidate_write_lease(
+        &self,
+        generation_id: Uuid,
+        holder: &str,
+    ) -> StoreResult<DeploymentState> {
+        upgrade_compatibility::open_candidate_write_lease(&self.pool, generation_id, holder).await
+    }
+
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }

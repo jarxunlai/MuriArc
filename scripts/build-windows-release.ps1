@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Builds an unsigned, production-mode MuriArc Windows desktop installer.
+Builds a production-mode MuriArc Windows desktop installer and signed updater artifacts.
 
 .DESCRIPTION
 Runs from a clean Windows checkout at an exact commit, pins pnpm 11.5.0,
@@ -8,6 +8,8 @@ executes the release checks unless -SkipChecks is supplied, and publishes
 MSI/NSIS artifacts plus SHA-256 evidence outside the repository.
 
 No AI model is downloaded or invoked by this script.
+The updater Minisign private key is read only from TAURI_SIGNING_PRIVATE_KEY;
+the matching public key is read from MURIARC_DESKTOP_UPDATER_PUBLIC_KEY.
 
 .EXAMPLE
 .\scripts\build-windows-release.ps1 `
@@ -37,6 +39,13 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+if ([string]::IsNullOrWhiteSpace($env:MURIARC_DESKTOP_UPDATER_PUBLIC_KEY)) {
+    throw 'MURIARC_DESKTOP_UPDATER_PUBLIC_KEY is required for a release build.'
+}
+if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+    throw 'TAURI_SIGNING_PRIVATE_KEY is required to produce signed updater artifacts.'
+}
 
 if ([string]::IsNullOrWhiteSpace($BuildRoot)) {
     $BuildRoot = if (Test-Path -LiteralPath 'E:\Muriarc') {
@@ -182,12 +191,23 @@ try {
     Assert-CommandSucceeded 'Tauri release bundle' $?
 
     $BundleRoot = Join-Path $env:CARGO_TARGET_DIR 'release\bundle'
-    $Artifacts = @(Get-ChildItem -LiteralPath $BundleRoot -Recurse -File | Where-Object {
+    $Installers = @(Get-ChildItem -LiteralPath $BundleRoot -Recurse -File | Where-Object {
         $_.Extension -in '.msi', '.exe'
     })
-    if ($Artifacts.Count -eq 0) {
+    if ($Installers.Count -eq 0) {
         throw "No MSI or NSIS release artifact was produced under $BundleRoot"
     }
+    $UpdaterSignatures = @(Get-ChildItem -LiteralPath $BundleRoot -Recurse -File | Where-Object {
+        $_.Extension -eq '.sig'
+    })
+    if ($UpdaterSignatures.Count -eq 0) {
+        throw "No signed updater artifact was produced under $BundleRoot"
+    }
+    $Artifacts = @($Installers + $UpdaterSignatures + @(
+        Get-ChildItem -LiteralPath $BundleRoot -Recurse -File | Where-Object {
+            $_.Extension -in '.zip', '.gz' -and $_.Name -notin $UpdaterSignatures.Name
+        }
+    ) | Sort-Object FullName -Unique)
 
     $ArtifactRoot = Join-Path $BuildRoot "desktop-release\$RunId"
     New-Item -ItemType Directory -Force -Path $ArtifactRoot | Out-Null

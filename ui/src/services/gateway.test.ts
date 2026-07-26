@@ -63,6 +63,34 @@ describe('MuriArc gateway selection', () => {
     expect(JSON.stringify(calls[1])).not.toContain('MuriArcData')
   })
 
+  it('binds a Desktop update to the checked version, maintenance class, and recovery confirmation', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const gateway = new LocalTauriGateway(async <T>(
+      command: string,
+      args?: Record<string, unknown>,
+    ): Promise<T> => {
+      calls.push([command, args])
+      return undefined as T
+    })
+
+    await gateway.applyDesktopUpdate({
+      version: '1.2.0',
+      maintenanceClass: 'm3',
+      confirmVerifiedRecovery: true,
+    })
+
+    expect(calls).toEqual([[
+      'apply_desktop_update',
+      {
+        input: {
+          version: '1.2.0',
+          maintenanceClass: 'm3',
+          confirmVerifiedRecovery: true,
+        },
+      },
+    ]])
+  })
+
   it('preserves structured Tauri error codes for UI recovery decisions', async () => {
     const gateway = new LocalTauriGateway(async () => {
       throw { code: 'conflict', message: 'AI 会话 revision 已变化' }

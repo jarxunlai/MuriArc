@@ -200,6 +200,201 @@ pub(crate) async fn adopt_current_release(
     })
 }
 
+pub(crate) async fn prepare_upgraded_candidate(
+    pool: &SqlitePool,
+    source_generation_id: Uuid,
+    candidate_generation_id: Uuid,
+) -> StoreResult<DeploymentState> {
+    if source_generation_id.is_nil()
+        || candidate_generation_id.is_nil()
+        || source_generation_id == candidate_generation_id
+    {
+        return Err(StoreError::Validation(
+            "source and Candidate generation IDs must be distinct and non-nil".to_owned(),
+        ));
+    }
+    let expected = ReleaseIdentity::current(BackendKind::Sqlite, &compiled_migrations());
+    let now = Utc::now();
+    let mut tx = pool.begin().await.map_err(database)?;
+    let row = sqlx::query(
+        "SELECT application_version, data_epoch, backend_state_digest,
+                gateway_contract_revision, generation_id, write_lease_id
+           FROM muriarc_deployment_state
+          WHERE singleton = 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database)?
+    .ok_or_else(|| StoreError::Conflict("Candidate deployment state is missing".to_owned()))?;
+    let observed_generation = Uuid::parse_str(
+        &row.try_get::<String, _>("generation_id")
+            .map_err(database)?,
+    )
+    .map_err(|error| StoreError::Serialization(error.to_string()))?;
+    let observed_identity = ReleaseIdentity::parse(
+        row.try_get("application_version").map_err(database)?,
+        row.try_get("data_epoch").map_err(database)?,
+        row.try_get("backend_state_digest").map_err(database)?,
+        row.try_get("gateway_contract_revision").map_err(database)?,
+    )
+    .map_err(StoreError::Serialization)?;
+    if observed_generation == candidate_generation_id && observed_identity == expected {
+        tx.rollback().await.map_err(database)?;
+        return compatibility_report(pool)
+            .await?
+            .require_read_only_compatible()
+            .cloned()
+            .map_err(StoreError::Conflict);
+    }
+    if observed_generation != source_generation_id {
+        return Err(StoreError::Conflict(
+            "restored Candidate does not belong to the declared source generation".to_owned(),
+        ));
+    }
+
+    sqlx::query(
+        "UPDATE muriarc_write_leases
+            SET status = 'revoked', revoked_at = COALESCE(revoked_at, ?)
+          WHERE generation_id = ? AND status IN ('active', 'draining')",
+    )
+    .bind(now)
+    .bind(source_generation_id.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(database)?;
+    let source = sqlx::query(
+        "UPDATE muriarc_generation_sets
+            SET status = 'retired'
+          WHERE generation_id = ? AND status IN ('active', 'retired')",
+    )
+    .bind(source_generation_id.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(database)?;
+    if source.rows_affected() != 1 {
+        return Err(StoreError::Conflict(
+            "source generation is missing from restored Candidate".to_owned(),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO muriarc_generation_sets (
+             generation_id, data_epoch, backend_state_digest, status, created_at, activated_at
+         ) VALUES (?, ?, ?, 'active', ?, ?)
+         ON CONFLICT (generation_id) DO UPDATE
+             SET data_epoch = excluded.data_epoch,
+                 backend_state_digest = excluded.backend_state_digest,
+                 status = 'active',
+                 activated_at = excluded.activated_at",
+    )
+    .bind(candidate_generation_id.to_string())
+    .bind(expected.data_epoch.as_str())
+    .bind(expected.backend_state_digest.as_str())
+    .bind(now)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(database)?;
+    let updated = sqlx::query(
+        "UPDATE muriarc_deployment_state
+            SET application_version = ?,
+                data_epoch = ?,
+                backend_state_digest = ?,
+                gateway_contract_revision = ?,
+                generation_id = ?,
+                write_lease_id = NULL,
+                first_write_at = NULL,
+                updated_at = ?
+          WHERE singleton = 1 AND generation_id = ?",
+    )
+    .bind(expected.application_version.as_str())
+    .bind(expected.data_epoch.as_str())
+    .bind(expected.backend_state_digest.as_str())
+    .bind(expected.gateway_contract_revision.as_str())
+    .bind(candidate_generation_id.to_string())
+    .bind(now)
+    .bind(source_generation_id.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(database)?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::Conflict(
+            "Candidate deployment state changed during preparation".to_owned(),
+        ));
+    }
+    tx.commit().await.map_err(database)?;
+    compatibility_report(pool)
+        .await?
+        .require_read_only_compatible()
+        .cloned()
+        .map_err(StoreError::Conflict)
+}
+
+pub(crate) async fn open_candidate_write_lease(
+    pool: &SqlitePool,
+    generation_id: Uuid,
+    holder: &str,
+) -> StoreResult<DeploymentState> {
+    if generation_id.is_nil() || holder.trim().is_empty() {
+        return Err(StoreError::Validation(
+            "Candidate generation and Write Lease holder are required".to_owned(),
+        ));
+    }
+    let report = compatibility_report(pool).await?;
+    let state = report
+        .require_read_only_compatible()
+        .map_err(StoreError::Conflict)?;
+    if state.generation_id != generation_id || state.first_write_at.is_some() {
+        return Err(StoreError::Conflict(
+            "Candidate is not at the verified pre-write boundary".to_owned(),
+        ));
+    }
+    let now = Utc::now();
+    let expires_at = now + Duration::days(3650);
+    let lease_id = Uuid::new_v4();
+    let mut tx = pool.begin().await.map_err(database)?;
+    let fencing_token: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(fencing_token), 0) + 1 FROM muriarc_write_leases")
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(database)?;
+    sqlx::query(
+        "INSERT INTO muriarc_write_leases (
+             lease_id, generation_id, holder, fencing_token, status, issued_at, expires_at
+         ) VALUES (?, ?, ?, ?, 'active', ?, ?)",
+    )
+    .bind(lease_id.to_string())
+    .bind(generation_id.to_string())
+    .bind(holder.trim())
+    .bind(fencing_token)
+    .bind(now)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(database)?;
+    let updated = sqlx::query(
+        "UPDATE muriarc_deployment_state
+            SET write_lease_id = ?, updated_at = ?
+          WHERE singleton = 1 AND generation_id = ? AND write_lease_id IS NULL",
+    )
+    .bind(lease_id.to_string())
+    .bind(now)
+    .bind(generation_id.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(database)?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::Conflict(
+            "Candidate deployment state did not accept the Write Lease".to_owned(),
+        ));
+    }
+    tx.commit().await.map_err(database)?;
+    compatibility_report(pool)
+        .await?
+        .require_compatible()
+        .cloned()
+        .map_err(StoreError::Conflict)
+}
+
 pub(crate) async fn persistent_recovery_inventory(
     pool: &SqlitePool,
 ) -> StoreResult<PersistentRecoveryInventory> {
@@ -446,5 +641,51 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("muriarc_write_lease_required"));
+    }
+
+    #[tokio::test]
+    async fn isolated_candidate_preparation_is_idempotent_and_read_only() {
+        let store = SqliteStore::in_memory().await.unwrap();
+        store.migrate().await.unwrap();
+        let source = store
+            .compatibility_report()
+            .await
+            .unwrap()
+            .observed
+            .unwrap();
+        store.apply_upgrade_migrations().await.unwrap();
+        let candidate_generation = Uuid::new_v4();
+        let candidate = store
+            .prepare_upgraded_candidate(source.generation_id, candidate_generation)
+            .await
+            .unwrap();
+        assert_eq!(candidate.generation_id, candidate_generation);
+        assert_eq!(candidate.write_lease_id, None);
+        assert_eq!(candidate.first_write_at, None);
+        assert_eq!(
+            store
+                .prepare_upgraded_candidate(source.generation_id, candidate_generation)
+                .await
+                .unwrap(),
+            candidate
+        );
+        store
+            .compatibility_report()
+            .await
+            .unwrap()
+            .require_read_only_compatible()
+            .unwrap();
+        let writable = store
+            .open_candidate_write_lease(candidate_generation, "desktop-updater")
+            .await
+            .unwrap();
+        assert_eq!(writable.generation_id, candidate_generation);
+        assert!(writable.write_lease_id.is_some());
+        store
+            .compatibility_report()
+            .await
+            .unwrap()
+            .require_compatible()
+            .unwrap();
     }
 }

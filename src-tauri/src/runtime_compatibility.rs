@@ -1,14 +1,10 @@
-use std::{
-    env,
-    error::Error,
-    fs::{self, OpenOptions},
-    io::{ErrorKind, Write},
-    path::Path,
-};
+use std::{env, error::Error, fs, io::ErrorKind, path::Path};
 
 use muriarc_core::{DeploymentGenerationManifest, DeploymentState, MuriArcStore};
 use muriarc_store_sqlite::SqliteStore;
 use uuid::Uuid;
+
+use crate::storage_root::{recover_atomic_file, write_json_atomic};
 
 const GENERATION_MANIFEST_FILE: &str = "deployment-generation.json";
 
@@ -105,12 +101,13 @@ fn fresh_data_root(root: &Path) -> Result<bool, Box<dyn Error>> {
     Ok(true)
 }
 
-fn verify_or_create_manifest(
+pub(crate) fn verify_or_create_manifest(
     root: &Path,
     state: &DeploymentState,
     allow_create: bool,
 ) -> Result<(), Box<dyn Error>> {
     let path = root.join(GENERATION_MANIFEST_FILE);
+    recover_atomic_file(&path)?;
     match fs::read(&path) {
         Ok(bytes) => {
             let manifest: DeploymentGenerationManifest = serde_json::from_slice(&bytes)?;
@@ -130,22 +127,9 @@ fn verify_or_create_manifest(
     }
 }
 
-fn write_manifest_atomic(
+pub(crate) fn write_manifest_atomic(
     path: &Path,
     manifest: &DeploymentGenerationManifest,
 ) -> Result<(), Box<dyn Error>> {
-    let temporary = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options.open(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(manifest)?)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    match fs::rename(&temporary, path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            Err(error.into())
-        }
-    }
+    write_json_atomic(path, manifest).map_err(Into::into)
 }

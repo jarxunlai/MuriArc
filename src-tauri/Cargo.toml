@@ -13,6 +13,8 @@ name = "muriarc_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
+base64 = "0.22.1"
+minisign-verify = "0.2.5"
 serde_json.workspace = true
 tauri-build = { version = "2", features = [] }
 
@@ -20,18 +22,22 @@ tauri-build = { version = "2", features = [] }
 async-trait.workspace = true
 base64 = "0.22.1"
 chrono.workspace = true
+fs2 = "0.4.3"
 muriarc-application = { path = "../crates/application" }
 muriarc-ai = { path = "../crates/ai" }
 muriarc-core = { path = "../crates/core" }
 muriarc-data = { path = "../crates/data" }
 muriarc-importer = { path = "../crates/importer" }
 muriarc-store-sqlite = { path = "../crates/store-sqlite" }
+muriarc-upgrade = { path = "../crates/upgrade" }
+minisign-verify = "0.2.5"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 sha2 = "0.10.9"
 sqlx = { workspace = true, features = ["sqlite"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2.7.2"
+tauri-plugin-updater = "2.10.1"
 tempfile = "3.23.0"
 thiserror.workspace = true
 uuid.workspace = true

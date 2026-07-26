@@ -1,0 +1,23 @@
+[package]
+name = "muriarc-release-evidence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Immutable release fixtures and seven-layer compatibility evidence for MuriArc"
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+muriarc-core = { path = "../core" }
+muriarc-upgrade = { path = "../upgrade" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.24.0"

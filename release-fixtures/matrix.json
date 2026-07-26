@@ -1,0 +1,18 @@
+{
+  "format_version": 1,
+  "pr_profiles": [
+    "managed-compose"
+  ],
+  "nightly_profiles": [
+    "native-system",
+    "managed-compose",
+    "desktop-windows"
+  ],
+  "rc_profiles": [
+    "native-system",
+    "managed-compose",
+    "desktop-windows"
+  ],
+  "rc_requires_all_catalog_entries": true,
+  "rc_requires_final_artifacts": true
+}

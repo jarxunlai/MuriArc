@@ -1,50 +1,50 @@
-# Feature Spec: Upgrade Engine 与 muriarcctl 控制面
+# Feature Spec: 不可变历史 Fixture、Expected Facts 与发布门禁
 
-> 本分支基于永久兼容 Foundation，建立所有 Native、Compose 与 Desktop Driver 共用的升级状态机；不在长期运行的 Server 内复制升级规则。
+> 本分支建立“旧数据真的来自旧 Release、最新版真的能完整读取并继续写入”的永久证据链，不用 HEAD 伪造历史数据库。
 
 ## 分支信息
 
 | 项目 | 值 |
 |---|---|
-| 分支名称 | `feature/upgrade-engine-control-plane` |
-| 基于提交 | `feature/server-upgrade-data-compatibility@13bd246` |
-| Worktree 路径 | `/home/ljx/Github/animal_lab-upgrade-engine-control-plane` |
-| 建立日期 | `2026-07-26` |
+| 分支名称 | feature/release-fixtures-gates |
+| 基于提交 | feature/upgrade-engine-control-plane@7ff7c8c |
+| Worktree 路径 | /home/ljx/Github/animal_lab-release-fixtures-gates |
+| 建立日期 | 2026-07-26 |
 
 ## 目标
 
-提供独立、可恢复、fail-closed 的 Upgrade Engine 与 `muriarcctl`。引擎必须在迁移前冻结写入、创建联合恢复集合并实际恢复验证，在隔离 Candidate 上完成迁移与七层验证后才允许原子切换；新版首次写入后禁止自动降级。
+定义不可变 Fixture/Catalog、Expected Facts 和七层 Verifier，建立 PR、Nightly、RC 三种兼容矩阵门禁。每个正式 Backend State 只能由对应 Release 制品生成；RC 必须使用最终安装包/镜像与 digest，任何 FAIL/SKIP 阻断。
 
 ## 实现范围
 
-- [x] 新增共享 `muriarc-upgrade` crate，定义固定 phase/state machine、Journal、Driver/Store ports、错误码和恢复语义。
-- [x] 实现宿主机独占锁、PostgreSQL advisory session lock、持久化 running operation 与 fencing Write Lease 三重互斥。
-- [x] 实现 PostgreSQL 控制面：创建/恢复 operation、Drain、撤销 Lease、Candidate generation、原子激活、新 Lease 与首次写入降级屏障。
-- [x] 将联合备份、实际恢复验证、Candidate 迁移、七层验证、只读激活验证建模为不可跳过的 typed evidence；缺证据不得进入下一 phase。
-- [x] 实现目标失败时的 pre-write 自动回退；检测 `first_write_at` 后只允许 forward-fix 或显式恢复确认。
-- [x] 实现只追加 JSONL Journal、幂等 resume、恢复点保留与显式 prune 安全约束。
-- [x] 实现 TUF-compatible Root/Timestamp/Snapshot/Targets metadata 校验骨架，包括阈值签名、过期、冻结、rollback 与 artifact digest/length 验证。
-- [x] 实现固定 Bootstrap Protocol：旧 ctl 验证目标 controller 协议和制品后 re-exec，不接受未签名或降级目标。
-- [x] 新增独立 Rust 二进制 `muriarcctl`，提供 install/doctor/status/update/upgrade/backup/verify/recovery 命令树；尚无 Driver/权限时必须报告前置条件而非假成功。
-- [x] 为状态转移、锁竞争、备份未恢复、Candidate 验证失败、断点 resume、首次写入后拒绝回退、TUF 攻击与 CLI 契约添加测试和文档。
+- [x] 新增共享 release-evidence crate，定义 Fixture Bundle、只追加 Catalog、生成制品 provenance、三种独立 digest 和 Expected Facts 强类型 schema。
+- [x] Expected Facts 覆盖账号/角色/项目、动物/繁育、实验/Observation/样本、附件 bytes/SHA、AI 历史与密文、Audit/Provenance，以及升级后继续写入。
+- [x] 实现安全资产验证：固定相对路径、拒绝 symlink/额外文件、流式 SHA-256/长度、backend/epoch/generation/Keyset/config manifest 联合恢复集合核对。
+- [x] 实现七层 Verifier runner：资产恢复、Storage、Store/Application、真实 API、真实 Remote UI、继续写入、只读无副作用；FAIL/SKIP 都不得伪装通过。
+- [x] 生成可供 Upgrade Engine 使用的七层 VerificationEvidence，并校验 Expected Facts digest 与所有 evidence digest。
+- [x] 实现历史 Catalog append-only/entry-self-digest 检查、Release 生成器版本绑定和“HEAD 不得重建旧 State”的 fail-closed 规则。
+- [x] 新增独立 muriarc-verifier CLI，支持 asset、run、report 与 matrix；JSON 报告固定 schema 且不包含秘密。
+- [x] 增加 GHCR OCI Artifact digest/cosign provenance 的发布与拉取脚本/工作流骨架；禁止 latest，Catalog 只记录 digest。
+- [x] 实现 PR 影响选择、Nightly 全历史、RC 全历史/全 profile/最终制品矩阵定义；RC 对空 Catalog、非最终 digest、源码运行或任一 SKIP 失败。
+- [x] 添加合成小型 fixture contract、篡改/路径逃逸/缺层/错误来源 Release/继续写入不一致等测试与文档。
 
 ## 验收标准
 
-- 任意 phase 失败都保留可诊断 Journal；重跑不会重复越过已完成但未验证的边界。
-- 未持有 host/advisory/persistent 三重锁时不能进入 Drain；未有 verified restore 时不能迁移 Candidate；七层验证不完整时不能激活。
-- 激活前失败可恢复旧 generation；激活后且尚无首写可自动回退；存在首写则引擎拒绝自动降级。
-- Engine 不直接依赖 systemd、Docker、Tauri UI 或具体 Provider；Driver 不可绕过 Engine transition guard。
-- `muriarc-server` 不获得 Docker socket、systemd 或 DDL 权限；升级 CLI 不暴露 raw migration 或跳过验证参数。
-- CLI JSON 输出稳定且不泄露密码、API key、Token、Cookie、数据库 URL 或 Journal 中的秘密。
+- Fixture 内数据库/附件/Keyset/config/Expected Facts 任一缺失、损坏、额外或路径不安全都 fail closed。
+- Catalog 现有 entry 不能修改/删除/复用 Backend State；新增 entry 必须绑定生成它的 Release artifact 与 provenance digest。
+- Verifier 必须覆盖七层，且 Candidate 的继续写入不会污染只读检查；Expected Facts 未覆盖的业务域不能被静默忽略。
+- PR 可按影响缩小“历史 State 集合”，但被选中的每个 State 仍运行完整七层；Nightly/RC 不允许缩小。
+- RC 报告必须绑定最终 Native/Compose/Desktop artifact digest；任何 FAIL/SKIP 或源码 cargo run 都阻断。
+- 大数据库/附件不进入 Git；Git 只含 schema、小型合成 contract、Catalog digest 和工作流。
 
 ## 技术约束
 
-- 已发布 migration 仍只追加；本分支只能为控制面需要追加新 migration 并更新 checksum manifest。
-- `core` 不依赖 SQLx/CLI/Driver；升级控制 Store 与业务 Store 权限和连接明确分离。
-- Candidate 禁止外部 Provider、后台 Job/Cleanup、真实用户流量和附件写入。
-- 备份必须覆盖 PostgreSQL/SQLite、附件、配置、密钥、AI 状态和 generation manifest；默认保留最后验证恢复点。
-- 不把数据库、备份、密钥、TUF 私钥、运行 Journal 或真实数据加入 Git。
+- Fixture 生成器嵌入 ApplicationVersion/DataEpoch/BackendStateDigest；若与目标 Catalog entry 不同则拒绝发布。
+- fixture_artifact_digest 不与 backend_state_digest 或 expected_facts_digest 混用。
+- 所有测试数据均为合成数据；密钥仅为合成 Keyset，禁止真实账号、动物数据或 Provider Key。
+- Verifier 使用真实 Store/Application/API/RemoteHttpGateway UI adapter；DemoGateway 不能形成 RC 通过。
+- OCI 使用 digest 固定；cosign 私钥、OIDC Token、Registry 凭据和大资产不进入仓库。
 
 ## 跨分支备注
 
-本分支先于 `feature/release-fixtures-gates` 和交付 Driver 合并。Native/Compose、Desktop 只实现 Driver；历史 Fixture/Verifier 提供七层验证器，不得复制状态机或绕过证据门禁。
+本分支输出 Fixture/Catalog/Verifier ports，供 Native/Compose、Desktop 与最终 1.0 集成分支调用。E0001 双后端正式 Fixture 在 release-integration-1-0 分支由最终 Release 制品生成，不在本分支用 HEAD 预造。

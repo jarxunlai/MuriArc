@@ -44,6 +44,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Immutable migration checksums
         run: python scripts/check_migration_checksums.py
+      - name: Immutable Fixture Catalog and matrix contracts
+        run: |
+          python3 scripts/check_fixture_catalog.py --catalog release-fixtures/catalog.json
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+          python3 scripts/compatibility_matrix.py plan \
+            --mode nightly \
+            --catalog release-fixtures/catalog.json \
+            --definition release-fixtures/matrix.json \
+            --output "${RUNNER_TEMP}/compatibility-plan.json"
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Domain, data, migration, and Store clippy
@@ -57,6 +66,8 @@ jobs:
         run: cargo clippy --locked -p muriarc-server --all-targets --all-features -- -D warnings
       - name: Upgrade control-plane clippy
         run: cargo clippy --locked -p muriarc-upgrade -p muriarcctl --all-targets --all-features -- -D warnings
+      - name: Release evidence clippy
+        run: cargo clippy --locked -p muriarc-release-evidence -p muriarc-verifier --all-targets --all-features -- -D warnings
       - name: Domain, data, migration, and dual Store tests
         run: >-
           cargo test --locked
@@ -68,6 +79,8 @@ jobs:
         run: cargo test --locked -p muriarc-server --all-targets --all-features
       - name: Upgrade state machine, trust, CLI, and PostgreSQL fencing tests
         run: cargo test --locked -p muriarc-upgrade -p muriarcctl --all-targets --all-features
+      - name: Immutable Fixture and seven-layer verifier tests
+        run: cargo test --locked -p muriarc-release-evidence -p muriarc-verifier --all-targets --all-features
 
   ui:
     name: Vue UI and branding

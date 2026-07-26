@@ -1,0 +1,119 @@
+name: Immutable compatibility evidence
+
+on:
+  pull_request:
+  schedule:
+    - cron: "23 18 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Compatibility gate to execute
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - nightly
+          - rc
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: compatibility-evidence-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  evidence:
+    name: Catalog, verifier, and fail-closed matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Select PR, Nightly, or RC mode
+        id: gate
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          changed="${RUNNER_TEMP}/changed-files.txt"
+          : > "$changed"
+          if [[ "${{ github.event_name }}" == pull_request ]]; then
+            mode=pr
+            base="${{ github.event.pull_request.base.sha }}"
+            git diff --name-only "$base"...HEAD > "$changed"
+            previous="${RUNNER_TEMP}/previous-catalog.json"
+            if git cat-file -e "$base:release-fixtures/catalog.json" 2>/dev/null; then
+              git show "$base:release-fixtures/catalog.json" > "$previous"
+            else
+              printf '{"format_version":1,"entries":[]}\n' > "$previous"
+            fi
+            echo "previous_catalog=$previous" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == workflow_dispatch ]]; then
+            mode="${{ inputs.mode }}"
+          else
+            mode=nightly
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "changed_files=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Immutable Catalog schema and append-only check
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          args=(--catalog release-fixtures/catalog.json)
+          if [[ -n "${{ steps.gate.outputs.previous_catalog }}" ]]; then
+            args+=(--previous "${{ steps.gate.outputs.previous_catalog }}")
+          fi
+          if [[ "${{ steps.gate.outputs.mode }}" == rc ]]; then
+            args+=(--require-non-empty)
+          fi
+          python3 scripts/check_fixture_catalog.py "${args[@]}"
+
+      - name: Python evidence planner tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
+      - name: Rust format and strict evidence clippy
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked -p muriarc-release-evidence -p muriarc-verifier \
+            --all-targets --all-features -- -D warnings
+
+      - name: Evidence contract tests
+        run: cargo test --locked -p muriarc-release-evidence -p muriarc-verifier --all-targets --all-features
+
+      - name: Build standalone verifier
+        run: cargo build --locked --release -p muriarc-verifier
+
+      - name: Execute compatibility matrix
+        env:
+          MURIARC_VERIFIER: ${{ github.workspace }}/target/release/muriarc-verifier
+          MURIARC_COMPATIBILITY_DRIVER: ${{ vars.MURIARC_COMPATIBILITY_DRIVER }}
+          MURIARC_TARGET_ARTIFACTS: ${{ vars.MURIARC_TARGET_ARTIFACTS }}
+          MURIARC_FIXTURE_CACHE: ${{ runner.temp }}/muriarc-fixture-cache
+        run: |
+          scripts/run-release-compatibility.sh \
+            --mode "${{ steps.gate.outputs.mode }}" \
+            --changed-files "${{ steps.gate.outputs.changed_files }}" \
+            --run-root "${RUNNER_TEMP}/muriarc-compatibility"
+
+      - name: Upload compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-evidence-${{ steps.gate.outputs.mode }}
+          path: ${{ runner.temp }}/muriarc-compatibility
+          if-no-files-found: ignore
+          retention-days: 30

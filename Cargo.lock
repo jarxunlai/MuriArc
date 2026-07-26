@@ -2737,6 +2737,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "muriarc-release-evidence"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "muriarc-core",
+ "muriarc-upgrade",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "muriarc-server"
 version = "0.1.0"
 dependencies = [
@@ -2834,6 +2851,19 @@ dependencies = [
  "tokio",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "muriarc-verifier"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "muriarc-core",
+ "muriarc-release-evidence",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

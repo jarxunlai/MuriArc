@@ -4,6 +4,7 @@ mod animal_schema;
 mod cancellation;
 mod catalog;
 mod export;
+mod genotyping;
 mod measurement;
 mod plan;
 
@@ -24,6 +25,10 @@ pub use export::{
     export_animals_csv, export_animals_csv_with_cancel, export_animals_csv_with_options,
     export_animals_xlsx, export_animals_xlsx_with_cancel, export_animals_xlsx_with_options,
     filter_animals, filter_animals_with_cancel,
+};
+pub use genotyping::{
+    GenotypingFieldMapping, GenotypingImportPreview, GenotypingImportRow, genotyping_template_csv,
+    preview_genotyping,
 };
 pub use measurement::{
     MeasurementFieldMapping, MeasurementImportPreview, MeasurementImportRow,

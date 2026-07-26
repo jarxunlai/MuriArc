@@ -222,7 +222,7 @@ impl DesktopDataState {
             .map(|value| parse_id("project", value))
             .transpose()?;
         let effective_project = self
-            .authorize_attachment_target(input.entity_type, entity_id, requested_project_id)
+            .authorize_attachment_target(input.entity_type, entity_id, requested_project_id, false)
             .await?;
         let mut attachments = self
             .store
@@ -245,7 +245,7 @@ impl DesktopDataState {
             .map(|value| parse_id("project", value))
             .transpose()?;
         let effective_project = self
-            .authorize_attachment_target(input.entity_type, entity_id, requested_project_id)
+            .authorize_attachment_target(input.entity_type, entity_id, requested_project_id, true)
             .await?;
         let file_name = validate_attachment_file_name(input.file_name)?;
         let media_type = validate_attachment_media_type(input.media_type)?;
@@ -299,7 +299,12 @@ impl DesktopDataState {
         let entity_type = AttachmentTargetInput::from_stored(&attachment.entity_type)
             .ok_or(DesktopDataError::ScopeMismatch)?;
         let effective_project = self
-            .authorize_attachment_target(entity_type, attachment.entity_id, attachment.project_id)
+            .authorize_attachment_target(
+                entity_type,
+                attachment.entity_id,
+                attachment.project_id,
+                false,
+            )
             .await?;
         if effective_project != attachment.project_id {
             return Err(DesktopDataError::ScopeMismatch);
@@ -323,7 +328,12 @@ impl DesktopDataState {
         let entity_type = AttachmentTargetInput::from_stored(&attachment.entity_type)
             .ok_or(DesktopDataError::ScopeMismatch)?;
         let effective_project = self
-            .authorize_attachment_target(entity_type, attachment.entity_id, attachment.project_id)
+            .authorize_attachment_target(
+                entity_type,
+                attachment.entity_id,
+                attachment.project_id,
+                true,
+            )
             .await?;
         if effective_project != attachment.project_id {
             return Err(DesktopDataError::ScopeMismatch);
@@ -357,6 +367,7 @@ impl DesktopDataState {
         entity_type: AttachmentTargetInput,
         entity_id: Uuid,
         requested_project_id: Option<Uuid>,
+        write: bool,
     ) -> Result<Option<Uuid>, DesktopDataError> {
         match entity_type {
             AttachmentTargetInput::Project => {
@@ -394,6 +405,21 @@ impl DesktopDataState {
                     }
                 }
                 Ok(requested_project_id)
+            }
+            AttachmentTargetInput::GenotypingBatch => {
+                let batch = self.store.get_genotyping_batch(entity_id).await?;
+                ensure_local_lab(batch.lab_id)?;
+                if requested_project_id != batch.project_id {
+                    return Err(DesktopDataError::ScopeMismatch);
+                }
+                if write && batch.status != muriarc_core::GenotypingBatchStatus::Draft {
+                    return Err(StoreError::Conflict(
+                        "attachments can only be changed while the genotyping batch is a draft"
+                            .to_owned(),
+                    )
+                    .into());
+                }
+                Ok(batch.project_id)
             }
             AttachmentTargetInput::Experiment => {
                 let experiment = self.store.get_experiment(entity_id).await?;
@@ -1213,6 +1239,7 @@ fn validate_attachment_reason(value: String) -> Result<String, DesktopDataError>
 pub(crate) enum AttachmentTargetInput {
     Project,
     Animal,
+    GenotypingBatch,
     Experiment,
     Measurement,
     Sample,
@@ -1223,6 +1250,7 @@ impl AttachmentTargetInput {
         match self {
             Self::Project => "project",
             Self::Animal => "animal",
+            Self::GenotypingBatch => "genotyping_batch",
             Self::Experiment => "experiment",
             Self::Measurement => "measurement",
             Self::Sample => "sample",
@@ -1233,6 +1261,7 @@ impl AttachmentTargetInput {
         match value {
             "project" => Some(Self::Project),
             "animal" => Some(Self::Animal),
+            "genotyping_batch" => Some(Self::GenotypingBatch),
             "experiment" => Some(Self::Experiment),
             "measurement" => Some(Self::Measurement),
             "sample" => Some(Self::Sample),

@@ -36,7 +36,9 @@ fail closed，不创建空库。OS keyring 凭据和 WebView cache 不属于 dat
 - Attachment 内容在文件库，数据库记录 hash、版本和关联。
 - 正式写入必须包含 Provenance 与 Audit；删除默认为 soft delete。
 - Genetics v2 以 `GenotypeDefinition` 聚合一个或多个显式组件；`GenotypingRecord` 表示某只
-  Animal 在某一时点对定义的检测状态。旧 `Genotype` 保留原语义，不在迁移中自动折叠或重写。
+  Animal 在某一时点对定义的检测状态。`GenotypingBatch` 通过显式关系表绑定一组记录、一份
+  CSV/XLSX 原始结果和至少一张胶图；确认事务同时写入记录、关系、AnimalEvent、Audit 与
+  Provenance，失败时保留草稿和附件但不产生部分正式记录。旧 `Genotype` 保留原语义，不在迁移中自动折叠或重写。
 - BreedingPair 必须恰好一个雄性成员和至少一个雌性成员；同一动物不能同时进入冲突的活跃
   配对。MatingEvent 是人工确认的事实，不由预测或 AI 自动生成。
 - Litter 与其存活 offspring Draft 在一个事务中创建；Draft → Animal 同时写入 Animal、
@@ -57,8 +59,9 @@ fail closed，不创建空库。OS keyring 凭据和 WebView cache 不属于 dat
 - Genetics、Breeding 与 Observation 分别使用 `/genotype-definitions`、`/genotyping-records`，
   `/breeding-*`、`/mating-events`、`/litters`、`/animal-drafts`，以及
   `/experiment-events`、`/observation-*` REST 资源；Tauri Gateway 提供同等应用语义。
-- 普通导入只接受 Animal Registry 或 Experiment Measurement CSV/XLSX；普通结构化导出只
-  生成 Animal Registry CSV/XLSX。两者是受控数据产品，不是通用迁移协议。
+- 普通导入只接受 Animal Registry 或 Experiment Measurement CSV/XLSX；基因鉴定使用独立的
+  `GenotypingBatch` 工作流，不能绕过胶图、预览哈希和原子确认。普通结构化导出只生成 Animal
+  Registry CSV/XLSX。这些都是受控数据产品，不是通用迁移协议。
 - Snapshot 是 Lab 业务归档边界，包含新增 Genetics/Breeding/Observation 聚合、既有业务
   实体、Audit、Provenance 和附件；当前只生成和校验，不支持 restore/apply。
 - MCP/AI 工具只能调用 application use case；禁止数据库连接、raw SQL、任意 HTTP、自动

@@ -4,7 +4,8 @@ use muriarc_core::store_contract::{
     run_ai_conversation_contract, run_ai_conversation_source_retention_contract,
     run_ai_experiment_grouping_contract, run_ai_import_commit_atomicity_contract,
     run_ai_measurement_approval_contract, run_ai_model_profile_contract,
-    run_import_source_archive_contract, run_research_extensions_contract, run_store_contract,
+    run_genotyping_batch_contract, run_import_source_archive_contract,
+    run_research_extensions_contract, run_store_contract,
 };
 use muriarc_core::{
     Actor, AiExtractionApprovalInput, AiExtractionApprovalSelection, AiExtractionRejectionInput,
@@ -244,6 +245,12 @@ async fn sqlite_store_obeys_research_extensions_contract() {
 }
 
 #[tokio::test]
+async fn sqlite_store_obeys_genotyping_batch_contract() {
+    let store = SqliteStore::in_memory().await.unwrap();
+    run_genotyping_batch_contract(&store).await;
+}
+
+#[tokio::test]
 async fn sqlite_store_obeys_ai_experiment_grouping_contract() {
     let store = SqliteStore::in_memory().await.unwrap();
     run_ai_experiment_grouping_contract(&store).await;
@@ -345,8 +352,8 @@ async fn ai_conversation_management_migration_preserves_legacy_rows_across_direc
                 .unwrap();
         assert_eq!(
             final_ledger,
-            (28, Some(29)),
-            "the merged SQLite migration set must end at 0029 (version 0005 is intentionally absent)"
+            (29, Some(30)),
+            "the merged SQLite migration set must end at 0030 (version 0005 is intentionally absent)"
         );
         let saved = store.get_ai_conversation(conversation_id).await.unwrap();
         assert_eq!(saved.title, "Legacy conversation");

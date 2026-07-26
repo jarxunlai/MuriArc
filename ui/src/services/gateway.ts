@@ -43,6 +43,12 @@ import type {
   GeneLocus,
   GenotypeComponentMode,
   GenotypeDefinition,
+  GenotypingBatch,
+  GenotypingBatchDetail,
+  GenotypingBatchPreviewResult,
+  GenotypingBatchReceipt,
+  GenotypingBatchStatus,
+  GenotypingImportPreview,
   GenotypingRecord,
   GenotypingState,
   Litter,
@@ -221,6 +227,36 @@ export interface CreateGenotypingRecordInput {
   notes?: string
 }
 
+export interface CreateGenotypingBatchInput {
+  projectId?: string
+  batchNumber: string
+  genotypeDefinitionId: string
+  assessedAt: string
+  method?: string
+  notes?: string
+}
+
+export interface PreviewGenotypingBatchInput {
+  batchId: string
+  projectId?: string
+  expectedRevision: number
+  sourceAttachmentId: string
+}
+
+export interface CommitGenotypingBatchInput {
+  batchId: string
+  projectId?: string
+  expectedRevision: number
+  previewHash: string
+}
+
+export interface CancelGenotypingBatchInput {
+  batchId: string
+  projectId?: string
+  expectedRevision: number
+  reason: string
+}
+
 export interface GeneticsArchiveInput {
   id: string
   expectedRevision: number
@@ -362,7 +398,7 @@ export interface ReviseObservationInput {
   notes?: string
 }
 
-export type AttachmentTarget = 'project' | 'animal' | 'experiment' | 'measurement' | 'sample'
+export type AttachmentTarget = 'project' | 'animal' | 'genotyping_batch' | 'experiment' | 'measurement' | 'sample'
 
 export interface AttachmentMetadata {
   id: string
@@ -790,6 +826,14 @@ export interface MuriArcGateway {
   createGenotypingRecord(input: CreateGenotypingRecordInput): Promise<GenotypingRecord>
   voidGenotypingRecord(input: VoidGenotypingRecordInput): Promise<GenotypingRecord>
   correctGenotypingRecord(input: CorrectGenotypingRecordInput): Promise<CorrectGenotypingRecordResult>
+  listGenotypingBatches?(projectId?: string, status?: GenotypingBatchStatus): Promise<GenotypingBatch[]>
+  getGenotypingBatch?(batchId: string, projectId?: string): Promise<GenotypingBatchDetail>
+  getGenotypingBatchForRecord?(recordId: string, projectId?: string): Promise<GenotypingBatch | undefined>
+  createGenotypingBatch?(input: CreateGenotypingBatchInput): Promise<GenotypingBatch>
+  previewGenotypingBatch?(input: PreviewGenotypingBatchInput): Promise<GenotypingBatchPreviewResult>
+  commitGenotypingBatch?(input: CommitGenotypingBatchInput): Promise<GenotypingBatchReceipt>
+  cancelGenotypingBatch?(input: CancelGenotypingBatchInput): Promise<GenotypingBatch>
+  downloadGenotypingBatchTemplate?(): Promise<Blob>
   listBreedingLines(): Promise<BreedingLine[]>
   createBreedingLine(input: CreateBreedingLineInput): Promise<BreedingLine>
   listColonies(breedingLineId?: string): Promise<Colony[]>
@@ -1088,6 +1132,53 @@ export class LocalTauriGateway implements MuriArcGateway {
       voided: mapGenotypingRecord(result.voided),
       replacement: mapGenotypingRecord(result.replacement),
     }))
+  }
+  listGenotypingBatches(projectId?: string, status?: GenotypingBatchStatus) {
+    return this.call<RawGenotypingBatch[]>('list_genotyping_batches', {
+      input: { projectId, status },
+    }).then((items) => items.map(mapGenotypingBatch))
+  }
+  async getGenotypingBatch(batchId: string, _projectId?: string): Promise<GenotypingBatchDetail> {
+    const result = await this.call<RawGenotypingBatchDetail>('get_genotyping_batch', { batchId })
+    return mapGenotypingBatchDetail(result)
+  }
+  async getGenotypingBatchForRecord(recordId: string, _projectId?: string) {
+    const result = await this.call<RawGenotypingBatch | null>('get_genotyping_batch_for_record', {
+      recordId,
+    })
+    return result ? mapGenotypingBatch(result) : undefined
+  }
+  createGenotypingBatch(input: CreateGenotypingBatchInput) {
+    return this.call<RawGenotypingBatch>('create_genotyping_batch', { input })
+      .then(mapGenotypingBatch)
+  }
+  async previewGenotypingBatch(input: PreviewGenotypingBatchInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return mapGenotypingBatchPreviewResult(
+      await this.call<RawGenotypingBatchPreviewResult>('preview_genotyping_batch', {
+        input: localInput,
+      }),
+    )
+  }
+  async commitGenotypingBatch(input: CommitGenotypingBatchInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return mapGenotypingBatchReceipt(
+      await this.call<RawGenotypingBatchReceipt>('commit_genotyping_batch', {
+        input: localInput,
+      }),
+    )
+  }
+  cancelGenotypingBatch(input: CancelGenotypingBatchInput) {
+    const { projectId: _projectId, ...localInput } = input
+    return this.call<RawGenotypingBatch>('cancel_genotyping_batch', { input: localInput })
+      .then(mapGenotypingBatch)
+  }
+  async downloadGenotypingBatchTemplate(): Promise<Blob> {
+    const result = await this.call<{ fileName: string; mediaType: string; bytes: number[] }>(
+      'get_genotyping_batch_template',
+    )
+    const bytes = Uint8Array.from(result.bytes)
+    return new Blob([bytes.buffer], { type: result.mediaType })
   }
   listBreedingLines() {
     return this.call<RawBreedingLine[]>('list_breeding_lines')
@@ -1674,6 +1765,60 @@ interface RawGenotypingRecord {
   voided_at?: string | null
   void_reason?: string | null
   meta: RawRecordMeta
+}
+
+interface RawGenotypingBatch {
+  id: string
+  lab_id: string
+  project_id?: string | null
+  batch_number: string
+  genotype_definition_id: string
+  assessed_at: string
+  method?: string | null
+  notes?: string | null
+  status: GenotypingBatchStatus
+  created_by?: string | null
+  source_attachment_id?: string | null
+  preview_hash?: string | null
+  preview_row_count?: number | null
+  committed_at?: string | null
+  cancelled_at?: string | null
+  cancel_reason?: string | null
+  meta: RawRecordMeta
+}
+
+interface RawGenotypingImportPreview {
+  total_rows: number
+  accepted_rows: Array<{
+    source_row: number
+    animal_id: string
+    display_id: string
+    state: GenotypingState
+    notes?: string | null
+  }>
+  issues: Array<{
+    row?: number | null
+    field?: string | null
+    severity: 'warning' | 'error'
+    code: string
+    message: string
+  }>
+  preview_hash: string
+}
+
+interface RawGenotypingBatchPreviewResult {
+  batch: RawGenotypingBatch
+  preview: RawGenotypingImportPreview
+}
+
+interface RawGenotypingBatchDetail {
+  batch: RawGenotypingBatch
+  records: RawGenotypingRecord[]
+}
+
+interface RawGenotypingBatchReceipt {
+  batch: RawGenotypingBatch
+  records: RawGenotypingRecord[]
 }
 
 interface RawGeneticsReferenceCounts {
@@ -2830,6 +2975,109 @@ export class RemoteHttpGateway implements MuriArcGateway {
       voided: mapGenotypingRecord(response.data.voided),
       replacement: mapGenotypingRecord(response.data.replacement),
     }
+  }
+
+  async listGenotypingBatches(
+    projectId?: string,
+    status?: GenotypingBatchStatus,
+  ): Promise<GenotypingBatch[]> {
+    const query = new URLSearchParams({ limit: '100' })
+    const scope = activeProjectId(projectId)
+    if (scope) query.set('project_id', scope)
+    if (status) query.set('status', status)
+    const response = await this.request<ApiCollection<RawGenotypingBatch>>(
+      `/genotyping-batches?${query}`,
+    )
+    return response.data.map(mapGenotypingBatch)
+  }
+
+  async getGenotypingBatch(batchId: string, projectId?: string): Promise<GenotypingBatchDetail> {
+    const query = new URLSearchParams()
+    const scope = activeProjectId(projectId)
+    if (scope) query.set('project_id', scope)
+    const response = await this.request<ApiItem<RawGenotypingBatchDetail>>(
+      `/genotyping-batches/${encodeURIComponent(batchId)}?${query}`,
+    )
+    return mapGenotypingBatchDetail(response.data)
+  }
+
+  async getGenotypingBatchForRecord(recordId: string, projectId?: string) {
+    const query = new URLSearchParams()
+    const scope = activeProjectId(projectId)
+    if (scope) query.set('project_id', scope)
+    const response = await this.request<ApiItem<RawGenotypingBatch | null>>(
+      `/genotyping-records/${encodeURIComponent(recordId)}/batch?${query}`,
+    )
+    return response.data ? mapGenotypingBatch(response.data) : undefined
+  }
+
+  async createGenotypingBatch(input: CreateGenotypingBatchInput): Promise<GenotypingBatch> {
+    const response = await this.request<ApiItem<RawGenotypingBatch>>('/genotyping-batches', {
+      method: 'POST',
+      body: JSON.stringify({
+        project_id: activeProjectId(input.projectId) ?? null,
+        batch_number: input.batchNumber,
+        genotype_definition_id: input.genotypeDefinitionId,
+        assessed_at: input.assessedAt,
+        method: input.method ?? null,
+        notes: input.notes ?? null,
+      }),
+    })
+    return mapGenotypingBatch(response.data)
+  }
+
+  async previewGenotypingBatch(input: PreviewGenotypingBatchInput) {
+    const response = await this.request<ApiItem<RawGenotypingBatchPreviewResult>>(
+      `/genotyping-batches/${encodeURIComponent(input.batchId)}/preview`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: activeProjectId(input.projectId) ?? null,
+          expected_revision: input.expectedRevision,
+          source_attachment_id: input.sourceAttachmentId,
+        }),
+      },
+    )
+    return mapGenotypingBatchPreviewResult(response.data)
+  }
+
+  async commitGenotypingBatch(input: CommitGenotypingBatchInput) {
+    const response = await this.request<ApiItem<RawGenotypingBatchReceipt>>(
+      `/genotyping-batches/${encodeURIComponent(input.batchId)}/commit`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: activeProjectId(input.projectId) ?? null,
+          expected_revision: input.expectedRevision,
+          preview_hash: input.previewHash,
+        }),
+      },
+    )
+    return mapGenotypingBatchReceipt(response.data)
+  }
+
+  async cancelGenotypingBatch(input: CancelGenotypingBatchInput) {
+    const response = await this.request<ApiItem<RawGenotypingBatch>>(
+      `/genotyping-batches/${encodeURIComponent(input.batchId)}/cancel`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          project_id: activeProjectId(input.projectId) ?? null,
+          expected_revision: input.expectedRevision,
+          reason: input.reason,
+        }),
+      },
+    )
+    return mapGenotypingBatch(response.data)
+  }
+
+  async downloadGenotypingBatchTemplate(): Promise<Blob> {
+    const response = await this.send(
+      '/genotyping-batches/template.csv',
+      {},
+      { accept: 'text/csv' },
+    )
+    return response.blob()
   }
 
   async listBreedingLines(): Promise<BreedingLine[]> {
@@ -4172,6 +4420,64 @@ function mapGenotypingRecord(raw: RawGenotypingRecord): GenotypingRecord {
     createdAt: raw.meta.created_at,
     updatedAt: raw.meta.updated_at,
   }
+}
+
+function mapGenotypingBatch(raw: RawGenotypingBatch): GenotypingBatch {
+  return {
+    id: raw.id,
+    projectId: raw.project_id ?? undefined,
+    batchNumber: raw.batch_number,
+    genotypeDefinitionId: raw.genotype_definition_id,
+    assessedAt: raw.assessed_at,
+    method: raw.method ?? undefined,
+    notes: raw.notes ?? undefined,
+    status: raw.status,
+    createdBy: raw.created_by ?? undefined,
+    sourceAttachmentId: raw.source_attachment_id ?? undefined,
+    previewHash: raw.preview_hash ?? undefined,
+    previewRowCount: raw.preview_row_count ?? undefined,
+    committedAt: raw.committed_at ?? undefined,
+    cancelledAt: raw.cancelled_at ?? undefined,
+    cancelReason: raw.cancel_reason ?? undefined,
+    revision: raw.meta.revision,
+    createdAt: raw.meta.created_at,
+    updatedAt: raw.meta.updated_at,
+  }
+}
+
+function mapGenotypingImportPreview(raw: RawGenotypingImportPreview): GenotypingImportPreview {
+  return {
+    totalRows: raw.total_rows,
+    acceptedRows: raw.accepted_rows.map((row) => ({
+      sourceRow: row.source_row,
+      animalId: row.animal_id,
+      displayId: row.display_id,
+      state: row.state,
+      notes: row.notes ?? undefined,
+    })),
+    issues: raw.issues.map((issue) => ({
+      row: issue.row ?? undefined,
+      field: issue.field ?? undefined,
+      severity: issue.severity,
+      code: issue.code,
+      message: issue.message,
+    })),
+    previewHash: raw.preview_hash,
+  }
+}
+
+function mapGenotypingBatchPreviewResult(
+  raw: RawGenotypingBatchPreviewResult,
+): GenotypingBatchPreviewResult {
+  return { batch: mapGenotypingBatch(raw.batch), preview: mapGenotypingImportPreview(raw.preview) }
+}
+
+function mapGenotypingBatchDetail(raw: RawGenotypingBatchDetail): GenotypingBatchDetail {
+  return { batch: mapGenotypingBatch(raw.batch), records: raw.records.map(mapGenotypingRecord) }
+}
+
+function mapGenotypingBatchReceipt(raw: RawGenotypingBatchReceipt): GenotypingBatchReceipt {
+  return { batch: mapGenotypingBatch(raw.batch), records: raw.records.map(mapGenotypingRecord) }
 }
 
 function mapGeneticsReferenceCounts(raw: RawGeneticsReferenceCounts): GeneticsReferenceCounts {

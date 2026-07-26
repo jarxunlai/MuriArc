@@ -1010,13 +1010,7 @@ impl BusinessReadService {
                 let sources = envelope
                     .items
                     .iter()
-                    .map(|item| {
-                        BusinessSourceRef::new(
-                            EntityType::GenotypingRecord,
-                            item.record.id,
-                            Some(item.record.meta.revision),
-                        )
-                    })
+                    .flat_map(genotyping_overview_sources)
                     .collect();
                 Ok(BusinessReadResult {
                     data: ResourceSearchResult::GenotypingRecords(envelope),
@@ -2292,13 +2286,11 @@ impl BusinessReadService {
                 Some(item.revision),
             )
         }));
-        sources.extend(current_genotyping_records.iter().map(|item| {
-            BusinessSourceRef::new(
-                EntityType::GenotypingRecord,
-                item.record.id,
-                Some(item.record.meta.revision),
-            )
-        }));
+        sources.extend(
+            current_genotyping_records
+                .iter()
+                .flat_map(genotyping_overview_sources),
+        );
         sources.extend(
             events
                 .items
@@ -2420,13 +2412,12 @@ impl BusinessReadService {
         sources.extend(experiments.items.iter().map(|item| {
             BusinessSourceRef::new(EntityType::Experiment, item.id, Some(item.meta.revision))
         }));
-        sources.extend(current_genotyping_records.items.iter().map(|item| {
-            BusinessSourceRef::new(
-                EntityType::GenotypingRecord,
-                item.record.id,
-                Some(item.record.meta.revision),
-            )
-        }));
+        sources.extend(
+            current_genotyping_records
+                .items
+                .iter()
+                .flat_map(genotyping_overview_sources),
+        );
 
         Ok(BusinessReadResult {
             data: ProjectContext {
@@ -2439,6 +2430,29 @@ impl BusinessReadService {
             sources,
         })
     }
+}
+
+fn genotyping_overview_sources(item: &CurrentGenotypingRecordOverview) -> Vec<BusinessSourceRef> {
+    let mut sources = vec![BusinessSourceRef::new(
+        EntityType::GenotypingRecord,
+        item.record.id,
+        Some(item.record.meta.revision),
+    )];
+    if let Some(batch) = &item.source_batch {
+        sources.push(BusinessSourceRef::new(
+            EntityType::GenotypingBatch,
+            batch.id,
+            Some(batch.revision),
+        ));
+        sources.extend(batch.gel_attachments.iter().map(|attachment| {
+            BusinessSourceRef::new(
+                EntityType::Attachment,
+                attachment.id,
+                Some(attachment.revision),
+            )
+        }));
+    }
+    sources
 }
 
 fn required_project_experiment(

@@ -65,6 +65,7 @@ pub enum EntityType {
     Genotype,
     GenotypeDefinition,
     GenotypingRecord,
+    GenotypingBatch,
     BreedingLine,
     Colony,
     BreedingPair,
@@ -124,6 +125,7 @@ impl EntityType {
             Self::Genotype => "genotype",
             Self::GenotypeDefinition => "genotype_definition",
             Self::GenotypingRecord => "genotyping_record",
+            Self::GenotypingBatch => "genotyping_batch",
             Self::BreedingLine => "breeding_line",
             Self::Colony => "colony",
             Self::BreedingPair => "breeding_pair",
@@ -214,6 +216,8 @@ pub enum DomainError {
     InvalidGenotypeDefinition,
     #[error("genotyping record state and assessment fields are invalid")]
     InvalidGenotypingRecord,
+    #[error("genotyping batch metadata, preview or lifecycle is invalid")]
+    InvalidGenotypingBatch,
     #[error("breeding line configuration is invalid")]
     InvalidBreedingLine,
     #[error("colony configuration is invalid")]

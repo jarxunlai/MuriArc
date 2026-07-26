@@ -37,12 +37,13 @@ use chrono::{DateTime, Utc};
 use muriarc_core::{
     AiExtractionStatus, AiImportResolution, AnimalFilter, AnimalStatus, Attachment, AuditContext,
     AuditFilter, DerivativeKind, EntityType, ExperimentFilter, FieldValueType,
-    GenotypeComponentMode, GenotypingState, IdentifierScope, ImportCommitOptions,
-    ImportCommitResult, ImportPlan, ImportSourceArchive, Job, MeasurementFilter, MuriArcStore,
-    ObservationFilter, ParticipationFilter, PrivateImageFilter, ProjectAnimalAssignmentFilter,
-    ProvenanceFilter, SampleFilter, Sex, StoreError, TemplateStatus, UserFilter,
-    is_ai_managed_attachment_entity_type, is_ai_operational_or_configuration_entity_type,
-    is_ai_source_import_job, is_private_ai_source_attachment_audit, is_private_ai_source_job_audit,
+    GenotypeComponentMode, GenotypingBatch, GenotypingBatchFilter, GenotypingState,
+    IdentifierScope, ImportCommitOptions, ImportCommitResult, ImportPlan, ImportSourceArchive, Job,
+    MeasurementFilter, MuriArcStore, ObservationFilter, ParticipationFilter, PrivateImageFilter,
+    ProjectAnimalAssignmentFilter, ProvenanceFilter, SampleFilter, Sex, StoreError, TemplateStatus,
+    UserFilter, is_ai_managed_attachment_entity_type,
+    is_ai_operational_or_configuration_entity_type, is_ai_source_import_job,
+    is_private_ai_source_attachment_audit, is_private_ai_source_job_audit,
 };
 use muriarc_importer::{
     AnimalDirectory, AnimalExportFilter, AnimalExportOptions, AnimalExportRecord, CageDirectory,
@@ -1305,6 +1306,13 @@ pub async fn collect_animal_export_records_scoped(
     Ok(records)
 }
 
+#[derive(Debug, Serialize)]
+struct SnapshotGenotypingBatch {
+    batch: GenotypingBatch,
+    /// Ordered by the immutable batch display order stored in the relation table.
+    record_ids: Vec<Uuid>,
+}
+
 pub async fn build_lab_snapshot(
     store: &dyn MuriArcStore,
     attachment_root: &Path,
@@ -1350,6 +1358,23 @@ pub async fn build_lab_snapshot(
         alleles.extend(store.list_alleles(locus.id).await?);
     }
     let mut genotype_definitions = store.list_genotype_definitions(lab_id).await?;
+    let batches = store
+        .list_genotyping_batches(&GenotypingBatchFilter {
+            lab_id,
+            project_id: None,
+            status: None,
+        })
+        .await?;
+    let mut genotyping_batches = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let record_ids = store
+            .list_genotyping_batch_records(batch.id)
+            .await?
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        genotyping_batches.push(SnapshotGenotypingBatch { batch, record_ids });
+    }
     let mut breeding_lines = store.list_breeding_lines(lab_id).await?;
     let mut colonies = store.list_colonies(lab_id, None).await?;
     let mut breeding_pairs = store.list_breeding_pairs(lab_id, None).await?;
@@ -1644,6 +1669,7 @@ pub async fn build_lab_snapshot(
     sort_by_id(&mut genotypes, |value| value.id);
     sort_by_id(&mut genotype_definitions, |value| value.id);
     sort_by_id(&mut genotyping_records, |value| value.id);
+    genotyping_batches.sort_by_key(|value| value.batch.id);
     sort_by_id(&mut breeding_lines, |value| value.id);
     sort_by_id(&mut colonies, |value| value.id);
     sort_by_id(&mut breeding_pairs, |value| value.id);
@@ -1678,6 +1704,7 @@ pub async fn build_lab_snapshot(
         jsonl_entry("genotype", &genotypes)?,
         jsonl_entry("genotype_definition", &genotype_definitions)?,
         jsonl_entry("genotyping_record", &genotyping_records)?,
+        jsonl_entry("genotyping_batch", &genotyping_batches)?,
         jsonl_entry("breeding_line", &breeding_lines)?,
         jsonl_entry("colony", &colonies)?,
         jsonl_entry("breeding_pair", &breeding_pairs)?,
@@ -2159,12 +2186,12 @@ mod tests {
         AttachmentDerivative, AuditContext, BreedingLine, BreedingMemberRole, BreedingPair,
         BreedingPairMember, Colony, DerivativeKind, DerivativeStatus, Experiment, ExperimentEvent,
         ExperimentTemplateVersion, FieldValueType, GeneLocus, GenotypeComponent,
-        GenotypeComponentMode, GenotypeDefinition, GenotypingRecord, GenotypingState, Lab, Litter,
-        MatingEvent, MeasurementFilter, MuriArcStore, Observation, ObservationDefinition,
-        ObservationPolicy, ObservationSubjectType, ObservationValueData, ObservationValueRecord,
-        ObservationValueType, Participation, PrivateAiImage, PrivateImageStatus, Project,
-        RecordMeta, RecordStatus, Sex, TemplateField, ToolRun, ToolRunStatus, User, WorkspaceStore,
-        WriteSource,
+        GenotypeComponentMode, GenotypeDefinition, GenotypingBatch, GenotypingRecord,
+        GenotypingState, Lab, Litter, MatingEvent, MeasurementFilter, MuriArcStore, Observation,
+        ObservationDefinition, ObservationPolicy, ObservationSubjectType, ObservationValueData,
+        ObservationValueRecord, ObservationValueType, Participation, PrivateAiImage,
+        PrivateImageStatus, Project, RecordMeta, RecordStatus, Sex, TemplateField, ToolRun,
+        ToolRunStatus, User, WorkspaceStore, WriteSource,
     };
     use muriarc_snapshot::verify_bundle;
     use muriarc_store_sqlite::SqliteStore;
@@ -3359,6 +3386,20 @@ mod tests {
             .create_genotyping_record(&genotyping_record, &audit)
             .await
             .unwrap();
+        let genotyping_batch = GenotypingBatch::new(
+            lab.id,
+            None,
+            "SNAPSHOT-PCR-01",
+            genotype_definition.id,
+            now,
+            None,
+            now,
+        )
+        .unwrap();
+        store
+            .create_genotyping_batch(&genotyping_batch, &audit)
+            .await
+            .unwrap();
 
         let mut line = BreedingLine::new(lab.id, "Snapshot line", now).unwrap();
         line.replace_genotype_definitions(vec![genotype_definition.id])
@@ -3459,6 +3500,7 @@ mod tests {
         for entity in [
             "genotype_definition",
             "genotyping_record",
+            "genotyping_batch",
             "breeding_line",
             "colony",
             "breeding_pair",

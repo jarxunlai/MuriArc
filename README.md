@@ -102,8 +102,9 @@ Server 每次启动在单事务中核对身份、LabAdmin membership 与凭据�
 - 旧数据库只以只读方式扫描；迁移目标始终是新文件。
 - 大附件存文件库，数据库只保存元数据和 SHA-256。
 - Server 所有正式写入均记录操作者、来源、revision 与审计事件。
-- 普通 CSV/XLSX 导入只支持动物登记与实验测量；普通 CSV/XLSX 导出只生成 Animal
-  Registry 数据产品，不能作为迁移工具。
+- 普通 CSV/XLSX 导入只支持动物登记与实验测量；批量基因鉴定使用专用工作流，将一份结果
+  表和一张或多张胶图绑定到可审计批次后原子确认。普通 CSV/XLSX 导出只生成 Animal Registry
+  数据产品，不能作为迁移工具。
 - Snapshot 是实验室完整业务归档与完整性校验边界，但当前没有 restore/apply；部署恢复仍需
   经演练的数据库与附件联合备份。
 
@@ -118,6 +119,7 @@ MuriArc 0.1.0 为预发布重构版本：Genetics v2、Breeding、Observation、
   Desktop/Tablet/Mobile Playwright 场景均纳入交付门禁。
 - Snapshot 生成并校验 manifest、全量业务 JSONL、附件、大小与 SHA-256；不提供
   restore/apply、实时同步或自动合并。
-- 普通导入/导出没有通用实体选择器：导入仅动物登记/实验测量，导出仅 Animal Registry。
+- 普通导入/导出没有通用实体选择器：导入仅动物登记/实验测量，导出仅 Animal Registry；
+  基因鉴定批次是独立的结果表 + 胶图证据工作流。
 - Windows Desktop 安装包为首发本地交付目标；macOS 必须在真实设备验证后发布。
 - 公开发布前必须完成遗留凭据轮换与自有远程 Git 历史中的敏感数据清理，并再次执行发布审计。

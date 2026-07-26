@@ -16,6 +16,7 @@ mod data_api;
 mod data_remap_tests;
 mod experiments;
 mod genetics;
+mod genotyping_batches;
 mod jobs_api;
 mod library;
 mod measurements;
@@ -112,6 +113,7 @@ fn base_router(state: AppState) -> Router {
         .merge(projects::router())
         .merge(experiments::router())
         .merge(genetics::router())
+        .merge(genotyping_batches::router())
         .merge(research::router())
         .merge(measurements::router())
         .merge(observations::router())

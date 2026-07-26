@@ -27,6 +27,13 @@ use muriarc_core::{AiModelProfileStore, AiOperationStore, MuriArcStore};
 use muriarc_data::DataFiles;
 use tokio::sync::RwLock;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeAccessMode {
+    #[default]
+    ReadWrite,
+    ReadOnlyActivation,
+}
+
 pub use ai_secrets::{
     AiLabSettingsView, AiModelDefaultsView, AiModelProfileView, AiModelValidationView,
     AiProviderDiagnosticsView, AiProviderEndpointView, AiProviderModelPresetView,
@@ -91,6 +98,7 @@ pub struct AppState {
     pub attachment_root: Option<Arc<PathBuf>>,
     pub ui_root: Option<Arc<PathBuf>>,
     pub runtime_compatibility_verified: bool,
+    pub runtime_access_mode: RuntimeAccessMode,
     pub(crate) admin_private_views: Arc<RwLock<HashSet<(uuid::Uuid, uuid::Uuid)>>>,
     pub technical_logs: Arc<dyn TechnicalLogService>,
     #[cfg(feature = "postgres")]
@@ -117,6 +125,7 @@ impl AppState {
             attachment_root: None,
             ui_root: None,
             runtime_compatibility_verified: false,
+            runtime_access_mode: RuntimeAccessMode::ReadWrite,
             admin_private_views: Arc::new(RwLock::new(HashSet::new())),
             technical_logs: Arc::new(DisabledTechnicalLogService),
             #[cfg(feature = "postgres")]
@@ -144,9 +153,14 @@ impl AppState {
         self
     }
 
-    pub fn with_runtime_compatibility(mut self, ui_root: Option<PathBuf>) -> Self {
+    pub fn with_runtime_compatibility(
+        mut self,
+        ui_root: Option<PathBuf>,
+        access_mode: RuntimeAccessMode,
+    ) -> Self {
         self.ui_root = ui_root.map(Arc::new);
         self.runtime_compatibility_verified = true;
+        self.runtime_access_mode = access_mode;
         self
     }
 

@@ -1,50 +1,57 @@
-# Feature Spec: 不可变历史 Fixture、Expected Facts 与发布门禁
+# Feature Spec: Native/systemd 与 Managed Compose 安全交付
 
-> 本分支建立“旧数据真的来自旧 Release、最新版真的能完整读取并继续写入”的永久证据链，不用 HEAD 伪造历史数据库。
+> 本分支只实现 Server 两种正式交付 Driver、制品布局和服务生命周期，不复制 Upgrade Engine 状态机，也不把 Docker/systemd 权限交给长期运行的 Server。
 
 ## 分支信息
 
 | 项目 | 值 |
 |---|---|
-| 分支名称 | feature/release-fixtures-gates |
-| 基于提交 | feature/upgrade-engine-control-plane@7ff7c8c |
-| Worktree 路径 | /home/ljx/Github/animal_lab-release-fixtures-gates |
-| 建立日期 | 2026-07-26 |
+| 分支名称 | `feature/native-compose-delivery` |
+| 基于提交 | `feature/release-fixtures-gates@0461187` |
+| Worktree 路径 | `/home/ljx/Github/animal_lab-native-compose-delivery` |
+| 建立日期 | `2026-07-27` |
 
 ## 目标
 
-定义不可变 Fixture/Catalog、Expected Facts 和七层 Verifier，建立 PR、Nightly、RC 三种兼容矩阵门禁。每个正式 Backend State 只能由对应 Release 制品生成；RC 必须使用最终安装包/镜像与 digest，任何 FAIL/SKIP 阻断。
+提供可签名、可验证、权限分离的 Native/systemd 与 Managed Compose bundle；让 `muriarcctl` 能检查和安装 profile，并让正式升级 Driver 通过共享 Engine 执行服务控制、联合备份、Candidate 与切换。任何未满足的 BYO PostgreSQL/存储能力必须 fail closed。
 
 ## 实现范围
 
-- [x] 新增共享 release-evidence crate，定义 Fixture Bundle、只追加 Catalog、生成制品 provenance、三种独立 digest 和 Expected Facts 强类型 schema。
-- [x] Expected Facts 覆盖账号/角色/项目、动物/繁育、实验/Observation/样本、附件 bytes/SHA、AI 历史与密文、Audit/Provenance，以及升级后继续写入。
-- [x] 实现安全资产验证：固定相对路径、拒绝 symlink/额外文件、流式 SHA-256/长度、backend/epoch/generation/Keyset/config manifest 联合恢复集合核对。
-- [x] 实现七层 Verifier runner：资产恢复、Storage、Store/Application、真实 API、真实 Remote UI、继续写入、只读无副作用；FAIL/SKIP 都不得伪装通过。
-- [x] 生成可供 Upgrade Engine 使用的七层 VerificationEvidence，并校验 Expected Facts digest 与所有 evidence digest。
-- [x] 实现历史 Catalog append-only/entry-self-digest 检查、Release 生成器版本绑定和“HEAD 不得重建旧 State”的 fail-closed 规则。
-- [x] 新增独立 muriarc-verifier CLI，支持 asset、run、report 与 matrix；JSON 报告固定 schema 且不包含秘密。
-- [x] 增加 GHCR OCI Artifact digest/cosign provenance 的发布与拉取脚本/工作流骨架；禁止 latest，Catalog 只记录 digest。
-- [x] 实现 PR 影响选择、Nightly 全历史、RC 全历史/全 profile/最终制品矩阵定义；RC 对空 Catalog、非最终 digest、源码运行或任一 SKIP 失败。
-- [x] 添加合成小型 fixture contract、篡改/路径逃逸/缺层/错误来源 Release/继续写入不一致等测试与文档。
+- [x] 新增共享 delivery crate，固定 Bundle manifest、文件 digest、路径与权限契约。
+- [x] Native 布局使用 `/opt/muriarc/releases/<version>`、`/opt/muriarc/current`、`/etc/muriarc`、`/var/lib/muriarc` 和专用系统用户。
+- [x] 提供 systemd service、sysusers、tmpfiles 和环境模板；Server 仅有业务权限，控制器/执行器保持 root 管理权限。
+- [x] Managed Compose 使用 digest-pinned GHCR 镜像和签名 bundle；应用/迁移容器不挂 Docker socket，不使用 latest/Watchtower/build。
+- [x] 增加 `muriarcctl install/doctor/status` 的 profile Driver 接入；升级能力缺少签名目标、备份或 Candidate 条件时必须失败，不得模拟成功。
+- [x] 实现服务 drain/stop/start、健康检查和 profile capability 探测的强类型接口与 fake-runner contract tests。
+- [x] Server 接入 SIGTERM/SIGINT graceful shutdown；`/livez`、`/readyz`、compatibility health 保持稳定。
+- [x] 增加 signed portable bundle 构建/验证脚本，包含 server、ctl、目标执行器、verifier、UI、Release Manifest 和模板。
+- [x] 更新部署文档与 CI，检查模板、Compose policy、制品清单和低权限边界。
+
+## 明确的 fail-closed 边界
+
+- [ ] 在最终签名制品与真实 PostgreSQL/volume RC 环境中接通 physical backup/restore、
+  Candidate database/directory、七层 verifier 和 activation pointer 的完整 `UpgradeDriver`。
+
+当前 `muriarcctl upgrade` 对该未验证边界返回 `prerequisite_failed`，而不是执行在线原地
+migration 或伪造 typed evidence。这个未完成项只能由后续 1.0 集成分支在真实 Native/Compose
+环境中关闭；本分支已经提供所需的不可变 bundle、root-only pointer、一次性 DDL executor、
+服务生命周期和 capability 探测接口。
 
 ## 验收标准
 
-- Fixture 内数据库/附件/Keyset/config/Expected Facts 任一缺失、损坏、额外或路径不安全都 fail closed。
-- Catalog 现有 entry 不能修改/删除/复用 Backend State；新增 entry 必须绑定生成它的 Release artifact 与 provenance digest。
-- Verifier 必须覆盖七层，且 Candidate 的继续写入不会污染只读检查；Expected Facts 未覆盖的业务域不能被静默忽略。
-- PR 可按影响缩小“历史 State 集合”，但被选中的每个 State 仍运行完整七层；Nightly/RC 不允许缩小。
-- RC 报告必须绑定最终 Native/Compose/Desktop artifact digest；任何 FAIL/SKIP 或源码 cargo run 都阻断。
-- 大数据库/附件不进入 Git；Git 只含 schema、小型合成 contract、Catalog digest 和工作流。
+- Native/Compose 模板都只暴露 `127.0.0.1:8787`，PostgreSQL 无宿主机端口。
+- Server unit/container 没有 Docker socket、systemd、DDL/升级控制凭据；升级只从宿主机 `muriarcctl` 发起。
+- Bundle 存在 symlink、额外/缺失文件、digest 不符、可变镜像引用或错误权限时拒绝安装。
+- BYO 环境无法创建隔离 Candidate、实际恢复备份或取得必要权限时 doctor/upgrade 明确失败。
+- 收到停止信号后停止接收新流量并等待在途请求；readiness 验证数据库、Epoch/Generation、Crypto、附件根和 UI。
 
 ## 技术约束
 
-- Fixture 生成器嵌入 ApplicationVersion/DataEpoch/BackendStateDigest；若与目标 Catalog entry 不同则拒绝发布。
-- fixture_artifact_digest 不与 backend_state_digest 或 expected_facts_digest 混用。
-- 所有测试数据均为合成数据；密钥仅为合成 Keyset，禁止真实账号、动物数据或 Provider Key。
-- Verifier 使用真实 Store/Application/API/RemoteHttpGateway UI adapter；DemoGateway 不能形成 RC 通过。
-- OCI 使用 digest 固定；cosign 私钥、OIDC Token、Registry 凭据和大资产不进入仓库。
+- 不修改 Upgrade Engine 的固定 phase 顺序；Driver 方法必须幂等并返回 typed evidence。
+- 不把数据库、附件、密钥、备份、Journal 或真实 `.env` 加入 Git。
+- Compose 生产 bundle 不含 `build:`、`latest`、Watchtower 或 Docker socket mount。
+- Native 的 `muriarc-server` 使用 `muriarc` 用户；`muriarcctl` 与目标执行器不在 Server unit 内运行。
 
 ## 跨分支备注
 
-本分支输出 Fixture/Catalog/Verifier ports，供 Native/Compose、Desktop 与最终 1.0 集成分支调用。E0001 双后端正式 Fixture 在 release-integration-1-0 分支由最终 Release 制品生成，不在本分支用 HEAD 预造。
+本分支依赖兼容基础、Upgrade Engine 和 release-evidence。Desktop 使用独立 Driver；Cloudflare 只消费本分支的 loopback origin 和 health contract。最终 1.0 集成分支生成真实签名制品并执行 systemd/Compose RC。

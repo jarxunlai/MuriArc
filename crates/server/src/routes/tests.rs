@@ -30,8 +30,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use crate::{
-    AppState, AuthPrincipal, DisabledAiProviderStore, StaticTokenAuthenticator, StoreJobRepository,
-    application_router,
+    AppState, AuthPrincipal, DisabledAiProviderStore, RuntimeAccessMode, StaticTokenAuthenticator,
+    StoreJobRepository, application_router,
 };
 
 const HUMAN_TOKEN: &str = "human-token-000000000000000000000000";
@@ -55,21 +55,32 @@ struct Fixture {
 
 impl Fixture {
     async fn new(ui_dir: Option<PathBuf>) -> Self {
-        Self::new_inner(ui_dir, false, false).await
+        Self::new_inner(ui_dir, false, false, RuntimeAccessMode::ReadWrite).await
     }
 
     async fn new_with_ai(ui_dir: Option<PathBuf>) -> Self {
-        Self::new_inner(ui_dir, true, true).await
+        Self::new_inner(ui_dir, true, true, RuntimeAccessMode::ReadWrite).await
     }
 
     async fn new_with_ai_operations(ui_dir: Option<PathBuf>, enable_ai_operations: bool) -> Self {
-        Self::new_inner(ui_dir, enable_ai_operations, false).await
+        Self::new_inner(
+            ui_dir,
+            enable_ai_operations,
+            false,
+            RuntimeAccessMode::ReadWrite,
+        )
+        .await
+    }
+
+    async fn new_read_only(ui_dir: Option<PathBuf>) -> Self {
+        Self::new_inner(ui_dir, false, false, RuntimeAccessMode::ReadOnlyActivation).await
     }
 
     async fn new_inner(
         ui_dir: Option<PathBuf>,
         enable_ai_operations: bool,
         enable_full_ai: bool,
+        access_mode: RuntimeAccessMode,
     ) -> Self {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
         store.migrate().await.unwrap();
@@ -210,6 +221,7 @@ impl Fixture {
             }
             state
         };
+        let state = state.with_runtime_compatibility(ui_dir.clone(), access_mode);
         Self {
             app: application_router(state, ui_dir),
             store,
@@ -231,6 +243,37 @@ impl Fixture {
             .body(Body::from(value.to_string()))
             .unwrap()
     }
+}
+
+#[tokio::test]
+async fn read_only_activation_allows_health_reads_and_blocks_mutations() {
+    let fixture = Fixture::new_read_only(None).await;
+    let live = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/livez")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
+
+    let blocked = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(Method::POST, "/api/v1/animals", HUMAN_TOKEN, json!({})))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = blocked.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+        "maintenance_read_only"
+    );
 }
 
 #[tokio::test]

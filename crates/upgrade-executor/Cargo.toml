@@ -1,18 +1,19 @@
 [package]
-name = "muriarcctl"
+name = "muriarc-upgrade-executor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "MuriArc local upgrade and recovery control plane"
+description = "One-shot DDL executor restricted to isolated MuriArc Candidate databases"
 
 [[bin]]
-name = "muriarcctl"
+name = "muriarc-upgrade-executor"
 path = "src/main.rs"
 
 [dependencies]
-muriarc-delivery = { path = "../delivery" }
+muriarc-core = { path = "../core" }
+muriarc-store-postgres = { path = "../store-postgres" }
 muriarc-upgrade = { path = "../upgrade" }
 serde.workspace = true
 serde_json.workspace = true

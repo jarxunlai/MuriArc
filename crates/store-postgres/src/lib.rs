@@ -53,6 +53,29 @@ impl PostgresStore {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    /// DDL primitive reserved for a controller-created, isolated Candidate
+    /// database. Ordinary Server startup must continue to use
+    /// `compatibility_report` and never call this method.
+    pub async fn apply_upgrade_migrations(&self) -> StoreResult<()> {
+        MIGRATOR
+            .run(&self.pool)
+            .await
+            .map_err(|error| StoreError::Database(error.to_string()))
+    }
+
+    pub async fn prepare_upgraded_candidate(
+        &self,
+        source_generation_id: Uuid,
+        candidate_generation_id: Uuid,
+    ) -> StoreResult<DeploymentState> {
+        upgrade_compatibility::prepare_upgraded_candidate(
+            &self.pool,
+            source_generation_id,
+            candidate_generation_id,
+        )
+        .await
+    }
 }
 
 fn map_sqlx(error: sqlx::Error) -> StoreError {
@@ -9136,6 +9159,30 @@ mod tests {
             ]
         );
         assert_phase4_migration_sql_constraints(&fresh_pool).await;
+        fresh_store
+            .apply_upgrade_migrations()
+            .await
+            .expect("Candidate DDL primitive must be idempotent on current schema");
+        let candidate_generation_id = Uuid::new_v4();
+        let candidate = fresh_store
+            .prepare_upgraded_candidate(generation_id, candidate_generation_id)
+            .await
+            .expect("restored Candidate must enter exact read-only target identity");
+        assert_eq!(candidate.generation_id, candidate_generation_id);
+        assert_eq!(candidate.write_lease_id, None);
+        assert_eq!(
+            fresh_store
+                .prepare_upgraded_candidate(generation_id, candidate_generation_id)
+                .await
+                .expect("Candidate preparation must be idempotent"),
+            candidate
+        );
+        fresh_store
+            .compatibility_report()
+            .await
+            .unwrap()
+            .require_read_only_compatible()
+            .expect("Candidate compatibility may differ only by its missing Write Lease");
         drop_migration_test_database(&admin_pool, &fresh_name, fresh_pool).await;
 
         let (incremental_name, incremental_pool) =

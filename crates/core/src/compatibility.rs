@@ -253,6 +253,41 @@ impl CompatibilityReport {
                 .join("; "))
         }
     }
+
+    /// Read-only activation deliberately has no Write Lease. Every other
+    /// identity, migration, generation, and storage compatibility issue still
+    /// blocks readiness. This is not a general-purpose bypass for ordinary
+    /// Server startup.
+    pub fn require_read_only_compatible(&self) -> Result<&DeploymentState, String> {
+        let state = self
+            .observed
+            .as_ref()
+            .ok_or_else(|| "deployment_state_missing".to_owned())?;
+        if state.identity != self.expected
+            || self
+                .issues
+                .iter()
+                .any(|issue| issue.code != "write_lease_missing")
+        {
+            return Err(self
+                .issues
+                .iter()
+                .map(|issue| format!("{}: {}", issue.code, issue.detail))
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
+        if self
+            .issues
+            .iter()
+            .filter(|issue| issue.code == "write_lease_missing")
+            .count()
+            != 1
+            || state.write_lease_id.is_some()
+        {
+            return Err("read_only_activation_requires_exactly_one_missing_write_lease".to_owned());
+        }
+        Ok(state)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,6 +414,7 @@ pub const RELEASE_CATALOG: &[ReleaseCatalogEntry] = &[ReleaseCatalogEntry {
 }];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseArtifact {
     pub media_type: String,
     pub digest: BackendStateDigest,
@@ -386,6 +422,7 @@ pub struct ReleaseArtifact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseManifest {
     pub format_version: u32,
     pub application_version: ApplicationVersion,
@@ -576,5 +613,38 @@ mod tests {
             manifest.validate().unwrap_err(),
             "release manifest control protocol range is invalid"
         );
+    }
+
+    #[test]
+    fn read_only_compatibility_allows_only_the_missing_lease_boundary() {
+        let identity = ReleaseIdentity::parse(
+            "1.0.0".to_owned(),
+            "E0001".to_owned(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            "gateway-v1".to_owned(),
+        )
+        .unwrap();
+        let report = CompatibilityReport {
+            backend: BackendKind::Postgres,
+            expected: identity.clone(),
+            observed: Some(DeploymentState {
+                identity,
+                generation_id: Uuid::new_v4(),
+                write_lease_id: None,
+                first_write_at: None,
+                updated_at: Utc::now(),
+            }),
+            issues: vec![CompatibilityIssue::new(
+                "write_lease_missing",
+                "read-only activation deliberately has no lease",
+            )],
+        };
+        assert!(report.require_read_only_compatible().is_ok());
+        let mut changed = report;
+        changed.issues.push(CompatibilityIssue::new(
+            "backend_state_digest_mismatch",
+            "wrong schema",
+        ));
+        assert!(changed.require_read_only_compatible().is_err());
     }
 }

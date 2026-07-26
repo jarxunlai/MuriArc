@@ -9,6 +9,7 @@ use std::{
 use muriarc_core::{
     DeploymentGenerationManifest, DeploymentState, MuriArcStore, PersistentRecoveryInventory,
 };
+use muriarc_server::RuntimeAccessMode;
 use muriarc_store_postgres::PostgresStore;
 use uuid::Uuid;
 
@@ -18,6 +19,7 @@ pub(crate) struct ServerRuntimeCompatibility {
     #[allow(dead_code)]
     pub deployment_state: DeploymentState,
     pub recovery_inventory: PersistentRecoveryInventory,
+    pub access_mode: RuntimeAccessMode,
 }
 
 pub(crate) async fn prepare_server_runtime(
@@ -26,6 +28,10 @@ pub(crate) async fn prepare_server_runtime(
     attachment_root: &Path,
 ) -> Result<ServerRuntimeCompatibility, Box<dyn Error>> {
     let preview_bootstrap = preview_bootstrap_enabled()?;
+    let access_mode = runtime_access_mode()?;
+    if preview_bootstrap && access_mode == RuntimeAccessMode::ReadOnlyActivation {
+        return Err("preview bootstrap cannot run in read-only activation mode".into());
+    }
     if preview_bootstrap {
         tracing::warn!(
             "explicit preview_epoch_0 bootstrap enabled; this escape hatch is not a stable-version upgrade path"
@@ -55,10 +61,17 @@ pub(crate) async fn prepare_server_runtime(
     }
 
     let report = store.compatibility_report().await?;
-    let deployment_state = if report.is_compatible() {
+    let deployment_state = if access_mode == RuntimeAccessMode::ReadWrite && report.is_compatible()
+    {
         report
             .observed
+            .clone()
             .ok_or("compatible report did not contain deployment state")?
+    } else if access_mode == RuntimeAccessMode::ReadOnlyActivation {
+        report
+            .require_read_only_compatible()
+            .map_err(|error| -> Box<dyn Error> { error.into() })?
+            .clone()
     } else if preview_bootstrap
         && report.issues.len() == 1
         && report.issues[0].code == "deployment_state_missing"
@@ -81,7 +94,24 @@ pub(crate) async fn prepare_server_runtime(
     Ok(ServerRuntimeCompatibility {
         deployment_state,
         recovery_inventory,
+        access_mode,
     })
+}
+
+fn runtime_access_mode() -> Result<RuntimeAccessMode, Box<dyn Error>> {
+    match env::var("MURIARC_ACTIVATION_MODE") {
+        Err(env::VarError::NotPresent) => Ok(RuntimeAccessMode::ReadWrite),
+        Err(error) => Err(error.into()),
+        Ok(value) => parse_runtime_access_mode(&value).map_err(Into::into),
+    }
+}
+
+fn parse_runtime_access_mode(value: &str) -> Result<RuntimeAccessMode, &'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "read-write" => Ok(RuntimeAccessMode::ReadWrite),
+        "read-only" => Ok(RuntimeAccessMode::ReadOnlyActivation),
+        _ => Err("MURIARC_ACTIVATION_MODE must be read-write or read-only"),
+    }
 }
 
 fn preview_bootstrap_enabled() -> Result<bool, Box<dyn Error>> {
@@ -223,5 +253,14 @@ mod tests {
             .to_string();
         assert!(error.contains("generation_manifest_mismatch"));
         let _ = BackendKind::Postgres;
+    }
+
+    #[test]
+    fn activation_mode_is_explicit_and_fail_closed() {
+        assert_eq!(
+            parse_runtime_access_mode("read-only").unwrap(),
+            RuntimeAccessMode::ReadOnlyActivation
+        );
+        assert!(parse_runtime_access_mode("maintenance-ish").is_err());
     }
 }

@@ -2674,6 +2674,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "muriarc-delivery"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "muriarc-core",
+ "muriarc-upgrade",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "muriarc-desktop"
 version = "0.1.0"
 dependencies = [
@@ -2854,6 +2869,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "muriarc-upgrade-executor"
+version = "0.1.0"
+dependencies = [
+ "muriarc-core",
+ "muriarc-store-postgres",
+ "muriarc-upgrade",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "muriarc-verifier"
 version = "0.1.0"
 dependencies = [
@@ -2870,9 +2899,11 @@ dependencies = [
 name = "muriarcctl"
 version = "0.1.0"
 dependencies = [
+ "muriarc-delivery",
  "muriarc-upgrade",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "uuid",
 ]

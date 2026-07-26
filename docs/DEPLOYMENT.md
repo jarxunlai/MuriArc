@@ -1,5 +1,10 @@
 # MuriArc Server deployment
 
+> 本文保留源码 checkout 与 preview 部署说明。`1.0 / E0001` 起的签名
+> Native/systemd、Managed Compose、generation 激活和安全升级契约见
+> [SERVER_DELIVERY.md](SERVER_DELIVERY.md)。正式环境不得用根目录开发 Compose 或直接重建
+> 容器绕过 `muriarcctl`。
+
 The shared edition is an Axum server backed by PostgreSQL and serving the same responsive Vue application used by the desktop edition. Axum listens on the container network, while the provided Compose file publishes its host port only on loopback by default; terminate TLS in Caddy, Nginx, or an equivalent reverse proxy.
 
 This document is only for the shared Server deployment. The personal Desktop

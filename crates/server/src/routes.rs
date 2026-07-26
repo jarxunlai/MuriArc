@@ -40,8 +40,8 @@ use axum::{
         DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
-    http::{StatusCode, request::Parts},
-    middleware,
+    http::{Method, StatusCode, request::Parts},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::get,
 };
@@ -163,7 +163,12 @@ fn base_router(state: AppState) -> Router {
         .route("/api/v1/compatibility", get(compatibility_health))
         .nest("/api/v1", api_v1);
 
-    api.merge(mcp::router(state.clone())).with_state(state)
+    api.merge(mcp::router(state.clone()))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_runtime_access_mode,
+        ))
+        .with_state(state)
 }
 
 async fn fallback() -> ApiError {
@@ -218,7 +223,7 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn compatibility_health(State(state): State<AppState>) -> impl IntoResponse {
     match state.store.compatibility_report().await {
-        Ok(report) if report.is_compatible() => (
+        Ok(report) if runtime_report_is_ready(&state, &report) => (
             StatusCode::OK,
             Json(CompatibilityHealthResponse {
                 status: "compatible",
@@ -259,7 +264,14 @@ async fn readiness(state: &AppState) -> Result<CompatibilityReport, String> {
         .compatibility_report()
         .await
         .map_err(|error| error.to_string())?;
-    report.require_compatible()?;
+    match state.runtime_access_mode {
+        crate::RuntimeAccessMode::ReadWrite => {
+            report.require_compatible()?;
+        }
+        crate::RuntimeAccessMode::ReadOnlyActivation => {
+            report.require_read_only_compatible()?;
+        }
+    }
     if state.data_files.is_none() {
         return Err("data storage is not configured".to_owned());
     }
@@ -286,6 +298,35 @@ async fn readiness(state: &AppState) -> Result<CompatibilityReport, String> {
         return Err("UI index asset is missing".to_owned());
     }
     Ok(report)
+}
+
+fn runtime_report_is_ready(state: &AppState, report: &CompatibilityReport) -> bool {
+    match state.runtime_access_mode {
+        crate::RuntimeAccessMode::ReadWrite => report.is_compatible(),
+        crate::RuntimeAccessMode::ReadOnlyActivation => {
+            report.require_read_only_compatible().is_ok()
+        }
+    }
+}
+
+async fn enforce_runtime_access_mode(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<axum::response::Response, ApiError> {
+    if state.runtime_access_mode == crate::RuntimeAccessMode::ReadOnlyActivation
+        && !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+        )
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "maintenance_read_only",
+            "MuriArc is validating an upgraded generation in read-only maintenance mode",
+        ));
+    }
+    Ok(next.run(request).await)
 }
 
 pub(super) fn authorize(

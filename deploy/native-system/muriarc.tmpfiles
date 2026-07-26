@@ -1,0 +1,7 @@
+d /var/lib/muriarc 0750 root muriarc -
+d /var/lib/muriarc/generations 0710 root muriarc -
+d /var/lib/muriarc/control 0700 root root -
+d /var/lib/muriarc/backups 0700 root root -
+d /var/lib/muriarc/candidates 0700 root root -
+d /opt/muriarc/releases 0755 root root -
+d /etc/muriarc 0750 root muriarc -

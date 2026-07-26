@@ -18,7 +18,7 @@ use muriarc_data::{AttachmentFiles, DataFiles, cleanup_expired_ai_conversation_s
 use muriarc_server::{
     AiMasterKey, AppState, Authenticator, ChainedAuthenticator, EnvironmentRootConfig,
     LiveBootstrapAuthenticator, PostgresAiProviderStore, PostgresAuthBackend,
-    PostgresTechnicalLogService, PostgresUserGovernance, SessionCookieConfig,
+    PostgresTechnicalLogService, PostgresUserGovernance, RuntimeAccessMode, SessionCookieConfig,
     StaticTokenAuthenticator, StoreJobRepository, application_router,
     sync_postgres_environment_root,
 };
@@ -53,22 +53,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .await?;
 
     let root_config = environment_root_config(server_lab_id)?;
-    let root_outcome = sync_postgres_environment_root(store.as_ref(), &root_config).await?;
-    if root_outcome.changed() {
-        tracing::warn!(
-            lab_created = root_outcome.lab_created,
-            lab_updated = root_outcome.lab_updated,
-            user_created = root_outcome.user_created,
-            user_updated = root_outcome.user_updated,
-            membership_created = root_outcome.membership_created,
-            membership_updated = root_outcome.membership_updated,
-            credential_created = root_outcome.credential_created,
-            credential_updated = root_outcome.credential_updated,
-            sessions_revoked = root_outcome.sessions_revoked,
-            "environment root configuration was reconciled"
-        );
+    if runtime.access_mode == RuntimeAccessMode::ReadWrite {
+        let root_outcome = sync_postgres_environment_root(store.as_ref(), &root_config).await?;
+        if root_outcome.changed() {
+            tracing::warn!(
+                lab_created = root_outcome.lab_created,
+                lab_updated = root_outcome.lab_updated,
+                user_created = root_outcome.user_created,
+                user_updated = root_outcome.user_updated,
+                membership_created = root_outcome.membership_created,
+                membership_updated = root_outcome.membership_updated,
+                credential_created = root_outcome.credential_created,
+                credential_updated = root_outcome.credential_updated,
+                sessions_revoked = root_outcome.sessions_revoked,
+                "environment root configuration was reconciled"
+            );
+        } else {
+            tracing::info!("environment root configuration is already synchronized");
+        }
     } else {
-        tracing::info!("environment root configuration is already synchronized");
+        tracing::info!(
+            "read-only activation skips Environment Root reconciliation and all startup writes"
+        );
     }
     let bootstrap_authenticator = bootstrap_authenticator(&root_config)?;
     let environment_root_user_id = root_config.user_id;
@@ -87,7 +93,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         persistent_auth.clone(),
     ];
     let authenticator = ChainedAuthenticator::new(authenticators);
-    let state = AppState::new(
+    let mut state = AppState::new(
         store.clone(),
         Arc::new(authenticator),
         Arc::new(StoreJobRepository::new(store.clone())),
@@ -97,30 +103,63 @@ async fn main() -> Result<(), Box<dyn Error>> {
         store.as_ref().clone(),
         server_lab_id,
         environment_root_user_id,
-    ))
-    .with_technical_logs(Arc::new(PostgresTechnicalLogService::new(
-        store.as_ref().clone(),
-    )));
+    ));
+    if runtime.access_mode == RuntimeAccessMode::ReadWrite {
+        state = state.with_technical_logs(Arc::new(PostgresTechnicalLogService::new(
+            store.as_ref().clone(),
+        )));
+    }
     let state = configure_ai(
         state,
         store.clone(),
         &data_root,
         &runtime.recovery_inventory,
+        runtime.access_mode == RuntimeAccessMode::ReadWrite,
     )
     .await?;
     let state = state.with_data_storage(DataFiles::new(data_root), attachment_root.clone());
     let cleanup_store: Arc<dyn MuriArcStore> = store.clone();
-    let _ai_source_cleanup = spawn_ai_source_cleanup(cleanup_store, server_lab_id, attachment_root);
+    let ai_source_cleanup = (runtime.access_mode == RuntimeAccessMode::ReadWrite)
+        .then(|| spawn_ai_source_cleanup(cleanup_store, server_lab_id, attachment_root));
     let ui_dir = env::var_os("MURIARC_UI_DIR").map(PathBuf::from);
     if ui_dir.is_none() {
         tracing::warn!("MURIARC_UI_DIR is not set; shared Web UI will not be served");
     }
-    let state = state.with_runtime_compatibility(ui_dir.clone());
+    let state = state.with_runtime_compatibility(ui_dir.clone(), runtime.access_mode);
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
 
     tracing::info!(address = %bind_address, "MuriArc server listening");
-    axum::serve(listener, application_router(state, ui_dir)).await?;
+    axum::serve(listener, application_router(state, ui_dir))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    if let Some(ai_source_cleanup) = ai_source_cleanup {
+        ai_source_cleanup.abort();
+        let _ = ai_source_cleanup.await;
+    }
+    tracing::info!("MuriArc server shutdown completed");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler must install");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    tracing::error!(error = %error, "Ctrl-C shutdown listener failed");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::error!(error = %error, "shutdown listener failed");
+    }
+    tracing::info!("shutdown requested; draining in-flight requests");
 }
 
 fn spawn_ai_source_cleanup(
@@ -169,6 +208,7 @@ async fn configure_ai(
     store: Arc<PostgresStore>,
     data_root: &Path,
     recovery_inventory: &PersistentRecoveryInventory,
+    allow_key_creation: bool,
 ) -> Result<AppState, Box<dyn Error>> {
     let encoded_key = match optional_secret_env("MURIARC_AI_MASTER_KEY")? {
         Some(value) => Zeroizing::new(value),
@@ -178,7 +218,7 @@ async fn configure_ai(
                 .unwrap_or_else(|| data_root.join("secrets/ai-master-key"));
             Zeroizing::new(load_or_create_ai_master_key_file(
                 &path,
-                recovery_inventory.encrypted_secret_records == 0,
+                allow_key_creation && recovery_inventory.encrypted_secret_records == 0,
             )?)
         }
     };
@@ -206,7 +246,7 @@ fn load_or_create_ai_master_key_file(
         Err(error) if error.kind() == ErrorKind::NotFound && allow_create => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Err(format!(
-                "AI ciphertext exists but the deployment Master Key is missing: {}",
+                "deployment Master Key is missing and current mode forbids generating a replacement: {}",
                 path.display()
             )
             .into());

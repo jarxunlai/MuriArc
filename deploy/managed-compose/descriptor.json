@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "compose_file": "compose.yaml",
+  "server_image_environment": "MURIARC_SERVER_IMAGE",
+  "postgres_image_environment": "MURIARC_POSTGRES_IMAGE",
+  "image_policy": "ghcr-digest-only",
+  "docker_socket_mounted": false,
+  "direct_rebuild_allowed": false,
+  "watchtower_allowed": false,
+  "origin": "http://127.0.0.1:8787",
+  "postgres_major": 17,
+  "generation_storage": "isolated-directories-in-root-owned-server_data-volume",
+  "active_generation_source": "root-only-environment-file"
+}

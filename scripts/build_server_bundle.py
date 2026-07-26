@@ -121,11 +121,6 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
             True,
         ),
         InputFile(regular_file(args.verifier, "verifier"), PurePosixPath("bin/muriarc-verifier"), "verifier", True),
-        InputFile(
-            regular_file(args.release_manifest, "Release Manifest"),
-            PurePosixPath("release/release-manifest.json"),
-            "release_manifest",
-        ),
         InputFile(regular_file(cloudflare / "cloudflared.service", "cloudflared systemd unit"), PurePosixPath("deploy/cloudflare/cloudflared.service"), "systemd_service"),
         InputFile(regular_file(cloudflare / "cloudflared.sysusers", "cloudflared sysusers file"), PurePosixPath("deploy/cloudflare/cloudflared.sysusers"), "sysusers"),
         InputFile(regular_file(cloudflare / "cloudflared.tmpfiles", "cloudflared tmpfiles file"), PurePosixPath("deploy/cloudflare/cloudflared.tmpfiles"), "tmpfiles"),
@@ -222,7 +217,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--controller", required=True, type=Path)
     result.add_argument("--upgrade-executor", required=True, type=Path)
     result.add_argument("--verifier", required=True, type=Path)
-    result.add_argument("--release-manifest", required=True, type=Path)
     result.add_argument("--deploy-root", type=Path, default=Path("deploy"))
     result.add_argument("--server", type=Path)
     result.add_argument("--ui-dir", type=Path)

@@ -24,10 +24,6 @@ fn native_bundle(root: &Path) -> ServerBundleManifest {
         ),
         ("bin/muriarc-verifier", BundleFileRole::Verifier),
         ("ui/index.html", BundleFileRole::UiAsset),
-        (
-            "release/release-manifest.json",
-            BundleFileRole::ReleaseManifest,
-        ),
         ("deploy/muriarc.service", BundleFileRole::SystemdService),
         ("deploy/muriarc.sysusers", BundleFileRole::Sysusers),
         ("deploy/muriarc.tmpfiles", BundleFileRole::Tmpfiles),
@@ -74,10 +70,6 @@ fn managed_bundle(root: &Path) -> ServerBundleManifest {
             BundleFileRole::UpgradeExecutor,
         ),
         ("bin/muriarc-verifier", BundleFileRole::Verifier),
-        (
-            "release/release-manifest.json",
-            BundleFileRole::ReleaseManifest,
-        ),
         ("deploy/compose.yaml", BundleFileRole::ComposeFile),
         ("deploy/descriptor.json", BundleFileRole::ComposeDescriptor),
         ("deploy/.env.example", BundleFileRole::EnvironmentExample),
@@ -117,7 +109,7 @@ fn bundle_verifier_rejects_tamper_extra_and_traversal() {
     let manifest = native_bundle(root.path());
     let (_, verified) =
         verify_server_bundle(root.path(), Some(&manifest.digest().unwrap())).unwrap();
-    assert_eq!(verified.file_count, 11);
+    assert_eq!(verified.file_count, 10);
 
     fs::write(root.path().join("extra"), b"not registered").unwrap();
     assert!(verify_server_bundle(root.path(), None).is_err());

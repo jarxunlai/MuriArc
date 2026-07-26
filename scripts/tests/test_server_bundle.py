@@ -18,9 +18,6 @@ class ServerBundleBuilderTests(unittest.TestCase):
             path = root / name
             path.write_bytes(f"synthetic-{name}".encode())
             values[name] = path
-        manifest = root / "release-manifest.json"
-        manifest.write_text('{"synthetic":true}\n', encoding="utf-8")
-        values["manifest"] = manifest
         ui = root / "ui"
         ui.mkdir()
         (ui / "index.html").write_text("<main>MuriArc</main>\n", encoding="utf-8")
@@ -48,8 +45,6 @@ class ServerBundleBuilderTests(unittest.TestCase):
                 str(values["verifier"]),
                 "--ui-dir",
                 str(values["ui"]),
-                "--release-manifest",
-                str(values["manifest"]),
                 "--deploy-root",
                 str(REPOSITORY / "deploy"),
             ],
@@ -72,7 +67,7 @@ class ServerBundleBuilderTests(unittest.TestCase):
             paths = {item["path"] for item in manifest["files"]}
             self.assertIn("bin/muriarc-server", paths)
             self.assertIn("bin/muriarcctl", paths)
-            self.assertIn("release/release-manifest.json", paths)
+            self.assertNotIn("release/release-manifest.json", paths)
             self.assertIn("ui/index.html", paths)
             self.assertIn("deploy/cloudflare/cloudflared.service", paths)
             self.assertIn("deploy/cloudflare/muriarc.yml.example", paths)
@@ -106,8 +101,6 @@ class ServerBundleBuilderTests(unittest.TestCase):
                     str(values["verifier"]),
                     "--ui-dir",
                     str(values["ui"]),
-                    "--release-manifest",
-                    str(values["manifest"]),
                     "--deploy-root",
                     str(REPOSITORY / "deploy"),
                 ],

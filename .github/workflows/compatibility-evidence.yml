@@ -77,9 +77,6 @@ jobs:
           if [[ -n "${{ steps.gate.outputs.previous_catalog }}" ]]; then
             args+=(--previous "${{ steps.gate.outputs.previous_catalog }}")
           fi
-          if [[ "${{ steps.gate.outputs.mode }}" == rc ]]; then
-            args+=(--require-non-empty)
-          fi
           python3 scripts/check_fixture_catalog.py "${args[@]}"
 
       - name: Python evidence planner tests
@@ -97,7 +94,8 @@ jobs:
       - name: Build standalone verifier
         run: cargo build --locked --release -p muriarc-verifier
 
-      - name: Execute compatibility matrix
+      - name: Execute PR or Nightly compatibility matrix
+        if: steps.gate.outputs.mode != 'rc'
         env:
           MURIARC_VERIFIER: ${{ github.workspace }}/target/release/muriarc-verifier
           MURIARC_COMPATIBILITY_DRIVER: ${{ vars.MURIARC_COMPATIBILITY_DRIVER }}
@@ -107,6 +105,22 @@ jobs:
           scripts/run-release-compatibility.sh \
             --mode "${{ steps.gate.outputs.mode }}" \
             --changed-files "${{ steps.gate.outputs.changed_files }}" \
+            --run-root "${RUNNER_TEMP}/muriarc-compatibility"
+
+      - name: Execute complete final-artifact RC gate
+        if: steps.gate.outputs.mode == 'rc'
+        env:
+          MURIARC_VERIFIER: ${{ github.workspace }}/target/release/muriarc-verifier
+          MURIARC_FIXTURE_PRODUCER: ${{ vars.MURIARC_FIXTURE_PRODUCER }}
+          MURIARC_COMPATIBILITY_DRIVER: ${{ vars.MURIARC_COMPATIBILITY_DRIVER }}
+          MURIARC_RC_DRIVER: ${{ vars.MURIARC_RC_DRIVER }}
+          MURIARC_TARGET_ARTIFACTS: ${{ vars.MURIARC_TARGET_ARTIFACTS }}
+          MURIARC_ARTIFACT_LOCK: ${{ vars.MURIARC_ARTIFACT_LOCK }}
+          MURIARC_FIXTURE_CACHE: ${{ runner.temp }}/muriarc-fixture-cache
+        run: |
+          scripts/run-release-candidate.sh \
+            --release-manifest "${MURIARC_TARGET_ARTIFACTS}" \
+            --artifact-lock "${MURIARC_ARTIFACT_LOCK}" \
             --run-root "${RUNNER_TEMP}/muriarc-compatibility"
 
       - name: Upload compatibility evidence

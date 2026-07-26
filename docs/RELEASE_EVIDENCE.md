@@ -1,5 +1,77 @@
 # 不可变历史 Fixture 与兼容发布门禁
 
+## 正式 1.0 RC 的最终门禁
+
+兼容矩阵只回答“每个历史 Backend State 能否被最终交付形态读取、继续写入并保持只读无副作用”。
+正式 1.0 还必须把最终制品、签名 provenance、真实部署/恢复/故障注入和 Cloudflare staging 绑定到
+同一组 digest。固定定义位于 `release-fixtures/rc-gate.json`，统一入口为：
+
+最终 Native/Compose bundle 和 Windows 安装包先各自由签名流水线输出一个普通 JSON descriptor：
+`format_version`、`artifact_name`、`media_type`、`digest`、`size_bytes`、`provenance_digest` 和
+`signature_evidence_digest`。正式 release source 再用编译身份文件和这些 descriptor 组装外部
+Release Manifest：
+
+```bash
+scripts/assemble_release_manifest.py \
+  --identity /secure/release-identity.json \
+  --artifact native-system=/secure/native-descriptor.json \
+  --artifact managed-compose=/secure/compose-descriptor.json \
+  --artifact desktop-windows=/secure/windows-descriptor.json \
+  --release-provenance-digest sha256:... \
+  --output-directory /secure/new/muriarc-1.0.0-manifest
+```
+
+Assembler 只做闭合 schema/digest 编排，不生成或验证签名；它拒绝 preview source、工作树内输出
+和缺少三种最终制品。输出 `release-manifest.json` 与 `artifact-lock.json`，随后由 TUF/Tauri/发布
+provenance 流程签名和消费。Release Manifest 不嵌入其描述的 bundle，从而不存在自引用 digest。
+
+完整 RC 入口为：
+
+```bash
+export MURIARC_VERIFIER=/absolute/path/muriarc-verifier
+export MURIARC_FIXTURE_PRODUCER=/absolute/path/real-final-artifact-fixture-producer
+export MURIARC_COMPATIBILITY_DRIVER=/absolute/path/real-compatibility-driver
+export MURIARC_RC_DRIVER=/absolute/path/real-systemd-docker-windows-cloudflare-driver
+export MURIARC_FIXTURE_CACHE=/absolute/path/outside-git/fixture-cache
+
+scripts/run-release-candidate.sh \
+  --release-manifest /absolute/path/final-release-manifest.json \
+  --artifact-lock /absolute/path/signed-artifact-lock.json \
+  --run-root /absolute/new/path/outside-git/muriarc-1.0.0-rc
+```
+
+编排器先要求 Fixture producer 从最终制品生成 append-only candidate Catalog，再运行全历史七层
+RC matrix，并要求真实 RC Driver 对 Native/systemd、Managed Compose、Windows 安装包、两个
+Cloudflare Public overlay、故障注入、激活前回退/首次写入后拒绝降级以及 TUF/Sigstore/Tauri
+攻击执行固定场景，最后由 `scripts/check_release_readiness.py` 生成可签名的
+`release-readiness-report.json`。它不生成证据；缺 driver、空 Catalog、任何 `FAIL/SKIP`、
+`source_run`、DemoGateway、digest 不一致或工作树内报告都会失败。
+
+`artifact-lock.json` 不是可选的旁路文件：RC evidence 必须同时引用它的 SHA-256，且其中每个制品的
+digest、size、provenance 与 signature evidence 必须和 RC Driver 报告逐项一致。Fixture producer
+也必须读取同一份 lock，不能从未受信任的运行参数自行填写 source provenance。
+
+当前源码仍是 `0.1.0 / preview_epoch_0 / preview-only-adoption`，因此正式 readiness 必须失败。
+只有最终 release commit 同时切换为 `1.0.0 / E0001 / permanent-upgrade`，且双后端 E0001 Fixture
+的 `source_release_artifact_digest` 与 `source_release_provenance_digest` 指向最终签名制品时才可能通过。
+这项失败是安全边界，不得通过预造 HEAD Fixture 或修改 gate definition 绕过。
+
+### 首个 E0001 的无循环引导
+
+E0001 Fixture 不能先由 HEAD 生成再把应用版本改成 1.0；但如果先把 Fixture Catalog 提交进源码再
+重建制品，artifact digest 又会变化，形成循环。因此正式编排采用以下固定顺序：
+
+1. 从最终 release commit 构建并签名候选 Release Manifest 与三个最终制品；
+2. `MURIARC_FIXTURE_PRODUCER` **实际运行这些 digest 固定的制品**，生成/发布双后端 Fixture，
+   并在仓库外输出相对已提交 `catalog.json` 的 append-only `candidate-catalog.json`；
+3. 全历史 matrix 和 readiness 使用这个 candidate Catalog，并把其 digest 写入最终报告；
+4. RC 通过且正式制品按原 digest 发布后，将报告中的同一批 Catalog entry 原样追加回仓库，供
+   后续版本 Nightly/RC 使用，不重建或替换已经发布的 1.0 制品。
+
+这样 Catalog 控制文件的后置登记不会伪称它参与生成 1.0 artifact，也不会让“最终 artifact”因
+登记动作发生变化。producer 缺失、candidate 非 append-only、未含 SQLite/PostgreSQL E0001 或
+Fixture 的 source artifact/provenance 不匹配时，编排在兼容矩阵开始前失败。
+
 ## 为什么需要独立证据链
 
 数据库文件仍存在不等于升级成功。MuriArc 的兼容结论必须证明旧账号、权限、动物关系、实验、

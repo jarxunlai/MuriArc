@@ -32,8 +32,7 @@ python3 scripts/build_server_bundle.py \
   --controller /absolute/path/muriarcctl \
   --upgrade-executor /absolute/path/muriarc-upgrade-executor \
   --verifier /absolute/path/muriarc-verifier \
-  --ui-dir /absolute/path/ui-dist \
-  --release-manifest /absolute/path/release-manifest.json
+  --ui-dir /absolute/path/ui-dist
 ```
 
 脚本拒绝 symlink、空文件、路径逃逸、已存在输出目录和 Git 工作树内输出。生成结果包含
@@ -47,6 +46,12 @@ export MURIARCCTL_TRUSTED_BUNDLE_MANIFEST_DIGEST=sha256:<64-hex>
 ```
 
 仅有下载链接、tag、TLS 或文件名都不能替代签名元数据。
+
+Release Manifest 是 TUF target custom metadata/正式 RC 的外部签名对象，**不嵌入它所描述的
+Native 或 Compose bundle**。否则 Manifest 内的 profile artifact digest 会依赖包含自身的 bundle，
+形成不可解的自引用。发布流水线先封装最终 bundle/镜像/Windows 安装包并取得 digest，再生成外部
+Release Manifest；控制器从已验证元数据把 Manifest 交给 Upgrade Engine/Executor。bundle 内只含
+自己的闭合 `bundle-manifest.json`，安装时同时验证外层 target digest 和内层闭合清单 digest。
 
 ## 3. Native/systemd
 
@@ -143,3 +148,17 @@ Journal 和验证报告全部保存在 Git 之外。
 公网部署不得直接开放 Origin。Native 和 Managed Compose bundle 都携带独立宿主机
 `cloudflared` 模板与 Public Profile override；完整安装、安全补偿和 RC 边界见
 [CLOUDFLARE_PUBLIC_PROFILE.md](CLOUDFLARE_PUBLIC_PROFILE.md)。
+
+## 8. 最终 1.0 RC 编排
+
+正式发布不能只运行某一种部署 smoke。`scripts/run-release-candidate.sh` 把完整历史 Fixture 七层
+矩阵、Native/systemd、Managed Compose、Windows 安装包、Cloudflare staging、恢复/故障注入、
+首次写入降级保护和签名攻击证据绑定到最终 Release Manifest。`release-fixtures/rc-gate.json`
+是不可弱化的 required-scenario definition；`scripts/check_release_readiness.py` 只在所有记录为
+`pass`、`final_package`、`fail_count=0`、`skip_count=0`，且外部签名 `artifact-lock.json`、
+artifact/provenance/signature evidence/digest 完全一致时生成仓库外
+`release-readiness-report.json`。
+
+当前 preview 源码、空 Catalog 或缺少真实 RC Driver 都会失败。这表示发布控制面已 fail closed，
+不表示 1.0 已发布或真实用户数据已经通过验收。完整命令和证据格式见
+[RELEASE_EVIDENCE.md](RELEASE_EVIDENCE.md)。

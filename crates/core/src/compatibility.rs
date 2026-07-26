@@ -9,6 +9,9 @@ use uuid::Uuid;
 pub const CURRENT_APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CURRENT_DATA_EPOCH: &str = "preview_epoch_0";
 pub const CURRENT_GATEWAY_CONTRACT_REVISION: &str = "gateway-v1";
+/// A formal release must change this to `permanent-upgrade` together with its
+/// version/Epoch transition. The RC readiness gate rejects preview support.
+pub const CURRENT_RELEASE_SUPPORT: &str = "preview-only-adoption";
 pub const GENERATION_MANIFEST_FORMAT: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -410,7 +413,7 @@ pub const RELEASE_CATALOG: &[ReleaseCatalogEntry] = &[ReleaseCatalogEntry {
     application_version: CURRENT_APPLICATION_VERSION,
     data_epoch: CURRENT_DATA_EPOCH,
     gateway_contract_revision: CURRENT_GATEWAY_CONTRACT_REVISION,
-    support: "preview-only-adoption",
+    support: CURRENT_RELEASE_SUPPORT,
 }];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -587,6 +590,20 @@ mod tests {
         assert_eq!(decoded.raw, "future_state");
         assert_eq!(decoded.known, None);
         assert_eq!(decoded.review, CompatibilityReview::NeedsReview);
+    }
+
+    #[test]
+    fn release_support_matches_preview_or_permanent_epoch() {
+        let expected = if CURRENT_DATA_EPOCH == "preview_epoch_0" {
+            "preview-only-adoption"
+        } else {
+            "permanent-upgrade"
+        };
+        assert_eq!(CURRENT_RELEASE_SUPPORT, expected);
+        assert_eq!(
+            RELEASE_CATALOG.last().unwrap().support,
+            CURRENT_RELEASE_SUPPORT
+        );
     }
 
     #[test]

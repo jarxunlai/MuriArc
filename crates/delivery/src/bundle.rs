@@ -22,7 +22,7 @@ pub enum BundleFileRole {
     UpgradeExecutor,
     Verifier,
     UiAsset,
-    ReleaseManifest,
+    BundleManifest,
     SystemdService,
     Sysusers,
     Tmpfiles,
@@ -79,7 +79,6 @@ impl ServerBundleManifest {
                 BundleFileRole::UpgradeExecutor,
                 BundleFileRole::Verifier,
                 BundleFileRole::UiAsset,
-                BundleFileRole::ReleaseManifest,
                 BundleFileRole::SystemdService,
                 BundleFileRole::Sysusers,
                 BundleFileRole::Tmpfiles,
@@ -90,7 +89,6 @@ impl ServerBundleManifest {
                 BundleFileRole::Controller,
                 BundleFileRole::UpgradeExecutor,
                 BundleFileRole::Verifier,
-                BundleFileRole::ReleaseManifest,
                 BundleFileRole::ComposeFile,
                 BundleFileRole::ComposeDescriptor,
                 BundleFileRole::EnvironmentExample,
@@ -223,7 +221,7 @@ pub fn stage_verified_release(
         copy_create_new(
             &bundle_root.join(SERVER_BUNDLE_MANIFEST),
             &staging.join(SERVER_BUNDLE_MANIFEST),
-            BundleFileRole::ReleaseManifest,
+            BundleFileRole::BundleManifest,
         )?;
         fs::rename(&staging, &destination).map_err(io)?;
         Ok(destination.clone())

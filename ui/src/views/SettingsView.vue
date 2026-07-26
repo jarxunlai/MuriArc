@@ -2,9 +2,24 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useMessage } from 'naive-ui'
 import { useRouter } from 'vue-router'
-import { Archive, Bot, ChevronRight, Database, Dna, FolderKanban, KeyRound, Save, ShieldCheck, Users } from '@lucide/vue'
+import {
+  Archive,
+  Bot,
+  ChevronRight,
+  Database,
+  Dna,
+  FolderKanban,
+  FolderOpen,
+  HardDrive,
+  KeyRound,
+  RotateCcw,
+  Save,
+  ShieldCheck,
+  Users,
+} from '@lucide/vue'
 import { branding } from '@/branding'
 import { currentAuthSession, gateway } from '@/services/gateway'
+import type { LocalStorageSelection, LocalStorageStatus } from '@/services/gateway'
 import type { WorkspaceSettings } from '@/domain/models'
 import { createDataGateway } from '@/services/dataGateway'
 import { passwordPolicyError, passwordStrength } from '@/services/passwordStrength'
@@ -30,6 +45,13 @@ const loadingWorkspace = ref(false)
 const savingWorkspace = ref(false)
 const loggingOut = ref(false)
 const snapshotting = ref(false)
+const storageStatus = ref<LocalStorageStatus>()
+const storageSelection = ref<LocalStorageSelection>()
+const loadingStorage = ref(false)
+const choosingStorage = ref(false)
+const schedulingStorage = ref(false)
+const restoringStorage = ref(false)
+const openingStorage = ref(false)
 const accountUser = computed(() => currentAuthSession.value?.user)
 const accountIsEnvironmentRoot = computed(() => accountUser.value?.isEnvironmentRoot === true)
 const accountAvailable = gateway.mode === 'remote'
@@ -38,6 +60,12 @@ const accountAvailable = gateway.mode === 'remote'
 const accountPasswordStrength = computed(() => passwordStrength(newPassword.value))
 const canManageWorkspace = typeof gateway.getWorkspaceSettings === 'function'
   && typeof gateway.saveWorkspaceSettings === 'function'
+const localStorageAvailable = gateway.mode === 'local'
+  && typeof gateway.getLocalStorageStatus === 'function'
+  && typeof gateway.chooseLocalStorageDirectory === 'function'
+  && typeof gateway.requestLocalStorageMigration === 'function'
+  && typeof gateway.requestRestoreDefaultStorage === 'function'
+  && typeof gateway.openLocalStorageDirectory === 'function'
 const canManageMembers = gateway.mode === 'remote'
   && currentAuthSession.value?.user.labRoles.includes('lab_admin') === true
 const labRegistryAvailable = gateway.mode === 'local' || hasLabRegistryAccess()
@@ -164,6 +192,83 @@ async function createSnapshot() {
   }
 }
 
+async function loadLocalStorageStatus() {
+  if (!localStorageAvailable || !gateway.getLocalStorageStatus) return
+  loadingStorage.value = true
+  try {
+    storageStatus.value = await gateway.getLocalStorageStatus()
+  } catch (error) {
+    message.error(`无法读取本地数据位置：${errorMessage(error)}`)
+  } finally {
+    loadingStorage.value = false
+  }
+}
+
+async function chooseLocalStorageDirectory() {
+  if (!gateway.chooseLocalStorageDirectory || choosingStorage.value) return
+  choosingStorage.value = true
+  try {
+    const selection = await gateway.chooseLocalStorageDirectory()
+    if (selection) storageSelection.value = selection
+  } catch (error) {
+    message.error(`选择目录失败：${errorMessage(error)}`)
+  } finally {
+    choosingStorage.value = false
+  }
+}
+
+async function scheduleLocalStorageMigration() {
+  if (
+    !gateway.requestLocalStorageMigration
+    || !storageSelection.value
+    || schedulingStorage.value
+  ) return
+  schedulingStorage.value = true
+  try {
+    const result = await gateway.requestLocalStorageMigration(
+      storageSelection.value.selectionToken,
+    )
+    if (result.scheduled) {
+      storageSelection.value = undefined
+      message.success('迁移已安排；请完全退出 MuriArc 后重新启动')
+      await loadLocalStorageStatus()
+    }
+  } catch (error) {
+    message.error(`安排迁移失败：${errorMessage(error)}`)
+  } finally {
+    schedulingStorage.value = false
+  }
+}
+
+async function restoreDefaultStorage() {
+  if (!gateway.requestRestoreDefaultStorage || restoringStorage.value) return
+  restoringStorage.value = true
+  try {
+    const result = await gateway.requestRestoreDefaultStorage()
+    if (result.scheduled) {
+      storageSelection.value = undefined
+      message.success('恢复默认目录已安排；请完全退出 MuriArc 后重新启动')
+      await loadLocalStorageStatus()
+    }
+  } catch (error) {
+    message.error(`安排恢复失败：${errorMessage(error)}`)
+  } finally {
+    restoringStorage.value = false
+  }
+}
+
+async function openLocalStorageDirectory() {
+  if (!gateway.openLocalStorageDirectory || openingStorage.value) return
+  openingStorage.value = true
+  try {
+    await gateway.openLocalStorageDirectory()
+  } catch (error) {
+    message.error(`打开目录失败：${errorMessage(error)}`)
+  } finally {
+    openingStorage.value = false
+  }
+}
+
 async function logout() {
   if (!gateway.logout || loggingOut.value) return
   loggingOut.value = true
@@ -179,6 +284,7 @@ async function logout() {
 
 onMounted(() => {
   void loadWorkspace()
+  void loadLocalStorageStatus()
 })
 </script>
 
@@ -254,6 +360,81 @@ onMounted(() => {
 
         <template v-else-if="active === 'backup'">
           <div class="section-heading"><h2>备份与迁移</h2><p>快照包含版本化 manifest、完整业务 JSONL、附件和 SHA-256 校验；当前版本不支持 restore/apply。</p></div>
+          <section v-if="localStorageAvailable" class="storage-card" aria-label="Desktop 本地数据位置">
+            <div class="storage-card-heading">
+              <HardDrive :size="22" />
+              <div>
+                <strong>Desktop 本地数据位置</strong>
+                <span>数据库、附件、数据产物与非敏感 AI 配置使用同一个数据根目录。</span>
+              </div>
+              <n-tag :bordered="false" :type="storageStatus?.usesCustomRoot ? 'success' : 'default'">
+                {{ storageStatus?.usesCustomRoot ? '自定义目录' : '默认目录' }}
+              </n-tag>
+            </div>
+
+            <n-skeleton v-if="loadingStorage && !storageStatus" text :repeat="2" />
+            <template v-else-if="storageStatus">
+              <dl class="storage-paths">
+                <div><dt>当前数据目录</dt><dd>{{ storageStatus.activeDataRoot }}</dd></div>
+                <div><dt>系统默认目录</dt><dd>{{ storageStatus.defaultDataRoot }}</dd></div>
+                <div v-if="storageStatus.pendingTargetRoot">
+                  <dt>等待迁移到</dt><dd>{{ storageStatus.pendingTargetRoot }}</dd>
+                </div>
+              </dl>
+
+              <n-alert
+                v-if="storageStatus.migrationPending"
+                type="warning"
+                :bordered="false"
+                title="迁移将在下次启动前执行"
+              >
+                请先保存工作并完全退出 MuriArc，再重新启动。校验成功前不会切换数据目录，也不会创建新的空数据库。
+              </n-alert>
+              <n-alert v-else type="info" :bordered="false">
+                请选择本机固定磁盘上的独立空目录。迁移成功后旧目录仍会保留；API Key 继续由操作系统安全存储管理，WebView 缓存不会迁移。
+              </n-alert>
+
+              <div v-if="storageSelection" class="storage-selection">
+                <span>已选择的新位置</span>
+                <strong>{{ storageSelection.targetDataRoot }}</strong>
+                <small>确认后只会写入迁移安排；实际复制和校验要等完全退出并重新启动。</small>
+              </div>
+
+              <div class="storage-actions">
+                <n-button
+                  secondary
+                  :disabled="storageStatus.migrationPending"
+                  :loading="choosingStorage"
+                  @click="chooseLocalStorageDirectory"
+                >
+                  <template #icon><FolderOpen :size="16" /></template>
+                  选择新位置
+                </n-button>
+                <n-button
+                  v-if="storageSelection"
+                  type="primary"
+                  :disabled="storageStatus.migrationPending"
+                  :loading="schedulingStorage"
+                  @click="scheduleLocalStorageMigration"
+                >
+                  确认迁移
+                </n-button>
+                <n-button :loading="openingStorage" @click="openLocalStorageDirectory">
+                  打开数据目录
+                </n-button>
+                <n-button
+                  v-if="storageStatus.usesCustomRoot"
+                  quaternary
+                  :disabled="storageStatus.migrationPending"
+                  :loading="restoringStorage"
+                  @click="restoreDefaultStorage"
+                >
+                  <template #icon><RotateCcw :size="16" /></template>
+                  恢复默认位置
+                </n-button>
+              </div>
+            </template>
+          </section>
           <div class="action-card"><Archive :size="22" /><div><strong>创建完整业务归档快照</strong><span>用于完整性校验与离线留存；当前不能导入、恢复或直接迁移到 Server，正式恢复仍需数据库与附件联合备份。</span></div><n-button v-if="labRegistryAvailable" type="primary" secondary :loading="snapshotting" @click="createSnapshot">创建快照</n-button></div>
           <div class="action-card"><Database :size="22" /><div><strong>旧版数据库迁移</strong><span>为避免误改原库，V1 仅通过 muriarc-legacy-migrator CLI 对副本执行审计与单向迁移；完整步骤见 docs/MIGRATION.md。</span></div><n-tag :bordered="false">CLI · 只读源库</n-tag></div>
         </template>
@@ -286,8 +467,13 @@ onMounted(() => {
 .password-strength { display: grid; grid-template-columns: auto minmax(120px, 1fr); align-items: center; gap: 12px; margin: -10px 0 12px; color: var(--muri-text-tertiary); font-size: 11px; }.password-strength .n-progress { width: 100%; }
 .availability-alert { margin-bottom: 16px; }
 .session-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 13px; border: 1px solid var(--muri-border); border-radius: 7px; }.session-actions > div { display: flex; flex-direction: column; }.session-actions span { color: var(--muri-text-secondary); font-size: 11px; }
+.storage-card { display: grid; gap: 14px; margin-bottom: 18px; padding: 16px; border: 1px solid var(--muri-border); border-radius: 9px; background: var(--muri-surface-muted); }
+.storage-card-heading { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 10px; }.storage-card-heading > svg { color: var(--muri-primary); }.storage-card-heading > div { display: flex; min-width: 0; flex-direction: column; }.storage-card-heading span { color: var(--muri-text-secondary); font-size: 11px; }
+.storage-paths { display: grid; gap: 8px; margin: 0; }.storage-paths > div { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 12px; }.storage-paths dt { color: var(--muri-text-tertiary); font-size: 11px; }.storage-paths dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+.storage-selection { display: flex; flex-direction: column; gap: 3px; padding: 11px; border: 1px solid rgba(42,104,137,.22); border-radius: 7px; background: rgba(42,104,137,.06); }.storage-selection span,.storage-selection small { color: var(--muri-text-secondary); font-size: 11px; }.storage-selection strong { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+.storage-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .action-card { display: grid; grid-template-columns: 32px 1fr auto; align-items: center; gap: 10px; margin-bottom: 10px; padding: 13px; border: 1px solid var(--muri-border); border-radius: 7px; }.action-card > svg { color: var(--muri-primary); }.action-card div { display: flex; flex-direction: column; }.action-card span { color: var(--muri-text-secondary); font-size: 11px; }
 .policy-list { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }.policy-list > div { display: flex; align-items: flex-start; gap: 9px; padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; color: var(--muri-text-secondary); }.policy-list svg { flex: 0 0 auto; color: var(--muri-success); }.policy-list strong { display: block; color: var(--muri-text); }
 .about-panel { display: flex; min-height: 470px; align-items: center; justify-content: center; flex-direction: column; text-align: center; }.about-panel img { width: 122px; height: 122px; object-fit: contain; }.about-panel h2 { margin: 12px 0 2px; font-size: 27px; }.about-panel p { margin: 0 0 13px; color: var(--muri-text-secondary); }.about-panel small { max-width: 460px; margin-top: 20px; color: var(--muri-text-tertiary); line-height: 1.6; }
-@media (max-width: 900px) { .settings-layout { grid-template-columns: 1fr; }.settings-layout > nav { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--muri-border); }.settings-layout nav button { width: auto; flex: 0 0 auto; }.settings-content { padding: 19px 15px; }.settings-form { grid-template-columns: 1fr; }.settings-form :deep(.n-form-item) { grid-column: 1 !important; }.action-card { grid-template-columns: 28px 1fr; }.action-card button { grid-column: 2; justify-self: start; } }
+@media (max-width: 900px) { .settings-layout { grid-template-columns: 1fr; }.settings-layout > nav { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--muri-border); }.settings-layout nav button { width: auto; flex: 0 0 auto; }.settings-content { padding: 19px 15px; }.settings-form { grid-template-columns: 1fr; }.settings-form :deep(.n-form-item) { grid-column: 1 !important; }.storage-card-heading { grid-template-columns: 28px minmax(0, 1fr); }.storage-card-heading .n-tag { grid-column: 2; justify-self: start; }.storage-paths > div { grid-template-columns: 1fr; gap: 2px; }.action-card { grid-template-columns: 28px 1fr; }.action-card button { grid-column: 2; justify-self: start; } }
 </style>

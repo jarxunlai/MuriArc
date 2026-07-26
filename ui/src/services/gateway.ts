@@ -736,6 +736,26 @@ export interface RevokeMembershipInput {
   currentPassword: string
 }
 
+export interface LocalStorageStatus {
+  activeDataRoot: string
+  defaultDataRoot: string
+  usesCustomRoot: boolean
+  migrationPending: boolean
+  pendingTargetRoot?: string
+  requiresRestart: boolean
+}
+
+export interface LocalStorageSelection {
+  selectionToken: string
+  targetDataRoot: string
+}
+
+export interface StorageMigrationRequestResult {
+  scheduled: boolean
+  requiresRestart: boolean
+  targetDataRoot: string
+}
+
 export interface MuriArcGateway {
   readonly mode: GatewayMode
   readonly displayName: string
@@ -819,6 +839,11 @@ export interface MuriArcGateway {
   deleteAttachment?(input: DeleteAttachmentInput): Promise<AttachmentMetadata>
   getWorkspaceSettings?(): Promise<WorkspaceSettings>
   saveWorkspaceSettings?(input: WorkspaceSettings): Promise<WorkspaceSettings>
+  getLocalStorageStatus?(): Promise<LocalStorageStatus>
+  chooseLocalStorageDirectory?(): Promise<LocalStorageSelection | undefined>
+  requestLocalStorageMigration?(selectionToken: string): Promise<StorageMigrationRequestResult>
+  requestRestoreDefaultStorage?(): Promise<StorageMigrationRequestResult>
+  openLocalStorageDirectory?(): Promise<void>
   getAiSettings?(): Promise<AiSettings>
   saveAiSettings?(input: SaveAiSettingsInput): Promise<AiSettings>
   clearAiApiKey?(): Promise<AiSettings>
@@ -935,6 +960,27 @@ export class LocalTauriGateway implements MuriArcGateway {
     } catch (error) {
       throw gatewayError(error)
     }
+  }
+
+  getLocalStorageStatus() {
+    return this.call<LocalStorageStatus>('get_local_storage_status')
+  }
+  async chooseLocalStorageDirectory() {
+    const selection = await this.call<LocalStorageSelection | null>(
+      'choose_local_storage_directory',
+    )
+    return selection ?? undefined
+  }
+  requestLocalStorageMigration(selectionToken: string) {
+    return this.call<StorageMigrationRequestResult>('request_local_storage_migration', {
+      input: { selectionToken },
+    })
+  }
+  requestRestoreDefaultStorage() {
+    return this.call<StorageMigrationRequestResult>('request_restore_default_storage')
+  }
+  openLocalStorageDirectory() {
+    return this.call<void>('open_local_storage_directory')
   }
 
   listCages(_context?: AnimalAccessContext) { return this.call<Cage[]>('list_cages') }

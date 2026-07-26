@@ -32,6 +32,37 @@ describe('MuriArc gateway selection', () => {
     ]])
   })
 
+  it('sends only the one-time selection token when scheduling a local storage migration', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      calls.push([command, args])
+      if (command === 'choose_local_storage_directory') {
+        return {
+          selectionToken: 'selection-token-1',
+          targetDataRoot: 'D:\\MuriArcData',
+        } as T
+      }
+      return {
+        scheduled: true,
+        requiresRestart: true,
+        targetDataRoot: 'D:\\MuriArcData',
+      } as T
+    }
+    const gateway = new LocalTauriGateway(invokeCommand)
+
+    const selection = await gateway.chooseLocalStorageDirectory()
+    await gateway.requestLocalStorageMigration(selection!.selectionToken)
+
+    expect(calls).toEqual([
+      ['choose_local_storage_directory', undefined],
+      [
+        'request_local_storage_migration',
+        { input: { selectionToken: 'selection-token-1' } },
+      ],
+    ])
+    expect(JSON.stringify(calls[1])).not.toContain('MuriArcData')
+  })
+
   it('preserves structured Tauri error codes for UI recovery decisions', async () => {
     const gateway = new LocalTauriGateway(async () => {
       throw { code: 'conflict', message: 'AI 会话 revision 已变化' }

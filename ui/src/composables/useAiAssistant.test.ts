@@ -383,6 +383,18 @@ describe('useAiAssistant', () => {
     }))
   })
 
+  it('uses a control-free Unicode-bounded title without changing the first message', async () => {
+    const message = `查询 M-001\n${'🐁'.repeat(300)}\t并返回来源`
+
+    await ai.send(message, { fullConfirmed: true })
+
+    const startInput = mocks.startAiConversation.mock.calls[0]?.[0]
+    expect(startInput?.title).not.toMatch(/\p{Cc}/u)
+    expect(Array.from(startInput?.title ?? '')).toHaveLength(256)
+    expect(startInput?.title).toMatch(/^查询 M-001 /u)
+    expect(mocks.aiTurn).toHaveBeenCalledWith(expect.objectContaining({ message }))
+  })
+
   it('does not call a turn or consume the shared prompt when Full start verification fails', async () => {
     ai.composerDraft.value = '查询动物'
     mocks.startAiConversation.mockRejectedValueOnce(new Error('当前密码验证失败'))

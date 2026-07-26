@@ -1,6 +1,7 @@
 mod ai_models;
 mod ai_operations;
 mod genotyping_batches;
+mod upgrade_compatibility;
 mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2272,7 +2273,20 @@ impl MuriArcStore for PostgresStore {
         MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|error| StoreError::Database(error.to_string()))
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        upgrade_compatibility::ensure_adopted_after_control_plane_migration(&self.pool).await
+    }
+
+    async fn adopt_current_release(&self, generation_id: Uuid) -> StoreResult<DeploymentState> {
+        upgrade_compatibility::adopt_current_release(&self.pool, generation_id).await
+    }
+
+    async fn compatibility_report(&self) -> StoreResult<CompatibilityReport> {
+        upgrade_compatibility::compatibility_report(&self.pool).await
+    }
+
+    async fn persistent_recovery_inventory(&self) -> StoreResult<PersistentRecoveryInventory> {
+        upgrade_compatibility::persistent_recovery_inventory(&self.pool).await
     }
 
     async fn health_check(&self) -> StoreResult<()> {
@@ -9011,18 +9025,68 @@ mod tests {
         let expected_migration_count = i64::try_from(MIGRATOR.iter().count()).unwrap();
         let latest_migration_version = MIGRATOR.iter().map(|migration| migration.version).max();
         assert_eq!(
-            expected_migration_count, 32,
-            "the merged PostgreSQL migration set must contain versions 0001 through 0032"
+            expected_migration_count, 33,
+            "the merged PostgreSQL migration set must contain versions 0001 through 0033"
         );
         assert_eq!(
             latest_migration_version,
-            Some(32),
-            "the merged PostgreSQL migration set must end at 0032"
+            Some(33),
+            "the merged PostgreSQL migration set must end at 0033"
         );
         assert_eq!(
             fresh_versions,
             (expected_migration_count, latest_migration_version)
         );
+        let fresh_store = PostgresStore::from_pool(fresh_pool.clone());
+        let generation_id = Uuid::new_v4();
+        let deployment = fresh_store
+            .adopt_current_release(generation_id)
+            .await
+            .expect("fresh PostgreSQL schema must be adoptable");
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO labs (id, name, created_at, updated_at, deleted_at, revision) VALUES ($1, 'Write fence lab', $2, $2, NULL, 1)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(now)
+        .execute(&fresh_pool)
+        .await
+        .expect("active PostgreSQL write lease must allow writes");
+        let first_write_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT first_write_at FROM muriarc_deployment_state WHERE singleton = TRUE",
+        )
+        .fetch_one(&fresh_pool)
+        .await
+        .expect("first-write marker must be readable");
+        assert!(first_write_at.is_some());
+        sqlx::query(
+            "UPDATE muriarc_write_leases SET status = 'revoked', revoked_at = $1 WHERE lease_id = $2",
+        )
+        .bind(Utc::now())
+        .bind(deployment.write_lease_id.unwrap())
+        .execute(&fresh_pool)
+        .await
+        .expect("control plane must be able to revoke the write lease");
+        let late_write = sqlx::query(
+            "INSERT INTO labs (id, name, created_at, updated_at, deleted_at, revision) VALUES ($1, 'Late write lab', $2, $2, NULL, 1)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(now)
+        .execute(&fresh_pool)
+        .await
+        .expect_err("revoked PostgreSQL lease must reject late writes");
+        assert!(
+            late_write
+                .to_string()
+                .contains("muriarc_write_lease_required")
+        );
+        sqlx::query(
+            "UPDATE muriarc_write_leases SET status = 'active', revoked_at = NULL WHERE lease_id = $1",
+        )
+        .bind(deployment.write_lease_id.unwrap())
+        .execute(&fresh_pool)
+        .await
+        .expect("test control plane must restore the lease for remaining schema assertions");
         let fresh_columns: Vec<String> = sqlx::query_scalar(
             "SELECT column_name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'user_credentials' ORDER BY column_name",
         )
@@ -9335,8 +9399,8 @@ mod tests {
                 .expect("direct merged migration ledger must be readable");
         assert_eq!(
             direct_upgrade_ledger,
-            (32, Some(32)),
-            "the direct current-main to merged PostgreSQL upgrade must end at 0032"
+            (33, Some(33)),
+            "the direct current-main to merged PostgreSQL upgrade must end at 0033"
         );
 
         let profile_count: i64 = sqlx::query_scalar("SELECT count(*) FROM ai_model_profiles")
@@ -9794,8 +9858,8 @@ mod tests {
                 .expect("merged PostgreSQL migration ledger must be readable");
         assert_eq!(
             merged_stack_ledger,
-            (32, Some(32)),
-            "the merged PostgreSQL migration set must end at 0032"
+            (33, Some(33)),
+            "the merged PostgreSQL migration set must end at 0033"
         );
         type MergedStackConversationRow = (
             String,

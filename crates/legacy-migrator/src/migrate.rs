@@ -5,7 +5,8 @@ use std::{
 };
 
 use chrono::Utc;
-use muriarc_core::LOCAL_LAB_ID;
+use muriarc_core::{LOCAL_LAB_ID, MuriArcStore};
+use muriarc_store_sqlite::SqliteStore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -53,6 +54,14 @@ pub async fn migrate_legacy(source: &Path, target: &Path) -> Result<MigrationRep
     let staged_path = staged.path().to_path_buf();
     let target_pool = open_target(&staged_path).await?;
     MIGRATOR.run(&target_pool).await?;
+    SqliteStore::from_pool(target_pool.clone())
+        .adopt_current_release(Uuid::new_v4())
+        .await
+        .map_err(|error| {
+            LegacyMigrationError::Verification(format!(
+                "could not establish target generation and write lease: {error}"
+            ))
+        })?;
     validate_target_schema(&target_pool).await?;
 
     let (migrated, rejected_pedigree_links, expected_cage_counts) =

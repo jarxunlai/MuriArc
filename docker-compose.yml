@@ -38,6 +38,9 @@ services:
       MURIARC_UI_DIR: /opt/muriarc/ui
       MURIARC_DATA_ROOT: /var/lib/muriarc/data
       MURIARC_ATTACHMENT_ROOT: /var/lib/muriarc/attachments
+      # preview_epoch_0 only; the stable managed profile replaces this with a
+      # one-shot muriarcctl upgrade/init service.
+      MURIARC_PREVIEW_BOOTSTRAP: ${MURIARC_PREVIEW_BOOTSTRAP:-true}
       MURIARC_LAB_ID: ${MURIARC_LAB_ID:?set MURIARC_LAB_ID}
       MURIARC_LAB_NAME: ${MURIARC_LAB_NAME:?set MURIARC_LAB_NAME}
       MURIARC_ROOT_USER_ID: ${MURIARC_ROOT_USER_ID:?set MURIARC_ROOT_USER_ID}

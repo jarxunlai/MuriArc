@@ -89,6 +89,8 @@ pub struct AppState {
     pub(crate) ai_step_up: AiStepUpRateLimiter,
     pub data_files: Option<Arc<DataFiles>>,
     pub attachment_root: Option<Arc<PathBuf>>,
+    pub ui_root: Option<Arc<PathBuf>>,
+    pub runtime_compatibility_verified: bool,
     pub(crate) admin_private_views: Arc<RwLock<HashSet<(uuid::Uuid, uuid::Uuid)>>>,
     pub technical_logs: Arc<dyn TechnicalLogService>,
     #[cfg(feature = "postgres")]
@@ -113,6 +115,8 @@ impl AppState {
             ai_step_up: AiStepUpRateLimiter::default(),
             data_files: None,
             attachment_root: None,
+            ui_root: None,
+            runtime_compatibility_verified: false,
             admin_private_views: Arc::new(RwLock::new(HashSet::new())),
             technical_logs: Arc::new(DisabledTechnicalLogService),
             #[cfg(feature = "postgres")]
@@ -137,6 +141,12 @@ impl AppState {
     ) -> Self {
         self.data_files = Some(Arc::new(files));
         self.attachment_root = Some(Arc::new(attachment_root.into()));
+        self
+    }
+
+    pub fn with_runtime_compatibility(mut self, ui_root: Option<PathBuf>) -> Self {
+        self.ui_root = ui_root.map(Arc::new);
+        self.runtime_compatibility_verified = true;
         self
     }
 

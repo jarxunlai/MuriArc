@@ -114,7 +114,17 @@ pub struct ProvenanceFilter {
 /// write and its audit entry in one database transaction.
 #[async_trait]
 pub trait MuriArcStore: crate::WorkspaceStore + crate::AiOperationStore + Send + Sync {
+    /// Upgrade-control-plane primitive. Long-lived Server/Desktop startup code
+    /// must call `compatibility_report` and must never call this method.
     async fn migrate(&self) -> StoreResult<()>;
+    async fn adopt_current_release(
+        &self,
+        generation_id: Uuid,
+    ) -> StoreResult<crate::DeploymentState>;
+    async fn compatibility_report(&self) -> StoreResult<crate::CompatibilityReport>;
+    async fn persistent_recovery_inventory(
+        &self,
+    ) -> StoreResult<crate::PersistentRecoveryInventory>;
     async fn health_check(&self) -> StoreResult<()>;
 
     async fn create_lab(&self, lab: &Lab, audit: &AuditContext) -> StoreResult<()>;

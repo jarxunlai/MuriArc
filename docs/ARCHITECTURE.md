@@ -153,6 +153,10 @@ Environment Root 不是新增的领域角色枚举，而是“配置声明的唯
 
 ## Deployment
 
+升级不是 Server 子命令。长期运行进程只有业务权限；独立控制面拥有备份、DDL、Candidate 和
+切换权限。两套数据库共享强类型 ReleaseIdentity、Persistent Data Registry 和兼容报告，细节见
+[UPGRADE_COMPATIBILITY.md](UPGRADE_COMPATIBILITY.md)。
+
 - Desktop：Windows Tauri WebView 安装包为正式本地交付目标；SQLite、附件、数据产物和非敏感 AI 配置位于同一个 active data root（默认是 OS application data，可由用户选择本机固定磁盘上的独立空目录），密钥位于 OS keyring。Desktop 不通过 VNC/noVNC、浏览器远程桌面或 Server Docker 交付。
 - Server：PostgreSQL、附件 volume、加密 secret store；Axum 位于 HTTPS reverse proxy 后。
 - V1 不做 Local Web、本地 Axum+SQLite 浏览器服务，也不做 Desktop 与 Server 的实时同步。当前 snapshot 用于版本化完整业务归档、离线留存与

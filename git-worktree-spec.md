@@ -1,53 +1,49 @@
-# Feature Spec: 基因鉴定批次与胶图证据
+# Feature Spec: MuriArc 永久数据兼容基础
 
-> 此分支实现用户确认的批量基因鉴定录入：表格结果、批次元数据与多张胶图共同绑定并可追溯。
+> 此分支建立 1.0 前必须冻结的兼容契约；升级控制器、交付 Driver 与历史 Fixture 在后续分支实现。
 
 ## 分支信息
 
 | 项目 | 值 |
 |---|---|
-| 分支名称 | `feature/genotyping-batch-evidence` |
-| 基于提交 | `main@552dc0324f4c1d9bd70251854849294eb606f4d6` |
-| Worktree 路径 | `/home/ljx/Github/animal_lab-genotyping-batch-evidence` |
-| 建立日期 | `2026-07-25` |
+| 分支名称 | `feature/server-upgrade-data-compatibility` |
+| 基于提交 | `origin/main@ce223d819129de2d9fad6cbee2a691304c97a53d` |
+| Worktree 路径 | `/home/ljx/Github/animal_lab-server-upgrade-data-compatibility` |
+| 建立日期 | `2026-07-26` |
 
 ## 目标
 
-在“动物数据”中新增独立的基因鉴定批次工作流。用户可一次选择鉴定结果表格和一张或多张胶图，
-预览动物/基因型结果与证据文件，确认后形成正式批次；每条 Genetics v2 `GenotypingRecord`、
-原始胶图 Attachment、操作者、时间、hash、Audit 与 Provenance 均能从批次追溯。
+从 `preview_epoch_0` 建立可验证的版本、Epoch、Backend State、Gateway Contract、Generation、
+Persistent Data Registry 和 migration checksum 基础，使 Server/Desktop 普通启动能够拒绝错误
+数据库、缺失 generation、密钥或附件恢复集合，而不再静默把旧库原地改造成最新版。
 
 ## 实现范围
 
-- [x] 建立 `GenotypingBatch` 领域聚合及草稿/已提交生命周期，记录实验室、可选项目、批次编号、鉴定时间、方法、备注、创建者和 revision。
-- [x] 使用 `genotyping_batch_records` 显式关系表关联批次与既有 `GenotypingRecord`，并保证已提交批次、记录、附件关系、AnimalEvent、Audit 与 Provenance 由 Store adapter 原子确认。
-- [x] 增加 SQLite/PostgreSQL 纯向前迁移、Store port、两套 adapter 和共享 contract tests；扩展 snapshot。
-- [x] 增加 Server REST 与 Tauri commands：创建/读取/列出批次、上传/列出胶图证据、预览结果表格、确认或取消草稿。
-- [x] 在“动物数据”增加“动物登记 / 基因鉴定批次”入口；支持 CSV/XLSX、批次元数据、多图选择、缩略预览、映射/校验、确认收据和最近批次。
-- [x] 在动物档案的基因型记录中展示批次来源，并可回到批次查看胶图证据。
-- [x] 更新架构、安全、迁移与普通导入边界文档。
-- [x] 完成任务相关 Rust、UI、Store 与合成浏览器工作流验证。
-- [x] 从干净 feature commit 重建本机可人工使用的 Server 标准服务，并通过标准数据与部署核验。
-- [ ] 合并前使用独立 run-id 执行完整正式验收；本分支的可复用标准服务不替代独立 `all` 验收。
+- [x] 建立应用版本、Data Epoch、Backend State Digest、Gateway revision 和只追加 Release Catalog。
+- [x] 建立代码化 Persistent Data Registry、M0-M3/UI 影响分类和未知值保留 decoder。
+- [x] 为 SQLite/PostgreSQL 增加 deployment state、generation、upgrade operation、write lease 和首次写入标记。
+- [x] 为两套 Store 增加 compiled/applied migration 精确核对、generation adoption 和恢复集合 inventory。
+- [x] Server/Desktop 普通启动改为 fail-closed 核对；仅保留显式预发布 bootstrap 入口。
+- [x] 已有密文但 Master Key 缺失、已有附件但根目录缺失、generation manifest 不一致时阻断。
+- [x] 建立 migration checksum 清单与门禁，补充双后端兼容 contract tests。
+- [x] 更新架构、安全、迁移和 1.0 兼容契约文档。
 
 ## 验收标准
 
-- 用户能在同一工作流选择一份鉴定结果表格和多张胶图；确认前可删除或替换任一证据。
-- 表格至少包含动物业务编号和检测状态，基因型定义、鉴定时间与方法由批次元数据统一指定；系统拒绝不存在/不可见动物、未知定义、重复动物和跨实验室引用。
-- 确认成功后关系表把全部检测记录关联到同一批次，批次能列出全部记录与胶图；胶图保存文件名、MIME、大小、SHA-256 和版本。
-- 确认失败不会产生部分 GenotypingRecord；草稿及已上传证据保持可恢复或可取消，不伪装成正式结果。
-- Server 与 Desktop 语义一致；Editor 只能在项目范围读取，AnimalManager/LabAdmin 才能创建实验室级鉴定批次。
-- 所有正式写入包含 actor/source/revision/Audit/Provenance，删除或更正不覆盖历史事实。
+- 未执行升级控制面的普通进程不能修改 schema 或 deployment identity。
+- migration 被修改、缺少或额外出现时，兼容核对必须失败并给出稳定问题 code。
+- 数据库 generation 与 data-root manifest 不一致时，Server/Desktop 不开放业务入口。
+- 有 AI 密文却没有正确 Master Key、或有附件 metadata 却没有附件目录时不能生成替代状态。
+- SQLite/PostgreSQL 使用同一核心兼容类型和相同判定语义。
 
 ## 技术约束
 
-- `core` 不依赖 Tauri、Axum、SQLx 或 Provider；入口保持薄。
-- 不把胶图 Base64、路径、密钥或真实动物数据写入日志、审计、测试 fixture 或 Git。
-- 不用通用 EAV、任意 SQL 或前端多次写入模拟事务。
-- Genetics v2 是正式事实源；旧自由文本 `Genotype` 不作为批次结果写入目标。
-- Attachment 内容与数据库 metadata 继续使用现有安全检查、hash 与私有文件库。
-- SQLite/PostgreSQL adapter 必须通过同一 Store contract。
+- `core` 不依赖 Tauri、Axum、SQLx 或 Provider；Store adapter 负责读取各自 migration ledger。
+- migration 只追加；既有 SQL 由仓库内 checksum manifest 保护。
+- 不把数据库、附件、密钥、真实用户数据或恢复点加入 Git。
+- 兼容失败必须 fail closed；不得提供跳过备份、校验、Epoch 或 Digest 的普通 force 参数。
 
 ## 跨分支备注
 
-单一纵向 feature，无跨分支依赖。合并前应重新基于最新 main 验证迁移编号与 UI 冲突。
+本分支先合并。`feature/upgrade-engine-control-plane` 与 `feature/release-fixtures-gates`
+以这里的公共类型和数据库状态表为基础；交付、Desktop 与 Cloudflare 分支不得复制兼容判定。

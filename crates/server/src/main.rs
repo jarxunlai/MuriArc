@@ -11,7 +11,8 @@ use std::{
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Duration;
 use muriarc_core::{
-    AiModelProfileStore, AiOperationStore, AiScope, LabRole, MuriArcStore, WriteSource,
+    AiModelProfileStore, AiOperationStore, AiScope, LabRole, MuriArcStore,
+    PersistentRecoveryInventory, WriteSource,
 };
 use muriarc_data::{AttachmentFiles, DataFiles, cleanup_expired_ai_conversation_sources};
 use muriarc_server::{
@@ -26,6 +27,8 @@ use rand::{RngCore, rngs::OsRng};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+mod runtime_compatibility;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -42,8 +45,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .parse::<SocketAddr>()?;
     let server_lab_id = required_env("MURIARC_LAB_ID")?.parse::<Uuid>()?;
 
+    let data_root = PathBuf::from(required_env("MURIARC_DATA_ROOT")?);
+    let attachment_root = PathBuf::from(required_env("MURIARC_ATTACHMENT_ROOT")?);
     let store = Arc::new(PostgresStore::connect(&database_url).await?);
-    store.migrate().await?;
+    let runtime =
+        runtime_compatibility::prepare_server_runtime(store.as_ref(), &data_root, &attachment_root)
+            .await?;
 
     let root_config = environment_root_config(server_lab_id)?;
     let root_outcome = sync_postgres_environment_root(store.as_ref(), &root_config).await?;
@@ -94,19 +101,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .with_technical_logs(Arc::new(PostgresTechnicalLogService::new(
         store.as_ref().clone(),
     )));
-    let data_root = PathBuf::from(required_env("MURIARC_DATA_ROOT")?);
-    let attachment_root = PathBuf::from(required_env("MURIARC_ATTACHMENT_ROOT")?);
-    tokio::fs::create_dir_all(&data_root).await?;
-    tokio::fs::create_dir_all(&attachment_root).await?;
-    let state = configure_ai(state, store.clone(), &data_root).await?;
+    let state = configure_ai(
+        state,
+        store.clone(),
+        &data_root,
+        &runtime.recovery_inventory,
+    )
+    .await?;
     let state = state.with_data_storage(DataFiles::new(data_root), attachment_root.clone());
     let cleanup_store: Arc<dyn MuriArcStore> = store.clone();
     let _ai_source_cleanup = spawn_ai_source_cleanup(cleanup_store, server_lab_id, attachment_root);
-    let listener = tokio::net::TcpListener::bind(bind_address).await?;
     let ui_dir = env::var_os("MURIARC_UI_DIR").map(PathBuf::from);
     if ui_dir.is_none() {
         tracing::warn!("MURIARC_UI_DIR is not set; shared Web UI will not be served");
     }
+    let state = state.with_runtime_compatibility(ui_dir.clone());
+    let listener = tokio::net::TcpListener::bind(bind_address).await?;
 
     tracing::info!(address = %bind_address, "MuriArc server listening");
     axum::serve(listener, application_router(state, ui_dir)).await?;
@@ -158,6 +168,7 @@ async fn configure_ai(
     state: AppState,
     store: Arc<PostgresStore>,
     data_root: &Path,
+    recovery_inventory: &PersistentRecoveryInventory,
 ) -> Result<AppState, Box<dyn Error>> {
     let encoded_key = match optional_secret_env("MURIARC_AI_MASTER_KEY")? {
         Some(value) => Zeroizing::new(value),
@@ -165,7 +176,10 @@ async fn configure_ai(
             let path = env::var_os("MURIARC_AI_MASTER_KEY_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| data_root.join("secrets/ai-master-key"));
-            Zeroizing::new(load_or_create_ai_master_key_file(&path)?)
+            Zeroizing::new(load_or_create_ai_master_key_file(
+                &path,
+                recovery_inventory.encrypted_secret_records == 0,
+            )?)
         }
     };
     let key_version = optional_positive_i32_env("MURIARC_AI_MASTER_KEY_VERSION", 1)?;
@@ -174,25 +188,34 @@ async fn configure_ai(
         store.as_ref().clone(),
         master_key,
     ));
-    let migrated_profile_secrets = providers.migrate_legacy_profile_secrets().await?;
     let operations: Arc<dyn AiOperationStore> = store.clone();
     let model_profiles: Arc<dyn AiModelProfileStore> = store;
     tracing::info!(
         key_version,
-        migrated_profile_secrets,
-        "shared AI runtime is enabled with profile-bound encrypted credentials"
+        "shared AI runtime is enabled with profile-bound encrypted credentials; startup performed no data migration"
     );
     Ok(state.with_ai(operations, model_profiles, providers))
 }
 
-fn load_or_create_ai_master_key_file(path: &Path) -> Result<String, Box<dyn Error>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+fn load_or_create_ai_master_key_file(
+    path: &Path,
+    allow_create: bool,
+) -> Result<String, Box<dyn Error>> {
     match fs::read_to_string(path) {
         Ok(value) => return validated_master_key_file(value),
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) if error.kind() == ErrorKind::NotFound && allow_create => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(format!(
+                "AI ciphertext exists but the deployment Master Key is missing: {}",
+                path.display()
+            )
+            .into());
+        }
         Err(error) => return Err(error.into()),
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
 
     let mut bytes = [0_u8; 32];
@@ -361,8 +384,8 @@ mod ai_runtime_tests {
     fn generated_master_key_is_stable_across_restarts() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("secrets/ai-master-key");
-        let first = load_or_create_ai_master_key_file(&path).unwrap();
-        let second = load_or_create_ai_master_key_file(&path).unwrap();
+        let first = load_or_create_ai_master_key_file(&path, true).unwrap();
+        let second = load_or_create_ai_master_key_file(&path, true).unwrap();
         assert_eq!(first, second);
         assert_eq!(general_purpose::STANDARD.decode(first).unwrap().len(), 32);
     }

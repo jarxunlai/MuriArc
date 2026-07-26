@@ -51,14 +51,17 @@ download a model, or call an external Provider until a user has saved their own
 API key. A new user sees the enabled DeepSeek preset and the stable
 `waiting_for_personal_api_key` state rather than a runtime failure.
 
-On first start, when `MURIARC_AI_MASTER_KEY` is blank or absent, Server creates a
-stable random 32-byte Base64 key at
+On a genuinely empty deployment, when `MURIARC_AI_MASTER_KEY` is blank or absent,
+Server may create a stable random 32-byte Base64 key at
 `MURIARC_AI_MASTER_KEY_FILE` (default:
 `MURIARC_DATA_ROOT/secrets/ai-master-key`). The Compose deployment pins that file
 to `/var/lib/muriarc/secrets/ai-master-key` inside the persistent `server_data`
-volume. Back up this file together with deployment secrets. Subsequent starts
-reuse it; an invalid file or an unwritable secrets directory fails startup
-instead of falling back to plaintext or silently replacing the key.
+volume. Back up this file in the same recovery set as PostgreSQL, attachments,
+configuration and the generation manifest. Subsequent starts reuse it. If the
+database already contains encrypted credentials but neither the environment nor
+the configured key file provides the original key, startup fails closed and never
+generates a replacement. An invalid file or an unwritable secrets directory also
+fails startup instead of falling back to plaintext or silently replacing the key.
 
 Operators may instead inject a stable key explicitly:
 

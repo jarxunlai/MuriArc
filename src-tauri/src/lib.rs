@@ -13,6 +13,7 @@ mod data;
 mod genotyping_batches;
 mod model_profiles;
 mod research_extensions;
+mod runtime_compatibility;
 mod settings;
 mod storage_root;
 
@@ -1484,6 +1485,10 @@ pub fn run() {
             ))?;
             let active_data_root = storage_state.active_root().to_path_buf();
             let database_path = active_data_root.join("muriarc.sqlite3");
+            tauri::async_runtime::block_on(runtime_compatibility::prepare_desktop_runtime(
+                &database_path,
+                &active_data_root,
+            ))?;
             let settings = SettingsService::for_app_data(&active_data_root);
             let state = tauri::async_runtime::block_on(DesktopState::initialize_with_settings(
                 &database_path,

@@ -1,6 +1,7 @@
 mod ai_models;
 mod ai_operations;
 mod genotyping_batches;
+mod upgrade_compatibility;
 mod workspace;
 
 use std::{
@@ -79,6 +80,10 @@ impl SqliteStore {
 
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    pub fn from_pool(pool: SqlitePool) -> Self {
+        Self { pool }
     }
 }
 
@@ -1729,7 +1734,20 @@ impl MuriArcStore for SqliteStore {
         MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|error| StoreError::Database(error.to_string()))
+            .map_err(|error| StoreError::Database(error.to_string()))?;
+        upgrade_compatibility::ensure_adopted_after_control_plane_migration(&self.pool).await
+    }
+
+    async fn adopt_current_release(&self, generation_id: Uuid) -> StoreResult<DeploymentState> {
+        upgrade_compatibility::adopt_current_release(&self.pool, generation_id).await
+    }
+
+    async fn compatibility_report(&self) -> StoreResult<CompatibilityReport> {
+        upgrade_compatibility::compatibility_report(&self.pool).await
+    }
+
+    async fn persistent_recovery_inventory(&self) -> StoreResult<PersistentRecoveryInventory> {
+        upgrade_compatibility::persistent_recovery_inventory(&self.pool).await
     }
 
     async fn health_check(&self) -> StoreResult<()> {

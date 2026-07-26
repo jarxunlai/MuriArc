@@ -40,7 +40,7 @@ use axum::{
         DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
-    http::{Method, StatusCode, request::Parts},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header::CACHE_CONTROL, request::Parts},
     middleware::{self, Next},
     response::IntoResponse,
     routing::get,
@@ -161,14 +161,42 @@ fn base_router(state: AppState) -> Router {
         .route("/api/v1/livez", get(livez))
         .route("/api/v1/readyz", get(readyz))
         .route("/api/v1/compatibility", get(compatibility_health))
+        .route("/api/v1/runtime/capabilities", get(runtime_capabilities))
         .nest("/api/v1", api_v1);
 
-    api.merge(mcp::router(state.clone()))
+    let api = if state.deployment_security.external_api().enabled() {
+        api.merge(mcp::router(state.clone()))
+    } else {
+        api
+    };
+    api.layer(middleware::from_fn(disable_shared_cache))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             enforce_runtime_access_mode,
         ))
         .with_state(state)
+}
+
+async fn runtime_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<ItemResponse<crate::RuntimeCapabilities>> {
+    let metadata = crate::auth::request_metadata(&headers);
+    item(state.deployment_security.capabilities(), &metadata)
+}
+
+async fn disable_shared_cache(request: Request, next: Next) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    if !response.headers().contains_key(CACHE_CONTROL) {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    }
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("pragma"),
+        HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 async fn fallback() -> ApiError {

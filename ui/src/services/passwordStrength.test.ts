@@ -18,4 +18,10 @@ describe('password advice and acceptance boundary', () => {
     expect(passwordByteCount(oversized)).toBe(1026)
     expect(passwordPolicyError(oversized)).toContain('1024 字节')
   })
+
+  it('accepts the runtime minimum without adding character-composition rules', () => {
+    expect(passwordPolicyError('12345678901234', 15)).toContain('15 个字符')
+    expect(passwordPolicyError('纯中文密码也可以满足十五个字符长度要求', 15)).toBeUndefined()
+    expect(passwordStrength('123456789012345', 15).level).toBe('weak')
+  })
 })

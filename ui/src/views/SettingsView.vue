@@ -20,7 +20,7 @@ import {
   Users,
 } from '@lucide/vue'
 import { branding } from '@/branding'
-import { currentAuthSession, gateway } from '@/services/gateway'
+import { currentAuthSession, currentRuntimeCapabilities, gateway } from '@/services/gateway'
 import type {
   DesktopUpdateStatus,
   LocalStorageSelection,
@@ -67,7 +67,8 @@ const accountIsEnvironmentRoot = computed(() => accountUser.value?.isEnvironment
 const accountAvailable = gateway.mode === 'remote'
   && typeof gateway.updateProfile === 'function'
   && typeof gateway.changePassword === 'function'
-const accountPasswordStrength = computed(() => passwordStrength(newPassword.value))
+const passwordMinChars = computed(() => currentRuntimeCapabilities.value.passwordMinChars)
+const accountPasswordStrength = computed(() => passwordStrength(newPassword.value, passwordMinChars.value))
 const canManageWorkspace = typeof gateway.getWorkspaceSettings === 'function'
   && typeof gateway.saveWorkspaceSettings === 'function'
 const localStorageAvailable = gateway.mode === 'local'
@@ -175,7 +176,7 @@ function clearAccountPasswords() {
 
 async function changeAccountPassword() {
   if (!gateway.changePassword || changingPassword.value || accountIsEnvironmentRoot.value) return
-  const validation = passwordPolicyError(newPassword.value)
+  const validation = passwordPolicyError(newPassword.value, passwordMinChars.value)
   if (!currentPassword.value) {
     message.warning('请输入当前密码')
     clearAccountPasswords()
@@ -423,7 +424,7 @@ onMounted(() => {
             </n-form>
             <n-button type="primary" :loading="savingProfile" @click="saveProfile"><template #icon><Save :size="16" /></template>保存显示名称</n-button>
 
-            <div class="subsection-heading password-heading"><h3>修改密码</h3><p>只要求至少 8 个字符且不含控制字符；强度等级仅为建议。</p></div>
+            <div class="subsection-heading password-heading"><h3>修改密码</h3><p>只要求至少 {{ passwordMinChars }} 个字符且不含控制字符；强度等级仅为建议。</p></div>
             <n-form label-placement="top" class="settings-form">
               <n-form-item label="当前密码"><n-input v-model:value="currentPassword" type="password" show-password-on="click" :input-props="{ autocomplete: 'current-password' }" /></n-form-item>
               <n-form-item label="新密码"><n-input v-model:value="newPassword" type="password" show-password-on="click" maxlength="1024" :input-props="{ autocomplete: 'new-password' }" /></n-form-item>

@@ -113,6 +113,9 @@ Server 每次启动在单事务中核对身份、LabAdmin membership 与凭据�
 迁移规则见 [docs/MIGRATION.md](docs/MIGRATION.md)，安全边界见 [docs/SECURITY.md](docs/SECURITY.md)，共享版部署见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)，接口与逐步验收见 [docs/DELIVERY_ACCEPTANCE.md](docs/DELIVERY_ACCEPTANCE.md)。
 从正式版 1.0 开始的永久数据兼容、Generation、Write Lease 与 fail-closed 启动契约见
 [docs/UPGRADE_COMPATIBILITY.md](docs/UPGRADE_COMPATIBILITY.md)。
+公网 Server 只允许通过独立宿主机 Cloudflare Tunnel 暴露；无 MFA Profile 的补偿控制、
+95 MiB 限制和剩余风险见
+[docs/CLOUDFLARE_PUBLIC_PROFILE.md](docs/CLOUDFLARE_PUBLIC_PROFILE.md)。
 
 ## 当前状态
 

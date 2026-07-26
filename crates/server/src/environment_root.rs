@@ -8,12 +8,13 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::{hash_password, persistent_auth::verify_password};
+use crate::{
+    CredentialPolicy,
+    persistent_auth::{hash_password_with_policy, verify_password},
+};
 
 const ROOT_LOCK_ID: i64 = 5_568_604_466_432_177_475;
 const ROOT_REQUEST_ID: &str = "environment-root-sync";
-const PASSWORD_MIN_CHARS: usize = 8;
-const PASSWORD_MAX_BYTES: usize = 1024;
 
 pub struct EnvironmentRootConfig {
     pub lab_id: Uuid,
@@ -22,6 +23,7 @@ pub struct EnvironmentRootConfig {
     pub user_email: String,
     pub user_display_name: String,
     password: Zeroizing<String>,
+    credential_policy: CredentialPolicy,
 }
 
 impl fmt::Debug for EnvironmentRootConfig {
@@ -34,6 +36,7 @@ impl fmt::Debug for EnvironmentRootConfig {
             .field("user_email", &self.user_email)
             .field("user_display_name", &self.user_display_name)
             .field("password", &"[REDACTED]")
+            .field("credential_policy", &self.credential_policy)
             .finish()
     }
 }
@@ -46,6 +49,26 @@ impl EnvironmentRootConfig {
         user_email: impl Into<String>,
         user_display_name: impl Into<String>,
         password: impl Into<String>,
+    ) -> Result<Self, EnvironmentRootError> {
+        Self::new_with_policy(
+            lab_id,
+            lab_name,
+            user_id,
+            user_email,
+            user_display_name,
+            password,
+            CredentialPolicy::private(),
+        )
+    }
+
+    pub fn new_with_policy(
+        lab_id: Uuid,
+        lab_name: impl Into<String>,
+        user_id: Uuid,
+        user_email: impl Into<String>,
+        user_display_name: impl Into<String>,
+        password: impl Into<String>,
+        credential_policy: CredentialPolicy,
     ) -> Result<Self, EnvironmentRootError> {
         let lab_name = clean_text("lab name", lab_name.into(), 200)?;
         let user_email = clean_text("root email", user_email.into(), 320)?.to_ascii_lowercase();
@@ -61,13 +84,11 @@ impl EnvironmentRootConfig {
                 "root user UUID must differ from the lab UUID".to_owned(),
             ));
         }
-        if password.chars().count() < PASSWORD_MIN_CHARS
-            || password.len() > PASSWORD_MAX_BYTES
-            || password.chars().any(char::is_control)
-        {
-            return Err(EnvironmentRootError::InvalidConfig(
-                "root password must contain 8-1024 non-control characters".to_owned(),
-            ));
+        if !credential_policy.accepts(&password) {
+            return Err(EnvironmentRootError::InvalidConfig(format!(
+                "root password must contain {}-1024 non-control characters",
+                credential_policy.min_chars()
+            )));
         }
         Ok(Self {
             lab_id,
@@ -76,6 +97,7 @@ impl EnvironmentRootConfig {
             user_email,
             user_display_name,
             password: Zeroizing::new(password),
+            credential_policy,
         })
     }
 
@@ -451,7 +473,7 @@ async fn sync_credential(
     outcome: &mut EnvironmentRootOutcome,
 ) -> Result<(), EnvironmentRootError> {
     let row = sqlx::query(
-        "SELECT password_hash, must_change_password, revision FROM user_credentials WHERE user_id = $1 FOR UPDATE",
+        "SELECT password_hash, password_changed_at, must_change_password, credential_policy_revision, revision FROM user_credentials WHERE user_id = $1 FOR UPDATE",
     )
     .bind(config.user_id)
     .fetch_optional(&mut **tx)
@@ -461,17 +483,22 @@ async fn sync_credential(
     let mut revoke_sessions = outcome.user_updated;
     match row {
         None => {
-            let password_hash = hash_password(config.password()).map_err(|_| {
+            let password_hash = hash_password_with_policy(
+                config.password(),
+                config.credential_policy,
+            )
+            .map_err(|_| {
                 EnvironmentRootError::InvalidConfig(
                     "root password does not satisfy the configured password policy".to_owned(),
                 )
             })?;
             sqlx::query(
-                "INSERT INTO user_credentials (user_id, password_hash, created_at, password_changed_at, must_change_password, revision) VALUES ($1, $2, $3, $3, FALSE, 1)",
+                "INSERT INTO user_credentials (user_id, password_hash, created_at, password_changed_at, must_change_password, credential_policy_revision, revision) VALUES ($1, $2, $3, $3, FALSE, $4, 1)",
             )
             .bind(config.user_id)
             .bind(password_hash)
             .bind(now)
+            .bind(config.credential_policy.revision())
             .execute(&mut **tx)
             .await
             .map_err(database)?;
@@ -483,9 +510,12 @@ async fn sync_credential(
                 "create",
                 "auth.environment_root.credential.created",
                 None,
-                Some(
-                    json!({"algorithm": "argon2id", "must_change_password": false, "revision": 1}),
-                ),
+                Some(json!({
+                    "algorithm": "argon2id",
+                    "must_change_password": false,
+                    "credential_policy_revision": config.credential_policy.revision(),
+                    "revision": 1
+                })),
                 Some(&config.user_display_name),
                 Some(1),
                 now,
@@ -496,7 +526,12 @@ async fn sync_credential(
         }
         Some(row) => {
             let password_hash: String = row.try_get("password_hash").map_err(database)?;
+            let password_changed_at: DateTime<Utc> =
+                row.try_get("password_changed_at").map_err(database)?;
             let must_change: bool = row.try_get("must_change_password").map_err(database)?;
+            let credential_policy_revision: i32 = row
+                .try_get("credential_policy_revision")
+                .map_err(database)?;
             let revision: i64 = row.try_get("revision").map_err(database)?;
             let password_matches = verify_password(&password_hash, config.password().as_bytes())
                 .map_err(|_| {
@@ -504,24 +539,37 @@ async fn sync_credential(
                         "configured root credential contains an unsupported hash".to_owned(),
                     )
                 })?;
-            if !password_matches || must_change {
+            if !password_matches
+                || must_change
+                || credential_policy_revision < config.credential_policy.revision()
+            {
                 let next_revision = revision + 1;
                 let next_hash = if password_matches {
                     password_hash
                 } else {
-                    hash_password(config.password()).map_err(|_| {
-                        EnvironmentRootError::InvalidConfig(
-                            "root password does not satisfy the configured password policy"
-                                .to_owned(),
-                        )
-                    })?
+                    hash_password_with_policy(config.password(), config.credential_policy).map_err(
+                        |_| {
+                            EnvironmentRootError::InvalidConfig(
+                                "root password does not satisfy the configured password policy"
+                                    .to_owned(),
+                            )
+                        },
+                    )?
+                };
+                // Updating the policy revision changes how the existing
+                // credential is interpreted, not when the password changed.
+                let next_password_changed_at = if password_matches {
+                    password_changed_at
+                } else {
+                    now
                 };
                 sqlx::query(
-                    "UPDATE user_credentials SET password_hash = $2, password_changed_at = $3, must_change_password = FALSE, revision = $4 WHERE user_id = $1 AND revision = $5",
+                    "UPDATE user_credentials SET password_hash = $2, password_changed_at = $3, must_change_password = FALSE, credential_policy_revision = $4, revision = $5 WHERE user_id = $1 AND revision = $6",
                 )
                 .bind(config.user_id)
                 .bind(next_hash)
-                .bind(now)
+                .bind(next_password_changed_at)
+                .bind(config.credential_policy.revision())
                 .bind(next_revision)
                 .bind(revision)
                 .execute(&mut **tx)
@@ -534,10 +582,15 @@ async fn sync_credential(
                     config.user_id,
                     "update",
                     "auth.environment_root.credential.updated",
-                    Some(json!({"must_change_password": must_change, "revision": revision})),
+                    Some(json!({
+                        "must_change_password": must_change,
+                        "credential_policy_revision": credential_policy_revision,
+                        "revision": revision
+                    })),
                     Some(json!({
                         "algorithm": "argon2id",
                         "must_change_password": false,
+                        "credential_policy_revision": config.credential_policy.revision(),
                         "revision": next_revision
                     })),
                     Some(&config.user_display_name),
@@ -686,6 +739,67 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn policy_only_root_reconciliation_preserves_password_change_time() {
+        use chrono::TimeZone;
+
+        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            return;
+        };
+        assert!(database_url.contains("muriarc_test"));
+        let store = PostgresStore::connect(&database_url).await.unwrap();
+        muriarc_core::MuriArcStore::migrate(&store).await.unwrap();
+
+        let lab_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let email = format!("policy-root-{}@example.org", Uuid::new_v4());
+        let password = format!("policy-root-password-{}", Uuid::new_v4());
+        let private = EnvironmentRootConfig::new(
+            lab_id,
+            "Policy root lab",
+            user_id,
+            &email,
+            "Policy Root",
+            &password,
+        )
+        .unwrap();
+        sync_postgres_environment_root(&store, &private)
+            .await
+            .unwrap();
+
+        let original_changed_at = Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
+        sqlx::query("UPDATE user_credentials SET password_changed_at = $2 WHERE user_id = $1")
+            .bind(user_id)
+            .bind(original_changed_at)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let public = EnvironmentRootConfig::new_with_policy(
+            lab_id,
+            "Policy root lab",
+            user_id,
+            &email,
+            "Policy Root",
+            &password,
+            CredentialPolicy::cloudflare_public(),
+        )
+        .unwrap();
+        let outcome = sync_postgres_environment_root(&store, &public)
+            .await
+            .unwrap();
+        assert!(outcome.credential_updated);
+
+        let credential: (DateTime<Utc>, i32) = sqlx::query_as(
+            "SELECT password_changed_at, credential_policy_revision FROM user_credentials WHERE user_id = $1",
+        )
+        .bind(user_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(credential, (original_changed_at, 2));
     }
 
     #[tokio::test]

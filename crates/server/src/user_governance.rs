@@ -14,8 +14,9 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    AuthPrincipal, AuthenticationMethod, PostgresAiProviderStore, RequestMetadata, hash_password,
-    persistent_auth::verify_password,
+    AuthPrincipal, AuthenticationMethod, CredentialPolicy, PostgresAiProviderStore,
+    RequestMetadata,
+    persistent_auth::{hash_password_with_policy, verify_password},
 };
 
 const GOVERNANCE_LOCK_ID: i64 = 5_568_604_466_432_177_474;
@@ -174,14 +175,30 @@ pub struct PostgresUserGovernance {
     postgres: PostgresStore,
     lab_id: Uuid,
     environment_root_user_id: Uuid,
+    credential_policy: CredentialPolicy,
 }
 
 impl PostgresUserGovernance {
     pub fn new(postgres: PostgresStore, lab_id: Uuid, environment_root_user_id: Uuid) -> Self {
+        Self::new_with_policy(
+            postgres,
+            lab_id,
+            environment_root_user_id,
+            CredentialPolicy::private(),
+        )
+    }
+
+    pub fn new_with_policy(
+        postgres: PostgresStore,
+        lab_id: Uuid,
+        environment_root_user_id: Uuid,
+        credential_policy: CredentialPolicy,
+    ) -> Self {
         Self {
             postgres,
             lab_id,
             environment_root_user_id,
+            credential_policy,
         }
     }
 
@@ -235,10 +252,16 @@ impl PostgresUserGovernance {
         let user = User::new(self.lab_id, command.email, command.display_name, now)
             .map_err(|error| UserGovernanceError::Validation(error.to_string()))?;
         validate_email(&user.email)?;
-        let password_hash = hash_password(command.temporary_password.expose()).map_err(|_| {
+        let password_hash = hash_password_with_policy(
+            command.temporary_password.expose(),
+            self.credential_policy,
+        )
+        .map_err(|_| {
             UserGovernanceError::Validation(
-                "temporary password must contain at least 8 non-control characters and at most 1024 bytes"
-                    .to_owned(),
+                format!(
+                    "temporary password must contain at least {} non-control characters and at most 1024 bytes",
+                    self.credential_policy.min_chars()
+                ),
             )
         })?;
 
@@ -276,11 +299,12 @@ impl PostgresUserGovernance {
         .await?;
 
         sqlx::query(
-            "INSERT INTO user_credentials (user_id, password_hash, created_at, password_changed_at, must_change_password, revision) VALUES ($1, $2, $3, $3, TRUE, 1)",
+            "INSERT INTO user_credentials (user_id, password_hash, created_at, password_changed_at, must_change_password, credential_policy_revision, revision) VALUES ($1, $2, $3, $3, TRUE, $4, 1)",
         )
         .bind(user.id)
         .bind(&password_hash)
         .bind(now)
+        .bind(self.credential_policy.revision())
         .execute(&mut *transaction)
         .await
         .map_err(conflict_or_database)?;
@@ -297,6 +321,7 @@ impl PostgresUserGovernance {
                 "algorithm": "argon2id",
                 "created_at": now,
                 "must_change_password": true,
+                "credential_policy_revision": self.credential_policy.revision(),
                 "revision": 1
             })),
             now,
@@ -509,10 +534,16 @@ impl PostgresUserGovernance {
         temporary_password: SensitivePassword,
     ) -> Result<ManagedUser, UserGovernanceError> {
         let verified = self.verify_step_up(context).await?;
-        let password_hash = hash_password(temporary_password.expose()).map_err(|_| {
+        let password_hash = hash_password_with_policy(
+            temporary_password.expose(),
+            self.credential_policy,
+        )
+        .map_err(|_| {
             UserGovernanceError::Validation(
-                "temporary password must contain at least 8 non-control characters and at most 1024 bytes"
-                    .to_owned(),
+                format!(
+                    "temporary password must contain at least {} non-control characters and at most 1024 bytes",
+                    self.credential_policy.min_chars()
+                ),
             )
         })?;
         let now = Utc::now();
@@ -551,11 +582,12 @@ impl PostgresUserGovernance {
                 ));
             }
             let changed = sqlx::query(
-                "UPDATE user_credentials SET password_hash = $2, password_changed_at = $3, must_change_password = TRUE, revision = revision + 1 WHERE user_id = $1 AND revision = $4 AND password_hash = $5",
+                "UPDATE user_credentials SET password_hash = $2, password_changed_at = $3, must_change_password = TRUE, credential_policy_revision = $4, revision = revision + 1 WHERE user_id = $1 AND revision = $5 AND password_hash = $6",
             )
             .bind(user_id)
             .bind(&password_hash)
             .bind(now)
+            .bind(self.credential_policy.revision())
             .bind(expected_credential_revision)
             .bind(existing_hash)
             .execute(&mut *transaction)
@@ -576,11 +608,12 @@ impl PostgresUserGovernance {
         } else {
             ensure_revision(0, expected_credential_revision, "credential")?;
             sqlx::query(
-                "INSERT INTO user_credentials (user_id, password_hash, created_at, password_changed_at, must_change_password, revision) VALUES ($1, $2, $3, $3, TRUE, 1)",
+                "INSERT INTO user_credentials (user_id, password_hash, created_at, password_changed_at, must_change_password, credential_policy_revision, revision) VALUES ($1, $2, $3, $3, TRUE, $4, 1)",
             )
             .bind(user_id)
             .bind(&password_hash)
             .bind(now)
+            .bind(self.credential_policy.revision())
             .execute(&mut *transaction)
             .await
             .map_err(conflict_or_database)?;
@@ -597,6 +630,7 @@ impl PostgresUserGovernance {
             before,
             Some(json!({
                 "must_change_password": true,
+                "credential_policy_revision": self.credential_policy.revision(),
                 "revision": next_credential_revision,
                 "sessions_revoked": true,
                 "external_tokens_revoked": true

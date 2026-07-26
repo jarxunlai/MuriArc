@@ -94,6 +94,13 @@ CSRF 可在有效会话内安全恢复但不持久化明文，外部 token 仅�
 - 技术访问日志不记录请求体、query、密码、token、AI key 或动物业务内容。只有 Environment
   Root 可更改保留策略、预览并确认清理；清理本身必须写入不可删除的正式 Audit。
 
+## Cloudflare 公网 Profile
+
+Cloudflare Tunnel 不是应用授权替代品。公网 Profile 的 credential policy revision、HMAC 登录退避、
+external bearer/MCP 双层门禁、95 MiB capability、缓存规则和剩余风险见
+[CLOUDFLARE_PUBLIC_PROFILE.md](CLOUDFLARE_PUBLIC_PROFILE.md)。默认不信任任何代理 IP header，
+Tunnel/Access credential 不进入数据库、恢复集或 Upgrade Journal。
+
 ## Reporting
 
 请不要在公开 Issue 中提交真实动物数据、数据库、密钥或附件。安全问题应通过仓库维护者提供的私下渠道报告。

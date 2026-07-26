@@ -262,13 +262,15 @@ POST /api/v1/auth/tokens
 X-CSRF-Token: mac_...
 Content-Type: application/json
 
-{"name":"analysis-agent","scopes":["read","export"],"expires_in_days":90}
+{"name":"analysis-agent","scopes":["read","export"],"expires_in_days":90,"current_password":"..."}
 ```
 
 The response contains `data.token` once plus `data.details`. Use that value as
 `Authorization: Bearer mat_...`. `GET /api/v1/auth/tokens` lists metadata only;
-`DELETE /api/v1/auth/tokens/{id}` revokes a token. These management routes accept
-browser sessions only, and mutations require CSRF.
+`POST /api/v1/auth/tokens/{id}/revoke` with
+`{"current_password":"..."}` revokes a token. These management routes accept
+browser sessions only; token creation and revocation require current-password
+step-up as well as CSRF.
 
 `POST /mcp` accepts only bearer identities explicitly narrowed with AI scopes.
 Normal Web sessions are rejected. The first release exposes fixed read-only

@@ -492,6 +492,13 @@ pub const PERSISTENT_DATA_REGISTRY: &[PersistentDataRegistryEntry] = &[
         policy: "append-only-migrations; expand-backfill-switch-contract",
     },
     PersistentDataRegistryEntry {
+        id: "database.credential_policy_and_login_backoff",
+        kind: "security_state",
+        owner: "server-auth",
+        compatibility_floor: CURRENT_DATA_EPOCH,
+        policy: "policy-versioned; hmac-identity; generation-fenced; joint-recovery",
+    },
+    PersistentDataRegistryEntry {
         id: "database.persisted_enum_and_json",
         kind: "semantic_payloads",
         owner: "core-application-ai",

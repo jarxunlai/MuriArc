@@ -137,3 +137,9 @@ BYO PostgreSQL/存储只有在能证明以下能力时才可升级：PostgreSQL 
 每次升级产生的最后一个已验证恢复点默认不可删除；仅
 `muriarcctl recovery prune --backup <uuid>` 可清理更早的明确对象。数据库 dump、附件、Key、
 Journal 和验证报告全部保存在 Git 之外。
+
+## 7. Cloudflare 公网 Profile
+
+公网部署不得直接开放 Origin。Native 和 Managed Compose bundle 都携带独立宿主机
+`cloudflared` 模板与 Public Profile override；完整安装、安全补偿和 RC 边界见
+[CLOUDFLARE_PUBLIC_PROFILE.md](CLOUDFLARE_PUBLIC_PROFILE.md)。

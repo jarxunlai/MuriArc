@@ -1,0 +1,15 @@
+# Source tree: layer over ../managed-compose/compose.yaml. Signed bundle:
+# layer deploy/cloudflare/compose.override.yaml over deploy/compose.yaml.
+# cloudflared remains a host service; the Docker socket is never mounted here.
+services:
+  server:
+    environment:
+      MURIARC_DEPLOYMENT_PROFILE: cloudflare-public
+      MURIARC_AUTH_RATE_LIMIT_KEY_FILE: /run/secrets/muriarc_auth_rate_limit_key
+      MURIARC_EXTERNAL_API_ENABLED: "false"
+    secrets:
+      - muriarc_auth_rate_limit_key
+
+secrets:
+  muriarc_auth_rate_limit_key:
+    file: ${MURIARC_AUTH_RATE_LIMIT_KEY_FILE:?set a host path to the base64 32-byte rate-limit key}

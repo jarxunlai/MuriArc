@@ -1,56 +1,63 @@
-# Feature Spec: Desktop 安全签名更新与 Candidate generation
+# Feature Spec: Cloudflare 公网安全 Profile
 
-> 本分支实现 Windows Tauri Desktop 的签名更新和完整 SQLite/data-root Candidate 激活，不修改 Server Native/Compose 规则。
+> 本分支只实现公网暴露的补偿控制与部署模板；不改变 Upgrade Engine、Candidate generation 或正式发布签名规则。
 
 ## 分支信息
 
 | 项目 | 值 |
 |---|---|
-| 分支名称 | `feature/desktop-safe-updater` |
-| 基于提交 | `feature/native-compose-delivery@04d3449` |
-| Worktree 路径 | `/home/ljx/Github/animal_lab-desktop-safe-updater` |
+| 分支名称 | `feature/cloudflare-public-profile` |
+| 基于提交 | `feature/desktop-safe-updater@5d32501` |
+| Worktree 路径 | `/home/ljx/Github/animal_lab-cloudflare-public-profile` |
 | 建立日期 | `2026-07-27` |
 
 ## 目标
 
-Desktop 更新不得原地迁移用户唯一 SQLite 或数据目录。目标安装包必须先通过 Tauri 签名，旧 generation 完成 WAL checkpoint 和完整 Candidate 复制后，目标 Upgrade Engine 才能迁移、验证并原子切换。更新失败继续使用旧 generation；目标首次写入后禁止自动降级。
+以独立宿主机 `cloudflared` 把唯一 Web 同源域名转发到 `127.0.0.1:8787`，不公开 Origin、
+PostgreSQL 或应用端口。按产品决定不启用 Cloudflare Access/MFA，因此必须由 MuriArc 自身实施
+更强的密码策略、持久登录退避、统一错误、敏感操作密码 step-up、默认关闭的外部 bearer/MCP
+边界，以及由 Server 运行时声明的 95 MiB 附件上限。
 
 ## 实现范围
 
-- [x] 接入 Tauri updater plugin 与 fail-closed 签名配置，不允许未签名本地替换正式安装包。
-- [x] 建立 Desktop activation pointer、generation manifest、hash-chain operation Journal 与恢复点布局。
-- [x] 更新前对 SQLite 执行 WAL checkpoint，并复制 SQLite、attachments、artifacts、非敏感设置及 Keyring 引用；不复制明文 Provider API Key。
-- [x] Candidate 使用独立同卷目录和目标 migration primitive，启动恢复阶段不会运行外部 Provider、后台任务或真实用户写入。
-- [x] 目标版本验证 Candidate 的 Store/Application read surface、附件 SHA、AI 历史/secret reference、Audit inventory 和事务内继续写入后 rollback。
-- [x] 激活前失败保留旧 generation；激活采用原子 locator；首次写入后拒绝自动降级。
-- [x] 普通 Desktop 启动只核对精确 SQLite Epoch/Digest/Generation，不再隐式执行稳定版 migration。
-- [x] 跨机恢复保留 Provider profile 但因 OS Keyring 不随 data root 复制而强制重新输入 API Key。
-- [x] 增加 Rust/Windows CI、release 签名配置检查、Candidate 中断/恢复和旧数据继续写入测试。
-- [x] 更新 Desktop 交付与恢复文档。
+- [x] 新增 credential policy revision；公网 Profile 为 revision 2、最少 15 个非控制字符，
+  不要求字符组合、周期改密。
+- [x] 既有低 revision 凭据在下一次正确登录时标记 `must_change_password`；新密码、临时密码和
+  Environment Root 使用当前 policy revision。
+- [x] 使用带服务器秘密的 HMAC 身份摘要持久化登录失败和退避；未知账号仍走 dummy Argon2，
+  冷却期不暴露账号存在性。
+- [x] external bearer REST/MCP 默认关闭；启用时必须同时匹配独立 API hostname、
+  Cloudflare Service Token headers 和 MuriArc bearer token。
+- [x] external token 创建与撤销要求当前密码 step-up；管理员账号和权限操作继续沿用既有 step-up。
+- [x] 增加公开只读 runtime capability endpoint；公网 Profile 的附件流式限制为 95 MiB，
+  RemoteHttpGateway 在上传前读取并执行该限制，普通 JSON 仍为 1 MiB。
+- [x] 提供独立 `cloudflared` systemd 模板、最小权限环境文件示例和部署检查脚本；Token 不写入
+  MuriArc 数据库、配置备份、Upgrade Journal 或恢复集 manifest。
+- [x] 文档固定 WAF/登录限流/Managed Challenge、缓存绕过、Origin 隐藏、不信任代理头、
+  无 MFA 抗钓鱼剩余风险和 Cloudflare Edge 可见明文 HTTP 内容的边界。
+- [x] 增加 migration checksum、Rust/前端/部署 policy tests。
 
-## 正式 RC 边界
+## 非目标
 
-- 本分支提供实现与合成测试，不宣称 Windows 正式 RC 已通过。
-- 最终 1.0 集成必须使用旧正式安装包生成数据，再用目标 MSI/NSIS updater archive 与 `.sig`
-  执行真实安装、进程退出/重启、WebView UI、故障注入和首次写入边界验证；任何 SKIP 阻断发布。
-- recovery copy 默认保留。面向用户的显式 recovery restore/prune UI/CLI 由最终恢复编排接入，
-  不得以自动删除恢复点代替。
+- 不把 Docker socket 或 Cloudflare Token 挂入 `muriarc-server`。
+- 不在本分支实现分块续传；95 MiB 以上附件是后续独立兼容扩展。
+- 不增加远程升级 Web API，不允许 Cloudflare 路径绕过 Write Lease、权限、Audit 或 AI 审批。
+- 不声称 Cloudflare staging、真实 WAF 或公网渗透测试已完成；最终 RC 必须使用真实域名和最终制品。
 
 ## 验收标准
 
-- 原始 SQLite、attachments、artifacts 和 Keyring 项在 Candidate 失败时保持不变。
-- 缺少数据库、目录、generation manifest、Keyring 引用或签名元数据时启动/更新 fail closed。
-- Desktop 安装包不能用源码 `cargo run` 或 `--no-bundle` 冒充正式 RC。
-- 同一 generation 上的 SQLite 与文件树必须一一对应；禁止自动创建空目录掩盖漏恢复。
-- 更新后旧账号、动物关系、实验/测量/样本、附件、AI 历史和 Audit 可读且可继续写入。
-
-## 技术约束
-
-- 复用共享兼容类型、Upgrade Engine 和 release-evidence，不复制迁移状态机。
-- Key 继续保存在 OS Keyring；日志、Journal、备份和测试 fixture 不记录明文 Key。
-- Candidate/备份/报告位于 Git 外；测试仅用合成 Keyring adapter 和合成数据。
-- Tauri updater endpoint/public key 是发布配置；私钥只能存在于受保护的发布环境。
+- Public Profile 缺少 rate-limit HMAC key、API 专用 hostname/Service Token 成对配置或安全 cookie
+  时启动 fail closed。
+- 登录错误对不存在账号、错误密码和冷却状态保持同一 HTTP 状态/错误正文；数据库不保存原始探测邮箱。
+- 正确旧密码可以建立仅用于强制改密的 Session，但不能继续访问业务 API 或 external token。
+- 默认 bearer 与 `/mcp` 均不可用；开启后缺任一 Cloudflare header、错误 Host 或错误 MuriArc token
+  都失败，浏览器 Session 不可隐式升级为 external identity。
+- 95 MiB 可上传，超过 capability 的请求在 UI 和 Server 两端阻断；JSON、导入和 AI source 的独立
+  小上限不被放大。
+- `/api/*`、`/mcp`、认证、AI、附件和导出响应不可被共享缓存；只有内容哈希静态资产允许缓存。
 
 ## 跨分支备注
 
-依赖 `04d3449` 及其之前的兼容基础、Upgrade Engine、Release Fixture 门禁。Cloudflare 与 Desktop 无运行时依赖。最终 1.0 集成分支使用 Windows 正式安装包生成并验证 E0001 Desktop fixture。
+依赖 `5d32501` 及此前所有兼容、Upgrade、Fixture、Native/Compose 与 Desktop 阶段。最终
+`feature/release-integration-1-0` 只能把本分支作为实现输入；真实 Cloudflare staging、E0001 fixture
+和签名 RC 证据仍必须由最终制品生成，任何 `FAIL/SKIP` 阻断发布。

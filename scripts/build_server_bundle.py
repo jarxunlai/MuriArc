@@ -111,6 +111,7 @@ def copy_one(item: InputFile, output: Path) -> dict[str, object]:
 
 
 def inputs(args: argparse.Namespace) -> list[InputFile]:
+    cloudflare = real_directory(args.deploy_root / "cloudflare-public", "Cloudflare deploy directory")
     common = [
         InputFile(regular_file(args.controller, "controller"), PurePosixPath("bin/muriarcctl"), "controller", True),
         InputFile(
@@ -125,6 +126,10 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
             PurePosixPath("release/release-manifest.json"),
             "release_manifest",
         ),
+        InputFile(regular_file(cloudflare / "cloudflared.service", "cloudflared systemd unit"), PurePosixPath("deploy/cloudflare/cloudflared.service"), "systemd_service"),
+        InputFile(regular_file(cloudflare / "cloudflared.sysusers", "cloudflared sysusers file"), PurePosixPath("deploy/cloudflare/cloudflared.sysusers"), "sysusers"),
+        InputFile(regular_file(cloudflare / "cloudflared.tmpfiles", "cloudflared tmpfiles file"), PurePosixPath("deploy/cloudflare/cloudflared.tmpfiles"), "tmpfiles"),
+        InputFile(regular_file(cloudflare / "muriarc.yml.example", "Cloudflare Tunnel config example"), PurePosixPath("deploy/cloudflare/muriarc.yml.example"), "environment_example"),
     ]
     if args.profile == "native-system":
         if args.server is None or args.ui_dir is None:
@@ -139,6 +144,8 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
                 InputFile(regular_file(deploy / "delivery.json", "delivery descriptor"), PurePosixPath("deploy/delivery.json"), "delivery_descriptor"),
                 InputFile(regular_file(deploy / "server.env.example", "environment example"), PurePosixPath("deploy/server.env.example"), "environment_example"),
                 InputFile(regular_file(deploy / "active.env.example", "activation example"), PurePosixPath("deploy/active.env.example"), "environment_example"),
+                InputFile(regular_file(cloudflare / "muriarc-cloudflare-public.conf.example", "MuriArc public profile systemd drop-in"), PurePosixPath("deploy/cloudflare/muriarc-cloudflare-public.conf.example"), "environment_example"),
+                InputFile(regular_file(cloudflare / "muriarc-external-api.conf.example", "MuriArc external API systemd drop-in"), PurePosixPath("deploy/cloudflare/muriarc-external-api.conf.example"), "environment_example"),
             ]
         )
         common.extend(tree_files(real_directory(args.ui_dir, "UI directory"), PurePosixPath("ui"), "ui_asset"))
@@ -150,6 +157,8 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
                 InputFile(regular_file(deploy / "descriptor.json", "Compose descriptor"), PurePosixPath("deploy/descriptor.json"), "compose_descriptor"),
                 InputFile(regular_file(deploy / ".env.example", "environment example"), PurePosixPath("deploy/.env.example"), "environment_example"),
                 InputFile(regular_file(deploy / "active.env.example", "activation example"), PurePosixPath("deploy/active.env.example"), "environment_example"),
+                InputFile(regular_file(cloudflare / "compose.override.yaml", "Cloudflare Compose override"), PurePosixPath("deploy/cloudflare/compose.override.yaml"), "compose_file"),
+                InputFile(regular_file(cloudflare / "compose.external-api.override.yaml", "Cloudflare external API Compose override"), PurePosixPath("deploy/cloudflare/compose.external-api.override.yaml"), "compose_file"),
             ]
         )
     targets = [item.target.as_posix() for item in common]

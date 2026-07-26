@@ -1,0 +1,2 @@
+d /etc/cloudflared 0750 root cloudflared -
+d /var/lib/cloudflared 0750 cloudflared cloudflared -

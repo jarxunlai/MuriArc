@@ -46,6 +46,11 @@ and reject INSERT/UPDATE/DELETE with `muriarc_write_lease_required` after the
 lease is revoked. Future migrations that add business tables must install the
 same fences. Control-plane tables and the SQLx ledger are excluded.
 
+PostgreSQL migration `0034` appends credential policy revision and HMAC-keyed
+login backoff state for the Cloudflare Public Profile, then re-installs the
+generation write fences so the new auth table is part of the same recovery and
+Write Lease boundary. It stores no probed email address or Cloudflare secret.
+
 The data root contains `deployment-generation.json`. Server and Desktop compare
 its generation, Epoch, and Backend digest with the database before opening the
 application. Missing or mismatched manifests are never reconstructed during an

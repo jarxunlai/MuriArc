@@ -8,6 +8,7 @@ mod ai_step_up;
 mod auth;
 #[cfg(all(feature = "postgres", test))]
 mod bootstrap;
+mod deployment_security;
 #[cfg(feature = "postgres")]
 mod environment_root;
 mod error;
@@ -54,6 +55,10 @@ pub use auth::{
 pub use bootstrap::{
     BootstrapSeedConfig, BootstrapSeedError, BootstrapSeedOutcome, seed_postgres_bootstrap,
 };
+pub use deployment_security::{
+    CLOUDFLARE_ATTACHMENT_MAX_BYTES, CredentialPolicy, DeploymentProfile, DeploymentSecurityPolicy,
+    ExternalApiPolicy, RuntimeCapabilities,
+};
 #[cfg(feature = "postgres")]
 pub use environment_root::{
     EnvironmentRootConfig, EnvironmentRootError, EnvironmentRootOutcome,
@@ -89,6 +94,7 @@ pub struct AppState {
     pub authenticator: Arc<dyn Authenticator>,
     pub sessions: Arc<dyn SessionBackend>,
     pub session_cookie: SessionCookieConfig,
+    pub deployment_security: Arc<DeploymentSecurityPolicy>,
     pub jobs: Arc<dyn JobRepository>,
     pub ai_operations: Option<Arc<dyn AiOperationStore>>,
     pub ai_model_profiles: Option<Arc<dyn AiModelProfileStore>>,
@@ -116,6 +122,7 @@ impl AppState {
             authenticator,
             sessions: Arc::new(DisabledSessionBackend),
             session_cookie: SessionCookieConfig::default(),
+            deployment_security: Arc::new(DeploymentSecurityPolicy::development_default()),
             jobs,
             ai_operations: None,
             ai_model_profiles: None,
@@ -140,6 +147,11 @@ impl AppState {
     ) -> Self {
         self.sessions = sessions;
         self.session_cookie = session_cookie;
+        self
+    }
+
+    pub fn with_deployment_security(mut self, policy: DeploymentSecurityPolicy) -> Self {
+        self.deployment_security = Arc::new(policy);
         self
     }
 

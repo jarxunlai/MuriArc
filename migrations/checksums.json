@@ -35,6 +35,7 @@
     "migrations/postgres/0031_ai_source_object_cleanup_queue.sql": "cf7cd2766b6fb06522fb98f48becc49870c9fb8a1aef276f3014cdfdadadad7d",
     "migrations/postgres/0032_genotyping_batches.sql": "eeb11558e93e363fbfa286a4ef954fdf468eef625693e14aae3163c90279cd08",
     "migrations/postgres/0033_upgrade_compatibility_state.sql": "cb9115dfe6915784a1d309509f6cde4fe688dc8bf41fe0a8e12bb3e5da2e75f6",
+    "migrations/postgres/0034_public_auth_security.sql": "af85b79d017fc33c6803806216a1c9207eecb1db0f8db03be042d59e54eb2d8e",
     "migrations/sqlite/0001_initial.sql": "0d9184a2a228d7b4e580e32db7cb759abb9bf5f3c7e8614c1979d69d8351a6b8",
     "migrations/sqlite/0002_research_entities.sql": "61823b4b2368e5dee578e0e67b3fb2566f1cfb22fbb3ec578df8fdf254730762",
     "migrations/sqlite/0003_cage_capacity.sql": "63503a8b55db34083dd48f03d5de5defb51c863047149ed545624ff4d7c4c6f7",

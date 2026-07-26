@@ -23,6 +23,10 @@ def check() -> list[str]:
     compose = (ROOT / "deploy/managed-compose/compose.yaml").read_text(encoding="utf-8")
     unit = (ROOT / "deploy/native-system/muriarc.service").read_text(encoding="utf-8")
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    cloudflared = (ROOT / "deploy/cloudflare-public/cloudflared.service").read_text(encoding="utf-8")
+    tunnel = (ROOT / "deploy/cloudflare-public/muriarc.yml.example").read_text(encoding="utf-8")
+    public_dropin = (ROOT / "deploy/cloudflare-public/muriarc-cloudflare-public.conf.example").read_text(encoding="utf-8")
+    public_compose = (ROOT / "deploy/cloudflare-public/compose.override.yaml").read_text(encoding="utf-8")
     errors: list[str] = []
     errors += forbid(
         compose,
@@ -71,6 +75,37 @@ def check() -> list[str]:
         ],
         "Dockerfile",
     )
+    errors += require(
+        cloudflared,
+        [
+            "User=cloudflared",
+            "--no-autoupdate",
+            "/etc/cloudflared/muriarc.yml",
+            "NoNewPrivileges=true",
+            "ProtectSystem=strict",
+            "StateDirectory=cloudflared",
+        ],
+        "cloudflared systemd",
+    )
+    errors += forbid(
+        cloudflared + tunnel + public_dropin + public_compose,
+        ["/var/run/docker.sock", "0.0.0.0:8787", "5432", "watchtower"],
+        "Cloudflare Public Profile",
+    )
+    errors += require(
+        tunnel,
+        ["http://127.0.0.1:8787", "credentials-file:", "http_status:404"],
+        "Cloudflare Tunnel",
+    )
+    errors += require(
+        public_dropin + public_compose,
+        [
+            "MURIARC_DEPLOYMENT_PROFILE=cloudflare-public",
+            "MURIARC_AUTH_RATE_LIMIT_KEY_FILE",
+            "MURIARC_EXTERNAL_API_ENABLED=false",
+        ],
+        "Cloudflare MuriArc profile",
+    )
     return errors
 
 
@@ -80,7 +115,7 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 2
-    print("delivery templates: native-system and managed-compose policies verified")
+    print("delivery templates: native-system, managed-compose, and Cloudflare policies verified")
     return 0
 
 

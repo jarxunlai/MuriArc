@@ -10,7 +10,7 @@ import type {
   ProjectRole,
   ProjectSummary,
 } from '@/domain/models'
-import { currentAuthSession, gateway } from '@/services/gateway'
+import { currentAuthSession, currentRuntimeCapabilities, gateway } from '@/services/gateway'
 import { passwordPolicyError, passwordStrength } from '@/services/passwordStrength'
 import { currentProjectId, isLabAdmin } from '@/services/projectContext'
 
@@ -87,8 +87,9 @@ const projectOptions = computed(() => projects.value.map((project) => ({
   label: project.name,
   value: project.id,
 })))
-const createPasswordStrength = computed(() => passwordStrength(createForm.temporaryPassword))
-const resetPasswordStrength = computed(() => passwordStrength(resetTemporaryPassword.value))
+const passwordMinChars = computed(() => currentRuntimeCapabilities.value.passwordMinChars)
+const createPasswordStrength = computed(() => passwordStrength(createForm.temporaryPassword, passwordMinChars.value))
+const resetPasswordStrength = computed(() => passwordStrength(resetTemporaryPassword.value, passwordMinChars.value))
 const filteredUsers = computed(() => {
   const query = search.value.trim().toLocaleLowerCase()
   if (!query) return users.value
@@ -171,7 +172,7 @@ async function createUser() {
     clearCreatePasswords()
     return
   }
-  const validation = passwordPolicyError(createForm.temporaryPassword)
+  const validation = passwordPolicyError(createForm.temporaryPassword, passwordMinChars.value)
   if (validation) {
     message.warning(validation)
     clearCreatePasswords()
@@ -388,7 +389,7 @@ function closePasswordReset() {
 async function resetPassword() {
   const user = resetTarget.value
   if (!user || !gateway.resetManagedUserPassword || resetSaving.value) return
-  const validation = passwordPolicyError(resetTemporaryPassword.value)
+  const validation = passwordPolicyError(resetTemporaryPassword.value, passwordMinChars.value)
   if (!resetCurrentPassword.value) {
     message.warning('请输入当前管理员密码')
     resetTemporaryPassword.value = ''
@@ -504,7 +505,7 @@ watch(currentProjectId, () => {
         <div class="form-grid">
           <n-form-item label="显示名称"><n-input v-model:value="createForm.displayName" maxlength="200" /></n-form-item>
           <n-form-item label="登录邮箱"><n-input v-model:value="createForm.email" maxlength="320" /></n-form-item>
-          <n-form-item label="临时密码"><n-input v-model:value="createForm.temporaryPassword" type="password" show-password-on="click" autocomplete="new-password" maxlength="1024" placeholder="至少 8 个字符" /></n-form-item>
+          <n-form-item label="临时密码"><n-input v-model:value="createForm.temporaryPassword" type="password" show-password-on="click" autocomplete="new-password" maxlength="1024" :placeholder="`至少 ${passwordMinChars} 个字符`" /></n-form-item>
           <n-form-item label="实验室角色"><n-select v-model:value="createForm.labRole" clearable placeholder="仅项目成员" :options="labRoleOptions" /></n-form-item>
           <div class="password-strength full-row"><span>建议强度：{{ createPasswordStrength.label }}</span><n-progress type="line" :show-indicator="false" :percentage="createPasswordStrength.percentage" :status="createPasswordStrength.status" /></div>
           <n-form-item label="初始科研项目"><n-select v-model:value="createForm.projectId" clearable :options="projectOptions" placeholder="仅项目成员必须选择" /></n-form-item>

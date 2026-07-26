@@ -74,6 +74,11 @@ class ServerBundleBuilderTests(unittest.TestCase):
             self.assertIn("bin/muriarcctl", paths)
             self.assertIn("release/release-manifest.json", paths)
             self.assertIn("ui/index.html", paths)
+            self.assertIn("deploy/cloudflare/cloudflared.service", paths)
+            self.assertIn("deploy/cloudflare/muriarc.yml.example", paths)
+            self.assertIn(
+                "deploy/cloudflare/muriarc-cloudflare-public.conf.example", paths
+            )
 
     def test_symlinked_ui_asset_is_rejected_without_partial_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

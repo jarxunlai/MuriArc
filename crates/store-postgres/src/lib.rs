@@ -9048,13 +9048,13 @@ mod tests {
         let expected_migration_count = i64::try_from(MIGRATOR.iter().count()).unwrap();
         let latest_migration_version = MIGRATOR.iter().map(|migration| migration.version).max();
         assert_eq!(
-            expected_migration_count, 33,
-            "the merged PostgreSQL migration set must contain versions 0001 through 0033"
+            expected_migration_count, 34,
+            "the merged PostgreSQL migration set must contain versions 0001 through 0034"
         );
         assert_eq!(
             latest_migration_version,
-            Some(33),
-            "the merged PostgreSQL migration set must end at 0033"
+            Some(34),
+            "the merged PostgreSQL migration set must end at 0034"
         );
         assert_eq!(
             fresh_versions,
@@ -9446,8 +9446,8 @@ mod tests {
                 .expect("direct merged migration ledger must be readable");
         assert_eq!(
             direct_upgrade_ledger,
-            (33, Some(33)),
-            "the direct current-main to merged PostgreSQL upgrade must end at 0033"
+            (34, Some(34)),
+            "the direct current-main to merged PostgreSQL upgrade must end at 0034"
         );
 
         let profile_count: i64 = sqlx::query_scalar("SELECT count(*) FROM ai_model_profiles")
@@ -9905,8 +9905,8 @@ mod tests {
                 .expect("merged PostgreSQL migration ledger must be readable");
         assert_eq!(
             merged_stack_ledger,
-            (33, Some(33)),
-            "the merged PostgreSQL migration set must end at 0033"
+            (34, Some(34)),
+            "the merged PostgreSQL migration set must end at 0034"
         );
         type MergedStackConversationRow = (
             String,

@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core'
+import { shallowRef } from 'vue'
 import type {
   AiAutonomyMode,
   AiAutonomyUpdateInput,
@@ -811,11 +812,38 @@ export interface DesktopUpdateStatus {
   requiresVerifiedRecovery: boolean
 }
 
+export interface RuntimeCapabilities {
+  profile: 'private' | 'cloudflare-public'
+  credentialPolicyRevision: number
+  passwordMinChars: number
+  passwordMaxBytes: number
+  attachmentMaxBytes: number
+  importMaxBytes: number
+  aiSourceMaxBytes: number
+  externalApiEnabled: boolean
+  mcpEnabled: boolean
+  chunkedAttachmentUpload: boolean
+}
+
+export const currentRuntimeCapabilities = shallowRef<RuntimeCapabilities>({
+  profile: 'private',
+  credentialPolicyRevision: 1,
+  passwordMinChars: 8,
+  passwordMaxBytes: 1024,
+  attachmentMaxBytes: 100 * 1024 * 1024,
+  importMaxBytes: 32 * 1024 * 1024,
+  aiSourceMaxBytes: 32 * 1024 * 1024,
+  externalApiEnabled: false,
+  mcpEnabled: false,
+  chunkedAttachmentUpload: false,
+})
+
 export interface MuriArcGateway {
   readonly mode: GatewayMode
   readonly displayName: string
   readonly currentSession?: AuthSession
   readonly requiresLocalWelcome?: boolean
+  getRuntimeCapabilities?(): Promise<RuntimeCapabilities>
   listCages(context?: AnimalAccessContext): Promise<Cage[]>
   createCage(input: CreateCageInput): Promise<Cage>
   createAnimal(input: CreateAnimalInput): Promise<Animal>
@@ -2123,6 +2151,19 @@ interface RawCsrfResponse {
   expires_at: string
 }
 
+interface RawRuntimeCapabilities {
+  profile: RuntimeCapabilities['profile']
+  credential_policy_revision: number
+  password_min_chars: number
+  password_max_bytes: number
+  attachment_max_bytes: number
+  import_max_bytes: number
+  ai_source_max_bytes: number
+  external_api_enabled: boolean
+  mcp_enabled: boolean
+  chunked_attachment_upload: boolean
+}
+
 interface RawAiCitation {
   entity_type: string
   entity_id: string
@@ -2296,6 +2337,7 @@ export class RemoteHttpGateway implements MuriArcGateway {
   private csrfToken?: string
   private session?: AuthSession
   private restoringSession?: Promise<AuthSession>
+  private runtimeCapabilities?: RuntimeCapabilities
 
   get currentSession(): AuthSession | undefined {
     return this.session
@@ -2305,6 +2347,37 @@ export class RemoteHttpGateway implements MuriArcGateway {
     this.baseUrl = (options.baseUrl ?? import.meta.env.VITE_MURIARC_API_BASE ?? '/api/v1').replace(/\/$/, '')
     this.fetchRequest = options.fetch ?? globalThis.fetch.bind(globalThis)
     this.onUnauthorized = options.onUnauthorized ?? redirectToRemoteLogin
+  }
+
+  async getRuntimeCapabilities(): Promise<RuntimeCapabilities> {
+    if (this.runtimeCapabilities) return this.runtimeCapabilities
+    const response = await this.request<ApiItem<RawRuntimeCapabilities>>(
+      '/runtime/capabilities',
+      {},
+      { csrf: false },
+    )
+    const raw = response.data
+    const capabilities: RuntimeCapabilities = {
+      profile: raw.profile,
+      credentialPolicyRevision: raw.credential_policy_revision,
+      passwordMinChars: raw.password_min_chars,
+      passwordMaxBytes: raw.password_max_bytes,
+      attachmentMaxBytes: raw.attachment_max_bytes,
+      importMaxBytes: raw.import_max_bytes,
+      aiSourceMaxBytes: raw.ai_source_max_bytes,
+      externalApiEnabled: raw.external_api_enabled,
+      mcpEnabled: raw.mcp_enabled,
+      chunkedAttachmentUpload: raw.chunked_attachment_upload,
+    }
+    if (!Number.isSafeInteger(capabilities.passwordMinChars)
+      || capabilities.passwordMinChars < 8
+      || !Number.isSafeInteger(capabilities.attachmentMaxBytes)
+      || capabilities.attachmentMaxBytes <= 0) {
+      throw new HttpGatewayError(503, 'Server 返回了无效的运行时能力声明', 'invalid_runtime_capabilities')
+    }
+    this.runtimeCapabilities = capabilities
+    currentRuntimeCapabilities.value = capabilities
+    return capabilities
   }
 
   private async send(
@@ -3644,6 +3717,13 @@ export class RemoteHttpGateway implements MuriArcGateway {
   }
 
   async uploadAttachment(input: UploadAttachmentInput): Promise<AttachmentMetadata> {
+    const limit = currentRuntimeCapabilities.value.attachmentMaxBytes
+    if (input.content.size > limit) {
+      throw new GatewayError(
+        `附件超过 ${Math.floor(limit / 1024 / 1024)} MiB 运行时限制`,
+        'attachment_too_large',
+      )
+    }
     const query = attachmentScopeQuery({
       ...input,
       projectId: activeProjectId(input.projectId),

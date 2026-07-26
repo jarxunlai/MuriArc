@@ -78,6 +78,7 @@ router.beforeEach(async (to) => {
   }
 
   try {
+    await gateway.getRuntimeCapabilities?.()
     const session = await gateway.restoreSession()
     const fallback = defaultAuthenticatedRoute(session)
     if (session.user.mustChangePassword) {

@@ -19,8 +19,7 @@ use crate::{ApiError, AppState, AuthPrincipal, RequestMetadata};
 use super::{
     ApiJson, ApiPath, ApiQuery, CollectionResponse, ItemResponse,
     attachment_files::{
-        AttachmentFileError, MAX_ATTACHMENT_BYTES, open_verified, remove_installed_object,
-        write_object,
+        AttachmentFileError, open_verified, remove_installed_object, write_object_with_limit,
     },
     collection, ensure_lab, item, scope, store,
     validation::{collection_limit, optional_text, required_text, truncate, validation},
@@ -201,9 +200,12 @@ async fn upload(
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|size| size > MAX_ATTACHMENT_BYTES)
+        .is_some_and(|size| size > state.deployment_security.attachment_max_bytes())
     {
-        return Err(payload_too_large(&metadata));
+        return Err(payload_too_large(
+            &metadata,
+            state.deployment_security.attachment_max_bytes(),
+        ));
     }
     let effective_project = authorize_target(
         &state,
@@ -244,9 +246,20 @@ async fn upload(
 
     let root = attachment_root(&state, &metadata)?;
     let id = Uuid::new_v4();
-    let object = write_object(root.as_ref(), id, body)
-        .await
-        .map_err(|error| upload_file_error(error, &metadata))?;
+    let object = write_object_with_limit(
+        root.as_ref(),
+        id,
+        body,
+        state.deployment_security.attachment_max_bytes(),
+    )
+    .await
+    .map_err(|error| {
+        upload_file_error(
+            error,
+            &metadata,
+            state.deployment_security.attachment_max_bytes(),
+        )
+    })?;
     let inspection = match inspect_attachment(
         &object.absolute_path,
         &file_name,
@@ -613,9 +626,13 @@ fn attachment_root<'a>(
     })
 }
 
-fn upload_file_error(error: AttachmentFileError, metadata: &RequestMetadata) -> ApiError {
+fn upload_file_error(
+    error: AttachmentFileError,
+    metadata: &RequestMetadata,
+    max_bytes: u64,
+) -> ApiError {
     if matches!(error, AttachmentFileError::TooLarge) {
-        return payload_too_large(metadata);
+        return payload_too_large(metadata, max_bytes);
     }
     if matches!(error, AttachmentFileError::AlreadyExists) {
         return ApiError::conflict("attachment object already exists")
@@ -676,11 +693,11 @@ fn inspection_error(error: AttachmentInspectionError, metadata: &RequestMetadata
     .with_request_id(metadata.request_id.clone())
 }
 
-fn payload_too_large(metadata: &RequestMetadata) -> ApiError {
+fn payload_too_large(metadata: &RequestMetadata, max_bytes: u64) -> ApiError {
     ApiError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
         "payload_too_large",
-        format!("attachment must not exceed {MAX_ATTACHMENT_BYTES} bytes"),
+        format!("attachment must not exceed {max_bytes} bytes"),
     )
     .with_request_id(metadata.request_id.clone())
 }

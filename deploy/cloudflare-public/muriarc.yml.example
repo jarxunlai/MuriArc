@@ -1,0 +1,22 @@
+# Copy to /etc/cloudflared/muriarc.yml, replace placeholders, owner root:cloudflared, mode 0640.
+# The credentials JSON is a Cloudflare Tunnel credential. It belongs only to
+# cloudflared and must never be copied into /etc/muriarc, a MuriArc backup, the
+# database, an Upgrade Journal, or a release fixture.
+tunnel: REPLACE_TUNNEL_UUID
+credentials-file: /etc/cloudflared/REPLACE_TUNNEL_UUID.json
+protocol: quic
+
+ingress:
+  - hostname: REPLACE_WEB_HOSTNAME
+    service: http://127.0.0.1:8787
+    originRequest:
+      connectTimeout: 10s
+      httpHostHeader: REPLACE_WEB_HOSTNAME
+  # Optional only with the external-api drop-in and a Cloudflare Access
+  # Service Token policy. Keep it on a different hostname.
+  # - hostname: REPLACE_API_HOSTNAME
+  #   service: http://127.0.0.1:8787
+  #   originRequest:
+  #     connectTimeout: 10s
+  #     httpHostHeader: REPLACE_API_HOSTNAME
+  - service: http_status:404

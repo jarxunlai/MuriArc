@@ -16,11 +16,11 @@ use muriarc_core::{
 };
 use muriarc_data::{AttachmentFiles, DataFiles, cleanup_expired_ai_conversation_sources};
 use muriarc_server::{
-    AiMasterKey, AppState, Authenticator, ChainedAuthenticator, EnvironmentRootConfig,
-    LiveBootstrapAuthenticator, PostgresAiProviderStore, PostgresAuthBackend,
-    PostgresTechnicalLogService, PostgresUserGovernance, RuntimeAccessMode, SessionCookieConfig,
-    StaticTokenAuthenticator, StoreJobRepository, application_router,
-    sync_postgres_environment_root,
+    AiMasterKey, AppState, Authenticator, ChainedAuthenticator, DeploymentProfile,
+    DeploymentSecurityPolicy, EnvironmentRootConfig, ExternalApiPolicy, LiveBootstrapAuthenticator,
+    PostgresAiProviderStore, PostgresAuthBackend, PostgresTechnicalLogService,
+    PostgresUserGovernance, RuntimeAccessMode, SessionCookieConfig, StaticTokenAuthenticator,
+    StoreJobRepository, application_router, sync_postgres_environment_root,
 };
 use muriarc_store_postgres::PostgresStore;
 use rand::{RngCore, rngs::OsRng};
@@ -44,6 +44,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|_| "127.0.0.1:8787".to_owned())
         .parse::<SocketAddr>()?;
     let server_lab_id = required_env("MURIARC_LAB_ID")?.parse::<Uuid>()?;
+    let deployment_security = deployment_security_policy()?;
+    let session_cookie = session_cookie_config()?;
+    if deployment_security.profile() == DeploymentProfile::CloudflarePublic
+        && !session_cookie.secure
+    {
+        return Err("Cloudflare Public Profile requires secure session cookies".into());
+    }
 
     let data_root = PathBuf::from(required_env("MURIARC_DATA_ROOT")?);
     let attachment_root = PathBuf::from(required_env("MURIARC_ATTACHMENT_ROOT")?);
@@ -52,7 +59,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         runtime_compatibility::prepare_server_runtime(store.as_ref(), &data_root, &attachment_root)
             .await?;
 
-    let root_config = environment_root_config(server_lab_id)?;
+    let root_config =
+        environment_root_config(server_lab_id, deployment_security.credential_policy())?;
     if runtime.access_mode == RuntimeAccessMode::ReadWrite {
         let root_outcome = sync_postgres_environment_root(store.as_ref(), &root_config).await?;
         if root_outcome.changed() {
@@ -79,11 +87,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let bootstrap_authenticator = bootstrap_authenticator(&root_config)?;
     let environment_root_user_id = root_config.user_id;
     drop(root_config);
-    let persistent_auth = Arc::new(PostgresAuthBackend::new(
+    let persistent_auth = Arc::new(PostgresAuthBackend::new_with_policy(
         store.as_ref().clone(),
         store.clone(),
         server_lab_id,
         environment_root_user_id,
+        deployment_security.credential_policy(),
+        deployment_security.login_identity_hmac_key().copied(),
     )?);
     let authenticators: Vec<Arc<dyn Authenticator>> = vec![
         Arc::new(LiveBootstrapAuthenticator::new(
@@ -98,11 +108,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Arc::new(authenticator),
         Arc::new(StoreJobRepository::new(store.clone())),
     )
-    .with_sessions(persistent_auth, session_cookie_config()?)
-    .with_user_governance(PostgresUserGovernance::new(
+    .with_sessions(persistent_auth, session_cookie)
+    .with_deployment_security(deployment_security.clone())
+    .with_user_governance(PostgresUserGovernance::new_with_policy(
         store.as_ref().clone(),
         server_lab_id,
         environment_root_user_id,
+        deployment_security.credential_policy(),
     ));
     if runtime.access_mode == RuntimeAccessMode::ReadWrite {
         state = state.with_technical_logs(Arc::new(PostgresTechnicalLogService::new(
@@ -353,16 +365,82 @@ fn bootstrap_authenticator(
     Ok(StaticTokenAuthenticator::new(entries)?)
 }
 
-fn environment_root_config(server_lab_id: Uuid) -> Result<EnvironmentRootConfig, Box<dyn Error>> {
-    EnvironmentRootConfig::new(
+fn environment_root_config(
+    server_lab_id: Uuid,
+    credential_policy: muriarc_server::CredentialPolicy,
+) -> Result<EnvironmentRootConfig, Box<dyn Error>> {
+    EnvironmentRootConfig::new_with_policy(
         server_lab_id,
         required_env("MURIARC_LAB_NAME")?,
         required_env("MURIARC_ROOT_USER_ID")?.parse::<Uuid>()?,
         required_env("MURIARC_ROOT_USER_EMAIL")?,
         required_env("MURIARC_ROOT_USER_NAME")?,
         required_env("MURIARC_ROOT_PASSWORD")?,
+        credential_policy,
     )
     .map_err(Into::into)
+}
+
+fn deployment_security_policy() -> Result<DeploymentSecurityPolicy, Box<dyn Error>> {
+    let profile = match env::var("MURIARC_DEPLOYMENT_PROFILE") {
+        Err(env::VarError::NotPresent) => DeploymentProfile::Private,
+        Ok(value) if value == "private" => DeploymentProfile::Private,
+        Ok(value) if value == "cloudflare-public" => DeploymentProfile::CloudflarePublic,
+        Ok(_) => {
+            return Err("MURIARC_DEPLOYMENT_PROFILE must be private or cloudflare-public".into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let external_api = if optional_bool_env("MURIARC_EXTERNAL_API_ENABLED", false)? {
+        let hostname = required_env("MURIARC_EXTERNAL_API_HOSTNAME")?;
+        let client_id = read_required_secret_file("MURIARC_CF_ACCESS_CLIENT_ID_FILE")?;
+        let client_secret = read_required_secret_file("MURIARC_CF_ACCESS_CLIENT_SECRET_FILE")?;
+        ExternalApiPolicy::cloudflare_service_token(
+            hostname,
+            client_id.as_bytes(),
+            client_secret.as_bytes(),
+        )?
+    } else {
+        for name in [
+            "MURIARC_EXTERNAL_API_HOSTNAME",
+            "MURIARC_CF_ACCESS_CLIENT_ID_FILE",
+            "MURIARC_CF_ACCESS_CLIENT_SECRET_FILE",
+        ] {
+            if env::var_os(name).is_some() {
+                return Err(format!(
+                    "{name} must be unset while MURIARC_EXTERNAL_API_ENABLED is false"
+                )
+                .into());
+            }
+        }
+        ExternalApiPolicy::disabled()
+    };
+    match profile {
+        DeploymentProfile::Private => Ok(DeploymentSecurityPolicy::private(external_api)),
+        DeploymentProfile::CloudflarePublic => {
+            let encoded_key = read_required_secret_file("MURIARC_AUTH_RATE_LIMIT_KEY_FILE")?;
+            let decoded = general_purpose::STANDARD
+                .decode(encoded_key.as_bytes())
+                .map_err(|_| "MURIARC_AUTH_RATE_LIMIT_KEY_FILE must contain base64")?;
+            let key: [u8; 32] = decoded
+                .try_into()
+                .map_err(|_| "MURIARC_AUTH_RATE_LIMIT_KEY_FILE must decode to exactly 32 bytes")?;
+            Ok(DeploymentSecurityPolicy::cloudflare_public(
+                key,
+                external_api,
+            ))
+        }
+    }
+}
+
+fn read_required_secret_file(name: &'static str) -> Result<Zeroizing<String>, Box<dyn Error>> {
+    let path = PathBuf::from(required_env(name)?);
+    let value = Zeroizing::new(fs::read_to_string(&path)?);
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err(format!("secret file declared by {name} is empty or malformed").into());
+    }
+    Ok(Zeroizing::new(trimmed.to_owned()))
 }
 
 fn session_cookie_config() -> Result<SessionCookieConfig, Box<dyn Error>> {

@@ -202,6 +202,11 @@ function readableError(error: unknown): string {
   return 'AI 请求失败，请检查模型设置或稍后重试'
 }
 
+function conversationTitleFromMessage(message: string): string {
+  const normalized = message.replace(/[\p{Cc}\s]+/gu, ' ').trim()
+  return Array.from(normalized).slice(0, 256).join('') || 'MuriArc AI conversation'
+}
+
 function sourceValidationError(file: File): string | undefined {
   const extension = file.name.split('.').at(-1)?.toLocaleLowerCase() ?? ''
   if (!SUPPORTED_SOURCE_EXTENSIONS.has(extension)) {
@@ -1002,7 +1007,7 @@ export function useAiAssistant() {
     try {
       const started = await gateway.startAiConversation({
         projectId,
-        title: title.trim().slice(0, 256) || '新对话',
+        title: conversationTitleFromMessage(title),
         modelProfileId,
         requestedMode: mode,
         ...(reinforcedPasswordRequired.value && options.currentPassword

@@ -517,7 +517,6 @@ onMounted(() => {
             </template>
           </section>
           <div class="action-card"><Archive :size="22" /><div><strong>创建完整业务归档快照</strong><span>用于完整性校验与离线留存；当前不能导入、恢复或直接迁移到 Server，正式恢复仍需数据库与附件联合备份。</span></div><n-button v-if="labRegistryAvailable" type="primary" secondary :loading="snapshotting" @click="createSnapshot">创建快照</n-button></div>
-          <div class="action-card"><Database :size="22" /><div><strong>旧版数据库迁移</strong><span>为避免误改原库，V1 仅通过 muriarc-legacy-migrator CLI 对副本执行审计与单向迁移；完整步骤见 docs/MIGRATION.md。</span></div><n-tag :bordered="false">CLI · 只读源库</n-tag></div>
         </template>
 
         <template v-else-if="active === 'update'">
@@ -582,7 +581,7 @@ onMounted(() => {
         </template>
 
         <template v-else>
-          <div class="about-panel"><img :src="branding.logoMarkPath" :alt="`${branding.productName} Logo`" /><h2>{{ branding.productName }}</h2><p>{{ branding.tagline }}</p><n-tag :bordered="false">Version {{ branding.version }} · {{ branding.releaseStage }}</n-tag><small>{{ branding.sourceNotice }}<br />依据 Apache License 2.0 发布；完整归属见 LICENSE、NOTICE 与关于页。</small></div>
+          <div class="about-panel"><img :src="branding.logoMarkPath" :alt="`${branding.productName} Logo`" /><h2>{{ branding.productName }}</h2><p>{{ branding.tagline }}</p><n-tag :bordered="false">Version {{ branding.version }} · {{ branding.releaseStage }}</n-tag><small>由 jarxunlai 独立开发和维护，工程实现由 AI 辅助。<br />依据 Apache License 2.0 发布；完整归属见 LICENSE 与 NOTICE。</small></div>
         </template>
       </div>
     </section>

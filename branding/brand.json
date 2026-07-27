@@ -5,7 +5,6 @@
   "bundleIdentifier": "org.muriarc.desktop",
   "primaryColor": "#0f5faa",
   "accentColor": "#009ca6",
-  "sourceNotice": "MuriArc 基于 MurisPro / animal_lab 继续开发。",
   "logoMarkPath": "/logo-mark.png",
   "version": "0.1.0",
   "releaseStage": "预发布",

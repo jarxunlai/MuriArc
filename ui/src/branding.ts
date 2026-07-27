@@ -7,7 +7,6 @@ export interface BrandingConfig {
   bundleIdentifier: string
   primaryColor: string
   accentColor: string
-  sourceNotice: string
   logoMarkPath: string
   version: string
   releaseStage: string

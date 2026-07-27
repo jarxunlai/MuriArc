@@ -8,8 +8,6 @@
 
 MuriArc 是面向个人研究者和共享实验室的实验动物研究管理平台。它以动物全生命周期为主线，将笼位、繁育、基因型、实验执行、测量、样本、附件和审计组织在同一条可追溯数据链中。
 
-> MuriArc 基于开源项目 [MurisPro / animal_lab](https://github.com/lanternx/animal_lab) 继续开发。法律归属见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
-
 ## 运行形态
 
 - **Desktop**：Tauri v2 + SQLite，面向个人用户；正式本地交付为 Windows Tauri WebView 安装包，不通过 VNC/noVNC 或浏览器远程桌面部署。每次启动显示无密码“进入本地空间”，它只确认实验室和操作者、不是安全锁，进入后可完全离线使用。数据库、附件、数据产物和非敏感 AI 配置使用同一个本地数据根，用户可从设置中选择本机固定磁盘上的独立空目录并在重启前安全迁移；API Key 始终保留在 OS keyring。
@@ -33,7 +31,6 @@ crates/ai/                AI DSL、工具权限与审批
 crates/importer/          CSV/XLSX 解析、校验与事务导入计划
 crates/data/              导入、导出、附件与快照生成/校验服务
 crates/snapshot/          可校验快照格式
-crates/legacy-migrator/   旧库只读审计与迁移
 src-tauri/                桌面入口
 ui/                       Vue 3 + Vite 响应式前端
 branding/                 MuriArc 品牌源文件
@@ -98,10 +95,9 @@ Server 每次启动在单事务中核对身份、LabAdmin membership 与凭据�
 
 ## 数据安全
 
-- 数据库、附件、密钥、快照和旧库副本不进入 Git。
+- 数据库、附件、密钥、快照和恢复副本不进入 Git。
 - 安全升级由独立 muriarcctl 和共享 Upgrade Engine 编排；Server 不持有 Docker/systemd/DDL
   权限，未实际恢复验证完整备份、未完成 Candidate 七层验证时不得激活。
-- 旧数据库只以只读方式扫描；迁移目标始终是新文件。
 - 大附件存文件库，数据库只保存元数据和 SHA-256。
 - Server 所有正式写入均记录操作者、来源、revision 与审计事件。
 - 普通 CSV/XLSX 导入只支持动物登记与实验测量；批量基因鉴定使用专用工作流，将一份结果

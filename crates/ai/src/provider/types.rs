@@ -11,6 +11,7 @@ const MAX_MESSAGE_BYTES: usize = 256 * 1024;
 const MAX_TOOLS: usize = 64;
 const MAX_TOOL_SCHEMA_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_TOKENS: u32 = 131_072;
+const CONNECTION_CHECK_MAX_OUTPUT_TOKENS: u32 = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatRole {
@@ -133,6 +134,21 @@ impl CompletionRequest {
             temperature: None,
             max_output_tokens: None,
         }
+    }
+
+    /// Builds the transport-neutral request used to verify a Provider connection.
+    ///
+    /// The output budget deliberately leaves room for reasoning-capable models
+    /// that may spend tokens on hidden reasoning before emitting the requested
+    /// short final answer. Keeping this policy in the AI boundary prevents Server
+    /// and Desktop validation behavior from drifting apart.
+    pub fn provider_connection_check() -> Self {
+        let mut request = Self::new(vec![ChatMessage::user(
+            "Connection check. Reply with the single word OK.",
+        )]);
+        request.max_output_tokens = Some(CONNECTION_CHECK_MAX_OUTPUT_TOKENS);
+        request.temperature = Some(0.0);
+        request
     }
 
     pub(super) fn validate(&self) -> Result<(), ProviderError> {

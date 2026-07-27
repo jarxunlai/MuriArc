@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 #[cfg(feature = "postgres")]
 use muriarc_ai::{
-    AiProvider, ChatMessage, CompletionRequest, ProviderConfig, ProviderCredentials, ProviderError,
+    AiProvider, CompletionRequest, ProviderConfig, ProviderCredentials, ProviderError,
     TransportFailure,
 };
 use muriarc_ai::{AssistantRuntimeConfig, BuiltinProvider, ProviderKind};
@@ -4777,11 +4777,7 @@ mod postgres {
             };
             let provider = BuiltinProvider::from_config(config)
                 .map_err(|_| AiProviderStoreError::InvalidSettings)?;
-            let mut request = CompletionRequest::new(vec![ChatMessage::user(
-                "Connection check. Reply with the single word OK.",
-            )]);
-            request.max_output_tokens = Some(256);
-            request.temperature = Some(0.0);
+            let request = CompletionRequest::provider_connection_check();
             let started = Instant::now();
             let result = provider.complete(request, credentials).await;
             Ok(AiModelValidationView {

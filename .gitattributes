@@ -13,3 +13,4 @@
 *.sqlite binary
 *.sqlite3 binary
 *.xlsx binary
+*.pdf binary

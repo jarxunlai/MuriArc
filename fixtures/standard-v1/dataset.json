@@ -1,0 +1,2906 @@
+{
+  "schemaVersion": 1,
+  "datasetId": "muriarc-standard-v1",
+  "synthetic": true,
+  "fixedTimeline": {
+    "startsAt": "2024-04-11T00:00:00Z",
+    "endsAt": "2025-03-01T01:00:00Z"
+  },
+  "projects": [
+    {
+      "key": "intervention",
+      "name": "标准数据｜GeneA 干预实验",
+      "description": "12 只动物的固定时间轴纵向干预研究；标准基线，请勿人工修改。",
+      "mode": "baseline"
+    },
+    {
+      "key": "breeding",
+      "name": "标准数据｜GeneA 品系繁育",
+      "description": "GeneA 品系、繁育对、产仔、后代登记与谱系标准基线。",
+      "mode": "baseline"
+    },
+    {
+      "key": "sandbox",
+      "name": "标准数据｜人工测试沙盒",
+      "description": "供人工测试自由增删改；ready 不覆盖沙盒内容。",
+      "mode": "sandbox"
+    }
+  ],
+  "cages": [
+    {
+      "key": "int_cm",
+      "section": "STD-Intervention",
+      "displayId": "STD-INT-CM-01",
+      "location": "标准区 / 干预架 / 对照雄",
+      "kind": "experimental",
+      "capacity": 5,
+      "sortOrder": 10
+    },
+    {
+      "key": "int_cf",
+      "section": "STD-Intervention",
+      "displayId": "STD-INT-CF-01",
+      "location": "标准区 / 干预架 / 对照雌",
+      "kind": "experimental",
+      "capacity": 5,
+      "sortOrder": 20
+    },
+    {
+      "key": "int_tm",
+      "section": "STD-Intervention",
+      "displayId": "STD-INT-TM-01",
+      "location": "标准区 / 干预架 / 处理雄",
+      "kind": "experimental",
+      "capacity": 5,
+      "sortOrder": 30
+    },
+    {
+      "key": "int_tf",
+      "section": "STD-Intervention",
+      "displayId": "STD-INT-TF-01",
+      "location": "标准区 / 干预架 / 处理雌",
+      "kind": "experimental",
+      "capacity": 5,
+      "sortOrder": 40
+    },
+    {
+      "key": "breed_a",
+      "section": "STD-Breeding",
+      "displayId": "STD-BR-A-01",
+      "location": "标准区 / 繁育架 / A1",
+      "kind": "breeding",
+      "capacity": 3,
+      "sortOrder": 50
+    },
+    {
+      "key": "breed_b",
+      "section": "STD-Breeding",
+      "displayId": "STD-BR-B-01",
+      "location": "标准区 / 繁育架 / B1",
+      "kind": "breeding",
+      "capacity": 3,
+      "sortOrder": 60
+    },
+    {
+      "key": "f1_m",
+      "section": "STD-Weaning",
+      "displayId": "STD-F1-M-01",
+      "location": "标准区 / 离乳架 / 雄",
+      "kind": "standard",
+      "capacity": 5,
+      "sortOrder": 70
+    },
+    {
+      "key": "f1_f",
+      "section": "STD-Weaning",
+      "displayId": "STD-F1-F-01",
+      "location": "标准区 / 离乳架 / 雌",
+      "kind": "standard",
+      "capacity": 5,
+      "sortOrder": 80
+    },
+    {
+      "key": "sandbox",
+      "section": "STD-Sandbox",
+      "displayId": "STD-SBX-01",
+      "location": "标准区 / 人工沙盒",
+      "kind": "temporary",
+      "capacity": 5,
+      "sortOrder": 90,
+      "mode": "sandbox"
+    },
+    {
+      "key": "empty",
+      "section": "STD-Available",
+      "displayId": "STD-EMPTY-01",
+      "location": "标准区 / 空笼位",
+      "kind": "standard",
+      "capacity": 5,
+      "sortOrder": 100
+    }
+  ],
+  "animals": [
+    {
+      "key": "animal_001",
+      "displayId": "STD-M-001",
+      "sex": "male",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-05-11",
+      "legacyId": "SYNTH-BREEDER-001",
+      "project": "breeding",
+      "cage": "breed_a",
+      "source": "direct"
+    },
+    {
+      "key": "animal_002",
+      "displayId": "STD-M-002",
+      "sex": "female",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-04-12",
+      "legacyId": "SYNTH-BREEDER-002",
+      "project": "breeding",
+      "cage": "breed_a",
+      "source": "direct"
+    },
+    {
+      "key": "animal_003",
+      "displayId": "STD-M-003",
+      "sex": "male",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-05-13",
+      "legacyId": "SYNTH-BREEDER-003",
+      "project": "breeding",
+      "cage": "breed_b",
+      "source": "direct"
+    },
+    {
+      "key": "animal_004",
+      "displayId": "STD-M-004",
+      "sex": "female",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-04-14",
+      "legacyId": "SYNTH-BREEDER-004",
+      "project": "breeding",
+      "cage": "breed_b",
+      "source": "direct"
+    },
+    {
+      "key": "animal_005",
+      "displayId": "STD-M-005",
+      "sex": "male",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-05",
+      "legacyId": "SYNTH-INT-005",
+      "project": "intervention",
+      "cage": "int_cm",
+      "source": "minimal",
+      "cohort": "control"
+    },
+    {
+      "key": "animal_006",
+      "displayId": "STD-M-006",
+      "sex": "female",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-06",
+      "legacyId": "SYNTH-INT-006",
+      "project": "intervention",
+      "cage": "int_cf",
+      "source": "direct",
+      "cohort": "control"
+    },
+    {
+      "key": "animal_007",
+      "displayId": "STD-M-007",
+      "sex": "male",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-07",
+      "legacyId": "SYNTH-INT-007",
+      "project": "intervention",
+      "cage": "int_cm",
+      "source": "direct",
+      "cohort": "control"
+    },
+    {
+      "key": "animal_008",
+      "displayId": "STD-M-008",
+      "sex": "female",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-08",
+      "legacyId": "SYNTH-INT-008",
+      "project": "intervention",
+      "cage": "int_cf",
+      "source": "direct",
+      "cohort": "control"
+    },
+    {
+      "key": "animal_009",
+      "displayId": "STD-M-009",
+      "sex": "male",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-09",
+      "legacyId": "SYNTH-INT-009",
+      "project": "intervention",
+      "cage": "int_cm",
+      "source": "direct",
+      "cohort": "control"
+    },
+    {
+      "key": "animal_010",
+      "displayId": "STD-M-010",
+      "sex": "female",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-10",
+      "legacyId": "SYNTH-INT-010",
+      "project": "intervention",
+      "cage": "int_cf",
+      "source": "direct",
+      "cohort": "control"
+    },
+    {
+      "key": "animal_011",
+      "displayId": "STD-M-011",
+      "sex": "male",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-11",
+      "legacyId": "SYNTH-INT-011",
+      "project": "intervention",
+      "cage": "int_tm",
+      "source": "direct",
+      "cohort": "treatment"
+    },
+    {
+      "key": "animal_012",
+      "displayId": "STD-M-012",
+      "sex": "female",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-12",
+      "legacyId": "SYNTH-INT-012",
+      "project": "intervention",
+      "cage": "int_tf",
+      "source": "direct",
+      "cohort": "treatment"
+    },
+    {
+      "key": "animal_013",
+      "displayId": "STD-M-013",
+      "sex": "male",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-13",
+      "legacyId": "SYNTH-INT-013",
+      "project": "intervention",
+      "cage": "int_tm",
+      "source": "direct",
+      "cohort": "treatment"
+    },
+    {
+      "key": "animal_014",
+      "displayId": "STD-M-014",
+      "sex": "female",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-14",
+      "legacyId": "SYNTH-INT-014",
+      "project": "intervention",
+      "cage": "int_tf",
+      "source": "direct",
+      "cohort": "treatment"
+    },
+    {
+      "key": "animal_015",
+      "displayId": "STD-M-015",
+      "sex": "male",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-15",
+      "legacyId": "SYNTH-INT-015",
+      "project": "intervention",
+      "cage": "int_tm",
+      "source": "direct",
+      "cohort": "treatment"
+    },
+    {
+      "key": "animal_016",
+      "displayId": "STD-M-016",
+      "sex": "female",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-08-16",
+      "legacyId": "SYNTH-INT-016",
+      "project": "intervention",
+      "cage": "int_tf",
+      "source": "direct",
+      "cohort": "treatment"
+    },
+    {
+      "key": "animal_017",
+      "displayId": "STD-M-017",
+      "sex": "male",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-10-15",
+      "legacyId": null,
+      "project": "breeding",
+      "cage": "f1_m",
+      "source": "litter",
+      "temporaryLabel": "F1-01"
+    },
+    {
+      "key": "animal_018",
+      "displayId": "STD-M-018",
+      "sex": "female",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-10-15",
+      "legacyId": null,
+      "project": "breeding",
+      "cage": "f1_f",
+      "source": "litter",
+      "temporaryLabel": "F1-02"
+    },
+    {
+      "key": "animal_019",
+      "displayId": "STD-M-019",
+      "sex": "male",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-10-15",
+      "legacyId": null,
+      "project": "breeding",
+      "cage": "f1_m",
+      "source": "litter",
+      "temporaryLabel": "F1-03"
+    },
+    {
+      "key": "animal_020",
+      "displayId": "STD-M-020",
+      "sex": "female",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-10-15",
+      "legacyId": null,
+      "project": "breeding",
+      "cage": "f1_f",
+      "source": "litter",
+      "temporaryLabel": "F1-04"
+    },
+    {
+      "key": "animal_021",
+      "displayId": "STD-M-021",
+      "sex": "male",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-10-15",
+      "legacyId": null,
+      "project": "breeding",
+      "cage": "f1_m",
+      "source": "litter",
+      "temporaryLabel": "F1-05"
+    },
+    {
+      "key": "animal_022",
+      "displayId": "STD-M-022",
+      "sex": "female",
+      "strain": "C57BL/6J-GeneA",
+      "birthDate": "2024-10-15",
+      "legacyId": null,
+      "project": "breeding",
+      "cage": "f1_f",
+      "source": "litter",
+      "temporaryLabel": "F1-06"
+    },
+    {
+      "key": "animal_023",
+      "displayId": "STD-M-023",
+      "sex": "male",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-09-13",
+      "legacyId": "SYNTH-SBX-023",
+      "project": "sandbox",
+      "cage": "sandbox",
+      "source": "direct",
+      "mode": "sandbox"
+    },
+    {
+      "key": "animal_024",
+      "displayId": "STD-M-024",
+      "sex": "female",
+      "strain": "C57BL/6J",
+      "birthDate": "2024-09-14",
+      "legacyId": "SYNTH-SBX-024",
+      "project": "sandbox",
+      "cage": "sandbox",
+      "source": "direct",
+      "mode": "sandbox"
+    }
+  ],
+  "genetics": {
+    "locus": {
+      "key": "genea",
+      "symbol": "GeneA",
+      "description": "完全合成的标准测试 locus"
+    },
+    "alleles": [
+      {
+        "key": "wt",
+        "symbol": "WT",
+        "description": "合成野生型",
+        "isWildType": true
+      },
+      {
+        "key": "ko",
+        "symbol": "KO",
+        "description": "合成敲除等位基因",
+        "isWildType": false
+      }
+    ],
+    "definitions": [
+      {
+        "key": "wt_wt",
+        "name": "GeneA WT/WT",
+        "description": "野生型纯合",
+        "alleles": [
+          "wt",
+          "wt"
+        ]
+      },
+      {
+        "key": "wt_ko",
+        "name": "GeneA WT/KO",
+        "description": "杂合",
+        "alleles": [
+          "wt",
+          "ko"
+        ]
+      },
+      {
+        "key": "ko_ko",
+        "name": "GeneA KO/KO",
+        "description": "敲除纯合",
+        "alleles": [
+          "ko",
+          "ko"
+        ]
+      }
+    ],
+    "records": [
+      {
+        "key": "geno_001",
+        "animal": "animal_001",
+        "definition": "wt_wt",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_002",
+        "animal": "animal_002",
+        "definition": "wt_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_003",
+        "animal": "animal_003",
+        "definition": "ko_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_004",
+        "animal": "animal_004",
+        "definition": "wt_wt",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_005",
+        "animal": "animal_005",
+        "definition": "wt_ko",
+        "state": "expected",
+        "assessedAt": null,
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_006",
+        "animal": "animal_006",
+        "definition": "ko_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_007",
+        "animal": "animal_007",
+        "definition": "wt_wt",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_008",
+        "animal": "animal_008",
+        "definition": "wt_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_009",
+        "animal": "animal_009",
+        "definition": "ko_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_010",
+        "animal": "animal_010",
+        "definition": "wt_wt",
+        "state": "expected",
+        "assessedAt": null,
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_011",
+        "animal": "animal_011",
+        "definition": "wt_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_012",
+        "animal": "animal_012",
+        "definition": "ko_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_013",
+        "animal": "animal_013",
+        "definition": "wt_wt",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_014",
+        "animal": "animal_014",
+        "definition": "wt_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_015",
+        "animal": "animal_015",
+        "definition": "ko_ko",
+        "state": "expected",
+        "assessedAt": null,
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_016",
+        "animal": "animal_016",
+        "definition": "wt_wt",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_017",
+        "animal": "animal_017",
+        "definition": "wt_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_018",
+        "animal": "animal_018",
+        "definition": "ko_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_019",
+        "animal": "animal_019",
+        "definition": "wt_wt",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_020",
+        "animal": "animal_020",
+        "definition": "wt_ko",
+        "state": "expected",
+        "assessedAt": null,
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_021",
+        "animal": "animal_021",
+        "definition": "ko_ko",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      },
+      {
+        "key": "geno_022",
+        "animal": "animal_022",
+        "definition": "wt_wt",
+        "state": "confirmed",
+        "assessedAt": "2024-12-20T02:00:00Z",
+        "method": "synthetic-PCR",
+        "notes": "标准合成基因分型"
+      }
+    ]
+  },
+  "breeding": {
+    "line": {
+      "key": "genea_line",
+      "name": "标准 GeneA 品系",
+      "description": "用于标准测试的合成品系",
+      "definitions": [
+        "wt_wt",
+        "wt_ko",
+        "ko_ko"
+      ]
+    },
+    "colonies": [
+      {
+        "key": "founder",
+        "name": "GeneA Founder Colony",
+        "description": "亲本繁育群"
+      },
+      {
+        "key": "reserve",
+        "name": "GeneA Reserve Colony",
+        "description": "备用繁育群"
+      }
+    ],
+    "pairs": [
+      {
+        "key": "pair_a",
+        "colony": "founder",
+        "name": "GeneA Pair A",
+        "male": "animal_001",
+        "females": [
+          "animal_002"
+        ],
+        "startedAt": "2024-09-01T00:00:00Z",
+        "status": "active"
+      },
+      {
+        "key": "pair_b",
+        "colony": "reserve",
+        "name": "GeneA Pair B",
+        "male": "animal_003",
+        "females": [
+          "animal_004"
+        ],
+        "startedAt": "2024-09-02T00:00:00Z",
+        "status": "retired",
+        "endedAt": "2024-12-31T00:00:00Z"
+      }
+    ],
+    "mating": {
+      "key": "mating_a",
+      "pair": "pair_a",
+      "male": "animal_001",
+      "female": "animal_002",
+      "occurredAt": "2024-09-25T01:00:00Z",
+      "notes": "标准合成交配事件"
+    },
+    "litter": {
+      "key": "litter_a",
+      "pair": "pair_a",
+      "mating": "mating_a",
+      "bornOn": "2024-10-15",
+      "sizeTotal": 7,
+      "notes": "6 只登记，1 只保持 pending",
+      "drafts": [
+        {
+          "temporaryLabel": "F1-01",
+          "sex": "male",
+          "animal": "animal_017"
+        },
+        {
+          "temporaryLabel": "F1-02",
+          "sex": "female",
+          "animal": "animal_018"
+        },
+        {
+          "temporaryLabel": "F1-03",
+          "sex": "male",
+          "animal": "animal_019"
+        },
+        {
+          "temporaryLabel": "F1-04",
+          "sex": "female",
+          "animal": "animal_020"
+        },
+        {
+          "temporaryLabel": "F1-05",
+          "sex": "male",
+          "animal": "animal_021"
+        },
+        {
+          "temporaryLabel": "F1-06",
+          "sex": "female",
+          "animal": "animal_022"
+        },
+        {
+          "temporaryLabel": "F1-07",
+          "sex": "male",
+          "animal": null
+        }
+      ]
+    }
+  },
+  "templates": [
+    {
+      "key": "intervention_v1",
+      "project": "intervention",
+      "templateKey": "std_genea_intervention",
+      "version": 1,
+      "name": "标准 GeneA 纵向干预模板 v1",
+      "description": "体重、临床观察与采样的已发布标准模板。",
+      "status": "published",
+      "fields": [
+        {
+          "key": "body_weight",
+          "label": "体重",
+          "value_type": "number",
+          "unit": "g",
+          "required": true,
+          "categories": [],
+          "minimum": 10,
+          "maximum": 60,
+          "display_order": 10,
+          "ai_writable": false
+        },
+        {
+          "key": "clinical_note",
+          "label": "临床记录",
+          "value_type": "text",
+          "unit": null,
+          "required": false,
+          "categories": [],
+          "minimum": null,
+          "maximum": null,
+          "display_order": 20,
+          "ai_writable": false
+        }
+      ]
+    },
+    {
+      "key": "intervention_v2",
+      "project": "intervention",
+      "templateKey": "std_genea_intervention",
+      "version": 2,
+      "name": "标准 GeneA 纵向干预模板 v2 草稿",
+      "description": "保留为模板编辑测试，不发布。",
+      "status": "draft",
+      "fields": []
+    },
+    {
+      "key": "pilot_v1",
+      "project": "breeding",
+      "templateKey": "std_f1_pilot",
+      "version": 1,
+      "name": "标准 F1 基线表型模板",
+      "description": "F1 后代基线表型与退出流程。",
+      "status": "published",
+      "fields": [
+        {
+          "key": "body_weight",
+          "label": "体重",
+          "value_type": "number",
+          "unit": "g",
+          "required": true,
+          "categories": [],
+          "minimum": 5,
+          "maximum": 50,
+          "display_order": 10,
+          "ai_writable": false
+        }
+      ]
+    },
+    {
+      "key": "sandbox_v1",
+      "project": "sandbox",
+      "templateKey": "std_manual_sandbox",
+      "version": 1,
+      "name": "人工测试沙盒模板草稿",
+      "description": "用户可自由修改的模板草稿锚点。",
+      "status": "draft",
+      "fields": [],
+      "mode": "sandbox"
+    }
+  ],
+  "experiments": [
+    {
+      "key": "intervention",
+      "project": "intervention",
+      "name": "标准数据｜GeneA 纵向干预研究",
+      "description": "12 只动物、对照与处理两组、四个固定时间点。",
+      "template": null,
+      "status": "completed",
+      "mode": "baseline"
+    },
+    {
+      "key": "pilot",
+      "project": "breeding",
+      "name": "标准数据｜F1 基线表型 Pilot",
+      "description": "6 只 F1 后代的部分执行试验，用于覆盖取消与退出。",
+      "template": "pilot_v1",
+      "status": "cancelled",
+      "mode": "baseline"
+    },
+    {
+      "key": "sandbox",
+      "project": "sandbox",
+      "name": "标准数据｜人工实验沙盒",
+      "description": "保持 draft，供人工测试自由修改。",
+      "template": null,
+      "status": "draft",
+      "mode": "sandbox"
+    }
+  ],
+  "cohorts": [
+    {
+      "key": "int_control",
+      "experiment": "intervention",
+      "name": "对照组",
+      "description": "GeneA 干预对照组"
+    },
+    {
+      "key": "int_treatment",
+      "experiment": "intervention",
+      "name": "处理组",
+      "description": "GeneA 干预处理组"
+    },
+    {
+      "key": "pilot_wt",
+      "experiment": "pilot",
+      "name": "WT/WT 组",
+      "description": "F1 野生型基线组"
+    },
+    {
+      "key": "pilot_variant",
+      "experiment": "pilot",
+      "name": "GeneA 变异组",
+      "description": "F1 杂合/纯合基线组"
+    },
+    {
+      "key": "sandbox",
+      "experiment": "sandbox",
+      "name": "人工分组",
+      "description": "用户可自由修改",
+      "mode": "sandbox"
+    }
+  ],
+  "participations": [
+    {
+      "key": "int_005",
+      "experiment": "intervention",
+      "animal": "animal_005",
+      "cohort": "int_control",
+      "enrolledAt": "2025-01-02T00:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_006",
+      "experiment": "intervention",
+      "animal": "animal_006",
+      "cohort": "int_control",
+      "enrolledAt": "2025-01-02T01:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_007",
+      "experiment": "intervention",
+      "animal": "animal_007",
+      "cohort": "int_control",
+      "enrolledAt": "2025-01-02T02:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_008",
+      "experiment": "intervention",
+      "animal": "animal_008",
+      "cohort": "int_control",
+      "enrolledAt": "2025-01-02T03:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_009",
+      "experiment": "intervention",
+      "animal": "animal_009",
+      "cohort": "int_control",
+      "enrolledAt": "2025-01-02T04:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_010",
+      "experiment": "intervention",
+      "animal": "animal_010",
+      "cohort": "int_control",
+      "enrolledAt": "2025-01-02T05:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_011",
+      "experiment": "intervention",
+      "animal": "animal_011",
+      "cohort": "int_treatment",
+      "enrolledAt": "2025-01-02T00:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_012",
+      "experiment": "intervention",
+      "animal": "animal_012",
+      "cohort": "int_treatment",
+      "enrolledAt": "2025-01-02T01:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_013",
+      "experiment": "intervention",
+      "animal": "animal_013",
+      "cohort": "int_treatment",
+      "enrolledAt": "2025-01-02T02:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_014",
+      "experiment": "intervention",
+      "animal": "animal_014",
+      "cohort": "int_treatment",
+      "enrolledAt": "2025-01-02T03:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "int_015",
+      "experiment": "intervention",
+      "animal": "animal_015",
+      "cohort": "int_treatment",
+      "enrolledAt": "2025-01-02T04:00:00Z",
+      "status": "withdrawn"
+    },
+    {
+      "key": "int_016",
+      "experiment": "intervention",
+      "animal": "animal_016",
+      "cohort": "int_treatment",
+      "enrolledAt": "2025-01-02T05:00:00Z",
+      "status": "withdrawn"
+    },
+    {
+      "key": "pilot_017",
+      "experiment": "pilot",
+      "animal": "animal_017",
+      "cohort": "pilot_wt",
+      "enrolledAt": "2025-02-01T00:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "pilot_018",
+      "experiment": "pilot",
+      "animal": "animal_018",
+      "cohort": "pilot_wt",
+      "enrolledAt": "2025-02-01T01:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "pilot_019",
+      "experiment": "pilot",
+      "animal": "animal_019",
+      "cohort": "pilot_wt",
+      "enrolledAt": "2025-02-01T02:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "pilot_020",
+      "experiment": "pilot",
+      "animal": "animal_020",
+      "cohort": "pilot_variant",
+      "enrolledAt": "2025-02-01T03:00:00Z",
+      "status": "completed"
+    },
+    {
+      "key": "pilot_021",
+      "experiment": "pilot",
+      "animal": "animal_021",
+      "cohort": "pilot_variant",
+      "enrolledAt": "2025-02-01T04:00:00Z",
+      "status": "withdrawn"
+    },
+    {
+      "key": "pilot_022",
+      "experiment": "pilot",
+      "animal": "animal_022",
+      "cohort": "pilot_variant",
+      "enrolledAt": "2025-02-01T05:00:00Z",
+      "status": "withdrawn"
+    },
+    {
+      "key": "sbx_023",
+      "experiment": "sandbox",
+      "animal": "animal_023",
+      "cohort": "sandbox",
+      "enrolledAt": "2025-03-01T00:00:00Z",
+      "status": "enrolled",
+      "mode": "sandbox"
+    },
+    {
+      "key": "sbx_024",
+      "experiment": "sandbox",
+      "animal": "animal_024",
+      "cohort": "sandbox",
+      "enrolledAt": "2025-03-01T01:00:00Z",
+      "status": "enrolled",
+      "mode": "sandbox"
+    }
+  ],
+  "procedures": [
+    {
+      "key": "int_randomization",
+      "experiment": "intervention",
+      "animal": null,
+      "name": "随机分组",
+      "scheduledAt": "2025-01-02T00:00:00Z",
+      "performedAt": "2025-01-02T00:30:00Z",
+      "status": "completed",
+      "details": {
+        "method": "blocked_by_sex"
+      }
+    },
+    {
+      "key": "int_dose_d1",
+      "experiment": "intervention",
+      "animal": "animal_011",
+      "name": "D1 给药",
+      "scheduledAt": "2025-01-03T01:00:00Z",
+      "performedAt": "2025-01-03T01:05:00Z",
+      "status": "completed",
+      "details": {
+        "route": "oral",
+        "dose_mg_kg": 10
+      }
+    },
+    {
+      "key": "int_dose_d7",
+      "experiment": "intervention",
+      "animal": "animal_012",
+      "name": "D7 给药",
+      "scheduledAt": "2025-01-09T01:00:00Z",
+      "performedAt": "2025-01-09T01:04:00Z",
+      "status": "completed",
+      "details": {
+        "route": "oral",
+        "dose_mg_kg": 10
+      }
+    },
+    {
+      "key": "int_blood_d7",
+      "experiment": "intervention",
+      "animal": "animal_005",
+      "name": "D7 血清采集",
+      "scheduledAt": "2025-01-09T03:00:00Z",
+      "performedAt": "2025-01-09T03:05:00Z",
+      "status": "completed",
+      "details": {
+        "site": "tail_vein"
+      }
+    },
+    {
+      "key": "int_blood_d21",
+      "experiment": "intervention",
+      "animal": "animal_006",
+      "name": "D21 血清采集",
+      "scheduledAt": "2025-01-23T03:00:00Z",
+      "performedAt": "2025-01-23T03:06:00Z",
+      "status": "completed",
+      "details": {
+        "site": "tail_vein"
+      }
+    },
+    {
+      "key": "int_skipped",
+      "experiment": "intervention",
+      "animal": "animal_016",
+      "name": "退出后给药",
+      "scheduledAt": "2025-01-23T01:00:00Z",
+      "performedAt": null,
+      "status": "skipped",
+      "details": {
+        "reason": "withdrawn"
+      }
+    },
+    {
+      "key": "pilot_exam",
+      "experiment": "pilot",
+      "animal": "animal_017",
+      "name": "F1 基线体格检查",
+      "scheduledAt": "2025-02-02T01:00:00Z",
+      "performedAt": "2025-02-02T01:20:00Z",
+      "status": "completed",
+      "details": {
+        "operator": "synthetic"
+      }
+    },
+    {
+      "key": "pilot_pending",
+      "experiment": "pilot",
+      "animal": "animal_022",
+      "name": "取消前行为学检查",
+      "scheduledAt": "2025-02-05T01:00:00Z",
+      "performedAt": null,
+      "status": "skipped",
+      "details": {
+        "reason": "study_cancelled"
+      }
+    }
+  ],
+  "events": [
+    {
+      "key": "int_randomization",
+      "experiment": "intervention",
+      "eventKey": "randomization",
+      "label": "随机分组",
+      "occurredAt": "2025-01-02T00:30:00Z",
+      "details": {
+        "phase": "intervention",
+        "sequence": 1
+      }
+    },
+    {
+      "key": "int_baseline",
+      "experiment": "intervention",
+      "eventKey": "baseline",
+      "label": "D0 基线",
+      "occurredAt": "2025-01-02T02:00:00Z",
+      "details": {
+        "phase": "intervention",
+        "sequence": 2
+      }
+    },
+    {
+      "key": "int_dose_d1",
+      "experiment": "intervention",
+      "eventKey": "dose_d1",
+      "label": "D1 给药",
+      "occurredAt": "2025-01-03T01:00:00Z",
+      "details": {
+        "phase": "intervention",
+        "sequence": 3
+      }
+    },
+    {
+      "key": "int_weight_d7",
+      "experiment": "intervention",
+      "eventKey": "weight_d7",
+      "label": "D7 体重",
+      "occurredAt": "2025-01-09T02:00:00Z",
+      "details": {
+        "phase": "intervention",
+        "sequence": 4
+      }
+    },
+    {
+      "key": "int_blood_d7",
+      "experiment": "intervention",
+      "eventKey": "blood_d7",
+      "label": "D7 采血",
+      "occurredAt": "2025-01-09T03:00:00Z",
+      "details": {
+        "phase": "intervention",
+        "sequence": 5
+      }
+    },
+    {
+      "key": "int_weight_d14",
+      "experiment": "intervention",
+      "eventKey": "weight_d14",
+      "label": "D14 体重",
+      "occurredAt": "2025-01-16T02:00:00Z",
+      "details": {
+        "phase": "intervention",
+        "sequence": 6
+      }
+    },
+    {
+      "key": "int_weight_d21",
+      "experiment": "intervention",
+      "eventKey": "weight_d21",
+      "label": "D21 体重",
+      "occurredAt": "2025-01-23T02:00:00Z",
+      "details": {
+        "phase": "intervention",
+        "sequence": 7
+      }
+    },
+    {
+      "key": "int_closeout",
+      "experiment": "intervention",
+      "eventKey": "closeout",
+      "label": "研究结束",
+      "occurredAt": "2025-01-24T04:00:00Z",
+      "details": {
+        "phase": "intervention",
+        "sequence": 8
+      }
+    },
+    {
+      "key": "pilot_enroll",
+      "experiment": "pilot",
+      "eventKey": "pilot_enroll",
+      "label": "F1 入组",
+      "occurredAt": "2025-02-01T01:00:00Z",
+      "details": {
+        "phase": "pilot",
+        "sequence": 1
+      }
+    },
+    {
+      "key": "pilot_baseline",
+      "experiment": "pilot",
+      "eventKey": "pilot_baseline",
+      "label": "F1 基线",
+      "occurredAt": "2025-02-02T01:00:00Z",
+      "details": {
+        "phase": "pilot",
+        "sequence": 2
+      }
+    },
+    {
+      "key": "pilot_review",
+      "experiment": "pilot",
+      "eventKey": "pilot_review",
+      "label": "中期复核",
+      "occurredAt": "2025-02-04T01:00:00Z",
+      "details": {
+        "phase": "pilot",
+        "sequence": 3
+      }
+    },
+    {
+      "key": "pilot_cancel",
+      "experiment": "pilot",
+      "eventKey": "pilot_cancel",
+      "label": "试验取消",
+      "occurredAt": "2025-02-05T02:00:00Z",
+      "details": {
+        "phase": "pilot",
+        "sequence": 4
+      }
+    }
+  ],
+  "observationDefinitions": [
+    {
+      "key": "body_condition",
+      "experiment": "intervention",
+      "definitionKey": "body_condition",
+      "label": "体况评分",
+      "valueType": "number",
+      "unit": "score",
+      "categories": [],
+      "policy": "mutable"
+    },
+    {
+      "key": "clinical_note",
+      "experiment": "intervention",
+      "definitionKey": "clinical_note",
+      "label": "临床观察",
+      "valueType": "text",
+      "unit": null,
+      "categories": [],
+      "policy": "versioned"
+    },
+    {
+      "key": "adverse_event",
+      "experiment": "intervention",
+      "definitionKey": "adverse_event",
+      "label": "不良事件",
+      "valueType": "boolean",
+      "unit": null,
+      "categories": [],
+      "policy": "immutable"
+    },
+    {
+      "key": "review_date",
+      "experiment": "pilot",
+      "definitionKey": "review_date",
+      "label": "复核日期",
+      "valueType": "date",
+      "unit": null,
+      "categories": [],
+      "policy": "immutable"
+    },
+    {
+      "key": "activity_level",
+      "experiment": "pilot",
+      "definitionKey": "activity_level",
+      "label": "活动水平",
+      "valueType": "category",
+      "unit": null,
+      "categories": [
+        "low",
+        "normal",
+        "high"
+      ],
+      "policy": "versioned"
+    },
+    {
+      "key": "instrument_payload",
+      "experiment": "pilot",
+      "definitionKey": "instrument_payload",
+      "label": "仪器原始摘要",
+      "valueType": "json",
+      "unit": null,
+      "categories": [],
+      "policy": "immutable"
+    }
+  ],
+  "observations": [
+    {
+      "key": "body_condition_1",
+      "experiment": "intervention",
+      "event": "int_baseline",
+      "definition": "body_condition",
+      "subjectType": "animal",
+      "animal": "animal_005",
+      "context": {
+        "timepoint": "int_baseline"
+      },
+      "value": {
+        "type": "number",
+        "value": 3.0
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察",
+      "revision": {
+        "value": {
+          "type": "number",
+          "value": 3.5
+        },
+        "recordedAt": "2025-01-16T04:00:00Z",
+        "notes": "标准数据复核修订"
+      }
+    },
+    {
+      "key": "body_condition_2",
+      "experiment": "intervention",
+      "event": "int_baseline",
+      "definition": "body_condition",
+      "subjectType": "animal",
+      "animal": "animal_006",
+      "context": {
+        "timepoint": "int_baseline"
+      },
+      "value": {
+        "type": "number",
+        "value": 3.0
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察",
+      "revision": {
+        "value": {
+          "type": "number",
+          "value": 3.5
+        },
+        "recordedAt": "2025-01-16T04:00:00Z",
+        "notes": "标准数据复核修订"
+      }
+    },
+    {
+      "key": "body_condition_3",
+      "experiment": "intervention",
+      "event": "int_baseline",
+      "definition": "body_condition",
+      "subjectType": "animal",
+      "animal": "animal_007",
+      "context": {
+        "timepoint": "int_baseline"
+      },
+      "value": {
+        "type": "number",
+        "value": 2.5
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "body_condition_4",
+      "experiment": "intervention",
+      "event": "int_baseline",
+      "definition": "body_condition",
+      "subjectType": "animal",
+      "animal": "animal_008",
+      "context": {
+        "timepoint": "int_baseline"
+      },
+      "value": {
+        "type": "number",
+        "value": 3.5
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "clinical_note_1",
+      "experiment": "intervention",
+      "event": "int_weight_d7",
+      "definition": "clinical_note",
+      "subjectType": "animal",
+      "animal": "animal_005",
+      "context": {
+        "timepoint": "int_weight_d7"
+      },
+      "value": {
+        "type": "text",
+        "value": "正常"
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察",
+      "revision": {
+        "value": {
+          "type": "text",
+          "value": "正常（复核）"
+        },
+        "recordedAt": "2025-01-16T04:00:00Z",
+        "notes": "标准数据复核修订"
+      }
+    },
+    {
+      "key": "clinical_note_2",
+      "experiment": "intervention",
+      "event": "int_weight_d7",
+      "definition": "clinical_note",
+      "subjectType": "animal",
+      "animal": "animal_006",
+      "context": {
+        "timepoint": "int_weight_d7"
+      },
+      "value": {
+        "type": "text",
+        "value": "轻微抓挠"
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察",
+      "revision": {
+        "value": {
+          "type": "text",
+          "value": "轻微抓挠（复核）"
+        },
+        "recordedAt": "2025-01-16T04:00:00Z",
+        "notes": "标准数据复核修订"
+      }
+    },
+    {
+      "key": "clinical_note_3",
+      "experiment": "intervention",
+      "event": "int_weight_d7",
+      "definition": "clinical_note",
+      "subjectType": "animal",
+      "animal": "animal_007",
+      "context": {
+        "timepoint": "int_weight_d7"
+      },
+      "value": {
+        "type": "text",
+        "value": "正常"
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "clinical_note_4",
+      "experiment": "intervention",
+      "event": "int_weight_d7",
+      "definition": "clinical_note",
+      "subjectType": "animal",
+      "animal": "animal_008",
+      "context": {
+        "timepoint": "int_weight_d7"
+      },
+      "value": {
+        "type": "text",
+        "value": "毛色正常"
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "adverse_event_1",
+      "experiment": "intervention",
+      "event": "int_weight_d14",
+      "definition": "adverse_event",
+      "subjectType": "animal",
+      "animal": "animal_009",
+      "context": {
+        "timepoint": "int_weight_d14"
+      },
+      "value": {
+        "type": "boolean",
+        "value": false
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "adverse_event_2",
+      "experiment": "intervention",
+      "event": "int_weight_d14",
+      "definition": "adverse_event",
+      "subjectType": "animal",
+      "animal": "animal_010",
+      "context": {
+        "timepoint": "int_weight_d14"
+      },
+      "value": {
+        "type": "boolean",
+        "value": false
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "adverse_event_3",
+      "experiment": "intervention",
+      "event": "int_weight_d14",
+      "definition": "adverse_event",
+      "subjectType": "animal",
+      "animal": "animal_011",
+      "context": {
+        "timepoint": "int_weight_d14"
+      },
+      "value": {
+        "type": "boolean",
+        "value": true
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "adverse_event_4",
+      "experiment": "intervention",
+      "event": "int_weight_d14",
+      "definition": "adverse_event",
+      "subjectType": "animal",
+      "animal": "animal_012",
+      "context": {
+        "timepoint": "int_weight_d14"
+      },
+      "value": {
+        "type": "boolean",
+        "value": false
+      },
+      "recordedAt": "2025-01-16T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "review_date_1",
+      "experiment": "pilot",
+      "event": "pilot_review",
+      "definition": "review_date",
+      "subjectType": "animal",
+      "animal": "animal_017",
+      "context": {
+        "timepoint": "pilot_review"
+      },
+      "value": {
+        "type": "date",
+        "value": "2025-02-04"
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "review_date_2",
+      "experiment": "pilot",
+      "event": "pilot_review",
+      "definition": "review_date",
+      "subjectType": "animal",
+      "animal": "animal_018",
+      "context": {
+        "timepoint": "pilot_review"
+      },
+      "value": {
+        "type": "date",
+        "value": "2025-02-04"
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "review_date_3",
+      "experiment": "pilot",
+      "event": "pilot_review",
+      "definition": "review_date",
+      "subjectType": "animal",
+      "animal": "animal_019",
+      "context": {
+        "timepoint": "pilot_review"
+      },
+      "value": {
+        "type": "date",
+        "value": "2025-02-04"
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "review_date_4",
+      "experiment": "pilot",
+      "event": "pilot_review",
+      "definition": "review_date",
+      "subjectType": "animal",
+      "animal": "animal_020",
+      "context": {
+        "timepoint": "pilot_review"
+      },
+      "value": {
+        "type": "date",
+        "value": "2025-02-04"
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "activity_level_1",
+      "experiment": "pilot",
+      "event": "pilot_baseline",
+      "definition": "activity_level",
+      "subjectType": "animal",
+      "animal": "animal_017",
+      "context": {
+        "timepoint": "pilot_baseline"
+      },
+      "value": {
+        "type": "category",
+        "value": "normal"
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "activity_level_2",
+      "experiment": "pilot",
+      "event": "pilot_baseline",
+      "definition": "activity_level",
+      "subjectType": "animal",
+      "animal": "animal_018",
+      "context": {
+        "timepoint": "pilot_baseline"
+      },
+      "value": {
+        "type": "category",
+        "value": "high"
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "activity_level_3",
+      "experiment": "pilot",
+      "event": "pilot_baseline",
+      "definition": "activity_level",
+      "subjectType": "animal",
+      "animal": "animal_019",
+      "context": {
+        "timepoint": "pilot_baseline"
+      },
+      "value": {
+        "type": "category",
+        "value": "normal"
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "activity_level_4",
+      "experiment": "pilot",
+      "event": "pilot_baseline",
+      "definition": "activity_level",
+      "subjectType": "animal",
+      "animal": "animal_020",
+      "context": {
+        "timepoint": "pilot_baseline"
+      },
+      "value": {
+        "type": "category",
+        "value": "low"
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "instrument_payload_1",
+      "experiment": "pilot",
+      "event": "pilot_baseline",
+      "definition": "instrument_payload",
+      "subjectType": "animal",
+      "animal": "animal_017",
+      "context": {
+        "timepoint": "pilot_baseline"
+      },
+      "value": {
+        "type": "json",
+        "value": {
+          "device": "SYN-01",
+          "quality": "ok",
+          "row": 1
+        }
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "instrument_payload_2",
+      "experiment": "pilot",
+      "event": "pilot_baseline",
+      "definition": "instrument_payload",
+      "subjectType": "animal",
+      "animal": "animal_018",
+      "context": {
+        "timepoint": "pilot_baseline"
+      },
+      "value": {
+        "type": "json",
+        "value": {
+          "device": "SYN-01",
+          "quality": "ok",
+          "row": 2
+        }
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "instrument_payload_3",
+      "experiment": "pilot",
+      "event": "pilot_baseline",
+      "definition": "instrument_payload",
+      "subjectType": "animal",
+      "animal": "animal_019",
+      "context": {
+        "timepoint": "pilot_baseline"
+      },
+      "value": {
+        "type": "json",
+        "value": {
+          "device": "SYN-01",
+          "quality": "ok",
+          "row": 3
+        }
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    },
+    {
+      "key": "instrument_payload_4",
+      "experiment": "pilot",
+      "event": "pilot_baseline",
+      "definition": "instrument_payload",
+      "subjectType": "animal",
+      "animal": "animal_020",
+      "context": {
+        "timepoint": "pilot_baseline"
+      },
+      "value": {
+        "type": "json",
+        "value": {
+          "device": "SYN-01",
+          "quality": "ok",
+          "row": 4
+        }
+      },
+      "recordedAt": "2025-02-04T03:00:00Z",
+      "notes": "固定合成观察"
+    }
+  ],
+  "measurements": [
+    {
+      "key": "bw_005_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_005",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 20.0
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_005_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_005",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 20.6
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_005_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_005",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 21.1
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_005_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_005",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 21.6
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_006_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_006",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 20.4
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_006_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_006",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 20.9
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_006_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_006",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 21.5
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_006_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_006",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 22.0
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_007_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_007",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 20.7
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_007_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_007",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 21.2
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_007_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_007",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 21.8
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_007_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_007",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 22.3
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_008_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_008",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 21.1
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_008_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_008",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 21.6
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_008_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_008",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 22.2
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_008_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_008",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 22.7
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_009_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_009",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 21.4
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_009_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_009",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 21.9
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_009_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_009",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 22.5
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_009_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_009",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 23.0
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_010_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_010",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 21.8
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_010_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_010",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 22.3
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_010_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_010",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 22.9
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_010_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_010",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 23.4
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_011_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_011",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 22.1
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_011_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_011",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 22.5
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_011_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_011",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 22.8
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_011_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_011",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 23.2
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_012_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_012",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 22.4
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_012_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_012",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 22.8
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_012_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_012",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 23.1
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_012_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_012",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 23.5
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_013_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_013",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 22.8
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_013_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_013",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 23.2
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_013_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_013",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 23.5
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_013_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_013",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 23.9
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_014_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_014",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 23.1
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_014_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_014",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 23.5
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_014_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_014",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 23.8
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_014_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_014",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 24.2
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_015_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_015",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 23.5
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_015_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_015",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 23.9
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_015_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_015",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 24.2
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_015_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_015",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 24.6
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_016_d0",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_016",
+      "measurementKey": "body_weight_d0",
+      "label": "体重 D0",
+      "value": {
+        "type": "number",
+        "value": 23.9
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-02T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_016_d7",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_016",
+      "measurementKey": "body_weight_d7",
+      "label": "体重 D7",
+      "value": {
+        "type": "number",
+        "value": 24.2
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-09T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_016_d14",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_016",
+      "measurementKey": "body_weight_d14",
+      "label": "体重 D14",
+      "value": {
+        "type": "number",
+        "value": 24.6
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-16T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "bw_016_d21",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_016",
+      "measurementKey": "body_weight_d21",
+      "label": "体重 D21",
+      "value": {
+        "type": "number",
+        "value": 24.9
+      },
+      "unit": "g",
+      "measuredAt": "2025-01-23T02:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "clinical_text",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_005",
+      "measurementKey": "clinical_note",
+      "label": "临床备注",
+      "value": {
+        "type": "text",
+        "value": "状态良好"
+      },
+      "unit": null,
+      "measuredAt": "2025-01-09T05:00:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "clinical_text_draft",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_006",
+      "measurementKey": "clinical_note_draft",
+      "label": "待复核临床备注",
+      "value": {
+        "type": "text",
+        "value": "待二次复核"
+      },
+      "unit": null,
+      "measuredAt": "2025-01-09T05:05:00Z",
+      "status": "draft"
+    },
+    {
+      "key": "fasted",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_007",
+      "measurementKey": "fasted",
+      "label": "是否禁食",
+      "value": {
+        "type": "boolean",
+        "value": true
+      },
+      "unit": null,
+      "measuredAt": "2025-01-09T05:10:00Z",
+      "status": "signed"
+    },
+    {
+      "key": "collection_date",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_008",
+      "measurementKey": "collection_date",
+      "label": "采集日期",
+      "value": {
+        "type": "date",
+        "value": "2025-01-09"
+      },
+      "unit": null,
+      "measuredAt": "2025-01-09T05:15:00Z",
+      "status": "draft"
+    },
+    {
+      "key": "activity_category",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_009",
+      "measurementKey": "activity_category",
+      "label": "活动等级",
+      "value": {
+        "type": "category",
+        "value": "normal"
+      },
+      "unit": null,
+      "measuredAt": "2025-01-09T05:20:00Z",
+      "status": "draft"
+    }
+  ],
+  "samples": [
+    {
+      "key": "serum_005",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_005",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/01",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_006",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_006",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/02",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_007",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_007",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/03",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_008",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_008",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/04",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_009",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_009",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/05",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_010",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_010",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/06",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_011",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_011",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/07",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_012",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_012",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/08",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_013",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_013",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/09",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_014",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_014",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/10",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_015",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_015",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/11",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "serum_016",
+      "project": "intervention",
+      "experiment": "intervention",
+      "animal": "animal_016",
+      "sampleType": "serum",
+      "quantity": 0.25,
+      "unit": "mL",
+      "location": "Freezer-A/Box-01/12",
+      "collectedAt": "2025-01-09T03:00:00Z"
+    },
+    {
+      "key": "tissue_017",
+      "project": "breeding",
+      "experiment": "pilot",
+      "animal": "animal_017",
+      "sampleType": "ear_punch",
+      "quantity": 1,
+      "unit": "piece",
+      "location": "Freezer-B/Box-02/01",
+      "collectedAt": "2025-02-02T03:00:00Z"
+    },
+    {
+      "key": "tissue_018",
+      "project": "breeding",
+      "experiment": "pilot",
+      "animal": "animal_018",
+      "sampleType": "ear_punch",
+      "quantity": 1,
+      "unit": "piece",
+      "location": "Freezer-B/Box-02/02",
+      "collectedAt": "2025-02-02T03:00:00Z"
+    },
+    {
+      "key": "tissue_019",
+      "project": "breeding",
+      "experiment": "pilot",
+      "animal": "animal_019",
+      "sampleType": "ear_punch",
+      "quantity": 1,
+      "unit": "piece",
+      "location": "Freezer-B/Box-02/03",
+      "collectedAt": "2025-02-02T03:00:00Z"
+    },
+    {
+      "key": "tissue_020",
+      "project": "breeding",
+      "experiment": "pilot",
+      "animal": "animal_020",
+      "sampleType": "ear_punch",
+      "quantity": 1,
+      "unit": "piece",
+      "location": "Freezer-B/Box-02/04",
+      "collectedAt": "2025-02-02T03:00:00Z"
+    },
+    {
+      "key": "tissue_021",
+      "project": "breeding",
+      "experiment": "pilot",
+      "animal": "animal_021",
+      "sampleType": "ear_punch",
+      "quantity": 1,
+      "unit": "piece",
+      "location": "Freezer-B/Box-02/05",
+      "collectedAt": "2025-02-02T03:00:00Z"
+    },
+    {
+      "key": "tissue_022",
+      "project": "breeding",
+      "experiment": "pilot",
+      "animal": "animal_022",
+      "sampleType": "ear_punch",
+      "quantity": 1,
+      "unit": "piece",
+      "location": "Freezer-B/Box-02/06",
+      "collectedAt": "2025-02-02T03:00:00Z"
+    }
+  ],
+  "attachments": [
+    {
+      "key": "protocol",
+      "targetType": "project",
+      "target": "project:intervention",
+      "project": "intervention",
+      "file": "study-protocol.md",
+      "mediaType": "text/markdown"
+    },
+    {
+      "key": "weight_csv",
+      "targetType": "experiment",
+      "target": "experiment:intervention",
+      "project": "intervention",
+      "file": "body-weight.csv",
+      "mediaType": "text/csv"
+    },
+    {
+      "key": "summary_pdf",
+      "targetType": "experiment",
+      "target": "experiment:pilot",
+      "project": "breeding",
+      "file": "study-summary.pdf",
+      "mediaType": "application/pdf"
+    },
+    {
+      "key": "instrument",
+      "targetType": "measurement",
+      "target": "measurement:bw_005_d7",
+      "project": "intervention",
+      "file": "measurement-instrument.json",
+      "mediaType": "application/json"
+    },
+    {
+      "key": "cage_card",
+      "targetType": "animal",
+      "target": "animal:animal_005",
+      "project": "intervention",
+      "file": "animal-cage-card.png",
+      "mediaType": "image/png"
+    },
+    {
+      "key": "sample_manifest",
+      "targetType": "sample",
+      "target": "sample:serum_005",
+      "project": "intervention",
+      "file": "sample-manifest.json",
+      "mediaType": "application/json"
+    },
+    {
+      "key": "histology",
+      "targetType": "sample",
+      "target": "sample:tissue_017",
+      "project": "breeding",
+      "file": "histology-placeholder.png",
+      "mediaType": "image/png"
+    }
+  ],
+  "expectedCounts": {
+    "projects": 3,
+    "cages": 10,
+    "animals": 24,
+    "genotypingRecords": 22,
+    "breedingLines": 1,
+    "colonies": 2,
+    "breedingPairs": 2,
+    "matingEvents": 1,
+    "litters": 1,
+    "animalDrafts": 7,
+    "registeredDrafts": 6,
+    "pendingDrafts": 1,
+    "templateVersions": 4,
+    "experiments": 3,
+    "cohorts": 5,
+    "participations": 20,
+    "procedures": 8,
+    "experimentEvents": 12,
+    "observationDefinitions": 6,
+    "observations": 24,
+    "observationRevisions": 4,
+    "measurements": 53,
+    "samples": 18,
+    "attachments": 7
+  }
+}

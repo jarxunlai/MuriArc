@@ -1,0 +1,7 @@
+{
+  "synthetic": true,
+  "dataset": "standard-v1",
+  "samples": 18,
+  "serum": 12,
+  "tissue": 6
+}

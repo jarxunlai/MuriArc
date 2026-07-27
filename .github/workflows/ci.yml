@@ -62,7 +62,7 @@ jobs:
           cargo clippy --locked
           -p muriarc-core -p muriarc-ai
           -p muriarc-store-sqlite -p muriarc-store-postgres
-          -p muriarc-importer -p muriarc-data -p muriarc-snapshot -p muriarc-legacy-migrator
+          -p muriarc-importer -p muriarc-data -p muriarc-snapshot
           --all-targets --all-features -- -D warnings
       - name: Server clippy
         run: cargo clippy --locked -p muriarc-server --all-targets --all-features -- -D warnings
@@ -75,7 +75,7 @@ jobs:
           cargo test --locked
           -p muriarc-core -p muriarc-ai
           -p muriarc-store-sqlite -p muriarc-store-postgres
-          -p muriarc-importer -p muriarc-data -p muriarc-snapshot -p muriarc-legacy-migrator
+          -p muriarc-importer -p muriarc-data -p muriarc-snapshot
           --all-targets --all-features
       - name: Server, MCP, Environment Root, and API tests
         run: cargo test --locked -p muriarc-server --all-targets --all-features

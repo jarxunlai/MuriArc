@@ -617,7 +617,7 @@ impl DesktopUpgradeDriver {
         .map_err(persistence_error)?;
         if let Some(current) = current.as_ref() {
             let current_snapshot: UpgradeSnapshot =
-                serde_json::from_str(&current).map_err(serialization_error)?;
+                serde_json::from_str(current).map_err(serialization_error)?;
             if current_snapshot.revision > snapshot.revision {
                 return Err(UpgradeError::Persistence {
                     message: "Desktop operation persistence rejected a stale revision".to_owned(),

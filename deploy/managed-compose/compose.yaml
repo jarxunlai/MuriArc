@@ -1,0 +1,96 @@
+name: muriarc
+
+services:
+  db:
+    image: ${MURIARC_POSTGRES_IMAGE:?set a digest-pinned PostgreSQL 17 image}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MURIARC_POSTGRES_DB:-muriarc}
+      POSTGRES_USER: ${MURIARC_POSTGRES_USER:-muriarc}
+      POSTGRES_PASSWORD: ${MURIARC_POSTGRES_PASSWORD:?set MURIARC_POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+
+  server:
+    image: ${MURIARC_SERVER_IMAGE:?set a digest-pinned signed MuriArc image}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MURIARC_DATABASE_URL: postgresql://${MURIARC_POSTGRES_USER:-muriarc}:${MURIARC_POSTGRES_PASSWORD:?set MURIARC_POSTGRES_PASSWORD}@db:5432/${MURIARC_POSTGRES_DB:-muriarc}
+      MURIARC_BIND_ADDR: 0.0.0.0:8787
+      MURIARC_UI_DIR: /opt/muriarc/ui
+      MURIARC_DATA_ROOT: /var/lib/muriarc/generations/${MURIARC_ACTIVE_GENERATION:?set active generation UUID}/data
+      MURIARC_ATTACHMENT_ROOT: /var/lib/muriarc/generations/${MURIARC_ACTIVE_GENERATION:?set active generation UUID}/attachments
+      MURIARC_PREVIEW_BOOTSTRAP: "false"
+      MURIARC_ACTIVATION_MODE: ${MURIARC_ACTIVATION_MODE:-read-write}
+      MURIARC_LAB_ID: ${MURIARC_LAB_ID:?set MURIARC_LAB_ID}
+      MURIARC_LAB_NAME: ${MURIARC_LAB_NAME:?set MURIARC_LAB_NAME}
+      MURIARC_ROOT_USER_ID: ${MURIARC_ROOT_USER_ID:?set MURIARC_ROOT_USER_ID}
+      MURIARC_ROOT_USER_EMAIL: ${MURIARC_ROOT_USER_EMAIL:?set MURIARC_ROOT_USER_EMAIL}
+      MURIARC_ROOT_USER_NAME: ${MURIARC_ROOT_USER_NAME:?set MURIARC_ROOT_USER_NAME}
+      MURIARC_ROOT_PASSWORD: ${MURIARC_ROOT_PASSWORD:?set MURIARC_ROOT_PASSWORD}
+      MURIARC_SESSION_COOKIE_SECURE: ${MURIARC_SESSION_COOKIE_SECURE:-true}
+      MURIARC_DEPLOYMENT_PROFILE: ${MURIARC_DEPLOYMENT_PROFILE:-private}
+      MURIARC_EXTERNAL_API_ENABLED: ${MURIARC_EXTERNAL_API_ENABLED:-false}
+      MURIARC_AI_MASTER_KEY_FILE: /var/lib/muriarc/generations/${MURIARC_ACTIVE_GENERATION:?set active generation UUID}/secrets/ai-master-key
+      MURIARC_AI_MASTER_KEY_VERSION: ${MURIARC_AI_MASTER_KEY_VERSION:-1}
+      MURIARC_BOOTSTRAP_TOKEN: ""
+      MURIARC_BOOTSTRAP_MCP_TOKEN: ""
+      MURIARC_MCP_ALLOWED_ORIGINS: ${MURIARC_MCP_ALLOWED_ORIGINS:-}
+      RUST_LOG: ${RUST_LOG:-muriarc_server=info,tower_http=info}
+    ports: ["127.0.0.1:8787:8787"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8787/readyz"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    read_only: true
+    volumes:
+      - server_data:/var/lib/muriarc
+    tmpfs: [/tmp:size=64m,mode=1777]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 90s
+    networks: [backend, edge]
+
+  upgrade-executor:
+    image: ${MURIARC_SERVER_IMAGE:?set a digest-pinned signed MuriArc image}
+    profiles: [control]
+    user: "0:0"
+    entrypoint: ["/usr/local/bin/muriarc-upgrade-executor"]
+    environment:
+      MURIARC_CANDIDATE_DATABASE_URL: ${MURIARC_CANDIDATE_DATABASE_URL:-}
+      MURIARC_CANDIDATE_DATABASE_NAME: ${MURIARC_CANDIDATE_DATABASE_NAME:-}
+      MURIARC_CANDIDATE_DATA_ROOT: /var/lib/muriarc/generations/${MURIARC_CANDIDATE_GENERATION:-disabled}/data
+      MURIARC_CANDIDATE_ATTACHMENT_ROOT: /var/lib/muriarc/generations/${MURIARC_CANDIDATE_GENERATION:-disabled}/attachments
+      MURIARC_CANDIDATE_MASTER_KEY_FILE: /var/lib/muriarc/generations/${MURIARC_CANDIDATE_GENERATION:-disabled}/secrets/ai-master-key
+      MURIARC_CANDIDATE_EXTERNAL_PROVIDERS_DISABLED: "true"
+      MURIARC_CANDIDATE_BACKGROUND_JOBS_DISABLED: "true"
+      MURIARC_CANDIDATE_REAL_USER_WRITES_DISABLED: "true"
+    read_only: true
+    volumes:
+      - server_data:/var/lib/muriarc
+    tmpfs: [/tmp:size=64m,mode=1777]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [backend]
+
+volumes:
+  postgres_data:
+  server_data:
+
+networks:
+  backend:
+    internal: true
+  edge:

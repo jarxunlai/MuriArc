@@ -5,10 +5,11 @@ use argon2::{
     password_hash::SaltString,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use muriarc_core::{AiScope, MembershipFilter, MuriArcStore, StoreError, UserStatus, WriteSource};
 use muriarc_store_postgres::PostgresStore;
 use rand::rngs::OsRng;
+use ring::hmac;
 use serde_json::json;
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -16,15 +17,19 @@ use zeroize::Zeroizing;
 
 use crate::{
     AuthError, AuthPrincipal, AuthenticatedSession, Authenticator, ExternalTokenSummary,
-    NewExternalToken, NewSession, SessionBackend, StaticTokenAuthenticator, token_hash,
+    NewExternalToken, NewSession, SessionBackend, StaticTokenAuthenticator,
+    deployment_security::{CredentialPolicy, PASSWORD_MAX_BYTES},
+    token_hash,
 };
 
-const PASSWORD_MIN_CHARS: usize = 8;
-const PASSWORD_MAX_BYTES: usize = 1024;
 const EMAIL_MAX_BYTES: usize = 320;
 const ARGON2_MEMORY_KIB: u32 = 19 * 1024;
 const ARGON2_ITERATIONS: u32 = 2;
 const ARGON2_PARALLELISM: u32 = 1;
+const LOGIN_FAILURE_WINDOW_HOURS: i64 = 24;
+const LOGIN_BACKOFF_RETENTION_DAYS: i64 = 30;
+const LOGIN_BACKOFF_CLEANUP_BATCH: i64 = 500;
+const LOGIN_BACKOFF_LOCK_NAMESPACE: i64 = 0x4d_75_72_69_41_72_63_4c;
 
 #[derive(Clone)]
 pub struct PostgresAuthBackend {
@@ -33,6 +38,19 @@ pub struct PostgresAuthBackend {
     lab_id: Uuid,
     environment_root_user_id: Uuid,
     dummy_password_hash: Arc<str>,
+    credential_policy: CredentialPolicy,
+    login_identity_hmac_key: Option<Arc<[u8; 32]>>,
+}
+
+struct PasswordRecord {
+    user_id: Uuid,
+    password_hash: String,
+    credential_policy_revision: i32,
+}
+
+struct VerifiedLogin {
+    user_id: Uuid,
+    policy_upgrade_required: bool,
 }
 
 #[derive(Clone)]
@@ -80,6 +98,8 @@ impl std::fmt::Debug for PostgresAuthBackend {
             .field("lab_id", &self.lab_id)
             .field("environment_root_user_id", &self.environment_root_user_id)
             .field("dummy_password_hash", &"[REDACTED]")
+            .field("credential_policy", &self.credential_policy)
+            .field("login_identity_hmac_key", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
@@ -91,13 +111,34 @@ impl PostgresAuthBackend {
         lab_id: Uuid,
         environment_root_user_id: Uuid,
     ) -> Result<Self, AuthError> {
-        let dummy_password_hash = hash_password("MuriArc invalid credential placeholder")?;
+        Self::new_with_policy(
+            postgres,
+            store,
+            lab_id,
+            environment_root_user_id,
+            CredentialPolicy::private(),
+            None,
+        )
+    }
+
+    pub fn new_with_policy(
+        postgres: PostgresStore,
+        store: Arc<dyn MuriArcStore>,
+        lab_id: Uuid,
+        environment_root_user_id: Uuid,
+        credential_policy: CredentialPolicy,
+        login_identity_hmac_key: Option<[u8; 32]>,
+    ) -> Result<Self, AuthError> {
+        let dummy_password_hash =
+            hash_password_with_policy("MuriArc invalid credential placeholder", credential_policy)?;
         Ok(Self {
             store,
             postgres,
             lab_id,
             environment_root_user_id,
             dummy_password_hash: dummy_password_hash.into(),
+            credential_policy,
+            login_identity_hmac_key: login_identity_hmac_key.map(Arc::new),
         })
     }
 
@@ -162,13 +203,13 @@ impl PostgresAuthBackend {
         Ok(principal)
     }
 
-    async fn password_record(&self, email: &str) -> Result<Option<(Uuid, String)>, AuthError> {
+    async fn password_record(&self, email: &str) -> Result<Option<PasswordRecord>, AuthError> {
         let email = normalize_email(email);
         if email.is_empty() || email.len() > EMAIL_MAX_BYTES || !email.contains('@') {
             return Ok(None);
         }
         let rows = sqlx::query(
-            "SELECT c.user_id, c.password_hash FROM user_credentials c JOIN users u ON u.id = c.user_id WHERE u.lab_id = $1 AND lower(u.email) = $2 AND u.status = 'active' AND u.deleted_at IS NULL ORDER BY u.id LIMIT 2",
+            "SELECT c.user_id, c.password_hash, c.credential_policy_revision FROM user_credentials c JOIN users u ON u.id = c.user_id WHERE u.lab_id = $1 AND lower(u.email) = $2 AND u.status = 'active' AND u.deleted_at IS NULL ORDER BY u.id LIMIT 2",
         )
         .bind(self.lab_id)
         .bind(email)
@@ -179,20 +220,28 @@ impl PostgresAuthBackend {
             return Ok(None);
         }
         let row = &rows[0];
-        Ok(Some((
-            row.try_get("user_id").map_err(database)?,
-            row.try_get("password_hash").map_err(database)?,
-        )))
+        Ok(Some(PasswordRecord {
+            user_id: row.try_get("user_id").map_err(database)?,
+            password_hash: row.try_get("password_hash").map_err(database)?,
+            credential_policy_revision: row
+                .try_get("credential_policy_revision")
+                .map_err(database)?,
+        }))
     }
 
     async fn verify_login_password(
         &self,
-        record: Option<(Uuid, String)>,
+        record: Option<PasswordRecord>,
         supplied_password: &str,
-    ) -> Result<Uuid, AuthError> {
-        let (user_id, password_hash, record_exists) = match record {
-            Some((user_id, password_hash)) => (Some(user_id), password_hash, true),
-            None => (None, self.dummy_password_hash.to_string(), false),
+    ) -> Result<VerifiedLogin, AuthError> {
+        let (user_id, policy_revision, password_hash, record_exists) = match record {
+            Some(record) => (
+                Some(record.user_id),
+                record.credential_policy_revision,
+                record.password_hash,
+                true,
+            ),
+            None => (None, 0, self.dummy_password_hash.to_string(), false),
         };
         let supplied_password = supplied_password.to_owned();
         let valid = tokio::task::spawn_blocking(move || {
@@ -201,10 +250,96 @@ impl PostgresAuthBackend {
         .await
         .map_err(|_| AuthError::Unavailable)??;
         if record_exists && valid {
-            user_id.ok_or(AuthError::InvalidCredentials)
+            Ok(VerifiedLogin {
+                user_id: user_id.ok_or(AuthError::InvalidCredentials)?,
+                policy_upgrade_required: policy_revision < self.credential_policy.revision(),
+            })
         } else {
             Err(AuthError::InvalidCredentials)
         }
+    }
+
+    fn login_identity_digest(&self, email: &str) -> Option<[u8; 32]> {
+        let key = self.login_identity_hmac_key.as_deref()?;
+        let key = hmac::Key::new(hmac::HMAC_SHA256, key);
+        let mut context = Vec::with_capacity(64 + email.len());
+        context.extend_from_slice(b"muriarc-login-backoff-v1\0");
+        context.extend_from_slice(self.lab_id.as_bytes());
+        context.extend_from_slice(normalize_email(email).as_bytes());
+        hmac::sign(&key, &context).as_ref().try_into().ok()
+    }
+
+    async fn login_is_blocked(
+        &self,
+        identity_digest: Option<&[u8; 32]>,
+        now: DateTime<Utc>,
+    ) -> Result<bool, AuthError> {
+        let Some(identity_digest) = identity_digest else {
+            return Ok(false);
+        };
+        let blocked_until: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT blocked_until FROM auth_login_backoff WHERE identity_digest = $1",
+        )
+        .bind(identity_digest.as_slice())
+        .fetch_optional(self.postgres.pool())
+        .await
+        .map_err(database)?
+        .flatten();
+        Ok(blocked_until.is_some_and(|blocked_until| blocked_until > now))
+    }
+
+    async fn record_login_failure(
+        &self,
+        identity_digest: Option<&[u8; 32]>,
+        now: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
+        let Some(identity_digest) = identity_digest else {
+            return Ok(());
+        };
+        let mut tx = self.postgres.pool().begin().await.map_err(database)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(login_backoff_lock_id(identity_digest))
+            .execute(&mut *tx)
+            .await
+            .map_err(database)?;
+        let existing: Option<(i32, DateTime<Utc>, DateTime<Utc>)> = sqlx::query_as(
+            "SELECT failure_count, first_failed_at, last_failed_at FROM auth_login_backoff WHERE identity_digest = $1 FOR UPDATE",
+        )
+        .bind(identity_digest.as_slice())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(database)?;
+        let (failure_count, first_failed_at) = match existing {
+            Some((count, first, last))
+                if now - last <= Duration::hours(LOGIN_FAILURE_WINDOW_HOURS) =>
+            {
+                (count.saturating_add(1), first)
+            }
+            _ => (1, now),
+        };
+        let delay = login_backoff_delay(failure_count);
+        let blocked_until = (delay > Duration::zero()).then_some(now + delay);
+        sqlx::query(
+            "INSERT INTO auth_login_backoff (identity_digest, failure_count, blocked_until, first_failed_at, last_failed_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (identity_digest) DO UPDATE SET failure_count = EXCLUDED.failure_count, blocked_until = EXCLUDED.blocked_until, first_failed_at = EXCLUDED.first_failed_at, last_failed_at = EXCLUDED.last_failed_at",
+        )
+        .bind(identity_digest.as_slice())
+        .bind(failure_count)
+        .bind(blocked_until)
+        .bind(first_failed_at)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(database)?;
+        sqlx::query(
+            "DELETE FROM auth_login_backoff WHERE identity_digest IN (SELECT identity_digest FROM auth_login_backoff WHERE last_failed_at < $1 ORDER BY last_failed_at LIMIT $2)",
+        )
+        .bind(now - Duration::days(LOGIN_BACKOFF_RETENTION_DAYS))
+        .bind(LOGIN_BACKOFF_CLEANUP_BATCH)
+        .execute(&mut *tx)
+        .await
+        .map_err(database)?;
+        tx.commit().await.map_err(database)?;
+        Ok(())
     }
 }
 
@@ -239,16 +374,64 @@ impl SessionBackend for PostgresAuthBackend {
         if password.len() > PASSWORD_MAX_BYTES {
             return Err(AuthError::InvalidCredentials);
         }
+        let now = Utc::now();
+        let identity_digest = self.login_identity_digest(email);
+        let blocked = self.login_is_blocked(identity_digest.as_ref(), now).await?;
         let record = self.password_record(email).await?;
-        let user_id = self.verify_login_password(record, password).await?;
-        let principal = self.principal_for(user_id, None, WriteSource::Web).await?;
+        let verified = self.verify_login_password(record, password).await;
+        let verified = match verified {
+            Ok(verified) if !blocked => verified,
+            Ok(_) | Err(AuthError::InvalidCredentials) => {
+                if !blocked {
+                    self.record_login_failure(identity_digest.as_ref(), now)
+                        .await?;
+                }
+                return Err(AuthError::InvalidCredentials);
+            }
+            Err(error) => return Err(error),
+        };
+        let mut principal = self
+            .principal_for(verified.user_id, None, WriteSource::Web)
+            .await?;
 
         let mut tx = self.postgres.pool().begin().await.map_err(database)?;
+        if verified.policy_upgrade_required {
+            sqlx::query(
+                "UPDATE user_credentials SET must_change_password = TRUE, revision = revision + 1 WHERE user_id = $1 AND credential_policy_revision < $2",
+            )
+            .bind(verified.user_id)
+            .bind(self.credential_policy.revision())
+            .execute(&mut *tx)
+            .await
+            .map_err(database)?;
+            principal = principal
+                .with_credential_state(true, verified.user_id == self.environment_root_user_id);
+            write_auth_audit(
+                &mut tx,
+                &principal,
+                "user_credential",
+                verified.user_id,
+                "policy_upgrade_required",
+                json!({
+                    "credential_policy_revision_required": self.credential_policy.revision(),
+                    "must_change_password": true
+                }),
+                session.created_at,
+            )
+            .await?;
+        }
+        if let Some(identity_digest) = identity_digest {
+            sqlx::query("DELETE FROM auth_login_backoff WHERE identity_digest = $1")
+                .bind(identity_digest.as_slice())
+                .execute(&mut *tx)
+                .await
+                .map_err(database)?;
+        }
         sqlx::query(
             "INSERT INTO auth_sessions (id, user_id, token_hash, csrf_hash, created_at, last_seen_at, expires_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $5, $6, NULL)",
         )
         .bind(session.id)
-        .bind(user_id)
+        .bind(verified.user_id)
         .bind(session.token_hash.as_slice())
         .bind(session.csrf_hash.as_slice())
         .bind(session.created_at)
@@ -361,6 +544,7 @@ impl SessionBackend for PostgresAuthBackend {
         let existing_hash: String = row.try_get("password_hash").map_err(database)?;
         let expected_revision: i64 = row.try_get("revision").map_err(database)?;
         let verification_hash = existing_hash.clone();
+        let credential_policy = self.credential_policy;
         let current = Zeroizing::new(current_password.to_owned());
         let next = Zeroizing::new(new_password.to_owned());
         let next_hash = tokio::task::spawn_blocking(move || {
@@ -370,7 +554,7 @@ impl SessionBackend for PostgresAuthBackend {
             if verify_password(&verification_hash, next.as_bytes())? {
                 return Err(AuthError::PasswordReuse);
             }
-            hash_password(next.as_str())
+            hash_password_with_policy(next.as_str(), credential_policy)
         })
         .await
         .map_err(|_| AuthError::Unavailable)??;
@@ -378,11 +562,12 @@ impl SessionBackend for PostgresAuthBackend {
         let now = Utc::now();
         let mut tx = self.postgres.pool().begin().await.map_err(database)?;
         let changed = sqlx::query(
-            "UPDATE user_credentials SET password_hash = $2, password_changed_at = $3, must_change_password = FALSE, revision = revision + 1 WHERE user_id = $1 AND revision = $4 AND password_hash = $5",
+            "UPDATE user_credentials SET password_hash = $2, password_changed_at = $3, must_change_password = FALSE, credential_policy_revision = $4, revision = revision + 1 WHERE user_id = $1 AND revision = $5 AND password_hash = $6",
         )
         .bind(principal.user_id)
         .bind(next_hash)
         .bind(now)
+        .bind(self.credential_policy.revision())
         .bind(expected_revision)
         .bind(existing_hash)
         .execute(&mut *tx)
@@ -433,7 +618,8 @@ impl SessionBackend for PostgresAuthBackend {
                     "password_changed": true,
                     "must_change_password": false,
                     "other_sessions_revoked": revoked_session_ids.len(),
-                    "credential_revision": expected_revision + 1
+                    "credential_revision": expected_revision + 1,
+                    "credential_policy_revision": self.credential_policy.revision()
                 }),
                 occurred_at: now,
             },
@@ -676,7 +862,14 @@ async fn write_security_audit(
 }
 
 pub fn hash_password(password: &str) -> Result<String, AuthError> {
-    validate_new_password(password)?;
+    hash_password_with_policy(password, CredentialPolicy::private())
+}
+
+pub(crate) fn hash_password_with_policy(
+    password: &str,
+    credential_policy: CredentialPolicy,
+) -> Result<String, AuthError> {
+    validate_new_password(password, credential_policy)?;
     let salt = SaltString::generate(&mut OsRng);
     password_hasher()
         .hash_password(password.as_bytes(), &salt)
@@ -703,15 +896,33 @@ pub(crate) fn verify_password(encoded_hash: &str, supplied: &[u8]) -> Result<boo
     Ok(password_hasher().verify_password(supplied, &hash).is_ok())
 }
 
-fn validate_new_password(password: &str) -> Result<(), AuthError> {
-    if password.chars().count() < PASSWORD_MIN_CHARS
-        || password.len() > PASSWORD_MAX_BYTES
-        || password.chars().any(char::is_control)
-    {
-        Err(AuthError::PasswordPolicy)
+fn validate_new_password(
+    password: &str,
+    credential_policy: CredentialPolicy,
+) -> Result<(), AuthError> {
+    if !credential_policy.accepts(password) {
+        Err(AuthError::PasswordPolicy {
+            revision: credential_policy.revision(),
+            min_chars: credential_policy.min_chars(),
+        })
     } else {
         Ok(())
     }
+}
+
+fn login_backoff_delay(failure_count: i32) -> Duration {
+    if failure_count < 5 {
+        return Duration::zero();
+    }
+    let exponent = u32::try_from(failure_count.saturating_sub(5)).unwrap_or(u32::MAX);
+    let multiplier = 1_i64.checked_shl(exponent.min(5)).unwrap_or(32);
+    Duration::seconds((30 * multiplier).min(15 * 60))
+}
+
+fn login_backoff_lock_id(identity_digest: &[u8; 32]) -> i64 {
+    let mut prefix = [0_u8; 8];
+    prefix.copy_from_slice(&identity_digest[..8]);
+    i64::from_be_bytes(prefix) ^ LOGIN_BACKOFF_LOCK_NAMESPACE
 }
 
 fn normalize_email(email: &str) -> String {
@@ -833,6 +1044,24 @@ mod tests {
     fn password_policy_rejects_short_and_control_characters() {
         assert!(hash_password("short").is_err());
         assert!(hash_password("valid length but\ncontrol").is_err());
+        assert!(
+            hash_password_with_policy("only-fourteen!", CredentialPolicy::cloudflare_public())
+                .is_err()
+        );
+        assert!(
+            hash_password_with_policy("fifteen-chars!!", CredentialPolicy::cloudflare_public())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn persistent_login_backoff_is_bounded_and_not_applied_before_threshold() {
+        assert_eq!(login_backoff_delay(1), Duration::zero());
+        assert_eq!(login_backoff_delay(4), Duration::zero());
+        assert_eq!(login_backoff_delay(5), Duration::seconds(30));
+        assert_eq!(login_backoff_delay(6), Duration::seconds(60));
+        assert_eq!(login_backoff_delay(10), Duration::seconds(15 * 60));
+        assert_eq!(login_backoff_delay(i32::MAX), Duration::seconds(15 * 60));
     }
 
     #[tokio::test]
@@ -1002,6 +1231,123 @@ mod tests {
             backend.authenticate_session(raw_session).await.unwrap_err(),
             AuthError::InvalidCredentials
         );
+    }
+
+    #[tokio::test]
+    async fn public_policy_marks_legacy_credentials_and_persists_hmac_backoff() {
+        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            return;
+        };
+        assert!(database_url.contains("muriarc_test"));
+        let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
+        store.migrate().await.unwrap();
+        let legacy_password = "legacy public password";
+        let config = crate::BootstrapSeedConfig::new(
+            Uuid::new_v4(),
+            "Public credential policy lab",
+            Uuid::new_v4(),
+            format!("public-policy-{}@example.org", Uuid::new_v4()),
+            "Public policy user",
+        )
+        .unwrap()
+        .with_password_hash(hash_password(legacy_password).unwrap())
+        .unwrap();
+        crate::seed_postgres_bootstrap(store.as_ref(), &config)
+            .await
+            .unwrap();
+
+        let rate_key = [73_u8; 32];
+        let backend = PostgresAuthBackend::new_with_policy(
+            store.as_ref().clone(),
+            store.clone(),
+            config.lab_id,
+            Uuid::new_v4(),
+            CredentialPolicy::cloudflare_public(),
+            Some(rate_key),
+        )
+        .unwrap();
+        let now = Utc::now();
+        let session = NewSession {
+            id: Uuid::new_v4(),
+            token_hash: token_hash("mas_public_policy_session_0000000000000000000000"),
+            csrf_hash: token_hash("mac_public_policy_session_0000000000000000000000"),
+            created_at: now,
+            expires_at: now + Duration::hours(1),
+        };
+        let logged_in = backend
+            .login(&config.user_email, legacy_password, &session)
+            .await
+            .unwrap();
+        assert!(logged_in.principal.must_change_password());
+        let forced: (bool, i32) = sqlx::query_as(
+            "SELECT must_change_password, credential_policy_revision FROM user_credentials WHERE user_id = $1",
+        )
+        .bind(config.user_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(forced, (true, 1));
+
+        let replacement = "replacement public password";
+        let changed = backend
+            .change_password(
+                &logged_in.principal,
+                session.id,
+                legacy_password,
+                replacement,
+                "public-policy-test",
+            )
+            .await
+            .unwrap();
+        assert!(!changed.must_change_password());
+        let upgraded: (bool, i32) = sqlx::query_as(
+            "SELECT must_change_password, credential_policy_revision FROM user_credentials WHERE user_id = $1",
+        )
+        .bind(config.user_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(upgraded, (false, 2));
+
+        let probed_email = format!("unknown-{}@example.org", Uuid::new_v4());
+        for index in 0..5 {
+            let rejected = backend
+                .login(
+                    &probed_email,
+                    "not the password",
+                    &NewSession {
+                        id: Uuid::new_v4(),
+                        token_hash: token_hash(&format!(
+                            "mas_rejected_{index}_000000000000000000000000"
+                        )),
+                        csrf_hash: token_hash(&format!(
+                            "mac_rejected_{index}_000000000000000000000000"
+                        )),
+                        created_at: now,
+                        expires_at: now + Duration::hours(1),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(rejected, AuthError::InvalidCredentials);
+        }
+        let identity_digest = backend.login_identity_digest(&probed_email).unwrap();
+        assert_eq!(
+            identity_digest,
+            backend
+                .login_identity_digest(&format!("  {}  ", probed_email.to_ascii_uppercase()))
+                .unwrap()
+        );
+        let backoff: (i32, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT failure_count, blocked_until FROM auth_login_backoff WHERE identity_digest = $1",
+        )
+        .bind(identity_digest.as_slice())
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(backoff.0, 5);
+        assert!(backoff.1.is_some_and(|until| until > now));
+        assert!(!format!("{backend:?}").contains(&probed_email));
     }
 
     #[tokio::test]

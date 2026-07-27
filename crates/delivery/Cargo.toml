@@ -1,0 +1,21 @@
+[package]
+name = "muriarc-delivery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Verified Native/systemd and Managed Compose delivery contracts for MuriArc"
+
+[dependencies]
+chrono.workspace = true
+muriarc-core = { path = "../core" }
+muriarc-upgrade = { path = "../upgrade" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.24.0"

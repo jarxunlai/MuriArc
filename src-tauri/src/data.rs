@@ -152,7 +152,18 @@ impl DesktopDataState {
         app_data_dir: impl AsRef<Path>,
     ) -> Result<Self, DesktopDataError> {
         let store = SqliteStore::connect_path(database_path).await?;
-        store.migrate().await?;
+        #[cfg(test)]
+        {
+            store.migrate().await?;
+            if store.compatibility_report().await?.observed.is_none() {
+                store.adopt_current_release(Uuid::new_v4()).await?;
+            }
+        }
+        store
+            .compatibility_report()
+            .await?
+            .require_compatible()
+            .map_err(StoreError::Conflict)?;
         let attachments = AttachmentFiles::new(app_data_dir.as_ref().join("attachments"));
         attachments.initialize().await?;
         let state = Self {

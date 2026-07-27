@@ -10,6 +10,7 @@ description = "Read-only MurisPro SQLite audit and one-way migration into MuriAr
 [dependencies]
 chrono.workspace = true
 muriarc-core = { path = "../core" }
+muriarc-store-sqlite = { path = "../store-sqlite" }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10.9"
@@ -20,5 +21,4 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-muriarc-store-sqlite = { path = "../store-sqlite" }
 tempfile = "3.24.0"

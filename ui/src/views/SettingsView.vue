@@ -7,19 +7,25 @@ import {
   Bot,
   ChevronRight,
   Database,
+  Download,
   Dna,
   FolderKanban,
   FolderOpen,
   HardDrive,
   KeyRound,
   RotateCcw,
+  RefreshCw,
   Save,
   ShieldCheck,
   Users,
 } from '@lucide/vue'
 import { branding } from '@/branding'
-import { currentAuthSession, gateway } from '@/services/gateway'
-import type { LocalStorageSelection, LocalStorageStatus } from '@/services/gateway'
+import { currentAuthSession, currentRuntimeCapabilities, gateway } from '@/services/gateway'
+import type {
+  DesktopUpdateStatus,
+  LocalStorageSelection,
+  LocalStorageStatus,
+} from '@/services/gateway'
 import type { WorkspaceSettings } from '@/domain/models'
 import { createDataGateway } from '@/services/dataGateway'
 import { passwordPolicyError, passwordStrength } from '@/services/passwordStrength'
@@ -52,12 +58,17 @@ const choosingStorage = ref(false)
 const schedulingStorage = ref(false)
 const restoringStorage = ref(false)
 const openingStorage = ref(false)
+const desktopUpdate = ref<DesktopUpdateStatus>()
+const checkingDesktopUpdate = ref(false)
+const applyingDesktopUpdate = ref(false)
+const confirmedDesktopRecovery = ref(false)
 const accountUser = computed(() => currentAuthSession.value?.user)
 const accountIsEnvironmentRoot = computed(() => accountUser.value?.isEnvironmentRoot === true)
 const accountAvailable = gateway.mode === 'remote'
   && typeof gateway.updateProfile === 'function'
   && typeof gateway.changePassword === 'function'
-const accountPasswordStrength = computed(() => passwordStrength(newPassword.value))
+const passwordMinChars = computed(() => currentRuntimeCapabilities.value.passwordMinChars)
+const accountPasswordStrength = computed(() => passwordStrength(newPassword.value, passwordMinChars.value))
 const canManageWorkspace = typeof gateway.getWorkspaceSettings === 'function'
   && typeof gateway.saveWorkspaceSettings === 'function'
 const localStorageAvailable = gateway.mode === 'local'
@@ -66,6 +77,9 @@ const localStorageAvailable = gateway.mode === 'local'
   && typeof gateway.requestLocalStorageMigration === 'function'
   && typeof gateway.requestRestoreDefaultStorage === 'function'
   && typeof gateway.openLocalStorageDirectory === 'function'
+const desktopUpdaterAvailable = gateway.mode === 'local'
+  && typeof gateway.checkDesktopUpdate === 'function'
+  && typeof gateway.applyDesktopUpdate === 'function'
 const canManageMembers = gateway.mode === 'remote'
   && currentAuthSession.value?.user.labRoles.includes('lab_admin') === true
 const labRegistryAvailable = gateway.mode === 'local' || hasLabRegistryAccess()
@@ -74,9 +88,29 @@ const menu = computed(() => [
   { key: 'account', label: '账号与安全', icon: KeyRound },
   { key: 'ai', label: 'AI 与模型', icon: Bot },
   ...(labRegistryAvailable ? [{ key: 'backup', label: '备份与迁移', icon: Archive }] : []),
+  ...(desktopUpdaterAvailable ? [{ key: 'update', label: '软件更新', icon: Download }] : []),
   { key: 'security', label: '安全与审计', icon: ShieldCheck },
   { key: 'about', label: '关于 MuriArc', icon: FolderKanban },
 ])
+
+const migrationClassLabels: Record<'m0' | 'm1' | 'm2' | 'm3', string> = {
+  m0: 'M0 · 界面/无数据结构变化',
+  m1: 'M1 · 短时冻结写入',
+  m2: 'M2 · 维护期间保持只读',
+  m3: 'M3 · 离线结构迁移',
+}
+
+function formatBytes(value?: number): string {
+  if (value === undefined || !Number.isFinite(value)) return '—'
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let current = Math.max(0, value)
+  let unit = 0
+  while (current >= 1024 && unit < units.length - 1) {
+    current /= 1024
+    unit += 1
+  }
+  return `${current.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : '操作失败，请重试'
@@ -142,7 +176,7 @@ function clearAccountPasswords() {
 
 async function changeAccountPassword() {
   if (!gateway.changePassword || changingPassword.value || accountIsEnvironmentRoot.value) return
-  const validation = passwordPolicyError(newPassword.value)
+  const validation = passwordPolicyError(newPassword.value, passwordMinChars.value)
   if (!currentPassword.value) {
     message.warning('请输入当前密码')
     clearAccountPasswords()
@@ -269,6 +303,53 @@ async function openLocalStorageDirectory() {
   }
 }
 
+async function checkDesktopUpdate() {
+  if (!gateway.checkDesktopUpdate || checkingDesktopUpdate.value) return
+  checkingDesktopUpdate.value = true
+  confirmedDesktopRecovery.value = false
+  try {
+    desktopUpdate.value = await gateway.checkDesktopUpdate()
+    if (!desktopUpdate.value.available) message.success('当前已经是最新版本')
+  } catch (error) {
+    message.error(`检查更新失败：${errorMessage(error)}`)
+  } finally {
+    checkingDesktopUpdate.value = false
+  }
+}
+
+async function applyDesktopUpdate() {
+  const update = desktopUpdate.value
+  if (
+    !gateway.applyDesktopUpdate
+    || !update?.available
+    || !update.targetVersion
+    || !update.migrationClass
+    || applyingDesktopUpdate.value
+  ) return
+  if (!confirmedDesktopRecovery.value) {
+    message.warning('请先确认恢复验证、维护窗口和首次写入边界')
+    return
+  }
+  if (update.space && !update.space.sufficient) {
+    message.error('空间预检未通过，不能下载或安装更新')
+    return
+  }
+  applyingDesktopUpdate.value = true
+  try {
+    message.info('正在下载并验证签名更新包；请勿强制结束程序')
+    await gateway.applyDesktopUpdate({
+      version: update.targetVersion,
+      maintenanceClass: update.migrationClass,
+      confirmVerifiedRecovery: true,
+    })
+    message.success('安全安装器已启动，MuriArc 将自动退出并重新打开')
+  } catch (error) {
+    message.error(`安装更新失败：${errorMessage(error)}`)
+  } finally {
+    applyingDesktopUpdate.value = false
+  }
+}
+
 async function logout() {
   if (!gateway.logout || loggingOut.value) return
   loggingOut.value = true
@@ -343,7 +424,7 @@ onMounted(() => {
             </n-form>
             <n-button type="primary" :loading="savingProfile" @click="saveProfile"><template #icon><Save :size="16" /></template>保存显示名称</n-button>
 
-            <div class="subsection-heading password-heading"><h3>修改密码</h3><p>只要求至少 8 个字符且不含控制字符；强度等级仅为建议。</p></div>
+            <div class="subsection-heading password-heading"><h3>修改密码</h3><p>只要求至少 {{ passwordMinChars }} 个字符且不含控制字符；强度等级仅为建议。</p></div>
             <n-form label-placement="top" class="settings-form">
               <n-form-item label="当前密码"><n-input v-model:value="currentPassword" type="password" show-password-on="click" :input-props="{ autocomplete: 'current-password' }" /></n-form-item>
               <n-form-item label="新密码"><n-input v-model:value="newPassword" type="password" show-password-on="click" maxlength="1024" :input-props="{ autocomplete: 'new-password' }" /></n-form-item>
@@ -439,6 +520,59 @@ onMounted(() => {
           <div class="action-card"><Database :size="22" /><div><strong>旧版数据库迁移</strong><span>为避免误改原库，V1 仅通过 muriarc-legacy-migrator CLI 对副本执行审计与单向迁移；完整步骤见 docs/MIGRATION.md。</span></div><n-tag :bordered="false">CLI · 只读源库</n-tag></div>
         </template>
 
+        <template v-else-if="active === 'update'">
+          <div class="section-heading"><h2>软件更新</h2><p>只安装经签名验证的正式更新；数据 Candidate、恢复副本和旧程序恢复副本全部通过后才会切换。</p></div>
+          <div class="update-actions">
+            <n-button type="primary" secondary :loading="checkingDesktopUpdate" @click="checkDesktopUpdate">
+              <template #icon><RefreshCw :size="16" /></template>
+              检查更新
+            </n-button>
+            <span>当前版本 {{ desktopUpdate?.currentVersion ?? branding.version }}</span>
+          </div>
+
+          <n-alert v-if="desktopUpdate && !desktopUpdate.available" type="success" :bordered="false" title="已是最新版本">
+            当前安装包无需升级，数据和程序均未发生变化。
+          </n-alert>
+
+          <section v-else-if="desktopUpdate?.available" class="update-card" aria-label="Desktop 安全更新确认">
+            <div class="storage-card-heading">
+              <Download :size="22" />
+              <div>
+                <strong>{{ desktopUpdate.currentVersion }} → {{ desktopUpdate.targetVersion }}</strong>
+                <span>{{ desktopUpdate.migrationClass ? migrationClassLabels[desktopUpdate.migrationClass] : '维护等级未知' }}</span>
+              </div>
+              <n-tag :bordered="false" :type="desktopUpdate.space?.sufficient ? 'success' : 'error'">
+                {{ desktopUpdate.space?.sufficient ? '空间通过' : '空间不足' }}
+              </n-tag>
+            </div>
+
+            <dl class="upgrade-facts">
+              <div><dt>签名更新包</dt><dd>{{ formatBytes(desktopUpdate.artifactSizeBytes) }}</dd></div>
+              <div><dt>数据卷空间</dt><dd>需要 {{ formatBytes(desktopUpdate.space?.dataRequiredBytes) }}；可用 {{ formatBytes(desktopUpdate.space?.dataFreeBytes) }}</dd></div>
+              <div><dt>控制目录空间</dt><dd>需要 {{ formatBytes(desktopUpdate.space?.controlRequiredBytes) }}；可用 {{ formatBytes(desktopUpdate.space?.controlFreeBytes) }}</dd></div>
+              <div><dt>服务影响</dt><dd>Desktop 会退出；M3 会在重新打开前完成离线 Candidate 验证。</dd></div>
+            </dl>
+
+            <n-alert type="warning" :bordered="false" title="数据保护是强制门禁">
+              更新会先保留旧程序、checkpoint SQLite，并实际恢复完整数据副本。Candidate 的数据库、附件、AI 历史、审计和继续写入验证任一失败，均不会切换数据；首次新写入后禁止自动降级。
+            </n-alert>
+            <n-checkbox v-model:checked="confirmedDesktopRecovery">
+              我已保存当前工作，并确认维护等级、磁盘空间、完整恢复验证和首次写入边界
+            </n-checkbox>
+            <n-button
+              type="primary"
+              :disabled="!confirmedDesktopRecovery || desktopUpdate.space?.sufficient !== true"
+              :loading="applyingDesktopUpdate"
+              @click="applyDesktopUpdate"
+            >
+              下载、验证并安装
+            </n-button>
+          </section>
+          <n-alert v-else type="info" :bordered="false">
+            MuriArc 不会静默安装更新。请先检查更新，再由你确认维护等级、空间和恢复策略。
+          </n-alert>
+        </template>
+
         <template v-else-if="active === 'security'">
           <div class="section-heading"><h2>安全与审计</h2><p>正式记录默认软删除，写入包含操作者、来源、revision 与时间。</p></div>
           <n-alert v-if="gateway.mode === 'local'" type="info" :bordered="false" title="本地个人模式">本地版使用操作者资料而非完整账号体系；共享 Server 会额外实施角色与项目权限。</n-alert>
@@ -472,8 +606,10 @@ onMounted(() => {
 .storage-paths { display: grid; gap: 8px; margin: 0; }.storage-paths > div { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 12px; }.storage-paths dt { color: var(--muri-text-tertiary); font-size: 11px; }.storage-paths dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
 .storage-selection { display: flex; flex-direction: column; gap: 3px; padding: 11px; border: 1px solid rgba(42,104,137,.22); border-radius: 7px; background: rgba(42,104,137,.06); }.storage-selection span,.storage-selection small { color: var(--muri-text-secondary); font-size: 11px; }.storage-selection strong { overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
 .storage-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.update-actions { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }.update-actions span { color: var(--muri-text-secondary); font-size: 12px; }
+.update-card { display: grid; gap: 14px; padding: 16px; border: 1px solid var(--muri-border); border-radius: 9px; background: var(--muri-surface-muted); }.upgrade-facts { display: grid; gap: 8px; margin: 0; }.upgrade-facts > div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 12px; }.upgrade-facts dt { color: var(--muri-text-tertiary); font-size: 11px; }.upgrade-facts dd { margin: 0; overflow-wrap: anywhere; font-size: 12px; }
 .action-card { display: grid; grid-template-columns: 32px 1fr auto; align-items: center; gap: 10px; margin-bottom: 10px; padding: 13px; border: 1px solid var(--muri-border); border-radius: 7px; }.action-card > svg { color: var(--muri-primary); }.action-card div { display: flex; flex-direction: column; }.action-card span { color: var(--muri-text-secondary); font-size: 11px; }
 .policy-list { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }.policy-list > div { display: flex; align-items: flex-start; gap: 9px; padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; color: var(--muri-text-secondary); }.policy-list svg { flex: 0 0 auto; color: var(--muri-success); }.policy-list strong { display: block; color: var(--muri-text); }
 .about-panel { display: flex; min-height: 470px; align-items: center; justify-content: center; flex-direction: column; text-align: center; }.about-panel img { width: 122px; height: 122px; object-fit: contain; }.about-panel h2 { margin: 12px 0 2px; font-size: 27px; }.about-panel p { margin: 0 0 13px; color: var(--muri-text-secondary); }.about-panel small { max-width: 460px; margin-top: 20px; color: var(--muri-text-tertiary); line-height: 1.6; }
-@media (max-width: 900px) { .settings-layout { grid-template-columns: 1fr; }.settings-layout > nav { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--muri-border); }.settings-layout nav button { width: auto; flex: 0 0 auto; }.settings-content { padding: 19px 15px; }.settings-form { grid-template-columns: 1fr; }.settings-form :deep(.n-form-item) { grid-column: 1 !important; }.storage-card-heading { grid-template-columns: 28px minmax(0, 1fr); }.storage-card-heading .n-tag { grid-column: 2; justify-self: start; }.storage-paths > div { grid-template-columns: 1fr; gap: 2px; }.action-card { grid-template-columns: 28px 1fr; }.action-card button { grid-column: 2; justify-self: start; } }
+@media (max-width: 900px) { .settings-layout { grid-template-columns: 1fr; }.settings-layout > nav { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--muri-border); }.settings-layout nav button { width: auto; flex: 0 0 auto; }.settings-content { padding: 19px 15px; }.settings-form { grid-template-columns: 1fr; }.settings-form :deep(.n-form-item) { grid-column: 1 !important; }.storage-card-heading { grid-template-columns: 28px minmax(0, 1fr); }.storage-card-heading .n-tag { grid-column: 2; justify-self: start; }.storage-paths > div,.upgrade-facts > div { grid-template-columns: 1fr; gap: 2px; }.action-card { grid-template-columns: 28px 1fr; }.action-card button { grid-column: 2; justify-self: start; } }
 </style>

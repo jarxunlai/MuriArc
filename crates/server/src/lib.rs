@@ -8,6 +8,7 @@ mod ai_step_up;
 mod auth;
 #[cfg(all(feature = "postgres", test))]
 mod bootstrap;
+mod deployment_security;
 #[cfg(feature = "postgres")]
 mod environment_root;
 mod error;
@@ -26,6 +27,13 @@ use ai_step_up::AiStepUpRateLimiter;
 use muriarc_core::{AiModelProfileStore, AiOperationStore, MuriArcStore};
 use muriarc_data::DataFiles;
 use tokio::sync::RwLock;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RuntimeAccessMode {
+    #[default]
+    ReadWrite,
+    ReadOnlyActivation,
+}
 
 pub use ai_secrets::{
     AiLabSettingsView, AiModelDefaultsView, AiModelProfileView, AiModelValidationView,
@@ -46,6 +54,10 @@ pub use auth::{
 #[cfg(all(feature = "postgres", test))]
 pub use bootstrap::{
     BootstrapSeedConfig, BootstrapSeedError, BootstrapSeedOutcome, seed_postgres_bootstrap,
+};
+pub use deployment_security::{
+    CLOUDFLARE_ATTACHMENT_MAX_BYTES, CredentialPolicy, DeploymentProfile, DeploymentSecurityPolicy,
+    ExternalApiPolicy, RuntimeCapabilities,
 };
 #[cfg(feature = "postgres")]
 pub use environment_root::{
@@ -82,6 +94,7 @@ pub struct AppState {
     pub authenticator: Arc<dyn Authenticator>,
     pub sessions: Arc<dyn SessionBackend>,
     pub session_cookie: SessionCookieConfig,
+    pub deployment_security: Arc<DeploymentSecurityPolicy>,
     pub jobs: Arc<dyn JobRepository>,
     pub ai_operations: Option<Arc<dyn AiOperationStore>>,
     pub ai_model_profiles: Option<Arc<dyn AiModelProfileStore>>,
@@ -89,6 +102,9 @@ pub struct AppState {
     pub(crate) ai_step_up: AiStepUpRateLimiter,
     pub data_files: Option<Arc<DataFiles>>,
     pub attachment_root: Option<Arc<PathBuf>>,
+    pub ui_root: Option<Arc<PathBuf>>,
+    pub runtime_compatibility_verified: bool,
+    pub runtime_access_mode: RuntimeAccessMode,
     pub(crate) admin_private_views: Arc<RwLock<HashSet<(uuid::Uuid, uuid::Uuid)>>>,
     pub technical_logs: Arc<dyn TechnicalLogService>,
     #[cfg(feature = "postgres")]
@@ -106,6 +122,7 @@ impl AppState {
             authenticator,
             sessions: Arc::new(DisabledSessionBackend),
             session_cookie: SessionCookieConfig::default(),
+            deployment_security: Arc::new(DeploymentSecurityPolicy::development_default()),
             jobs,
             ai_operations: None,
             ai_model_profiles: None,
@@ -113,6 +130,9 @@ impl AppState {
             ai_step_up: AiStepUpRateLimiter::default(),
             data_files: None,
             attachment_root: None,
+            ui_root: None,
+            runtime_compatibility_verified: false,
+            runtime_access_mode: RuntimeAccessMode::ReadWrite,
             admin_private_views: Arc::new(RwLock::new(HashSet::new())),
             technical_logs: Arc::new(DisabledTechnicalLogService),
             #[cfg(feature = "postgres")]
@@ -130,6 +150,11 @@ impl AppState {
         self
     }
 
+    pub fn with_deployment_security(mut self, policy: DeploymentSecurityPolicy) -> Self {
+        self.deployment_security = Arc::new(policy);
+        self
+    }
+
     pub fn with_data_storage(
         mut self,
         files: DataFiles,
@@ -137,6 +162,17 @@ impl AppState {
     ) -> Self {
         self.data_files = Some(Arc::new(files));
         self.attachment_root = Some(Arc::new(attachment_root.into()));
+        self
+    }
+
+    pub fn with_runtime_compatibility(
+        mut self,
+        ui_root: Option<PathBuf>,
+        access_mode: RuntimeAccessMode,
+    ) -> Self {
+        self.ui_root = ui_root.map(Arc::new);
+        self.runtime_compatibility_verified = true;
+        self.runtime_access_mode = access_mode;
         self
     }
 

@@ -1,0 +1,8 @@
+# Native/systemd drop-in: /etc/systemd/system/muriarc.service.d/cloudflare-public.conf
+# Generate a random 32-byte value, base64 encode it, store the single line at
+# /etc/muriarc/secrets/auth-rate-limit-key with owner root:muriarc and mode 0640.
+[Service]
+LoadCredential=auth-rate-limit-key:/etc/muriarc/secrets/auth-rate-limit-key
+Environment=MURIARC_DEPLOYMENT_PROFILE=cloudflare-public
+Environment=MURIARC_AUTH_RATE_LIMIT_KEY_FILE=%d/auth-rate-limit-key
+Environment=MURIARC_EXTERNAL_API_ENABLED=false

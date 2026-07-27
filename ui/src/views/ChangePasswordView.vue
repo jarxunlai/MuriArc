@@ -3,7 +3,7 @@ import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { KeyRound, LockKeyhole } from '@lucide/vue'
 import { branding } from '@/branding'
-import { currentAuthSession, gateway } from '@/services/gateway'
+import { currentAuthSession, currentRuntimeCapabilities, gateway } from '@/services/gateway'
 import { passwordPolicyError, passwordStrength } from '@/services/passwordStrength'
 
 const route = useRoute()
@@ -14,7 +14,8 @@ const confirmation = ref('')
 const loading = ref(false)
 const loggingOut = ref(false)
 const error = ref('')
-const strength = computed(() => passwordStrength(newPassword.value))
+const passwordMinChars = computed(() => currentRuntimeCapabilities.value.passwordMinChars)
+const strength = computed(() => passwordStrength(newPassword.value, passwordMinChars.value))
 
 const redirect = computed(() => {
   const value = route.query.redirect
@@ -36,7 +37,7 @@ function clearPasswords() {
 async function submit() {
   if (!gateway.changePassword || loading.value) return
   error.value = ''
-  const policyError = passwordPolicyError(newPassword.value)
+  const policyError = passwordPolicyError(newPassword.value, passwordMinChars.value)
   if (!currentPassword.value) error.value = '请输入当前临时密码'
   else if (policyError) error.value = policyError
   else if (newPassword.value !== confirmation.value) error.value = '两次输入的新密码不一致'
@@ -103,7 +104,7 @@ async function logout() {
           <n-input v-model:value="confirmation" type="password" show-password-on="click" :input-props="{ autocomplete: 'new-password' }" maxlength="1024" />
         </n-form-item>
         <n-alert v-if="error" type="error" :bordered="false" class="form-alert">{{ error }}</n-alert>
-        <n-alert type="info" :bordered="false" class="form-alert">只要求至少 8 个字符且不含控制字符；弱/中/强仅为建议，不会要求特定字符组合。</n-alert>
+        <n-alert type="info" :bordered="false" class="form-alert">只要求至少 {{ passwordMinChars }} 个字符且不含控制字符；弱/中/强仅为建议，不会要求特定字符组合。</n-alert>
         <n-button type="primary" attr-type="submit" block :loading="loading">修改密码并继续</n-button>
       </n-form>
       <n-button text block class="logout-button" :loading="loggingOut" @click="logout">退出当前账号</n-button>

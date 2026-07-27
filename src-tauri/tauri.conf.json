@@ -31,6 +31,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "category": "Medical",
     "shortDescription": "Animal research management",
@@ -42,6 +43,17 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/jarxunlai/MuriArc/releases/latest/download/latest.json"
+      ],
+      "pubkey": "MURIARC_DESKTOP_UPDATER_PUBLIC_KEY_NOT_CONFIGURED",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   },
   "mainBinaryName": "MuriArc"
 }

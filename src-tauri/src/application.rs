@@ -104,6 +104,11 @@ impl DesktopState {
             .parent()
             .unwrap_or_else(|| Path::new("."));
         let settings = SettingsService::for_app_data(app_data_dir);
+        let store = SqliteStore::connect_path(&database_path).await?;
+        store.migrate().await?;
+        if store.compatibility_report().await?.observed.is_none() {
+            store.adopt_current_release(Uuid::new_v4()).await?;
+        }
         Self::initialize_with_settings(database_path, settings).await
     }
 
@@ -112,13 +117,21 @@ impl DesktopState {
         settings: SettingsService,
     ) -> Result<Self, DesktopError> {
         let store = SqliteStore::connect_path(database_path).await?;
-        store.migrate().await?;
+        store
+            .compatibility_report()
+            .await?
+            .require_compatible()
+            .map_err(StoreError::Conflict)?;
         bootstrap_local_identity(&store).await?;
-        let mut migration_audit = AuditContext::system(WriteSource::Migration);
-        migration_audit.reason = Some("materialize_desktop_ai_model_profiles".to_owned());
-        settings
-            .initialize_model_profiles(&store, &migration_audit)
-            .await?;
+        let preview_bootstrap = crate::runtime_compatibility::preview_bootstrap_enabled()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        if cfg!(test) || preview_bootstrap {
+            let mut migration_audit = AuditContext::system(WriteSource::Migration);
+            migration_audit.reason = Some("materialize_desktop_ai_model_profiles".to_owned());
+            settings
+                .initialize_model_profiles(&store, &migration_audit)
+                .await?;
+        }
         Ok(Self {
             store,
             lab_id: LOCAL_LAB_ID,

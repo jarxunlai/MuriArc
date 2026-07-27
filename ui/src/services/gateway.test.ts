@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   currentAuthSession,
+  currentRuntimeCapabilities,
   DemoGateway,
   GatewayError,
   LocalTauriGateway,
@@ -61,6 +62,34 @@ describe('MuriArc gateway selection', () => {
       ],
     ])
     expect(JSON.stringify(calls[1])).not.toContain('MuriArcData')
+  })
+
+  it('binds a Desktop update to the checked version, maintenance class, and recovery confirmation', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const gateway = new LocalTauriGateway(async <T>(
+      command: string,
+      args?: Record<string, unknown>,
+    ): Promise<T> => {
+      calls.push([command, args])
+      return undefined as T
+    })
+
+    await gateway.applyDesktopUpdate({
+      version: '1.2.0',
+      maintenanceClass: 'm3',
+      confirmVerifiedRecovery: true,
+    })
+
+    expect(calls).toEqual([[
+      'apply_desktop_update',
+      {
+        input: {
+          version: '1.2.0',
+          maintenanceClass: 'm3',
+          confirmVerifiedRecovery: true,
+        },
+      },
+    ]])
   })
 
   it('preserves structured Tauri error codes for UI recovery decisions', async () => {
@@ -2080,6 +2109,51 @@ describe('MuriArc gateway selection', () => {
       femaleAnimalIds: ['animal-female'],
     } })
     expect(JSON.stringify(calls.slice(0, 2))).not.toContain('server-only-project')
+  })
+})
+
+describe('runtime deployment capabilities', () => {
+  it('loads the public profile contract and blocks oversized attachments before transport', async () => {
+    const previous = currentRuntimeCapabilities.value
+    const requests: string[] = []
+    const fetchRequest = vi.fn(async (input: RequestInfo | URL) => {
+      requests.push(String(input))
+      return new Response(JSON.stringify({
+        data: {
+          profile: 'cloudflare-public',
+          credential_policy_revision: 2,
+          password_min_chars: 15,
+          password_max_bytes: 1024,
+          attachment_max_bytes: 95 * 1024 * 1024,
+          import_max_bytes: 32 * 1024 * 1024,
+          ai_source_max_bytes: 32 * 1024 * 1024,
+          external_api_enabled: false,
+          mcp_enabled: false,
+          chunked_attachment_upload: false,
+        },
+        request_id: 'capability-test',
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    })
+    try {
+      const remote = new RemoteHttpGateway({
+        baseUrl: 'https://lab.example/api/v1',
+        fetch: fetchRequest,
+      })
+      await expect(remote.getRuntimeCapabilities()).resolves.toMatchObject({
+        profile: 'cloudflare-public',
+        passwordMinChars: 15,
+        attachmentMaxBytes: 95 * 1024 * 1024,
+      })
+      await expect(remote.uploadAttachment({
+        entityType: 'project',
+        entityId: 'project-1',
+        fileName: 'too-large.bin',
+        content: { size: 95 * 1024 * 1024 + 1 } as Blob,
+      })).rejects.toMatchObject({ code: 'attachment_too_large' })
+      expect(requests).toEqual(['https://lab.example/api/v1/runtime/capabilities'])
+    } finally {
+      currentRuntimeCapabilities.value = previous
+    }
   })
 })
 

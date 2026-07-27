@@ -1,5 +1,10 @@
 # MuriArc Server deployment
 
+> 本文保留源码 checkout 与 preview 部署说明。`1.0 / E0001` 起的签名
+> Native/systemd、Managed Compose、generation 激活和安全升级契约见
+> [SERVER_DELIVERY.md](SERVER_DELIVERY.md)。正式环境不得用根目录开发 Compose 或直接重建
+> 容器绕过 `muriarcctl`。
+
 The shared edition is an Axum server backed by PostgreSQL and serving the same responsive Vue application used by the desktop edition. Axum listens on the container network, while the provided Compose file publishes its host port only on loopback by default; terminate TLS in Caddy, Nginx, or an equivalent reverse proxy.
 
 This document is only for the shared Server deployment. The personal Desktop
@@ -51,14 +56,17 @@ download a model, or call an external Provider until a user has saved their own
 API key. A new user sees the enabled DeepSeek preset and the stable
 `waiting_for_personal_api_key` state rather than a runtime failure.
 
-On first start, when `MURIARC_AI_MASTER_KEY` is blank or absent, Server creates a
-stable random 32-byte Base64 key at
+On a genuinely empty deployment, when `MURIARC_AI_MASTER_KEY` is blank or absent,
+Server may create a stable random 32-byte Base64 key at
 `MURIARC_AI_MASTER_KEY_FILE` (default:
 `MURIARC_DATA_ROOT/secrets/ai-master-key`). The Compose deployment pins that file
 to `/var/lib/muriarc/secrets/ai-master-key` inside the persistent `server_data`
-volume. Back up this file together with deployment secrets. Subsequent starts
-reuse it; an invalid file or an unwritable secrets directory fails startup
-instead of falling back to plaintext or silently replacing the key.
+volume. Back up this file in the same recovery set as PostgreSQL, attachments,
+configuration and the generation manifest. Subsequent starts reuse it. If the
+database already contains encrypted credentials but neither the environment nor
+the configured key file provides the original key, startup fails closed and never
+generates a replacement. An invalid file or an unwritable secrets directory also
+fails startup instead of falling back to plaintext or silently replacing the key.
 
 Operators may instead inject a stable key explicitly:
 
@@ -254,13 +262,15 @@ POST /api/v1/auth/tokens
 X-CSRF-Token: mac_...
 Content-Type: application/json
 
-{"name":"analysis-agent","scopes":["read","export"],"expires_in_days":90}
+{"name":"analysis-agent","scopes":["read","export"],"expires_in_days":90,"current_password":"..."}
 ```
 
 The response contains `data.token` once plus `data.details`. Use that value as
 `Authorization: Bearer mat_...`. `GET /api/v1/auth/tokens` lists metadata only;
-`DELETE /api/v1/auth/tokens/{id}` revokes a token. These management routes accept
-browser sessions only, and mutations require CSRF.
+`POST /api/v1/auth/tokens/{id}/revoke` with
+`{"current_password":"..."}` revokes a token. These management routes accept
+browser sessions only; token creation and revocation require current-password
+step-up as well as CSRF.
 
 `POST /mcp` accepts only bearer identities explicitly narrowed with AI scopes.
 Normal Web sessions are rejected. The first release exposes fixed read-only

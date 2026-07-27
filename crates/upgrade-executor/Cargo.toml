@@ -1,0 +1,22 @@
+[package]
+name = "muriarc-upgrade-executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "One-shot DDL executor restricted to isolated MuriArc Candidate databases"
+
+[[bin]]
+name = "muriarc-upgrade-executor"
+path = "src/main.rs"
+
+[dependencies]
+muriarc-core = { path = "../core" }
+muriarc-store-postgres = { path = "../store-postgres" }
+muriarc-upgrade = { path = "../upgrade" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["postgres"] }
+tokio.workspace = true
+uuid.workspace = true

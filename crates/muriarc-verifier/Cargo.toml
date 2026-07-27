@@ -1,0 +1,21 @@
+[package]
+name = "muriarc-verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MuriArc immutable fixture and seven-layer compatibility verifier"
+
+[[bin]]
+name = "muriarc-verifier"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+muriarc-core = { path = "../core" }
+muriarc-release-evidence = { path = "../release-evidence" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+uuid.workspace = true

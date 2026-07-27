@@ -11,21 +11,24 @@ use std::{
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Duration;
 use muriarc_core::{
-    AiModelProfileStore, AiOperationStore, AiScope, LabRole, MuriArcStore, WriteSource,
+    AiModelProfileStore, AiOperationStore, AiScope, LabRole, MuriArcStore,
+    PersistentRecoveryInventory, WriteSource,
 };
 use muriarc_data::{AttachmentFiles, DataFiles, cleanup_expired_ai_conversation_sources};
 use muriarc_server::{
-    AiMasterKey, AppState, Authenticator, ChainedAuthenticator, EnvironmentRootConfig,
-    LiveBootstrapAuthenticator, PostgresAiProviderStore, PostgresAuthBackend,
-    PostgresTechnicalLogService, PostgresUserGovernance, SessionCookieConfig,
-    StaticTokenAuthenticator, StoreJobRepository, application_router,
-    sync_postgres_environment_root,
+    AiMasterKey, AppState, Authenticator, ChainedAuthenticator, DeploymentProfile,
+    DeploymentSecurityPolicy, EnvironmentRootConfig, ExternalApiPolicy, LiveBootstrapAuthenticator,
+    PostgresAiProviderStore, PostgresAuthBackend, PostgresTechnicalLogService,
+    PostgresUserGovernance, RuntimeAccessMode, SessionCookieConfig, StaticTokenAuthenticator,
+    StoreJobRepository, application_router, sync_postgres_environment_root,
 };
 use muriarc_store_postgres::PostgresStore;
 use rand::{RngCore, rngs::OsRng};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+mod runtime_compatibility;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -41,36 +44,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|_| "127.0.0.1:8787".to_owned())
         .parse::<SocketAddr>()?;
     let server_lab_id = required_env("MURIARC_LAB_ID")?.parse::<Uuid>()?;
+    let deployment_security = deployment_security_policy()?;
+    let session_cookie = session_cookie_config()?;
+    if deployment_security.profile() == DeploymentProfile::CloudflarePublic
+        && !session_cookie.secure
+    {
+        return Err("Cloudflare Public Profile requires secure session cookies".into());
+    }
 
+    let data_root = PathBuf::from(required_env("MURIARC_DATA_ROOT")?);
+    let attachment_root = PathBuf::from(required_env("MURIARC_ATTACHMENT_ROOT")?);
     let store = Arc::new(PostgresStore::connect(&database_url).await?);
-    store.migrate().await?;
+    let runtime =
+        runtime_compatibility::prepare_server_runtime(store.as_ref(), &data_root, &attachment_root)
+            .await?;
 
-    let root_config = environment_root_config(server_lab_id)?;
-    let root_outcome = sync_postgres_environment_root(store.as_ref(), &root_config).await?;
-    if root_outcome.changed() {
-        tracing::warn!(
-            lab_created = root_outcome.lab_created,
-            lab_updated = root_outcome.lab_updated,
-            user_created = root_outcome.user_created,
-            user_updated = root_outcome.user_updated,
-            membership_created = root_outcome.membership_created,
-            membership_updated = root_outcome.membership_updated,
-            credential_created = root_outcome.credential_created,
-            credential_updated = root_outcome.credential_updated,
-            sessions_revoked = root_outcome.sessions_revoked,
-            "environment root configuration was reconciled"
-        );
+    let root_config =
+        environment_root_config(server_lab_id, deployment_security.credential_policy())?;
+    if runtime.access_mode == RuntimeAccessMode::ReadWrite {
+        let root_outcome = sync_postgres_environment_root(store.as_ref(), &root_config).await?;
+        if root_outcome.changed() {
+            tracing::warn!(
+                lab_created = root_outcome.lab_created,
+                lab_updated = root_outcome.lab_updated,
+                user_created = root_outcome.user_created,
+                user_updated = root_outcome.user_updated,
+                membership_created = root_outcome.membership_created,
+                membership_updated = root_outcome.membership_updated,
+                credential_created = root_outcome.credential_created,
+                credential_updated = root_outcome.credential_updated,
+                sessions_revoked = root_outcome.sessions_revoked,
+                "environment root configuration was reconciled"
+            );
+        } else {
+            tracing::info!("environment root configuration is already synchronized");
+        }
     } else {
-        tracing::info!("environment root configuration is already synchronized");
+        tracing::info!(
+            "read-only activation skips Environment Root reconciliation and all startup writes"
+        );
     }
     let bootstrap_authenticator = bootstrap_authenticator(&root_config)?;
     let environment_root_user_id = root_config.user_id;
     drop(root_config);
-    let persistent_auth = Arc::new(PostgresAuthBackend::new(
+    let persistent_auth = Arc::new(PostgresAuthBackend::new_with_policy(
         store.as_ref().clone(),
         store.clone(),
         server_lab_id,
         environment_root_user_id,
+        deployment_security.credential_policy(),
+        deployment_security.login_identity_hmac_key().copied(),
     )?);
     let authenticators: Vec<Arc<dyn Authenticator>> = vec![
         Arc::new(LiveBootstrapAuthenticator::new(
@@ -80,37 +103,75 @@ async fn main() -> Result<(), Box<dyn Error>> {
         persistent_auth.clone(),
     ];
     let authenticator = ChainedAuthenticator::new(authenticators);
-    let state = AppState::new(
+    let mut state = AppState::new(
         store.clone(),
         Arc::new(authenticator),
         Arc::new(StoreJobRepository::new(store.clone())),
     )
-    .with_sessions(persistent_auth, session_cookie_config()?)
-    .with_user_governance(PostgresUserGovernance::new(
+    .with_sessions(persistent_auth, session_cookie)
+    .with_deployment_security(deployment_security.clone())
+    .with_user_governance(PostgresUserGovernance::new_with_policy(
         store.as_ref().clone(),
         server_lab_id,
         environment_root_user_id,
-    ))
-    .with_technical_logs(Arc::new(PostgresTechnicalLogService::new(
-        store.as_ref().clone(),
-    )));
-    let data_root = PathBuf::from(required_env("MURIARC_DATA_ROOT")?);
-    let attachment_root = PathBuf::from(required_env("MURIARC_ATTACHMENT_ROOT")?);
-    tokio::fs::create_dir_all(&data_root).await?;
-    tokio::fs::create_dir_all(&attachment_root).await?;
-    let state = configure_ai(state, store.clone(), &data_root).await?;
+        deployment_security.credential_policy(),
+    ));
+    if runtime.access_mode == RuntimeAccessMode::ReadWrite {
+        state = state.with_technical_logs(Arc::new(PostgresTechnicalLogService::new(
+            store.as_ref().clone(),
+        )));
+    }
+    let state = configure_ai(
+        state,
+        store.clone(),
+        &data_root,
+        &runtime.recovery_inventory,
+        runtime.access_mode == RuntimeAccessMode::ReadWrite,
+    )
+    .await?;
     let state = state.with_data_storage(DataFiles::new(data_root), attachment_root.clone());
     let cleanup_store: Arc<dyn MuriArcStore> = store.clone();
-    let _ai_source_cleanup = spawn_ai_source_cleanup(cleanup_store, server_lab_id, attachment_root);
-    let listener = tokio::net::TcpListener::bind(bind_address).await?;
+    let ai_source_cleanup = (runtime.access_mode == RuntimeAccessMode::ReadWrite)
+        .then(|| spawn_ai_source_cleanup(cleanup_store, server_lab_id, attachment_root));
     let ui_dir = env::var_os("MURIARC_UI_DIR").map(PathBuf::from);
     if ui_dir.is_none() {
         tracing::warn!("MURIARC_UI_DIR is not set; shared Web UI will not be served");
     }
+    let state = state.with_runtime_compatibility(ui_dir.clone(), runtime.access_mode);
+    let listener = tokio::net::TcpListener::bind(bind_address).await?;
 
     tracing::info!(address = %bind_address, "MuriArc server listening");
-    axum::serve(listener, application_router(state, ui_dir)).await?;
+    axum::serve(listener, application_router(state, ui_dir))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    if let Some(ai_source_cleanup) = ai_source_cleanup {
+        ai_source_cleanup.abort();
+        let _ = ai_source_cleanup.await;
+    }
+    tracing::info!("MuriArc server shutdown completed");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler must install");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(error) = result {
+                    tracing::error!(error = %error, "Ctrl-C shutdown listener failed");
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::error!(error = %error, "shutdown listener failed");
+    }
+    tracing::info!("shutdown requested; draining in-flight requests");
 }
 
 fn spawn_ai_source_cleanup(
@@ -158,6 +219,8 @@ async fn configure_ai(
     state: AppState,
     store: Arc<PostgresStore>,
     data_root: &Path,
+    recovery_inventory: &PersistentRecoveryInventory,
+    allow_key_creation: bool,
 ) -> Result<AppState, Box<dyn Error>> {
     let encoded_key = match optional_secret_env("MURIARC_AI_MASTER_KEY")? {
         Some(value) => Zeroizing::new(value),
@@ -165,7 +228,10 @@ async fn configure_ai(
             let path = env::var_os("MURIARC_AI_MASTER_KEY_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| data_root.join("secrets/ai-master-key"));
-            Zeroizing::new(load_or_create_ai_master_key_file(&path)?)
+            Zeroizing::new(load_or_create_ai_master_key_file(
+                &path,
+                allow_key_creation && recovery_inventory.encrypted_secret_records == 0,
+            )?)
         }
     };
     let key_version = optional_positive_i32_env("MURIARC_AI_MASTER_KEY_VERSION", 1)?;
@@ -174,25 +240,34 @@ async fn configure_ai(
         store.as_ref().clone(),
         master_key,
     ));
-    let migrated_profile_secrets = providers.migrate_legacy_profile_secrets().await?;
     let operations: Arc<dyn AiOperationStore> = store.clone();
     let model_profiles: Arc<dyn AiModelProfileStore> = store;
     tracing::info!(
         key_version,
-        migrated_profile_secrets,
-        "shared AI runtime is enabled with profile-bound encrypted credentials"
+        "shared AI runtime is enabled with profile-bound encrypted credentials; startup performed no data migration"
     );
     Ok(state.with_ai(operations, model_profiles, providers))
 }
 
-fn load_or_create_ai_master_key_file(path: &Path) -> Result<String, Box<dyn Error>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+fn load_or_create_ai_master_key_file(
+    path: &Path,
+    allow_create: bool,
+) -> Result<String, Box<dyn Error>> {
     match fs::read_to_string(path) {
         Ok(value) => return validated_master_key_file(value),
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) if error.kind() == ErrorKind::NotFound && allow_create => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Err(format!(
+                "deployment Master Key is missing and current mode forbids generating a replacement: {}",
+                path.display()
+            )
+            .into());
+        }
         Err(error) => return Err(error.into()),
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
 
     let mut bytes = [0_u8; 32];
@@ -290,16 +365,82 @@ fn bootstrap_authenticator(
     Ok(StaticTokenAuthenticator::new(entries)?)
 }
 
-fn environment_root_config(server_lab_id: Uuid) -> Result<EnvironmentRootConfig, Box<dyn Error>> {
-    EnvironmentRootConfig::new(
+fn environment_root_config(
+    server_lab_id: Uuid,
+    credential_policy: muriarc_server::CredentialPolicy,
+) -> Result<EnvironmentRootConfig, Box<dyn Error>> {
+    EnvironmentRootConfig::new_with_policy(
         server_lab_id,
         required_env("MURIARC_LAB_NAME")?,
         required_env("MURIARC_ROOT_USER_ID")?.parse::<Uuid>()?,
         required_env("MURIARC_ROOT_USER_EMAIL")?,
         required_env("MURIARC_ROOT_USER_NAME")?,
         required_env("MURIARC_ROOT_PASSWORD")?,
+        credential_policy,
     )
     .map_err(Into::into)
+}
+
+fn deployment_security_policy() -> Result<DeploymentSecurityPolicy, Box<dyn Error>> {
+    let profile = match env::var("MURIARC_DEPLOYMENT_PROFILE") {
+        Err(env::VarError::NotPresent) => DeploymentProfile::Private,
+        Ok(value) if value == "private" => DeploymentProfile::Private,
+        Ok(value) if value == "cloudflare-public" => DeploymentProfile::CloudflarePublic,
+        Ok(_) => {
+            return Err("MURIARC_DEPLOYMENT_PROFILE must be private or cloudflare-public".into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let external_api = if optional_bool_env("MURIARC_EXTERNAL_API_ENABLED", false)? {
+        let hostname = required_env("MURIARC_EXTERNAL_API_HOSTNAME")?;
+        let client_id = read_required_secret_file("MURIARC_CF_ACCESS_CLIENT_ID_FILE")?;
+        let client_secret = read_required_secret_file("MURIARC_CF_ACCESS_CLIENT_SECRET_FILE")?;
+        ExternalApiPolicy::cloudflare_service_token(
+            hostname,
+            client_id.as_bytes(),
+            client_secret.as_bytes(),
+        )?
+    } else {
+        for name in [
+            "MURIARC_EXTERNAL_API_HOSTNAME",
+            "MURIARC_CF_ACCESS_CLIENT_ID_FILE",
+            "MURIARC_CF_ACCESS_CLIENT_SECRET_FILE",
+        ] {
+            if env::var_os(name).is_some() {
+                return Err(format!(
+                    "{name} must be unset while MURIARC_EXTERNAL_API_ENABLED is false"
+                )
+                .into());
+            }
+        }
+        ExternalApiPolicy::disabled()
+    };
+    match profile {
+        DeploymentProfile::Private => Ok(DeploymentSecurityPolicy::private(external_api)),
+        DeploymentProfile::CloudflarePublic => {
+            let encoded_key = read_required_secret_file("MURIARC_AUTH_RATE_LIMIT_KEY_FILE")?;
+            let decoded = general_purpose::STANDARD
+                .decode(encoded_key.as_bytes())
+                .map_err(|_| "MURIARC_AUTH_RATE_LIMIT_KEY_FILE must contain base64")?;
+            let key: [u8; 32] = decoded
+                .try_into()
+                .map_err(|_| "MURIARC_AUTH_RATE_LIMIT_KEY_FILE must decode to exactly 32 bytes")?;
+            Ok(DeploymentSecurityPolicy::cloudflare_public(
+                key,
+                external_api,
+            ))
+        }
+    }
+}
+
+fn read_required_secret_file(name: &'static str) -> Result<Zeroizing<String>, Box<dyn Error>> {
+    let path = PathBuf::from(required_env(name)?);
+    let value = Zeroizing::new(fs::read_to_string(&path)?);
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Err(format!("secret file declared by {name} is empty or malformed").into());
+    }
+    Ok(Zeroizing::new(trimmed.to_owned()))
 }
 
 fn session_cookie_config() -> Result<SessionCookieConfig, Box<dyn Error>> {
@@ -361,8 +502,8 @@ mod ai_runtime_tests {
     fn generated_master_key_is_stable_across_restarts() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("secrets/ai-master-key");
-        let first = load_or_create_ai_master_key_file(&path).unwrap();
-        let second = load_or_create_ai_master_key_file(&path).unwrap();
+        let first = load_or_create_ai_master_key_file(&path, true).unwrap();
+        let second = load_or_create_ai_master_key_file(&path, true).unwrap();
         assert_eq!(first, second);
         assert_eq!(general_purpose::STANDARD.decode(first).unwrap().len(), 32);
     }

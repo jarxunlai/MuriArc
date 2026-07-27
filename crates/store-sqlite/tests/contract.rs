@@ -352,8 +352,8 @@ async fn ai_conversation_management_migration_preserves_legacy_rows_across_direc
                 .unwrap();
         assert_eq!(
             final_ledger,
-            (29, Some(30)),
-            "the merged SQLite migration set must end at 0030 (version 0005 is intentionally absent)"
+            (30, Some(31)),
+            "the merged SQLite migration set must end at 0031 (version 0005 is intentionally absent)"
         );
         let saved = store.get_ai_conversation(conversation_id).await.unwrap();
         assert_eq!(saved.title, "Legacy conversation");

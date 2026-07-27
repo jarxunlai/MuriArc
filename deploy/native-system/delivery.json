@@ -1,0 +1,17 @@
+{
+  "format_version": 1,
+  "profile": "native-system",
+  "paths": {
+    "release_root": "/opt/muriarc/releases",
+    "current_release": "/opt/muriarc/current",
+    "config_root": "/etc/muriarc",
+    "data_root": "/var/lib/muriarc",
+    "control_root": "/var/lib/muriarc/control"
+  },
+  "service_user": "muriarc",
+  "loopback_origin": "http://127.0.0.1:8787",
+  "environment_file": "/etc/muriarc/server.env",
+  "activation_file": "/var/lib/muriarc/control/active.env",
+  "compose_project": null,
+  "compose_file": null
+}

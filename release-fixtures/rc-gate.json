@@ -1,0 +1,92 @@
+{
+  "format_version": 1,
+  "initial_release": {
+    "application_version": "1.0.0",
+    "data_epoch": "E0001",
+    "postgres_major": 17
+  },
+  "required_artifacts": [
+    "native-system",
+    "managed-compose",
+    "desktop-windows"
+  ],
+  "required_scenarios": [
+    {
+      "scenario_id": "native-system-install-upgrade-restore",
+      "artifact_name": "native-system",
+      "environment": "linux-systemd"
+    },
+    {
+      "scenario_id": "managed-compose-install-upgrade-restore",
+      "artifact_name": "managed-compose",
+      "environment": "linux-docker"
+    },
+    {
+      "scenario_id": "desktop-windows-install-upgrade-restore",
+      "artifact_name": "desktop-windows",
+      "environment": "windows-installer"
+    },
+    {
+      "scenario_id": "cloudflare-public-native",
+      "artifact_name": "native-system",
+      "environment": "cloudflare-staging"
+    },
+    {
+      "scenario_id": "cloudflare-public-compose",
+      "artifact_name": "managed-compose",
+      "environment": "cloudflare-staging"
+    },
+    {
+      "scenario_id": "native-system-fault-injection",
+      "artifact_name": "native-system",
+      "environment": "linux-systemd"
+    },
+    {
+      "scenario_id": "managed-compose-fault-injection",
+      "artifact_name": "managed-compose",
+      "environment": "linux-docker"
+    },
+    {
+      "scenario_id": "desktop-windows-fault-injection",
+      "artifact_name": "desktop-windows",
+      "environment": "windows-installer"
+    },
+    {
+      "scenario_id": "native-system-first-write-rollback-guard",
+      "artifact_name": "native-system",
+      "environment": "linux-systemd"
+    },
+    {
+      "scenario_id": "managed-compose-first-write-rollback-guard",
+      "artifact_name": "managed-compose",
+      "environment": "linux-docker"
+    },
+    {
+      "scenario_id": "desktop-windows-first-write-rollback-guard",
+      "artifact_name": "desktop-windows",
+      "environment": "windows-installer"
+    },
+    {
+      "scenario_id": "native-system-tuf-attacks",
+      "artifact_name": "native-system",
+      "environment": "linux-systemd"
+    },
+    {
+      "scenario_id": "managed-compose-tuf-sigstore-attacks",
+      "artifact_name": "managed-compose",
+      "environment": "linux-docker"
+    },
+    {
+      "scenario_id": "desktop-windows-tauri-signature-attacks",
+      "artifact_name": "desktop-windows",
+      "environment": "windows-installer"
+    }
+  ],
+  "requires_non_empty_catalog": true,
+  "requires_current_backend_fixtures": [
+    "sqlite",
+    "postgres"
+  ],
+  "requires_complete_compatibility_matrix": true,
+  "requires_final_packages": true
+}

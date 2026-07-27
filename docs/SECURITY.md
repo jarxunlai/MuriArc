@@ -24,6 +24,13 @@ CSRF 可在有效会话内安全恢复但不持久化明文，外部 token 仅�
 
 ## Required controls
 
+- 普通启动不得隐式执行 schema migration。Epoch、Backend digest、Generation、Write Lease、
+  generation manifest、Crypto 和附件根任一不一致均阻断 Readiness。
+- 数据库级写屏障在 Lease 撤销后拒绝迟到的 AI、Job、Cleanup、Session 与业务写入；首次新版
+  写入被持久标记，此后禁止自动降级。
+- 已有 AI 密文但 Master Key 缺失时禁止生成替代 Key；已有附件 metadata 但根目录缺失或为空
+  时禁止创建空目录伪装恢复成功。
+
 - 密码使用 Argon2id；生产 cookie 默认设置 Secure、HttpOnly、SameSite=Strict。
 - 所有 cookie-auth mutation 强制验证 `X-CSRF-Token`；bearer token 不从 cookie 读取，避免混淆代理问题。
 - 页面刷新后只可通过有效 HttpOnly session 调用安全的 `GET /api/v1/auth/csrf` 恢复 CSRF；该端点拒绝 bearer 身份并返回 `Cache-Control: no-store`。
@@ -86,6 +93,13 @@ CSRF 可在有效会话内安全恢复但不持久化明文，外部 token 仅�
   membership，并且不能移除最后一名有效 ProjectAdmin。
 - 技术访问日志不记录请求体、query、密码、token、AI key 或动物业务内容。只有 Environment
   Root 可更改保留策略、预览并确认清理；清理本身必须写入不可删除的正式 Audit。
+
+## Cloudflare 公网 Profile
+
+Cloudflare Tunnel 不是应用授权替代品。公网 Profile 的 credential policy revision、HMAC 登录退避、
+external bearer/MCP 双层门禁、95 MiB capability、缓存规则和剩余风险见
+[CLOUDFLARE_PUBLIC_PROFILE.md](CLOUDFLARE_PUBLIC_PROFILE.md)。默认不信任任何代理 IP header，
+Tunnel/Access credential 不进入数据库、恢复集或 Upgrade Journal。
 
 ## Reporting
 

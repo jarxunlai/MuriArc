@@ -8,7 +8,7 @@ use axum::{
         header::{CACHE_CONTROL, SET_COOKIE},
     },
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{get, patch, post},
 };
 use chrono::{Duration, Utc};
 use muriarc_core::{AiScope, LabRole, ProjectRole};
@@ -46,7 +46,9 @@ pub(super) fn protected_router() -> Router<AppState> {
     Router::new()
         .route("/auth/profile", patch(update_profile))
         .route("/auth/tokens", get(list_tokens).post(create_token))
-        .route("/auth/tokens/{id}", delete(revoke_token))
+        // Dedicated POST avoids relying on intermediaries to preserve a body
+        // on DELETE while retaining both password step-up and CSRF.
+        .route("/auth/tokens/{id}/revoke", post(revoke_token))
 }
 
 #[derive(Deserialize)]
@@ -109,6 +111,13 @@ struct CreateTokenRequest {
     name: String,
     scopes: BTreeSet<AiScope>,
     expires_in_days: Option<u16>,
+    current_password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeTokenRequest {
+    current_password: String,
 }
 
 #[derive(Serialize)]
@@ -128,8 +137,9 @@ async fn login(
         || payload.email.len() > MAX_EMAIL_BYTES
         || payload.password.len() > MAX_PASSWORD_BYTES
     {
-        return Err(ApiError::unauthorized("invalid email or password")
-            .with_request_id(metadata.request_id));
+        return Err(
+            ApiError::unauthorized("authentication failed").with_request_id(metadata.request_id)
+        );
     }
 
     let session_token =
@@ -315,6 +325,19 @@ async fn create_token(
     ApiJson(payload): ApiJson<CreateTokenRequest>,
 ) -> Result<Response, ApiError> {
     ensure_browser_session(method, &metadata)?;
+    ensure_external_api_enabled(&state, &metadata)?;
+    state
+        .sessions
+        .verify_current_password(principal.user_id, &payload.current_password)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "step_up_failed",
+                "current password verification failed",
+            )
+            .with_request_id(metadata.request_id.clone())
+        })?;
     let name = payload.name.trim().to_owned();
     if name.is_empty()
         || name.len() > MAX_TOKEN_NAME_BYTES
@@ -384,14 +407,43 @@ async fn revoke_token(
     method: AuthenticationMethod,
     metadata: RequestMetadata,
     ApiPath(token_id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<RevokeTokenRequest>,
 ) -> Result<StatusCode, ApiError> {
     ensure_browser_session(method, &metadata)?;
+    state
+        .sessions
+        .verify_current_password(principal.user_id, &payload.current_password)
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "step_up_failed",
+                "current password verification failed",
+            )
+            .with_request_id(metadata.request_id.clone())
+        })?;
     state
         .sessions
         .revoke_external_token(principal.user_id, token_id)
         .await
         .map_err(|error| auth_error(error, &metadata))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn ensure_external_api_enabled(
+    state: &AppState,
+    metadata: &RequestMetadata,
+) -> Result<(), ApiError> {
+    if state.deployment_security.external_api().enabled() {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "external_api_disabled",
+            "external API access must be enabled by the deployment operator before issuing tokens",
+        )
+        .with_request_id(metadata.request_id.clone()))
+    }
 }
 
 fn ensure_browser_session(
@@ -473,8 +525,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        AuthError, AuthenticatedSession, InMemoryJobRepository, SessionBackend,
-        SessionCookieConfig, StaticTokenAuthenticator, api_router,
+        AuthError, AuthenticatedSession, DeploymentSecurityPolicy, ExternalApiPolicy,
+        InMemoryJobRepository, SessionBackend, SessionCookieConfig, StaticTokenAuthenticator,
+        api_router,
     };
 
     #[derive(Default)]
@@ -560,6 +613,18 @@ mod tests {
             Ok(stored.clone())
         }
 
+        async fn verify_current_password(
+            &self,
+            _user_id: Uuid,
+            password: &str,
+        ) -> Result<(), AuthError> {
+            if password == "correct horse battery staple" {
+                Ok(())
+            } else {
+                Err(AuthError::InvalidCredentials)
+            }
+        }
+
         async fn revoke_session(&self, session_id: Uuid, user_id: Uuid) -> Result<(), AuthError> {
             let guard = self.session.lock().unwrap();
             let (session, principal) = guard.as_ref().ok_or(AuthError::InvalidCredentials)?;
@@ -614,10 +679,17 @@ mod tests {
 
         async fn revoke_external_token(
             &self,
-            _user_id: Uuid,
-            _token_id: Uuid,
+            user_id: Uuid,
+            token_id: Uuid,
         ) -> Result<(), AuthError> {
-            Err(AuthError::Unavailable)
+            let mut tokens = self.external_tokens.lock().unwrap();
+            let original_len = tokens.len();
+            tokens.retain(|(owner, token)| !(*owner == user_id && token.id == token_id));
+            if tokens.len() == original_len {
+                Err(AuthError::InvalidCredentials)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -626,6 +698,13 @@ mod tests {
     }
 
     async fn test_app_with_backend(backend: Arc<TestSessionBackend>) -> Router {
+        test_app_with_security(backend, DeploymentSecurityPolicy::development_default()).await
+    }
+
+    async fn test_app_with_security(
+        backend: Arc<TestSessionBackend>,
+        security: DeploymentSecurityPolicy,
+    ) -> Router {
         let store = Arc::new(SqliteStore::in_memory().await.unwrap());
         muriarc_core::MuriArcStore::migrate(store.as_ref())
             .await
@@ -638,7 +717,8 @@ mod tests {
         .with_sessions(
             backend,
             SessionCookieConfig::new(false, Duration::hours(12)).unwrap(),
-        );
+        )
+        .with_deployment_security(security);
         api_router(state)
     }
 
@@ -668,6 +748,64 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Secure"));
+    }
+
+    #[tokio::test]
+    async fn disabled_external_api_unmounts_mcp_and_rejects_bearer_before_authentication() {
+        let app = test_app_with_security(
+            Arc::new(TestSessionBackend::default()),
+            DeploymentSecurityPolicy::private(ExternalApiPolicy::disabled()),
+        )
+        .await;
+
+        let capabilities = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/runtime/capabilities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capabilities.status(), StatusCode::OK);
+        assert_eq!(
+            capabilities.headers().get(CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        let capabilities = json_body(capabilities).await;
+        assert_eq!(capabilities["data"]["external_api_enabled"], false);
+        assert_eq!(capabilities["data"]["mcp_enabled"], false);
+
+        let mcp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mcp.status(), StatusCode::NOT_FOUND);
+
+        let bearer = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projects")
+                    .header("authorization", "Bearer mat_disabled_external_api")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bearer.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_body(bearer).await["error"]["code"],
+            "external_api_disabled"
+        );
     }
 
     #[tokio::test]
@@ -765,7 +903,8 @@ mod tests {
                         json!({
                             "name": "Read-only integration",
                             "scopes": ["read"],
-                            "expires_in_days": 30
+                            "expires_in_days": 30,
+                            "current_password": "correct horse battery staple"
                         })
                         .to_string(),
                     ))
@@ -776,6 +915,7 @@ mod tests {
         assert_eq!(issued.status(), StatusCode::OK);
         let issued = json_body(issued).await;
         let raw_external = issued["data"]["token"].as_str().unwrap().to_owned();
+        let external_id = issued["data"]["details"]["id"].as_str().unwrap().to_owned();
         assert!(raw_external.starts_with("mat_"));
 
         let listed = app
@@ -793,6 +933,60 @@ mod tests {
         let listed = json_body(listed).await;
         assert_eq!(listed["count"], json!(1));
         assert!(!listed.to_string().contains(&raw_external));
+
+        let wrong_step_up = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/auth/tokens/{external_id}/revoke"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header(crate::auth::CSRF_HEADER_NAME, &csrf)
+                    .body(Body::from(
+                        json!({"current_password": "wrong password"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_step_up.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            json_body(wrong_step_up).await["error"]["code"],
+            "step_up_failed"
+        );
+
+        let revoked_external = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/auth/tokens/{external_id}/revoke"))
+                    .header("content-type", "application/json")
+                    .header("cookie", &cookie)
+                    .header(crate::auth::CSRF_HEADER_NAME, &csrf)
+                    .body(Body::from(
+                        json!({"current_password": "correct horse battery staple"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked_external.status(), StatusCode::NO_CONTENT);
+
+        let listed_after_revoke = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/auth/tokens")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed_after_revoke.status(), StatusCode::OK);
+        assert_eq!(json_body(listed_after_revoke).await["count"], json!(0));
 
         let missing_csrf = app
             .clone()

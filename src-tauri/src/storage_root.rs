@@ -18,7 +18,16 @@ const LOCATOR_FILE: &str = "storage-location.json";
 const MIGRATION_FILE: &str = "storage-migration.json";
 const ROOT_MARKER_FILE: &str = ".muriarc-storage-root.json";
 const BACKUP_DIRECTORY: &str = "storage-backups";
-const MANAGED_ENTRIES: [&str; 4] = ["muriarc.sqlite3", "attachments", "data", "ai-provider.json"];
+const DESKTOP_UPGRADE_INTENT_FILE: &str = "desktop-upgrade-intent.json";
+const DESKTOP_UPGRADE_HISTORY_DIRECTORY: &str = "desktop-upgrade-history";
+const DESKTOP_UPGRADE_JOURNAL_DIRECTORY: &str = "upgrade-journals";
+const MANAGED_ENTRIES: [&str; 5] = [
+    "muriarc.sqlite3",
+    "attachments",
+    "data",
+    "ai-provider.json",
+    "deployment-generation.json",
+];
 
 #[derive(Debug, Error)]
 pub(crate) enum StorageRootError {
@@ -152,11 +161,48 @@ struct StorageMigrationIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct TreeDigest {
-    file_count: u64,
-    directory_count: u64,
-    total_bytes: u64,
-    sha256: String,
+pub(crate) struct TreeDigest {
+    pub(crate) file_count: u64,
+    pub(crate) directory_count: u64,
+    pub(crate) total_bytes: u64,
+    pub(crate) sha256: String,
+}
+
+pub(crate) fn resolve_active_root_for_upgrade(
+    config_root: &Path,
+) -> Result<PathBuf, StorageRootError> {
+    let config_root = canonical_directory(config_root)?;
+    recover_atomic_file(&config_root.join(LOCATOR_FILE))?;
+    recover_atomic_file(&config_root.join(MIGRATION_FILE))?;
+    if read_json_optional::<StorageMigrationIntent>(&config_root.join(MIGRATION_FILE))?.is_some() {
+        return Err(StorageRootError::MigrationPending);
+    }
+    match read_json_optional::<StorageLocator>(&config_root.join(LOCATOR_FILE))? {
+        Some(locator) if locator.version == STORAGE_VERSION => {
+            canonical_directory(&locator.active_data_root)
+                .map_err(|_| StorageRootError::ActiveRootUnavailable)
+        }
+        Some(_) => Err(StorageRootError::InvalidConfiguration),
+        None => Ok(config_root),
+    }
+}
+
+pub(crate) fn activate_root_for_upgrade(
+    config_root: &Path,
+    candidate_root: &Path,
+) -> Result<(), StorageRootError> {
+    let config_root = canonical_directory(config_root)?;
+    let candidate_root = canonical_directory(candidate_root)?;
+    if paths_overlap(&config_root, &candidate_root) {
+        return Err(StorageRootError::InvalidTarget);
+    }
+    write_json_atomic(
+        &config_root.join(LOCATOR_FILE),
+        &StorageLocator {
+            version: STORAGE_VERSION,
+            active_data_root: candidate_root,
+        },
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,12 +611,13 @@ fn finalize_default_target(
     Ok(())
 }
 
-fn default_finalize_names() -> [&'static str; 5] {
+fn default_finalize_names() -> [&'static str; 6] {
     [
         "muriarc.sqlite3",
         "attachments",
         "data",
         "ai-provider.json",
+        "deployment-generation.json",
         ROOT_MARKER_FILE,
     ]
 }
@@ -597,7 +644,7 @@ fn cleanup_completed_migration(
     Ok(())
 }
 
-async fn checkpoint_and_verify_database(path: &Path) -> Result<(), StorageRootError> {
+pub(crate) async fn checkpoint_and_verify_database(path: &Path) -> Result<(), StorageRootError> {
     if !path.is_file() {
         return Err(StorageRootError::VerificationFailed);
     }
@@ -619,7 +666,7 @@ async fn checkpoint_and_verify_database(path: &Path) -> Result<(), StorageRootEr
     Ok(())
 }
 
-async fn verify_database_read_only(path: &Path) -> Result<(), StorageRootError> {
+pub(crate) async fn verify_database_read_only(path: &Path) -> Result<(), StorageRootError> {
     if !path.is_file() {
         return Err(StorageRootError::VerificationFailed);
     }
@@ -640,7 +687,7 @@ async fn verify_database_read_only(path: &Path) -> Result<(), StorageRootError> 
     }
 }
 
-fn copy_managed_tree(source: &Path, target: &Path) -> Result<(), StorageRootError> {
+pub(crate) fn copy_managed_tree(source: &Path, target: &Path) -> Result<(), StorageRootError> {
     for name in MANAGED_ENTRIES {
         let source_entry = source.join(name);
         if source_entry.exists() {
@@ -676,10 +723,18 @@ fn copy_entry(source: &Path, target: &Path) -> Result<(), StorageRootError> {
     Ok(())
 }
 
-fn tree_digest(root: &Path) -> Result<TreeDigest, StorageRootError> {
+pub(crate) fn tree_digest(root: &Path) -> Result<TreeDigest, StorageRootError> {
+    tree_digest_for_names(root, &MANAGED_ENTRIES)
+}
+
+pub(crate) fn payload_tree_digest(root: &Path) -> Result<TreeDigest, StorageRootError> {
+    tree_digest_for_names(root, &["attachments", "data", "ai-provider.json"])
+}
+
+fn tree_digest_for_names(root: &Path, names: &[&str]) -> Result<TreeDigest, StorageRootError> {
     let mut entries = Vec::new();
-    for name in MANAGED_ENTRIES {
-        let entry = root.join(name);
+    for name in names {
+        let entry = root.join(*name);
         if entry.exists() {
             collect_entries(root, &entry, &mut entries)?;
         }
@@ -801,11 +856,15 @@ fn validate_default_target_entries(target: &Path) -> Result<(), StorageRootError
                     | MIGRATION_FILE
                     | ROOT_MARKER_FILE
                     | BACKUP_DIRECTORY
+                    | DESKTOP_UPGRADE_INTENT_FILE
+                    | DESKTOP_UPGRADE_HISTORY_DIRECTORY
+                    | DESKTOP_UPGRADE_JOURNAL_DIRECTORY
                     | "storage-location.json.bak"
                     | "storage-migration.json.bak"
             )
             || name.starts_with(".storage-location.json.tmp-")
-            || name.starts_with(".storage-migration.json.tmp-");
+            || name.starts_with(".storage-migration.json.tmp-")
+            || name.starts_with(".desktop-upgrade-intent.json.tmp-");
         if !allowed {
             return Err(StorageRootError::TargetNotEmpty);
         }
@@ -960,7 +1019,10 @@ fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), StorageRootError> {
+pub(crate) fn write_json_atomic<T: Serialize>(
+    path: &Path,
+    value: &T,
+) -> Result<(), StorageRootError> {
     let parent = path
         .parent()
         .ok_or(StorageRootError::InvalidConfiguration)?;
@@ -1007,7 +1069,7 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Storage
     Ok(())
 }
 
-fn recover_atomic_file(path: &Path) -> Result<(), StorageRootError> {
+pub(crate) fn recover_atomic_file(path: &Path) -> Result<(), StorageRootError> {
     let backup = path.with_extension(format!(
         "{}bak",
         path.extension()
@@ -1021,7 +1083,7 @@ fn recover_atomic_file(path: &Path) -> Result<(), StorageRootError> {
     Ok(())
 }
 
-fn remove_atomic_file(path: &Path) -> Result<(), StorageRootError> {
+pub(crate) fn remove_atomic_file(path: &Path) -> Result<(), StorageRootError> {
     if path.exists() {
         fs::remove_file(path)?;
     }
@@ -1038,7 +1100,9 @@ fn remove_atomic_file(path: &Path) -> Result<(), StorageRootError> {
     Ok(())
 }
 
-fn read_json_optional<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, StorageRootError> {
+pub(crate) fn read_json_optional<T: DeserializeOwned>(
+    path: &Path,
+) -> Result<Option<T>, StorageRootError> {
     if !path.exists() {
         return Ok(None);
     }
@@ -1097,6 +1161,11 @@ mod tests {
         fs::create_dir(root.join("data")).unwrap();
         fs::write(root.join("data").join("artifact.bin"), b"artifact").unwrap();
         fs::write(root.join("ai-provider.json"), br#"{"enabled":true}"#).unwrap();
+        fs::write(
+            root.join("deployment-generation.json"),
+            br#"{"generationId":"fixture"}"#,
+        )
+        .unwrap();
     }
 
     fn roots() -> (TempDir, PathBuf, PathBuf, PathBuf) {
@@ -1145,6 +1214,10 @@ mod tests {
         assert_eq!(
             fs::read(target.join("data").join("artifact.bin")).unwrap(),
             b"artifact"
+        );
+        assert_eq!(
+            fs::read(target.join("deployment-generation.json")).unwrap(),
+            br#"{"generationId":"fixture"}"#
         );
         assert!(config.join("muriarc.sqlite3").is_file());
         assert!(!config.join(MIGRATION_FILE).exists());

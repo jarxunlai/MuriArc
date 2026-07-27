@@ -85,6 +85,10 @@ legacy read-only，不会伪造档案身份后继续调用 Provider。
 
 ## Upgrade and rollback policy
 
+正式升级的四维身份、deployment state、generation manifest、Write Lease、首次写入降级边界和
+恢复集合以 [UPGRADE_COMPATIBILITY.md](UPGRADE_COMPATIBILITY.md) 为准。普通 Server/Desktop
+启动只核对，不执行结构 migration；只有升级控制面可调用 Store migration primitive。
+
 - PostgreSQL 迁移门禁必须在一次性真实 PostgreSQL 17 上覆盖空库完整应用、重复应用，以及从
   旧版本增量应用；SQLite 使用独立临时数据库执行相同 Store contract。未提供测试数据库而被
   skip 不算通过。
@@ -94,6 +98,8 @@ legacy read-only，不会伪造档案身份后继续调用 Provider。
   version，或从生产数据猜测重建凭据。
 - `MURIARC_AI_MASTER_KEY_VERSION` 只有在全部既有密文已用旧版本解密并重新加密后才能推进；
   轮换失败必须阻断启动并保留原数据，不能清空密钥行或要求用户在无报告的情况下重输。
+- `migrations/checksums.json` 锁定已登记 SQL；CI 拒绝修改、删除或未登记新增。新结构只能追加
+  migration，并为新增业务表安装数据库级 Write Lease fence。
 
 ## Ordinary import/export boundary
 

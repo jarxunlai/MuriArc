@@ -1,0 +1,21 @@
+[package]
+name = "muriarcctl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MuriArc local upgrade and recovery control plane"
+
+[[bin]]
+name = "muriarcctl"
+path = "src/main.rs"
+
+[dependencies]
+muriarc-delivery = { path = "../delivery" }
+muriarc-upgrade = { path = "../upgrade" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["postgres"] }
+tokio.workspace = true
+uuid.workspace = true

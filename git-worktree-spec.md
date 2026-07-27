@@ -1,53 +1,58 @@
-# Feature Spec: 基因鉴定批次与胶图证据
+# Feature Spec: MuriArc 1.0 发布集成与 Fail-Closed RC
 
-> 此分支实现用户确认的批量基因鉴定录入：表格结果、批次元数据与多张胶图共同绑定并可追溯。
+> 本分支只实现正式发布编排与门禁，不把当前 `0.1.0 / preview_epoch_0` 冒充为 1.0，也不生成
+> 虚假的 E0001 Fixture、Windows/systemd/Docker/Cloudflare 证据或签名结果。
 
 ## 分支信息
 
 | 项目 | 值 |
 |---|---|
-| 分支名称 | `feature/genotyping-batch-evidence` |
-| 基于提交 | `main@552dc0324f4c1d9bd70251854849294eb606f4d6` |
-| Worktree 路径 | `/home/ljx/Github/animal_lab-genotyping-batch-evidence` |
-| 建立日期 | `2026-07-25` |
+| 分支名称 | `feature/release-integration-1-0` |
+| 基于提交 | `feature/cloudflare-public-profile@ef89402` |
+| Worktree 路径 | `/home/ljx/Github/animal_lab-release-integration-1-0` |
+| 建立日期 | `2026-07-27` |
 
 ## 目标
 
-在“动物数据”中新增独立的基因鉴定批次工作流。用户可一次选择鉴定结果表格和一张或多张胶图，
-预览动物/基因型结果与证据文件，确认后形成正式批次；每条 Genetics v2 `GenotypingRecord`、
-原始胶图 Attachment、操作者、时间、hash、Audit 与 Provenance 均能从批次追溯。
+建立可由正式发布流水线调用的 1.0 RC 编排：把最终 Native bundle、Managed Compose bundle、
+Windows 安装包、Release Manifest、TUF/Sigstore/Tauri provenance、完整历史兼容矩阵和真实
+systemd/Docker/Windows/Cloudflare/fault-injection 证据绑定到同一组 digest。Catalog 为空、E0001
+不是由最终制品生成、任一层 `FAIL/SKIP`、源码运行或 DemoGateway 都必须阻断。
 
 ## 实现范围
 
-- [x] 建立 `GenotypingBatch` 领域聚合及草稿/已提交生命周期，记录实验室、可选项目、批次编号、鉴定时间、方法、备注、创建者和 revision。
-- [x] 使用 `genotyping_batch_records` 显式关系表关联批次与既有 `GenotypingRecord`，并保证已提交批次、记录、附件关系、AnimalEvent、Audit 与 Provenance 由 Store adapter 原子确认。
-- [x] 增加 SQLite/PostgreSQL 纯向前迁移、Store port、两套 adapter 和共享 contract tests；扩展 snapshot。
-- [x] 增加 Server REST 与 Tauri commands：创建/读取/列出批次、上传/列出胶图证据、预览结果表格、确认或取消草稿。
-- [x] 在“动物数据”增加“动物登记 / 基因鉴定批次”入口；支持 CSV/XLSX、批次元数据、多图选择、缩略预览、映射/校验、确认收据和最近批次。
-- [x] 在动物档案的基因型记录中展示批次来源，并可回到批次查看胶图证据。
-- [x] 更新架构、安全、迁移与普通导入边界文档。
-- [x] 完成任务相关 Rust、UI、Store 与合成浏览器工作流验证。
-- [x] 从干净 feature commit 重建本机可人工使用的 Server 标准服务，并通过标准数据与部署核验。
-- [ ] 合并前使用独立 run-id 执行完整正式验收；本分支的可复用标准服务不替代独立 `all` 验收。
+- [x] 增加版本化 RC gate definition，固定 Native、Compose、Desktop、Cloudflare Public、恢复、
+  故障注入和签名攻击场景及其最终制品映射。
+- [x] 增加 Release readiness validator，验证源码正式身份、Release Manifest、最终 artifact lock、
+  双后端 E0001 Fixture、完整 RC compatibility matrix 和场景证据的 digest 闭环。
+- [x] 空 Catalog、缺少 SQLite/PostgreSQL 当前状态、错误 source artifact/provenance、任何
+  `FAIL/SKIP`、非 final package、重复或额外场景均 fail closed。
+- [x] 增加宿主编排脚本：先执行完整历史 RC matrix，再调用真实 RC Driver，最后运行 readiness
+  validator；所有恢复数据、报告与制品必须在 Git 工作树之外。
+- [x] 将 GitHub RC workflow 接入统一编排；PR/Nightly 保持分层矩阵，RC 缺少最终 driver、manifest、
+  Fixture 或真实环境时明确失败。
+- [x] 增加 Python/Rust/Workflow 合同测试和发布文档；测试只能构造临时合成控制文件，不能生成
+  或登记真实 E0001 Fixture。
+
+## 非目标
+
+- 不把 workspace 版本改为 `1.0.0`，不把 Epoch 改为 `E0001`，不追加空壳 Catalog 条目。
+- 不创建签名、GHCR OCI、Windows 安装包或 Cloudflare staging 通过记录。
+- 不在 Git 中保存数据库、附件、Keyset、真实账号、Journal、Fixture 大资产或 RC 报告。
+- 不允许源码 `cargo run`、DemoGateway、SKIP 或手工勾选替代最终制品证据。
 
 ## 验收标准
 
-- 用户能在同一工作流选择一份鉴定结果表格和多张胶图；确认前可删除或替换任一证据。
-- 表格至少包含动物业务编号和检测状态，基因型定义、鉴定时间与方法由批次元数据统一指定；系统拒绝不存在/不可见动物、未知定义、重复动物和跨实验室引用。
-- 确认成功后关系表把全部检测记录关联到同一批次，批次能列出全部记录与胶图；胶图保存文件名、MIME、大小、SHA-256 和版本。
-- 确认失败不会产生部分 GenotypingRecord；草稿及已上传证据保持可恢复或可取消，不伪装成正式结果。
-- Server 与 Desktop 语义一致；Editor 只能在项目范围读取，AnimalManager/LabAdmin 才能创建实验室级鉴定批次。
-- 所有正式写入包含 actor/source/revision/Audit/Provenance，删除或更正不覆盖历史事实。
-
-## 技术约束
-
-- `core` 不依赖 Tauri、Axum、SQLx 或 Provider；入口保持薄。
-- 不把胶图 Base64、路径、密钥或真实动物数据写入日志、审计、测试 fixture 或 Git。
-- 不用通用 EAV、任意 SQL 或前端多次写入模拟事务。
-- Genetics v2 是正式事实源；旧自由文本 `Genotype` 不作为批次结果写入目标。
-- Attachment 内容与数据库 metadata 继续使用现有安全检查、hash 与私有文件库。
-- SQLite/PostgreSQL adapter 必须通过同一 Store contract。
+- 当前仓库运行正式 1.0 readiness 必须失败，并明确指出仍是 preview 或 Catalog 为空。
+- 对完整合成控制面：只有版本/Epoch、双后端 Fixture 来源、artifact/provenance、全历史矩阵、
+  required scenarios 和所有 digest 完全一致且全部 PASS/final_package 时 validator 才通过。
+- 外部 `artifact-lock.json` 必须被 RC evidence 按 digest 引用；Driver 报告不能替换其中的 artifact
+  size、provenance 或 signature evidence。
+- 任意删除、重复、FAIL、SKIP、source_run、digest 篡改、错误 profile/artifact 映射均由测试证明失败。
+- `run-release-candidate.sh` 拒绝工作树内输出、缺少真实 driver/verifier/manifest，并且不生成伪证据。
 
 ## 跨分支备注
 
-单一纵向 feature，无跨分支依赖。合并前应重新基于最新 main 验证迁移编号与 UI 冲突。
+依赖 `ef89402` 及此前兼容基础、Upgrade Engine、Fixture、Native/Compose、Desktop、Cloudflare 全部
+阶段。该分支完成后只代表“发布门禁和编排已就绪”，不代表真实 1.0 RC 已通过；正式发布必须在
+最终 release commit、最终 digest 和真实外部环境上另行执行。

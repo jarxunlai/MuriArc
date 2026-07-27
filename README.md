@@ -99,6 +99,8 @@ Server 每次启动在单事务中核对身份、LabAdmin membership 与凭据�
 ## 数据安全
 
 - 数据库、附件、密钥、快照和旧库副本不进入 Git。
+- 安全升级由独立 muriarcctl 和共享 Upgrade Engine 编排；Server 不持有 Docker/systemd/DDL
+  权限，未实际恢复验证完整备份、未完成 Candidate 七层验证时不得激活。
 - 旧数据库只以只读方式扫描；迁移目标始终是新文件。
 - 大附件存文件库，数据库只保存元数据和 SHA-256。
 - Server 所有正式写入均记录操作者、来源、revision 与审计事件。
@@ -109,6 +111,11 @@ Server 每次启动在单事务中核对身份、LabAdmin membership 与凭据�
   经演练的数据库与附件联合备份。
 
 迁移规则见 [docs/MIGRATION.md](docs/MIGRATION.md)，安全边界见 [docs/SECURITY.md](docs/SECURITY.md)，共享版部署见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)，接口与逐步验收见 [docs/DELIVERY_ACCEPTANCE.md](docs/DELIVERY_ACCEPTANCE.md)。
+从正式版 1.0 开始的永久数据兼容、Generation、Write Lease 与 fail-closed 启动契约见
+[docs/UPGRADE_COMPATIBILITY.md](docs/UPGRADE_COMPATIBILITY.md)。
+公网 Server 只允许通过独立宿主机 Cloudflare Tunnel 暴露；无 MFA Profile 的补偿控制、
+95 MiB 限制和剩余风险见
+[docs/CLOUDFLARE_PUBLIC_PROFILE.md](docs/CLOUDFLARE_PUBLIC_PROFILE.md)。
 
 ## 当前状态
 

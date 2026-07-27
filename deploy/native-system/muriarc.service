@@ -1,0 +1,43 @@
+[Unit]
+Description=MuriArc shared laboratory server
+Documentation=https://github.com/jarxunlai/MuriArc
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=muriarc
+Group=muriarc
+WorkingDirectory=/var/lib/muriarc
+EnvironmentFile=/etc/muriarc/server.env
+EnvironmentFile=/var/lib/muriarc/control/active.env
+ExecStart=/opt/muriarc/current/bin/muriarc-server
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=90s
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/muriarc /etc/muriarc
+ReadWritePaths=/var/lib/muriarc
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

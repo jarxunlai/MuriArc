@@ -1,0 +1,17 @@
+# Optional third layer for a dedicated Cloudflare Access-protected API hostname.
+services:
+  server:
+    environment:
+      MURIARC_EXTERNAL_API_ENABLED: "true"
+      MURIARC_EXTERNAL_API_HOSTNAME: ${MURIARC_EXTERNAL_API_HOSTNAME:?set the dedicated API hostname}
+      MURIARC_CF_ACCESS_CLIENT_ID_FILE: /run/secrets/muriarc_cf_access_client_id
+      MURIARC_CF_ACCESS_CLIENT_SECRET_FILE: /run/secrets/muriarc_cf_access_client_secret
+    secrets:
+      - muriarc_cf_access_client_id
+      - muriarc_cf_access_client_secret
+
+secrets:
+  muriarc_cf_access_client_id:
+    file: ${MURIARC_CF_ACCESS_CLIENT_ID_FILE:?set the Service Token client-id file}
+  muriarc_cf_access_client_secret:
+    file: ${MURIARC_CF_ACCESS_CLIENT_SECRET_FILE:?set the Service Token secret file}

@@ -40,13 +40,13 @@ use axum::{
         DefaultBodyLimit, FromRequest, FromRequestParts, Path, Query, Request, State,
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
-    http::{StatusCode, request::Parts},
-    middleware,
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header::CACHE_CONTROL, request::Parts},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::get,
 };
 use muriarc_application::ApplicationResult;
-use muriarc_core::{Permission, StoreResult};
+use muriarc_core::{CompatibilityReport, Permission, StoreResult};
 use serde::{Serialize, de::DeserializeOwned};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
@@ -79,6 +79,16 @@ struct HealthResponse {
     version: &'static str,
     status: &'static str,
     database: &'static str,
+    compatibility: &'static str,
+    storage: &'static str,
+    ui: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CompatibilityHealthResponse {
+    status: &'static str,
+    report: Option<CompatibilityReport>,
+    error: Option<String>,
 }
 
 pub fn api_router(state: AppState) -> Router {
@@ -145,10 +155,48 @@ fn base_router(state: AppState) -> Router {
         // index.html by the SPA fallback.
         .fallback(fallback);
     let api = Router::new()
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
         .route("/api/v1/health", get(health))
+        .route("/api/v1/livez", get(livez))
+        .route("/api/v1/readyz", get(readyz))
+        .route("/api/v1/compatibility", get(compatibility_health))
+        .route("/api/v1/runtime/capabilities", get(runtime_capabilities))
         .nest("/api/v1", api_v1);
 
-    api.merge(mcp::router(state.clone())).with_state(state)
+    let api = if state.deployment_security.external_api().enabled() {
+        api.merge(mcp::router(state.clone()))
+    } else {
+        api
+    };
+    api.layer(middleware::from_fn(disable_shared_cache))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_runtime_access_mode,
+        ))
+        .with_state(state)
+}
+
+async fn runtime_capabilities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<ItemResponse<crate::RuntimeCapabilities>> {
+    let metadata = crate::auth::request_metadata(&headers);
+    item(state.deployment_security.capabilities(), &metadata)
+}
+
+async fn disable_shared_cache(request: Request, next: Next) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    if !response.headers().contains_key(CACHE_CONTROL) {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    }
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("pragma"),
+        HeaderValue::from_static("no-cache"),
+    );
+    response
 }
 
 async fn fallback() -> ApiError {
@@ -156,14 +204,17 @@ async fn fallback() -> ApiError {
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    match state.store.health_check().await {
-        Ok(()) => (
+    match readiness(&state).await {
+        Ok(_) => (
             StatusCode::OK,
             Json(HealthResponse {
                 service: "muriarc-server",
                 version: env!("CARGO_PKG_VERSION"),
                 status: "ok",
                 database: "ok",
+                compatibility: "ok",
+                storage: "ok",
+                ui: "ok",
             }),
         ),
         Err(error) => {
@@ -175,10 +226,135 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
                     version: env!("CARGO_PKG_VERSION"),
                     status: "degraded",
                     database: "unavailable",
+                    compatibility: "unavailable",
+                    storage: "unavailable",
+                    ui: "unavailable",
                 }),
             )
         }
     }
+}
+
+async fn livez() -> impl IntoResponse {
+    (StatusCode::OK, "ok\n")
+}
+
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    match readiness(&state).await {
+        Ok(_) => (StatusCode::OK, "ready\n"),
+        Err(error) => {
+            tracing::warn!(error = %error, "readiness check failed");
+            (StatusCode::SERVICE_UNAVAILABLE, "not ready\n")
+        }
+    }
+}
+
+async fn compatibility_health(State(state): State<AppState>) -> impl IntoResponse {
+    match state.store.compatibility_report().await {
+        Ok(report) if runtime_report_is_ready(&state, &report) => (
+            StatusCode::OK,
+            Json(CompatibilityHealthResponse {
+                status: "compatible",
+                report: Some(report),
+                error: None,
+            }),
+        ),
+        Ok(report) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(CompatibilityHealthResponse {
+                status: "incompatible",
+                report: Some(report),
+                error: None,
+            }),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(CompatibilityHealthResponse {
+                status: "unavailable",
+                report: None,
+                error: Some(error.to_string()),
+            }),
+        ),
+    }
+}
+
+async fn readiness(state: &AppState) -> Result<CompatibilityReport, String> {
+    if !state.runtime_compatibility_verified {
+        return Err("runtime compatibility preflight was not completed".to_owned());
+    }
+    state
+        .store
+        .health_check()
+        .await
+        .map_err(|error| error.to_string())?;
+    let report = state
+        .store
+        .compatibility_report()
+        .await
+        .map_err(|error| error.to_string())?;
+    match state.runtime_access_mode {
+        crate::RuntimeAccessMode::ReadWrite => {
+            report.require_compatible()?;
+        }
+        crate::RuntimeAccessMode::ReadOnlyActivation => {
+            report.require_read_only_compatible()?;
+        }
+    }
+    if state.data_files.is_none() {
+        return Err("data storage is not configured".to_owned());
+    }
+    let attachment_root = state
+        .attachment_root
+        .as_ref()
+        .ok_or_else(|| "attachment root is not configured".to_owned())?;
+    if !tokio::fs::metadata(attachment_root.as_ref())
+        .await
+        .map_err(|error| error.to_string())?
+        .is_dir()
+    {
+        return Err("attachment root is not a directory".to_owned());
+    }
+    let ui_root = state
+        .ui_root
+        .as_ref()
+        .ok_or_else(|| "UI asset root is not configured".to_owned())?;
+    if !tokio::fs::metadata(ui_root.join("index.html"))
+        .await
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("UI index asset is missing".to_owned());
+    }
+    Ok(report)
+}
+
+fn runtime_report_is_ready(state: &AppState, report: &CompatibilityReport) -> bool {
+    match state.runtime_access_mode {
+        crate::RuntimeAccessMode::ReadWrite => report.is_compatible(),
+        crate::RuntimeAccessMode::ReadOnlyActivation => {
+            report.require_read_only_compatible().is_ok()
+        }
+    }
+}
+
+async fn enforce_runtime_access_mode(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<axum::response::Response, ApiError> {
+    if state.runtime_access_mode == crate::RuntimeAccessMode::ReadOnlyActivation
+        && !matches!(
+            *request.method(),
+            Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+        )
+    {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "maintenance_read_only",
+            "MuriArc is validating an upgraded generation in read-only maintenance mode",
+        ));
+    }
+    Ok(next.run(request).await)
 }
 
 pub(super) fn authorize(

@@ -5,19 +5,11 @@ use futures_util::TryStreamExt;
 use muriarc_core::Attachment;
 use muriarc_data::AttachmentFiles;
 pub(crate) use muriarc_data::{
-    AttachmentFileError, MAX_ATTACHMENT_BYTES, StoredAttachmentObject as StoredObject,
+    AttachmentFileError, StoredAttachmentObject as StoredObject,
     VerifiedAttachmentObject as VerifiedObject,
 };
 use tokio_util::io::StreamReader;
 use uuid::Uuid;
-
-pub(crate) async fn write_object(
-    root: &Path,
-    id: Uuid,
-    body: Body,
-) -> Result<StoredObject, AttachmentFileError> {
-    write_object_with_limit(root, id, body, MAX_ATTACHMENT_BYTES).await
-}
 
 pub(crate) async fn write_object_with_limit(
     root: &Path,

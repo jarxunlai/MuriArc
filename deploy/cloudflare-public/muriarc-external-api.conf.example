@@ -1,0 +1,11 @@
+# Optional second drop-in. Do not install it for the normal Web-only profile.
+# The dedicated API hostname must be protected by a Cloudflare Access Service
+# Token policy. These credential files are deployment-only secrets and are not
+# members of the MuriArc recovery set.
+[Service]
+LoadCredential=cf-access-client-id:/etc/cloudflared/muriarc-api-client-id
+LoadCredential=cf-access-client-secret:/etc/cloudflared/muriarc-api-client-secret
+Environment=MURIARC_EXTERNAL_API_ENABLED=true
+Environment=MURIARC_EXTERNAL_API_HOSTNAME=REPLACE_API_HOSTNAME
+Environment=MURIARC_CF_ACCESS_CLIENT_ID_FILE=%d/cf-access-client-id
+Environment=MURIARC_CF_ACCESS_CLIENT_SECRET_FILE=%d/cf-access-client-secret

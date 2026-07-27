@@ -513,8 +513,8 @@ pub enum AuthError {
     EnvironmentRootManaged,
     #[error("the new password must differ from the current password")]
     PasswordReuse,
-    #[error("the password does not satisfy the password policy")]
-    PasswordPolicy,
+    #[error("the password does not satisfy credential policy revision {revision}")]
+    PasswordPolicy { revision: i32, min_chars: usize },
     #[error("the profile does not satisfy validation rules")]
     InvalidProfile,
     #[error("CSRF validation failed")]
@@ -548,10 +548,12 @@ impl AuthError {
                 "password_reuse",
                 "the new password must differ from the current password",
             ),
-            Self::PasswordPolicy => ApiError::new(
+            Self::PasswordPolicy { min_chars, .. } => ApiError::new(
                 axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                 "invalid_password",
-                "passwords require at least 8 non-control characters and at most 1024 bytes",
+                format!(
+                    "passwords require at least {min_chars} non-control characters and at most 1024 bytes"
+                ),
             ),
             Self::InvalidProfile => ApiError::new(
                 axum::http::StatusCode::UNPROCESSABLE_ENTITY,
@@ -631,6 +633,24 @@ pub(crate) async fn authenticate_request(
         .map_err(|error| error.into_api_error().with_request_id(request_id.clone()))?
     {
         Some(token) => {
+            state
+                .deployment_security
+                .external_api()
+                .authorize(request.headers())
+                .map_err(|error| {
+                    let (code, message) = match error {
+                        crate::deployment_security::ExternalApiAccessError::Disabled => (
+                            "external_api_disabled",
+                            "external bearer API access is disabled",
+                        ),
+                        crate::deployment_security::ExternalApiAccessError::Denied => (
+                            "external_api_denied",
+                            "external API gateway verification failed",
+                        ),
+                    };
+                    ApiError::new(axum::http::StatusCode::FORBIDDEN, code, message)
+                        .with_request_id(request_id.clone())
+                })?;
             let principal = state
                 .authenticator
                 .authenticate(token)

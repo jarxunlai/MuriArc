@@ -6,7 +6,7 @@
   "primaryColor": "#0f5faa",
   "accentColor": "#009ca6",
   "logoMarkPath": "/logo-mark.png",
-  "version": "0.1.0",
-  "releaseStage": "预发布",
+  "version": "1.0.0",
+  "releaseStage": "发布候选",
   "logoMasterSha256": "9973d3c11403850d71df87b324ea15e4a35745894c7f6c9058268ce198124070"
 }

@@ -7,11 +7,12 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const CURRENT_APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const CURRENT_DATA_EPOCH: &str = "preview_epoch_0";
+pub const CURRENT_DATA_EPOCH: &str = "E0001";
 pub const CURRENT_GATEWAY_CONTRACT_REVISION: &str = "gateway-v1";
-/// A formal release must change this to `permanent-upgrade` together with its
-/// version/Epoch transition. The RC readiness gate rejects preview support.
-pub const CURRENT_RELEASE_SUPPORT: &str = "preview-only-adoption";
+/// The permanent compatibility contract is active in the candidate source
+/// identity, but it is not a release claim until the unchanged final artifacts
+/// pass the complete physical RC gate.
+pub const CURRENT_RELEASE_SUPPORT: &str = "permanent-upgrade";
 pub const GENERATION_MANIFEST_FORMAT: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

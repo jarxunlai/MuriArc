@@ -4,7 +4,7 @@
 
 ## 状态
 
-本文定义计划用于 `1.0.0 / E0001` 及后续版本的正式 Server 交付边界。仓库当前仍是 `0.1.0 / preview_epoch_0`；合同测试和模板通过不等于真实物理 RC 已通过。
+本文定义 `1.0.0 / E0001 / permanent-upgrade` 候选及后续版本的正式 Server 交付边界。合同测试、候选源码身份和模板通过不等于真实物理 RC 已通过。
 
 根目录开发 Compose 只用于源码/preview。正式安装只能从一个签名 Server bundle 选择 `native-system` 或 `managed-compose`，二者不能混用。
 

@@ -2,7 +2,7 @@
 
 > English | [简体中文](UPGRADE_ENGINE_cn.md)
 
-The control-plane contracts and delivery drivers are implemented, but a real upgrade is successful only when the physical driver and final signed artifacts produce complete evidence. The current repository has not passed the `1.0.0 / E0001` RC.
+The control-plane contracts and delivery drivers are implemented, and the candidate source identity is `1.0.0 / E0001 / permanent-upgrade`. A real upgrade and release are successful only when the physical drivers and unchanged final signed artifacts produce complete evidence; that RC has not passed.
 
 ## Authority boundary
 

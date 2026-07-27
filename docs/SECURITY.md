@@ -4,7 +4,7 @@
 
 ## Security status
 
-This document describes implemented controls and mandatory deployment boundaries for the current `0.1.0 / preview_epoch_0` line. It is not a claim that a public `1.0.0 / E0001` RC or an external security audit has passed.
+This document describes implemented controls and mandatory deployment boundaries for the `1.0.0 / E0001 / permanent-upgrade` candidate source. It is not a claim that the physical RC or an external security audit has passed.
 
 ## Trust boundaries
 

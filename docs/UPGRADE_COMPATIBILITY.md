@@ -2,13 +2,13 @@
 
 > English | [简体中文](UPGRADE_COMPATIBILITY_cn.md)
 
-This contract is implemented for the current preview line, but the permanent compatibility floor and formal release identity begin only after the final `1.0.0 / E0001` artifacts pass the complete RC.
+The candidate source now carries the `1.0.0 / E0001 / permanent-upgrade` identity. The permanent compatibility promise and formal release status begin only after the unchanged final artifacts pass the complete physical RC.
 
 ## Compatibility floor
 
 The permanent compatibility promise starts at the first stable
-`1.0 / E0001` release. The current `0.1.0` line is registered as
-`preview_epoch_0` so that pre-release databases can be adopted explicitly,
+`1.0 / E0001` release. The pre-release `0.1.0` line remains registered as
+`preview_epoch_0` so that those databases can be adopted explicitly,
 tested, and converted into the first immutable fixture. A stable release may
 be upgraded to the latest stable release in one administrator operation; the
 controller may execute multiple internal Epoch hops.

@@ -4,7 +4,7 @@
 
 ## Status and evidence rule
 
-This checklist describes implemented product scope and the evidence required for development/manual acceptance. MuriArc remains `0.1.0 / preview_epoch_0`; no result in this document should be read as a formal `1.0.0 / E0001` RC pass.
+This checklist describes implemented product scope and the evidence required for development/manual acceptance. The candidate source identity is `1.0.0 / E0001 / permanent-upgrade`, but no result in this document should be read as a physical RC pass.
 
 Automated checks, a dirty-main development service, an unsigned Tester package, or a source-built Compose stack are useful development evidence but not final artifact acceptance.
 
@@ -116,7 +116,7 @@ Use synthetic data and a disposable account/environment. Do not paste access cre
 
 ## Known limitations
 
-- The current repository has not completed the physical `1.0.0 / E0001` RC.
+- The `1.0.0 / E0001` candidate has not completed the physical RC.
 - Business Snapshot has no general restore/apply.
 - Ordinary import/export is deliberately narrow and is not database migration or synchronization.
 - macOS formal packaging/acceptance is not complete.

@@ -53,9 +53,9 @@ Cloudflare Public overlay、故障注入、激活前回退/首次写入后拒绝
 digest、size、provenance 与 signature evidence 必须和 RC Driver 报告逐项一致。Fixture producer
 也必须读取同一份 lock，不能从未受信任的运行参数自行填写 source provenance。
 
-当前源码仍是 `0.1.0 / preview_epoch_0 / preview-only-adoption`，因此正式 readiness 必须失败。
-只有最终 release commit 同时切换为 `1.0.0 / E0001 / permanent-upgrade`，且双后端 E0001 Fixture
-的 `source_release_artifact_digest` 与 `source_release_provenance_digest` 指向最终签名制品时才可能通过。
+当前候选源码已切换为 `1.0.0 / E0001 / permanent-upgrade`，但这只满足源码身份条件，不代表 readiness 或 RC 已通过。
+只有同一 release commit 构建的最终签名制品实际生成双后端 E0001 Fixture，且其
+`source_release_artifact_digest` 与 `source_release_provenance_digest` 指向这些制品时，readiness 才可能通过。
 这项失败是安全边界，不得通过预造 HEAD Fixture 或修改 gate definition 绕过。
 
 ### 首个 E0001 的无循环引导

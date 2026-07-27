@@ -2,7 +2,7 @@
 
 > English | [简体中文](README_cn.md)
 
-MuriArc is currently `0.1.0 / preview_epoch_0` and is preparing, but has not passed, the `1.0.0 / E0001` release candidate. Documentation must preserve that distinction.
+The candidate source identity is `1.0.0 / E0001 / permanent-upgrade`, but the physical RC has not passed and `v1.0.0` has not been released. Documentation must preserve that distinction.
 
 ## Product and engineering
 

@@ -2629,7 +2629,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-ai"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2649,7 +2649,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-application"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "muriarc-core",
@@ -2664,7 +2664,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2678,7 +2678,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-data"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "csv",
@@ -2701,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-delivery"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "muriarc-core",
@@ -2716,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-desktop"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-importer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "calamine",
  "chrono",
@@ -2766,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-release-evidence"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2783,7 +2783,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2820,7 +2820,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-snapshot"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "serde",
@@ -2833,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-store-postgres"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2847,7 +2847,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-store-sqlite"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2861,7 +2861,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-upgrade"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-upgrade-executor"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "muriarc-core",
  "muriarc-store-postgres",
@@ -2897,7 +2897,7 @@ dependencies = [
 
 [[package]]
 name = "muriarc-verifier"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "muriarc-core",
@@ -2910,7 +2910,7 @@ dependencies = [
 
 [[package]]
 name = "muriarcctl"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "muriarc-delivery",
  "muriarc-upgrade",

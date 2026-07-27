@@ -11,9 +11,7 @@
 - 大 Fixture 保存为 GHCR OCI Artifact。Catalog 只接受
   `ghcr.io/...@sha256:<digest>`，不接受 tag、`latest` 或可变引用。
 
-当前项目仍为 `0.1.0 / preview_epoch_0`，所以 Catalog 有意为空。空 Catalog 不代表兼容验证已
-通过；RC 模式会明确失败。第一个 E0001 条目必须由最终 1.0 Release 制品实际生成，禁止用开发
-分支 HEAD 预造“1.0 历史数据”。
+当前候选源码身份已是 `1.0.0 / E0001 / permanent-upgrade`，但 Catalog 仍有意为空，因为最终制品尚未完成真实 Fixture 生产与 RC。空 Catalog 不代表兼容验证已通过；RC 模式会明确失败。第一个 E0001 条目必须由最终 1.0 Release 制品实际生成，禁止用源码 HEAD 预造“1.0 历史数据”。
 
 首个 1.0 RC 为避免“先提交 Catalog 导致最终 artifact digest 改变”的循环，由正式 Fixture
 producer 在仓库外生成 append-only `candidate-catalog.json`；完整 RC 报告绑定其 digest。正式

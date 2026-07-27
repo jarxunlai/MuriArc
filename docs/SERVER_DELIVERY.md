@@ -4,7 +4,7 @@
 
 ## Status
 
-This document defines the formal Server delivery boundary intended for `1.0.0 / E0001` and later. The repository is still `0.1.0 / preview_epoch_0`; contract tests and templates do not mean a physical RC has passed.
+This document defines the formal Server delivery boundary for the `1.0.0 / E0001 / permanent-upgrade` candidate and later. Contract tests, candidate source identity, and templates do not mean the physical RC has passed.
 
 The root development Compose file remains a source/preview tool. A formal install uses exactly one signed Server bundle profile: `native-system` or `managed-compose`.
 

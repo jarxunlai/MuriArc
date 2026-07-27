@@ -38,6 +38,10 @@ def main() -> int:
     settings = (ROOT / "ui" / "src" / "views" / "SettingsView.vue").read_text(encoding="utf-8-sig")
     desktop_settings = (ROOT / "src-tauri" / "src" / "settings.rs").read_text(encoding="utf-8-sig")
     desktop_build = (ROOT / "src-tauri" / "build.rs").read_text(encoding="utf-8-sig")
+    compatibility = (ROOT / "crates" / "core" / "src" / "compatibility.rs").read_text(
+        encoding="utf-8-sig"
+    )
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8-sig")
 
     failures: list[str] = []
     product_name = str(brand["productName"])
@@ -48,8 +52,9 @@ def main() -> int:
     primary_color = str(brand["primaryColor"]).lower()
     master_hash = str(brand["logoMasterSha256"]).lower()
 
+    release_stage = str(brand.get("releaseStage", ""))
     require(bool(product_name.strip()), "branding.productName is empty", failures)
-    require(bool(str(brand.get("releaseStage", "")).strip()), "branding.releaseStage is empty", failures)
+    require(bool(release_stage.strip()), "branding.releaseStage is empty", failures)
     require(tauri.get("productName") == product_name, "Tauri productName drifted", failures)
     require(tauri.get("mainBinaryName") == product_name, "Tauri mainBinaryName drifted", failures)
     require(tauri.get("identifier") == identifier, "Tauri bundle identifier drifted", failures)
@@ -65,6 +70,35 @@ def main() -> int:
     )
     require(bool(workspace_version) and workspace_version.group(1) == version, "Cargo workspace version drifted", failures)
     require(f"image: muriarc/server:{version}" in compose, "Compose image version drifted", failures)
+
+    epoch = re.search(
+        r'^pub const CURRENT_DATA_EPOCH: &str = "([^"]+)";$',
+        compatibility,
+        flags=re.MULTILINE,
+    )
+    support = re.search(
+        r'^pub const CURRENT_RELEASE_SUPPORT: &str = "([^"]+)";$',
+        compatibility,
+        flags=re.MULTILINE,
+    )
+    if version == "1.0.0":
+        require(release_stage == "发布候选", "1.0.0 source must remain release-candidate stage before physical RC", failures)
+        require(bool(epoch) and epoch.group(1) == "E0001", "1.0.0 data Epoch must be E0001", failures)
+        require(
+            bool(support) and support.group(1) == "permanent-upgrade",
+            "1.0.0 release support must be permanent-upgrade",
+            failures,
+        )
+    require(
+        "MURIARC_PREVIEW_BOOTSTRAP: ${MURIARC_PREVIEW_BOOTSTRAP:-false}" in compose,
+        "Source Compose must keep candidate bootstrap disabled by default",
+        failures,
+    )
+    require(
+        "MURIARC_PREVIEW_BOOTSTRAP=false" in env_example,
+        ".env.example must keep candidate bootstrap disabled by default",
+        failures,
+    )
 
     require(f"<title>{product_name}</title>" in html, "Web title drifted", failures)
     require(

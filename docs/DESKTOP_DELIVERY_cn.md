@@ -6,7 +6,7 @@
 
 Desktop 正式目标是内置 Vue UI、通过 Tauri IPC 使用 `LocalTauriGateway` 的 Windows Tauri v2 WebView 安装包。它不开放本地 HTTP API，也不通过 VNC/noVNC、浏览器远程桌面或 Server Docker 交付。
 
-仓库当前仍是 `0.1.0 / preview_epoch_0`。本地 debug build 或 unsigned Tester 包都不是签名 `1.0.0 / E0001` 发布。
+当前候选源码身份为 `1.0.0 / E0001 / permanent-upgrade`，但真实 RC 尚未通过。本地 debug build 或 unsigned Tester 包都不是签名正式发布。
 
 - SQLite：`<data-root>/muriarc.sqlite3`
 - 附件：`<data-root>/attachments/`

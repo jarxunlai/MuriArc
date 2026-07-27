@@ -20,7 +20,7 @@ Privacy and data boundary:
 
 Known release gates:
 
-- The repository remains `0.1.0 / preview_epoch_0`; `1.0.0 / E0001` has not passed the physical RC.
+- The candidate source identity is `1.0.0 / E0001 / permanent-upgrade`; the physical RC has not passed.
 - Snapshot restore/apply remains unavailable until typed preflight, cross-entity/attachment transactions, apply ledger, and canonical conflict semantics are implemented and accepted.
 - Multi-replica Server requires shared rate limiting in addition to process-local and reverse-proxy controls.
 - Public release requires a complete reachable-history and artifact audit for personal information, secrets, fixtures, generated files, and signing provenance.

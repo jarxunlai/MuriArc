@@ -8,7 +8,6 @@
 
 MuriArc 是面向个人研究者和共享实验室的实验动物研究管理平台。它以动物全生命周期为主线，将笼位、繁育、基因型、实验执行、测量、样本、附件和审计组织在同一条可追溯数据链中。
 
-> MuriArc 基于开源项目 [MurisPro / animal_lab](https://github.com/lanternx/animal_lab) 继续开发。法律归属见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
 
 ## 运行形态
 

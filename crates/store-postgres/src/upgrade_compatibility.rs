@@ -105,8 +105,22 @@ pub(crate) async fn ensure_adopted_after_control_plane_migration(pool: &PgPool) 
         && report.issues.len() == 1
         && report.issues[0].code == "deployment_state_missing"
     {
-        adopt_current_release(pool, Uuid::new_v4()).await?;
-        return Ok(());
+        match adopt_current_release(pool, Uuid::new_v4()).await {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                // Another controller can adopt the same current release after
+                // our initial report but before this adoption attempt. Keep
+                // explicit generation claims strict, while making the
+                // migrate-and-adopt convenience path idempotent for that race.
+                // The losing insert can surface either as a domain conflict or
+                // as a database uniqueness error, so accept only a freshly
+                // verified, fully compatible winner.
+                if compatibility_report(pool).await?.is_compatible() {
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        }
     }
     Err(StoreError::Conflict(format!(
         "control-plane migration did not produce an activatable state: {}",

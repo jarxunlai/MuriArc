@@ -159,12 +159,26 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item Env:MURIARC_DESKTOP_UPDATER_PUBLIC_KEY -ErrorAction SilentlyContinue
-          $Output = cargo check --release -p muriarc-desktop 2>&1 | Out-String
-          if ($LASTEXITCODE -eq 0) {
+          $Stdout = Join-Path $env:RUNNER_TEMP 'missing-updater-key.stdout.log'
+          $Stderr = Join-Path $env:RUNNER_TEMP 'missing-updater-key.stderr.log'
+          # cargo is expected to fail here. Start-Process keeps native stderr
+          # out of PowerShell's terminating ErrorActionPreference pipeline.
+          $Cargo = (Get-Command cargo -ErrorAction Stop).Source
+          $Process = Start-Process -FilePath $Cargo `
+            -ArgumentList @('check', '--release', '-p', 'muriarc-desktop') `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr
+          $CargoExitCode = $Process.ExitCode
+          $Output = @(
+            Get-Content -LiteralPath $Stdout -Raw
+            Get-Content -LiteralPath $Stderr -Raw
+          ) -join "`n"
+          Remove-Item -LiteralPath $Stdout, $Stderr -Force
+          if ($CargoExitCode -eq 0) {
             throw "Release Desktop build unexpectedly accepted a missing updater public key."
           }
           if ($Output -notmatch 'MURIARC_DESKTOP_UPDATER_PUBLIC_KEY is required') {
-            Write-Error $Output
+            Write-Host $Output
             throw "Release Desktop build failed for an unexpected reason."
           }
       - name: Desktop strict clippy

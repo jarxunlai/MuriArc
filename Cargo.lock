@@ -2765,23 +2765,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "muriarc-legacy-migrator"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "muriarc-core",
- "muriarc-store-sqlite",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "muriarc-release-evidence"
 version = "0.1.0"
 dependencies = [

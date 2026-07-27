@@ -1,14 +1,5 @@
 # Data manifest
 
-## Legacy MurisPro runtime database
-
-- source: Existing local MurisPro installation
-- local_path: Owner-managed external legacy database (not stored in Git)
-- managed_by: Project owner
-- used_by: `muriarc-legacy-migrator` audit and migration acceptance
-- status: legacy
-- notes: Never commit or modify in place. The owner-managed private acceptance manifest records the source fingerprint; migration verifies it before and after every acceptance run.
-
 ## MuriArc logo master
 
 - source: Project owner-provided image

@@ -1,5 +1,9 @@
 # Upgrade compatibility contract
 
+> English | [简体中文](UPGRADE_COMPATIBILITY_cn.md)
+
+This contract is implemented for the current preview line, but the permanent compatibility floor and formal release identity begin only after the final `1.0.0 / E0001` artifacts pass the complete RC.
+
 ## Compatibility floor
 
 The permanent compatibility promise starts at the first stable
@@ -73,7 +77,7 @@ preview flag or the signed updater.
 
 Server refuses to create a replacement AI Master Key when encrypted credential
 rows exist. It also refuses a missing/empty attachment root when attachment
-metadata exists. Normal startup does not run the legacy AI profile materializer.
+metadata exists. Normal startup does not run the pre-profile AI settings materializer.
 
 ## Migration immutability
 

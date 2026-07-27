@@ -1,22 +1,14 @@
 # MuriArc Server deployment
 
-> 本文保留源码 checkout 与 preview 部署说明。`1.0 / E0001` 起的签名
-> Native/systemd、Managed Compose、generation 激活和安全升级契约见
-> [SERVER_DELIVERY.md](SERVER_DELIVERY.md)。正式环境不得用根目录开发 Compose 或直接重建
-> 容器绕过 `muriarcctl`。
+> English | [简体中文](DEPLOYMENT_cn.md)
 
-The shared edition is an Axum server backed by PostgreSQL and serving the same responsive Vue application used by the desktop edition. Axum listens on the container network, while the provided Compose file publishes its host port only on loopback by default; terminate TLS in Caddy, Nginx, or an equivalent reverse proxy.
+## Scope and status
 
-This document is only for the shared Server deployment. The personal Desktop
-edition is delivered as a Windows Tauri WebView installer backed by local SQLite
-and OS keyring storage; it is not deployed through Docker, VNC, noVNC, or a
-browser remote desktop. See [DESKTOP_DELIVERY.md](DESKTOP_DELIVERY.md) for the
-Desktop local delivery boundary.
+This guide covers a source checkout and preview deployment of the shared Server edition. The repository is currently `0.1.0 / preview_epoch_0`; the root Compose file is not a signed `1.0.0 / E0001` deliverable. Stable Native/systemd and Managed Compose contracts are documented in [Server delivery](SERVER_DELIVERY.md).
 
-The shared edition uses persistent Argon2id credentials and revocable PostgreSQL
-sessions. Browser session secrets are held only in an HttpOnly, SameSite=Strict
-cookie; PostgreSQL stores SHA-256 token and CSRF digests, never their plaintext.
-TLS remains mandatory because `MURIARC_SESSION_COOKIE_SECURE` defaults to `true`.
+MuriArc Server is Axum + PostgreSQL + the responsive Vue UI. The application port is published on loopback by default. PostgreSQL must remain private, and production TLS terminates at a trusted reverse proxy or the documented Cloudflare Tunnel profile.
+
+Desktop is a separate Tauri + SQLite edition and is not deployed through Docker, VNC, or noVNC.
 
 ## 1. Prepare configuration
 
@@ -25,304 +17,104 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Generate independent database and Environment Root passwords plus stable Lab/Root UUIDs:
+Replace every placeholder. Required groups include:
+
+- PostgreSQL database, role, and password;
+- durable data and attachment roots;
+- stable Lab and Environment Root UUIDs, display values, and Root password;
+- cookie security and lifetime;
+- AI Master Key source/version;
+- preview bootstrap only when explicitly adopting `preview_epoch_0`;
+- optional external API and MCP origins.
+
+Generate independent values rather than reusing a personal password:
 
 ```bash
 openssl rand -hex 32
 openssl rand -base64 24
-uuidgen # MURIARC_LAB_ID
-uuidgen # MURIARC_ROOT_USER_ID; it must differ from the Lab UUID
+uuidgen  # Lab ID
+uuidgen  # Root user ID; must differ from Lab ID
 ```
 
-Fill every required value in `.env`, including:
+Mode `600` protects against ordinary users, not the host administrator, Docker daemon, process-environment collection, or an unencrypted backup. Encrypt configuration backups, restrict Docker membership, and never attach `.env`, `docker inspect`, or resolved Compose output to an issue.
 
-```dotenv
-MURIARC_LAB_ID=<stable-lab-uuid>
-MURIARC_LAB_NAME=<laboratory-display-name>
-MURIARC_ROOT_USER_ID=<stable-root-user-uuid>
-MURIARC_ROOT_USER_EMAIL=<root-login-email>
-MURIARC_ROOT_USER_NAME=<root-display-name>
-MURIARC_ROOT_PASSWORD=<environment-managed-password>
-```
+### Environment Root
 
-If the database password contains URL-reserved characters, URL-encode it before constructing `MURIARC_DATABASE_URL` for direct (non-Compose) execution. Keep the real `.env` outside Git and at mode `600`; verify with `stat -c '%a %n' .env`.
+Server reconciles the configured Root on every start under a PostgreSQL transaction and advisory lock. It creates or verifies the Lab, User, LabAdmin membership, and Argon2id credential. Identity conflicts, soft-deleted records, duplicate normalized email, cross-Lab ownership, or unsupported hashes fail closed.
 
-`MURIARC_ROOT_PASSWORD` deliberately remains plaintext in the host environment under the approved deployment model. Mode `600` does **not** protect it from the host administrator, Docker daemon or `docker inspect`, process-environment collection, or anyone who can read an unencrypted `.env` backup. Encrypt and access-control configuration backups, restrict Docker membership, and never attach Compose configuration or container-inspection output to tickets.
+To rotate Root identity or password, edit the host-owned environment and restart Server. Successful credential change revokes old Root sessions. The UI cannot read the old password or silently rewrite the deployment file.
 
-### Default AI runtime and encrypted per-user credentials
+### AI Master Key
 
-The shared AI runtime is enabled by default, but it does not install Ollama,
-download a model, or call an external Provider until a user has saved their own
-API key. A new user sees the enabled DeepSeek preset and the stable
-`waiting_for_personal_api_key` state rather than a runtime failure.
+A genuinely empty deployment may generate one stable 32-byte Base64 key in the protected data-root secrets directory when no environment key is supplied. Back up that file with PostgreSQL, attachments, configuration, and generation metadata.
 
-On a genuinely empty deployment, when `MURIARC_AI_MASTER_KEY` is blank or absent,
-Server may create a stable random 32-byte Base64 key at
-`MURIARC_AI_MASTER_KEY_FILE` (default:
-`MURIARC_DATA_ROOT/secrets/ai-master-key`). The Compose deployment pins that file
-to `/var/lib/muriarc/secrets/ai-master-key` inside the persistent `server_data`
-volume. Back up this file in the same recovery set as PostgreSQL, attachments,
-configuration and the generation manifest. Subsequent starts reuse it. If the
-database already contains encrypted credentials but neither the environment nor
-the configured key file provides the original key, startup fails closed and never
-generates a replacement. An invalid file or an unwritable secrets directory also
-fails startup instead of falling back to plaintext or silently replacing the key.
+If encrypted credential rows exist and the original key is unavailable, startup fails and never generates a replacement. Keep `MURIARC_AI_MASTER_KEY_VERSION` unchanged until a documented rotation has re-encrypted every existing user/profile secret. Users provide their own Provider keys; no key means no external request.
 
-Operators may instead inject a stable key explicitly:
+## 2. Validate and start the preview stack
 
 ```bash
-openssl rand -base64 32
-# Set the output as MURIARC_AI_MASTER_KEY
+docker compose config --quiet
+docker compose build server
+docker compose up -d --wait --wait-timeout 180
+curl --noproxy '*' --fail http://127.0.0.1:8787/api/v1/health
 ```
 
-Keep `MURIARC_AI_MASTER_KEY_VERSION=1` unless all existing credentials are
-re-encrypted through a documented rotation procedure. The master key is never
-stored in PostgreSQL. Each user's Provider key is encrypted independently with
-AES-256-GCM, a random nonce, and AAD bound to that user ID and key version.
-Losing or changing the master key makes existing credentials unreadable. Read
-APIs return only `hasKey`; Root and LabAdmin cannot read or reuse another user's
-key, model, endpoint, or Token parameters.
+The root Compose stack is intended for development and preview acceptance. It may apply the explicit preview bootstrap but must never be used to bypass stable `muriarcctl` upgrade control.
 
-Built-in non-sensitive presets cover DeepSeek
-(`https://api.deepseek.com`), 智谱 GLM
-(`https://open.bigmodel.cn/api/paas/v4`), Moonshot/Kimi
-(`https://api.moonshot.cn/v1`), OpenAI
-(`https://api.openai.com/v1`), and custom OpenAI-compatible services. Presets
-are convenience metadata only. Each user independently chooses a Provider,
-model, Base URL, API key, context/input/output/history budgets, Temperature,
-timeout, and optional vision model. Changing only model or Token parameters
-preserves the same Provider credential; changing Provider identity or Base URL
-without supplying a new key clears the old binding.
+Use `docker compose ps` and redacted application logs for diagnostics. Do not paste environment, cookies, CSRF, Tokens, passwords, Master Keys, Provider bodies, or private object paths into logs or tickets.
 
-When the laboratory's custom-URL approval policy is enabled (the default),
-non-official OpenAI-compatible and every `LocalHttp` URL must exactly match an
-enabled endpoint registered by LabAdmin. When the policy is explicitly disabled,
-users may save URLs that still pass protocol validation. OpenAI-compatible cloud
-URLs require HTTPS. Provider HTTP clients reject redirects, so approving one URL
-cannot silently redirect requests elsewhere. Use an HTTPS reverse proxy and
-network policy for non-loopback services. Never place a user's Provider API key
-in environment variables or deployment logs.
+## 3. Browser session and CSRF
 
-Database migration keeps each existing `ai_provider_settings` row owned by the
-same user, infers only a non-sensitive preset label from that user's existing
-URL, and adds safe runtime defaults. Existing Root settings remain Root-owned;
-Editor and Viewer accounts do not inherit them. Back up PostgreSQL and the
-master-key file before upgrade and verify a disposable restore before production.
+Login returns an opaque HttpOnly cookie plus a CSRF value for the active session. The UI holds the CSRF value in memory and sends it on state-changing requests. Production requires HTTPS and `MURIARC_SESSION_COOKIE_SECURE=true`.
 
-MuriArc reconciles the Environment Root on **every** Server start under one PostgreSQL transaction and advisory lock. It creates or verifies the Lab, Root User, LabAdmin membership, and Argon2id credential. A changed Root email/name is synchronized. If the environment password no longer verifies against the database hash, the hash, password-change timestamp, and credential revision are updated. Root identity or credential changes revoke all Root browser Sessions. Every write has a stable, sanitized Audit operation; plaintext passwords and hashes are never recorded.
+Logout revokes the current session. Password change and Root environment reconciliation revoke other affected sessions. Suspended/deleted users, revoked memberships, expired tokens, and forced-password-change state are enforced on every authenticated request.
 
-Startup fails rather than guessing when it finds a duplicate normalized email, a configured Root User ID owned by another Lab, a soft-deleted Lab/User/Root membership, an unsupported credential hash, or another identity conflict. Root remains an application-level LabAdmin plus a deployment-only `isEnvironmentRoot` marker:
+## 4. Reverse proxy and origin boundary
 
-1. Environment Root can govern every application account and is the only identity that can create, modify, suspend, demote, or reset LabAdmin accounts.
-2. LabAdmin can govern non-LabAdmin users and laboratory business, but cannot modify deployment configuration, code, Environment Root, or a peer LabAdmin.
-3. ProjectAdmin is restricted to authorized Projects.
-4. AnimalManager, Editor, and Viewer retain their Lab Registry, project-write, and read-only boundaries.
+A conventional reverse proxy should:
 
-To change the Root password or configured identity, edit `.env` and restart only the Server. The application intentionally provides no Root profile/password editor, reset action, suspension, or role-demotion endpoint. After restart, verify login and Audit, then confirm old Root Sessions have been revoked. Environment-managed password rotation does not silently rewrite `.env` from the UI.
+- terminate TLS;
+- forward only the intended application host;
+- preserve request size/time limits;
+- keep PostgreSQL and the container network private;
+- forward WebSocket/streaming behavior only where required;
+- avoid caching authenticated API or private attachment responses.
 
-Deployments upgrading from the removed persistent bootstrap seed **must** map the intended existing administrator to `MURIARC_ROOT_USER_ID` and explicitly set all five `MURIARC_ROOT_*`/Lab name values before starting this version. There is no fallback to `MURIARC_BOOTSTRAP_PASSWORD`, and the old seed variables are ignored; this prevents silently retaining a forgotten bootstrap password.
+Do not trust arbitrary forwarded-host/proto headers. Configure exact trusted origins for browser MCP access. A non-browser MCP client still requires a revocable AI-scoped token.
 
-Optional `MURIARC_BOOTSTRAP_TOKEN` and `MURIARC_BOOTSTRAP_MCP_TOKEN` remain controlled-preview bearer adapters only. They must be independent 32+ character secrets and use the live configured Root identity, so suspension/role/credential gates are still read from PostgreSQL. Leave both empty for normal operation: they are environment secrets rather than database-revocable external tokens.
+For public exposure, use [Cloudflare Public Profile](CLOUDFLARE_PUBLIC_PROFILE.md); do not directly open port 8787 to the Internet.
 
-## 2. Web sessions and CSRF
+## 5. External tokens and MCP
 
-`POST /api/v1/auth/login` returns the CSRF token in JSON and sets the opaque
-session cookie. The UI keeps the CSRF token in memory and sends it as
-`X-CSRF-Token` on every cookie-authenticated method other than GET, HEAD, OPTIONS,
-or TRACE. After a page reload, `GET /api/v1/auth/csrf` safely reconstructs the
-same session-scoped token; it never returns the HttpOnly session secret, accepts
-browser sessions only, and uses `Cache-Control: no-store`. Login, current-session,
-CSRF recovery, and logout endpoints are:
+Persistent external tokens are user-bound, revocable, expiring, and scope-limited. They can only narrow the live user's permissions. External bearer REST/MCP is disabled by default in production/public profiles.
 
-```text
-POST /api/v1/auth/login
-GET  /api/v1/auth/session
-GET  /api/v1/auth/csrf
-POST /api/v1/auth/logout
-POST /api/v1/auth/password/change
-PATCH /api/v1/auth/profile
-```
-
-`GET /api/v1/auth/me` is a compatibility alias for the current-session endpoint.
-
-Stable browser contract:
-
-```http
-POST /api/v1/auth/login
-Content-Type: application/json
-
-{"email":"researcher@example.org","password":"..."}
-```
-
-Success sets `muriarc_session=<opaque>; Path=/; HttpOnly; SameSite=Strict;
-Secure` and returns:
-
-```json
-{
-  "data": {
-    "user": {
-      "id": "uuid",
-      "lab_id": "uuid",
-      "email": "researcher@example.org",
-      "display_name": "Researcher",
-      "lab_roles": ["lab_admin"],
-      "project_roles": [{"project_id": "uuid", "role": "viewer"}],
-      "authentication": "session",
-      "must_change_password": false,
-      "is_environment_root": false
-    },
-    "csrf_token": "mac_...",
-    "expires_at": "RFC3339 timestamp"
-  },
-  "request_id": "uuid"
-}
-```
-
-`GET /api/v1/auth/session` returns the same `user` object in `data`.
-`GET /api/v1/auth/csrf` returns
-`{"data":{"csrf_token":"mac_...","expires_at":"RFC3339"},"request_id":"uuid"}`
-for a live cookie session and rejects bearer credentials.
-`POST /api/v1/auth/logout` requires the cookie plus `X-CSRF-Token` and returns
-204 while expiring the cookie. Invalid login/session credentials return 401 with
-`error.code="unauthorized"`; missing or incorrect cookie CSRF returns 403 with
-`error.code="csrf_failed"`; an unavailable authentication backend returns 503
-with `error.code="authentication_unavailable"`. Authentication responses use
-`Cache-Control: no-store` and never echo passwords or session secrets in JSON.
-
-Session duration is controlled by `MURIARC_SESSION_TTL_HOURS` (default 12,
-integer range 1–720 hours). Set
-`MURIARC_SESSION_COOKIE_SECURE=false` only for explicit loopback HTTP development;
-never use that override on a network deployment.
-
-### Password lifecycle and account governance
-
-A user created through `POST /api/v1/admin/users` supplies `temporaryPassword` and starts with `mustChangePassword=true`. Login succeeds so the browser can establish a Session and CSRF token, but until `POST /api/v1/auth/password/change` succeeds every business route and external bearer capability returns HTTP 403 with `error.code="password_change_required"`. Only current Session/CSRF inspection, logout, and password change remain available. The UI hides business navigation and holds the user on `/change-password`.
-
-Passwords require 8 or more Unicode characters, no more than 1024 UTF-8 bytes, no control characters, and a new value different from the current value. No character-class recipe or periodic expiry is imposed. Password fields are cleared after every attempt; strength labels are advisory only.
-
-```http
-POST /api/v1/auth/password/change
-X-CSRF-Token: mac_...
-Content-Type: application/json
-
-{"currentPassword":"...","newPassword":"..."}
-```
-
-A successful self-change preserves the current Session and revokes every other Session. Normal users may change only their display name through `PATCH /api/v1/auth/profile`; administrators maintain a subordinate user's email/name through `PATCH /api/v1/admin/users/{id}/profile`.
-
-`POST /api/v1/admin/users/{id}/password-reset` accepts an administrator's current password, the target `expectedCredentialRevision`, and a new `temporaryPassword`. It never returns or exposes the previous password, sets `mustChangePassword=true`, increments credential revision, and revokes all target Sessions and external tokens. Account administration requires a live cookie Session, CSRF, current-password step-up, revision checks, and the Root/LabAdmin hierarchy above. Environment Root endpoints return `environment_root_managed`; peer LabAdmin governance returns `lab_admin_managed_by_environment_root`.
-
-## 3. Start the containers
-
-```bash
-docker compose config
-docker compose build
-docker compose up -d
-docker compose ps
-curl --fail http://127.0.0.1:8787/api/v1/health
-```
-
-PostgreSQL has no host port. The Server is published only as `127.0.0.1:8787`; firewall rules should expose the reverse proxy on 80/443, not port 8787 or PostgreSQL.
-
-## 4. HTTPS reverse proxy
-
-Minimal Caddy example:
-
-```caddyfile
-muriarc.example.org {
-    encode zstd gzip
-    reverse_proxy 127.0.0.1:8787
-}
-```
-
-Minimal Nginx location:
-
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:8787;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-}
-```
-
-Use a valid certificate, redirect HTTP to HTTPS, keep the host firewall enabled, and restrict administrative access to the laboratory network or VPN.
-
-## 5. External tokens and MCP boundary
-
-Authenticated users create, list, and revoke their own external tokens through
-`/api/v1/auth/tokens`. The raw token is returned exactly once; only its SHA-256
-digest, scopes, expiry, and revocation metadata are persisted. Effective access is
-always the intersection of the user's current Lab/Project roles and token scopes.
-Suspending or soft-deleting the user immediately invalidates sessions and tokens.
-
-```http
-POST /api/v1/auth/tokens
-X-CSRF-Token: mac_...
-Content-Type: application/json
-
-{"name":"analysis-agent","scopes":["read","export"],"expires_in_days":90,"current_password":"..."}
-```
-
-The response contains `data.token` once plus `data.details`. Use that value as
-`Authorization: Bearer mat_...`. `GET /api/v1/auth/tokens` lists metadata only;
-`POST /api/v1/auth/tokens/{id}/revoke` with
-`{"current_password":"..."}` revokes a token. These management routes accept
-browser sessions only; token creation and revocation require current-password
-step-up as well as CSRF.
-
-`POST /mcp` accepts only bearer identities explicitly narrowed with AI scopes.
-Normal Web sessions are rejected. The first release exposes fixed read-only
-domain tools and never accepts raw SQL.
-
-Browser clients send an `Origin` header. MuriArc denies all browser origins unless `MURIARC_MCP_ALLOWED_ORIGINS` contains an exact comma-separated match, for example:
-
-```dotenv
-MURIARC_MCP_ALLOWED_ORIGINS=https://muriarc.example.org,https://ai-gateway.example.org
-```
-
-Do not use wildcards. Non-browser clients normally omit `Origin`, but still need
-an unexpired, non-revoked external token with `read` scope and the underlying
-user's permissions. The optional bootstrap MCP token is only a controlled-preview
-fallback and should be empty in normal deployments.
+Bootstrap bearer values are preview adapters, not normal production credentials. If temporarily enabled, use distinct high-entropy values, keep them outside Git, and remove them after persistent login/token workflows are available.
 
 ## 6. Backup and restore
 
-Create encrypted, access-controlled PostgreSQL backups on a separate system:
+Back up as one recovery set:
 
-```bash
-docker compose exec -T db sh -lc 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom' > "muriarc-$(date +%F).dump"
-```
+- PostgreSQL;
+- data and attachment roots;
+- deployment configuration;
+- `deployment-generation.json` and control state;
+- AI Master Key/Keyset and non-plaintext AI state.
 
-Test restore regularly against a disposable database:
+A backup is not accepted until restored into an isolated environment and verified through Storage, Store/Application, real API/UI reads, attachment bytes, AI history references, Audit/Provenance, and continued-write invariants. Never test restoration against the only live copy.
 
-```bash
-docker compose exec -T db sh -lc 'createdb -U "$POSTGRES_USER" muriarc_restore_test'
-docker compose exec -T db sh -lc 'pg_restore -U "$POSTGRES_USER" -d muriarc_restore_test --clean --if-exists' < muriarc-YYYY-MM-DD.dump
-```
-
-Current MuriArc snapshots are integrity/export artifacts and cannot restore a deployment. Back up the attachment volume together with PostgreSQL, and verify attachment SHA-256 checksums after a tested restore.
+Ordinary business Snapshot does not replace a database/attachment recovery set.
 
 ## 7. Operations checklist
 
-- Pin reviewed image tags and apply OS/PostgreSQL security updates.
-- Keep `.env`, reverse-proxy credentials, AI provider keys, and backups out of Git.
-- Keep `.env` mode 600, encrypt its backups, restrict Docker access, and confirm optional bootstrap bearer variables are empty.
-- Rotate the Environment Root password only by editing `.env` and restarting the Server; verify the old Sessions are revoked.
-- Revoke unused sessions/external tokens and review authentication audit growth.
-- MuriArc itself serializes reinforced AI password checks per user session. Five
-  failures within 15 minutes trigger a 15-minute in-memory cooldown; a successful
-  verification clears that session's failure state. Monitor the structured
-  `security_event=ai_step_up_password_failed` and
-  `security_event=ai_step_up_verification_abandoned` warnings without logging
-  submitted credentials.
-- The built-in AI step-up limiter is process-local: it resets on restart and is not
-  shared by multiple replicas. Multi-replica deployments need an additional shared
-  limiter, and all deployments should apply conservative reverse-proxy rate limits
-  to both `/api/v1/auth/login` and `/api/v1/ai/approvals/*/decision` as defence in
-  depth. Alert on repeated authentication failures without logging request bodies.
-- Monitor `/api/v1/health`, container restarts, disk usage, PostgreSQL logs, and audit growth.
-- Confirm unknown `/api/v1/*` paths return JSON 404 rather than the Vue entry page.
-- Run migrations and restore drills against copies before upgrading a real laboratory.
-- Never share SQLite over a network drive and never point migration tools at the only copy of a legacy database.
+Before a non-development launch:
+
+1. Confirm the exact source/artifact identity and current release status.
+2. Verify all placeholders are replaced and secret files have restricted ownership/mode.
+3. Keep PostgreSQL private and expose only loopback to the proxy/Tunnel.
+4. Verify Secure cookie, exact origin, session lifetime, and external API policy.
+5. Verify Root login, forced-password-change behavior, logout, CSRF, suspension, and token revocation.
+6. Verify AI user isolation with mock Providers; never borrow Root's key for another user.
+7. Create and actually restore a joint recovery set.
+8. Record health, compatibility, storage, UI, and generation results without secrets.
+
+For the 1.0+ signed upgrade and maintenance-window workflow, continue with [Server delivery](SERVER_DELIVERY.md) and [Upgrade Engine](UPGRADE_ENGINE.md).

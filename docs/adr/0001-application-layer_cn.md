@@ -1,5 +1,7 @@
 # ADR-0001：引入共享 Application Layer
 
+> 简体中文 · 内部架构决策记录
+
 - 状态：Accepted
 - 日期：2026-07-19
 

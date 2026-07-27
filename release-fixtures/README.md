@@ -21,4 +21,4 @@ producer 在仓库外生成 append-only `candidate-catalog.json`；完整 RC 报
 producer 的 source artifact/provenance 必须来自同一次正式编排的外部签名
 `artifact-lock.json`，不能仅凭 Release Manifest 或可变环境变量自行声明。
 
-发布、拉取、验证与矩阵操作见 [`docs/RELEASE_EVIDENCE.md`](../docs/RELEASE_EVIDENCE.md)。
+发布、拉取、验证与矩阵操作见 [`docs/RELEASE_EVIDENCE_cn.md`](../docs/RELEASE_EVIDENCE_cn.md)。

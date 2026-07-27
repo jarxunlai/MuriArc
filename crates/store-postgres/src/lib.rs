@@ -8984,16 +8984,7 @@ mod tests {
 
     async fn drop_migration_test_database(admin_pool: &PgPool, database_name: &str, pool: PgPool) {
         pool.close().await;
-        sqlx::query(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
-        )
-        .bind(database_name)
-        .execute(admin_pool)
-        .await
-        .unwrap_or_else(|error| {
-            panic!("failed to terminate connections to {database_name}: {error}")
-        });
-        sqlx::query(&format!("DROP DATABASE \"{database_name}\""))
+        sqlx::query(&format!("DROP DATABASE \"{database_name}\" WITH (FORCE)"))
             .execute(admin_pool)
             .await
             .unwrap_or_else(|error| panic!("failed to drop {database_name}: {error}"));

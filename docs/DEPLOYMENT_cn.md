@@ -4,7 +4,7 @@
 
 ## 范围与状态
 
-本文覆盖共享 Server 形态的源码 checkout 与 preview 部署。仓库当前是 `0.1.0 / preview_epoch_0`；根目录 Compose 不是签名 `1.0.0 / E0001` 制品。稳定 Native/systemd 和 Managed Compose 合同见 [Server 正式交付](SERVER_DELIVERY_cn.md)。
+本文覆盖共享 Server 形态的源码 checkout 开发。当前候选源码身份为 `1.0.0 / E0001 / permanent-upgrade`，但根目录 Compose 不是签名正式制品，真实 RC 也尚未通过。稳定 Native/systemd 和 Managed Compose 合同见 [Server 正式交付](SERVER_DELIVERY_cn.md)。
 
 MuriArc Server 由 Axum + PostgreSQL + 响应式 Vue UI 组成。应用端口默认只发布到 loopback；PostgreSQL 必须保持私有，生产 TLS 在可信反向代理或文档规定的 Cloudflare Tunnel 终止。
 
@@ -24,7 +24,7 @@ chmod 600 .env
 - 稳定的 Lab 与 Environment Root UUID、显示信息和 Root 密码；
 - Cookie 安全与生命周期；
 - AI Master Key 来源/版本；
-- 只有显式采用 `preview_epoch_0` 时才启用的 preview bootstrap；
+- 默认关闭、且仅可用于一次性全新本地空栈的源码开发 bootstrap；
 - 可选外部 API 与 MCP origin。
 
 使用独立随机值，不复用个人密码：
@@ -50,7 +50,7 @@ Server 每次启动都在 PostgreSQL 事务与 advisory lock 下核对 Root，�
 
 若数据库已有加密凭据但原 Key 不可用，启动必须失败，不能生成替代 Key。`MURIARC_AI_MASTER_KEY_VERSION` 保持不变，直到文档化轮换已重新加密全部用户/档案秘密。每个用户使用自己的 Provider Key；未配置 Key 时不发外部请求。
 
-## 2. 校验并启动 preview stack
+## 2. 校验并启动源码 stack
 
 ```bash
 docker compose config --quiet
@@ -59,7 +59,7 @@ docker compose up -d --wait --wait-timeout 180
 curl --noproxy '*' --fail http://127.0.0.1:8787/api/v1/health
 ```
 
-根 Compose 只用于开发和 preview 验收，可以执行显式 preview bootstrap，但禁止用它绕过稳定版 `muriarcctl` 升级控制。
+根 Compose 只用于开发验收，并默认关闭 bootstrap。只有一次性、全新的本地空栈才可设置 `MURIARC_PREVIEW_BOOTSTRAP=true`；严禁用它重标或修补既有数据，也不得绕过稳定版 `muriarcctl` 升级控制。
 
 使用 `docker compose ps` 和脱敏应用日志诊断。禁止把环境、Cookie、CSRF、Token、密码、Master Key、Provider body 或私有 object path 写入日志/工单。
 

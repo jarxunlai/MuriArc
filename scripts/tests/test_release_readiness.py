@@ -248,9 +248,8 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertEqual(report["application_version"], "1.0.0")
         self.assertEqual(len(report["scenario_evidence_digests"]), len(readiness.MANDATORY_SCENARIOS))
 
-    def test_checked_out_preview_repository_cannot_claim_formal_readiness(self) -> None:
-        with self.assertRaisesRegex(readiness.ReadinessError, "formal permanent release identity"):
-            readiness.validate_source_identity(ROOT, self.release)
+    def test_checked_out_candidate_source_matches_formal_identity(self) -> None:
+        self.assertIsNone(readiness.validate_source_identity(ROOT, self.release))
 
     def test_workflow_routes_rc_through_the_complete_orchestrator(self) -> None:
         workflow = (ROOT / ".github/workflows/compatibility-evidence.yml").read_text(

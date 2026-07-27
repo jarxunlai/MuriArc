@@ -17,7 +17,7 @@ MuriArc is independently developed and maintained by `jarxunlai`, with AI-assist
 ## Release status
 
 > [!IMPORTANT]
-> The repository is currently **`0.1.0 / preview_epoch_0`**. It is preparing the **`1.0.0 / E0001`** release candidate, but no official 1.0 RC has passed yet. Preview builds, source checkouts, local test services, and unsigned tester packages are not production releases.
+> The candidate source identity is now **`1.0.0 / E0001 / permanent-upgrade`**, but the physical 1.0 RC has **not** passed and no official `v1.0.0` release exists yet. Source checkouts, local test services, and unsigned tester packages are not production releases.
 
 The permanent compatibility promise begins with a verified `1.0.0 / E0001` artifact set. The same signed artifact digests must pass the complete private RC matrix before they may be published unchanged as `v1.0.0`.
 
@@ -81,9 +81,9 @@ VITE_MURIARC_GATEWAY=remote pnpm --dir ui run build
 
 PostgreSQL Store tests require an isolated PostgreSQL 17 instance through `MURIARC_TEST_DATABASE_URL`; a skipped database suite is not a pass. Each worktree must use its own UI dependencies and runtime data. See [Environments](docs/ENVIRONMENTS.md).
 
-### Preview deployment
+### Source-checkout deployment
 
-The root Compose file and source commands are for development and preview validation only. Copy the example environment file, replace every placeholder, keep PostgreSQL private, and terminate TLS at a trusted reverse proxy. Do not treat a source-built Compose stack as a signed 1.0 deliverable.
+The root Compose file and source commands are for development validation only. Candidate startup is fail-closed by default: enable `MURIARC_PREVIEW_BOOTSTRAP=true` only for a disposable, empty local stack, never to relabel or repair existing data. Copy the example environment file, replace every placeholder, keep PostgreSQL private, and terminate TLS at a trusted reverse proxy. Do not treat a source-built Compose stack as a signed 1.0 deliverable.
 
 ```bash
 cp .env.example .env

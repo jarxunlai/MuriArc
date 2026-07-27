@@ -205,6 +205,9 @@ jobs:
       MURIARC_BOOTSTRAP_TOKEN: ci-bootstrap-token-00000000000000000000000000000000
       MURIARC_BOOTSTRAP_MCP_TOKEN: ci-mcp-token-000000000000000000000000000000000000
       MURIARC_SESSION_COOKIE_SECURE: "false"
+      # The root Compose stack is a disposable source-checkout smoke profile,
+      # never a final Managed Compose artifact. Candidate defaults stay closed.
+      MURIARC_PREVIEW_BOOTSTRAP: "true"
     steps:
       - uses: actions/checkout@v4
       - name: Validate Compose configuration

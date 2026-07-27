@@ -93,7 +93,7 @@ Desktop uses a local operator profile rather than Server credential tables. Its 
 - **Server**: Axum, PostgreSQL, responsive Web UI, and loopback-first ingress. Long-running `muriarc-server` has no Docker socket, systemd control, release-signing key, backup orchestration, or raw DDL authority.
 - **Upgrade control plane**: `muriarcctl` and the shared Upgrade Engine own signed-target verification, freeze/drain, backup/restore, Candidate verification, atomic activation, and Write Lease transitions.
 
-The repository is still `0.1.0 / preview_epoch_0`. The permanent `1.0.0 / E0001` compatibility and delivery identity becomes active only after the final artifact set passes the complete RC gates.
+The candidate source identity is `1.0.0 / E0001 / permanent-upgrade`. The permanent compatibility and delivery promise becomes active only after the unchanged final artifact set passes the complete physical RC gates.
 
 ## Architecture decisions
 

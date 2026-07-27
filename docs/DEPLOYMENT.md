@@ -4,7 +4,7 @@
 
 ## Scope and status
 
-This guide covers a source checkout and preview deployment of the shared Server edition. The repository is currently `0.1.0 / preview_epoch_0`; the root Compose file is not a signed `1.0.0 / E0001` deliverable. Stable Native/systemd and Managed Compose contracts are documented in [Server delivery](SERVER_DELIVERY.md).
+This guide covers source-checkout development of the shared Server edition. The candidate source identity is `1.0.0 / E0001 / permanent-upgrade`, but the root Compose file is not a signed release deliverable and the physical RC has not passed. Stable Native/systemd and Managed Compose contracts are documented in [Server delivery](SERVER_DELIVERY.md).
 
 MuriArc Server is Axum + PostgreSQL + the responsive Vue UI. The application port is published on loopback by default. PostgreSQL must remain private, and production TLS terminates at a trusted reverse proxy or the documented Cloudflare Tunnel profile.
 
@@ -24,7 +24,7 @@ Replace every placeholder. Required groups include:
 - stable Lab and Environment Root UUIDs, display values, and Root password;
 - cookie security and lifetime;
 - AI Master Key source/version;
-- preview bootstrap only when explicitly adopting `preview_epoch_0`;
+- source-checkout bootstrap kept false by default and enabled only for a disposable empty development stack;
 - optional external API and MCP origins.
 
 Generate independent values rather than reusing a personal password:
@@ -50,7 +50,7 @@ A genuinely empty deployment may generate one stable 32-byte Base64 key in the p
 
 If encrypted credential rows exist and the original key is unavailable, startup fails and never generates a replacement. Keep `MURIARC_AI_MASTER_KEY_VERSION` unchanged until a documented rotation has re-encrypted every existing user/profile secret. Users provide their own Provider keys; no key means no external request.
 
-## 2. Validate and start the preview stack
+## 2. Validate and start the source stack
 
 ```bash
 docker compose config --quiet
@@ -59,7 +59,7 @@ docker compose up -d --wait --wait-timeout 180
 curl --noproxy '*' --fail http://127.0.0.1:8787/api/v1/health
 ```
 
-The root Compose stack is intended for development and preview acceptance. It may apply the explicit preview bootstrap but must never be used to bypass stable `muriarcctl` upgrade control.
+The root Compose stack is intended only for development acceptance and keeps bootstrap disabled by default. Set `MURIARC_PREVIEW_BOOTSTRAP=true` only for a disposable empty local stack; never use it to relabel or repair existing data, and never bypass stable `muriarcctl` upgrade control.
 
 Use `docker compose ps` and redacted application logs for diagnostics. Do not paste environment, cookies, CSRF, Tokens, passwords, Master Keys, Provider bodies, or private object paths into logs or tickets.
 

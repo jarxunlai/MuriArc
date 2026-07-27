@@ -123,9 +123,9 @@ def check_links(paths: list[Path], failures: list[str]) -> None:
 def check_status_and_attribution(failures: list[str]) -> None:
     for rel in ("README.md", "README_cn.md"):
         text = (ROOT / rel).read_text(encoding="utf-8-sig")
-        for token in ("0.1.0", "preview_epoch_0", "1.0.0", "E0001"):
+        for token in ("1.0.0", "E0001", "permanent-upgrade"):
             if token not in text:
-                fail(f"release status token {token!r} missing from {rel}", failures)
+                fail(f"candidate identity token {token!r} missing from {rel}", failures)
         if "RC" not in text or not any(word in text.lower() for word in ("not", "no official", "尚未")):
             fail(f"{rel} must explicitly state that formal RC has not passed", failures)
 

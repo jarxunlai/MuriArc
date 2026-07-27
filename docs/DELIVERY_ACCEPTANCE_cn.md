@@ -4,7 +4,7 @@
 
 ## 状态与证据规则
 
-本文列出已实现产品范围和开发/人工验收证据。MuriArc 当前仍是 `0.1.0 / preview_epoch_0`，本文任何结果都不得解释为正式 `1.0.0 / E0001` RC PASS。
+本文列出已实现产品范围和开发/人工验收证据。当前候选源码身份为 `1.0.0 / E0001 / permanent-upgrade`，本文任何结果都不得解释为真实 RC PASS。
 
 自动门禁、dirty main 开发服务、unsigned Tester 包或源码 Compose 都可以作为开发证据，但不是最终制品验收。
 
@@ -116,7 +116,7 @@ PostgreSQL 因缺配置而 skip 不算 PASS。
 
 ## 已知限制
 
-- 当前仓库尚未完成真实 `1.0.0 / E0001` RC。
+- `1.0.0 / E0001` 候选尚未完成真实 RC。
 - 业务 Snapshot 没有通用 restore/apply。
 - 普通 Import/Export 有意保持窄范围，不是数据库迁移或同步。
 - macOS 正式打包/验收未完成。

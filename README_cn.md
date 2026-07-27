@@ -17,7 +17,7 @@ MuriArc 由 `jarxunlai` 独立开发和维护，工程实现由 AI 辅助。AI �
 ## 发布状态
 
 > [!IMPORTANT]
-> 仓库当前仍是 **`0.1.0 / preview_epoch_0`**，正在准备 **`1.0.0 / E0001`** 发布候选，但尚未完成正式 1.0 RC。Preview 构建、源码 checkout、本机测试服务和 unsigned Tester 包均不是生产发布。
+> 当前候选源码身份已切换为 **`1.0.0 / E0001 / permanent-upgrade`**，但真实 1.0 RC **尚未通过**，也尚未发布正式 `v1.0.0`。源码 checkout、本机测试服务和 unsigned Tester 包均不是生产发布。
 
 永久兼容承诺从通过验证的 `1.0.0 / E0001` 制品开始。同一批已签名制品的 digest 必须通过完整私有 RC 矩阵，之后才能不重建制品、原样发布为 `v1.0.0`。
 
@@ -81,9 +81,9 @@ VITE_MURIARC_GATEWAY=remote pnpm --dir ui run build
 
 PostgreSQL Store 测试必须通过 `MURIARC_TEST_DATABASE_URL` 连接独立 PostgreSQL 17；因变量缺失而 skip 不算通过。每个 worktree 必须使用自己的 UI 依赖和运行数据。详见[环境文档](docs/ENVIRONMENTS_cn.md)。
 
-### Preview 部署
+### 源码 checkout 部署
 
-根目录 Compose 和源码命令只用于开发/preview。复制示例环境文件后必须替换所有占位值、保持 PostgreSQL 私有，并在可信反向代理终止 TLS。源码构建的 Compose 不能冒充签名 1.0 制品。
+根目录 Compose 和源码命令只用于开发验证。候选版普通启动默认 fail closed；只有一次性、全新的本地空栈才可显式设置 `MURIARC_PREVIEW_BOOTSTRAP=true`，严禁用它重标或修补既有数据。复制示例环境文件后必须替换所有占位值、保持 PostgreSQL 私有，并在可信反向代理终止 TLS。源码构建的 Compose 不能冒充签名 1.0 制品。
 
 ```bash
 cp .env.example .env

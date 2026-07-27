@@ -26,7 +26,7 @@ services:
       context: .
       dockerfile: Dockerfile
       target: runtime
-    image: muriarc/server:0.1.0
+    image: muriarc/server:1.0.0
     restart: unless-stopped
     init: true
     depends_on:
@@ -38,9 +38,10 @@ services:
       MURIARC_UI_DIR: /opt/muriarc/ui
       MURIARC_DATA_ROOT: /var/lib/muriarc/data
       MURIARC_ATTACHMENT_ROOT: /var/lib/muriarc/attachments
-      # preview_epoch_0 only; the stable managed profile replaces this with a
-      # one-shot muriarcctl upgrade/init service.
-      MURIARC_PREVIEW_BOOTSTRAP: ${MURIARC_PREVIEW_BOOTSTRAP:-true}
+      # Source-checkout development only. Ordinary candidate startup is
+      # fail-closed; opt in explicitly only for a disposable empty dev stack.
+      # Stable Managed Compose always uses muriarcctl and keeps this false.
+      MURIARC_PREVIEW_BOOTSTRAP: ${MURIARC_PREVIEW_BOOTSTRAP:-false}
       MURIARC_LAB_ID: ${MURIARC_LAB_ID:?set MURIARC_LAB_ID}
       MURIARC_LAB_NAME: ${MURIARC_LAB_NAME:?set MURIARC_LAB_NAME}
       MURIARC_ROOT_USER_ID: ${MURIARC_ROOT_USER_ID:?set MURIARC_ROOT_USER_ID}

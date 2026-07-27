@@ -93,7 +93,7 @@ Desktop 使用本地操作者资料而非 Server 凭据表。无密码进入只�
 - **Server**：Axum、PostgreSQL、响应式 Web、默认 loopback 入口；长期运行的 `muriarc-server` 不拥有 Docker socket、systemd、发布签名、备份编排或 raw DDL 权限。
 - **升级控制面**：`muriarcctl` 与共享 Upgrade Engine 负责签名目标、freeze/drain、备份/实际恢复、Candidate 验证、原子激活和 Write Lease。
 
-仓库当前仍是 `0.1.0 / preview_epoch_0`。只有最终制品完成完整 RC，`1.0.0 / E0001` 永久兼容和正式交付身份才会生效。
+当前候选源码身份已是 `1.0.0 / E0001 / permanent-upgrade`。只有同一批最终制品完成完整真实 RC，永久兼容和正式交付承诺才会生效。
 
 ## 架构决策
 

@@ -6,7 +6,7 @@
 
 The formal Desktop target is a Windows Tauri v2 WebView installer containing the Vue UI and using `LocalTauriGateway` over Tauri IPC. It does not expose a local HTTP API and is not delivered through VNC/noVNC, a browser remote desktop, or Server Docker.
 
-The repository is still `0.1.0 / preview_epoch_0`. A local debug build or unsigned Tester package is not a signed `1.0.0 / E0001` release.
+The candidate source identity is `1.0.0 / E0001 / permanent-upgrade`, but the physical RC has not passed. A local debug build or unsigned Tester package is not a signed release.
 
 - SQLite: `<data-root>/muriarc.sqlite3`
 - Attachments: `<data-root>/attachments/`

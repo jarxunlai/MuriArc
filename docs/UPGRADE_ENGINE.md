@@ -1,5 +1,9 @@
 # Upgrade Engine and muriarcctl
 
+> English | [简体中文](UPGRADE_ENGINE_cn.md)
+
+The control-plane contracts and delivery drivers are implemented, but a real upgrade is successful only when the physical driver and final signed artifacts produce complete evidence. The current repository has not passed the `1.0.0 / E0001` RC.
+
 ## Authority boundary
 
 muriarc-server remains the low-privilege, long-running application. It has no
@@ -8,10 +12,7 @@ authority. muriarcctl is a separate local administrator process. Native,
 Managed Compose, and Desktop delivery code implements UpgradeDriver; it does
 not copy or reorder the shared state machine in muriarc-upgrade.
 
-The current control-plane branch deliberately fails commands that need a
-deployment Driver. It does not print a simulated success. Native/Compose and
-Desktop branches wire those commands to real service, backup, Candidate, and
-activation implementations.
+Commands that need a physical deployment Driver fail when that Driver is absent; they never print simulated success. Native, Managed Compose, and Desktop implementations connect the shared state machine to real service, backup, Candidate, and activation operations.
 
 ## Fixed state machine
 

@@ -153,6 +153,22 @@ fn provider_protocol_is_persisted_and_legacy_config_defaults_to_chat_completions
 }
 
 #[test]
+fn connection_check_request_reserves_budget_for_reasoning_models() {
+    let request = CompletionRequest::provider_connection_check();
+
+    assert_eq!(request.messages.len(), 1);
+    assert_eq!(request.messages[0].role, ChatRole::User);
+    assert_eq!(
+        request.messages[0].content,
+        "Connection check. Reply with the single word OK."
+    );
+    assert!(request.tools.is_empty());
+    assert_eq!(request.max_output_tokens, Some(256));
+    assert_eq!(request.temperature, Some(0.0));
+    request.validate().unwrap();
+}
+
+#[test]
 fn unicode_model_ids_use_the_store_compatible_character_limit() {
     let valid = ProviderConfig::local_http("local", "鼠".repeat(256), "http://127.0.0.1:11434/v1");
     assert!(LocalHttpProvider::new(valid).is_ok());

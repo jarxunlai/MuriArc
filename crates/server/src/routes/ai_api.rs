@@ -11,9 +11,9 @@ use muriarc_ai::{
     AiWorkflowError, AiWorkflowService, ApprovalDecision, ApprovalError, ApprovalRequirement,
     AssistantConversationDetail, AssistantConversationStartRequest,
     AssistantConversationStartResponse, AssistantConversationSummary, AssistantError,
-    AssistantTurnMedia, AssistantTurnRequest, AssistantTurnResponse, ChatMessage,
-    CompletionRequest, DraftDecisionRequest, DraftDecisionResponse, DraftStatus,
-    ProviderCredentials, ProviderError, ScopeSet, ToolScope, WriteDraftSummary,
+    AssistantTurnMedia, AssistantTurnRequest, AssistantTurnResponse, CompletionRequest,
+    DraftDecisionRequest, DraftDecisionResponse, DraftStatus, ProviderCredentials, ProviderError,
+    ScopeSet, ToolScope, WriteDraftSummary,
 };
 use muriarc_core::{
     AiAutonomyMode, AiConversationArchiveFilter, AiConversationChange, AiModelProfileBinding,
@@ -313,19 +313,6 @@ struct AiConnectionTestView {
     error_code: Option<&'static str>,
 }
 
-const CONNECTION_TEST_MAX_OUTPUT_TOKENS: u32 = 256;
-
-fn connection_test_request() -> CompletionRequest {
-    let mut request = CompletionRequest::new(vec![ChatMessage::user(
-        "Connection check. Reply with the single word OK.",
-    )]);
-    // Reasoning-capable OpenAI-compatible models may consume a small token
-    // budget entirely in hidden reasoning and return no final content.
-    request.max_output_tokens = Some(CONNECTION_TEST_MAX_OUTPUT_TOKENS);
-    request.temperature = Some(0.0);
-    request
-}
-
 async fn test_settings(
     State(state): State<AppState>,
     principal: AuthPrincipal,
@@ -344,7 +331,7 @@ async fn test_settings(
             .map_err(|_| ApiError::internal().with_request_id(metadata.request_id.clone()))?,
         None => ProviderCredentials::none(),
     };
-    let request = connection_test_request();
+    let request = CompletionRequest::provider_connection_check();
     let started = Instant::now();
     let result = provider.complete(request, credentials).await;
     let view = AiConnectionTestView {
@@ -2036,17 +2023,6 @@ mod tests {
             }
         });
         (format!("http://{address}/v1"), calls, handle)
-    }
-
-    #[test]
-    fn connection_test_allows_reasoning_models_to_emit_final_content() {
-        let request = connection_test_request();
-
-        assert_eq!(
-            request.max_output_tokens,
-            Some(CONNECTION_TEST_MAX_OUTPUT_TOKENS)
-        );
-        assert_eq!(request.temperature, Some(0.0));
     }
 
     #[test]

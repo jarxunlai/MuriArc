@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use muriarc_ai::{
-    AiProvider, AssistantRuntimeConfig, BuiltinProvider, ChatMessage, CompletionRequest,
-    ProviderConfig, ProviderCredentials, ProviderError, TransportFailure,
+    AiProvider, AssistantRuntimeConfig, BuiltinProvider, CompletionRequest, ProviderConfig,
+    ProviderCredentials, ProviderError, TransportFailure,
 };
 use muriarc_core::{
     AiModelProfile, AiModelProfileBinding, AiModelProfileFilter, AiModelProfileStore,
@@ -487,9 +487,7 @@ impl DesktopState {
             .transpose()
             .map_err(|_| SettingsError::InvalidCredential)?
             .unwrap_or_else(ProviderCredentials::none);
-        let mut request = CompletionRequest::new(vec![ChatMessage::user("Reply with exactly OK.")]);
-        request.temperature = Some(0.0);
-        request.max_output_tokens = Some(8);
+        let request = CompletionRequest::provider_connection_check();
         let started = Instant::now();
         match provider.complete(request, credentials).await {
             Ok(_) => Ok(AiModelValidationResult {
@@ -1076,8 +1074,20 @@ mod tests {
                     break;
                 }
             }
-            assert!(
-                String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions HTTP/1.1")
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            let payload: serde_json::Value = serde_json::from_str(
+                request
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body)
+                    .expect("validation request must contain a body"),
+            )
+            .unwrap();
+            assert_eq!(payload["max_tokens"], 256);
+            assert_eq!(payload["temperature"], 0.0);
+            assert_eq!(
+                payload["messages"][0]["content"],
+                "Connection check. Reply with the single word OK."
             );
             let body = serde_json::json!({
                 "id": "validation",

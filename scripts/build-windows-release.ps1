@@ -229,6 +229,7 @@ try {
     $UpdaterArchives = @(Get-ChildItem -LiteralPath $BundleRoot -Recurse -File | Where-Object {
         $_.Extension -in '.zip', '.gz'
     })
+    $FixtureProducerExecutable = Require-File (Join-Path $env:CARGO_TARGET_DIR 'release\muriarc-desktop.exe')
     if ($UpdaterArchives.Count -eq 0) {
         throw "No updater archive was produced under $BundleRoot"
     }
@@ -242,7 +243,7 @@ try {
         Get-ChildItem -LiteralPath $BundleRoot -Recurse -File | Where-Object {
             $_.Extension -in '.zip', '.gz' -and $_.Name -notin $UpdaterSignatures.Name
         }
-    ) | Sort-Object FullName -Unique)
+    ) + (Get-Item -LiteralPath $FixtureProducerExecutable) | Sort-Object FullName -Unique)
 
     $ArtifactRoot = Join-Path $BuildRoot "desktop-release\$RunId"
     if (Test-Path -LiteralPath $ArtifactRoot) {
@@ -278,11 +279,15 @@ try {
         $PayloadPath = Join-Path $PayloadRoot $Artifact.Name
         Copy-Item -LiteralPath $Artifact.FullName -Destination $PayloadPath
         $Hash = (Get-FileHash -LiteralPath $PayloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
-        $Kind = switch ($Artifact.Extension.ToLowerInvariant()) {
-            '.msi' { 'msi' }
-            '.exe' { 'nsis' }
-            '.sig' { 'tauri-updater-signature' }
-            default { 'tauri-updater-archive' }
+        $Kind = if ($Artifact.FullName -eq $FixtureProducerExecutable) {
+            'fixture-producer-executable'
+        } else {
+            switch ($Artifact.Extension.ToLowerInvariant()) {
+                '.msi' { 'msi' }
+                '.exe' { 'nsis' }
+                '.sig' { 'tauri-updater-signature' }
+                default { 'tauri-updater-archive' }
+            }
         }
         $InventoryEntries += [ordered]@{
             path = "payload/$($Artifact.Name)"
@@ -290,6 +295,9 @@ try {
             size_bytes = [int64]$Artifact.Length
             sha256 = "sha256:$Hash"
         }
+    }
+    if (@($InventoryEntries | Where-Object { $_.kind -eq 'fixture-producer-executable' }).Count -ne 1) {
+        throw 'The final Windows archive must contain exactly one fixture producer executable.'
     }
     $Inventory = [ordered]@{
         format_version = 1

@@ -68,6 +68,9 @@ class WindowsReleaseScriptTests(unittest.TestCase):
     def test_creates_closed_deterministic_final_zip(self) -> None:
         for marker in (
             "artifact-inventory.json",
+            "fixture-producer-executable",
+            "release\\muriarc-desktop.exe",
+            "exactly one fixture producer executable",
             "MuriArc-1.0.0-desktop-windows",
             "1980-01-01T00:00:00Z",
             "ZipArchiveMode]::Create",

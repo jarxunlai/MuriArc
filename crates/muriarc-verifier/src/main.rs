@@ -40,6 +40,13 @@ enum Command {
         definition: PathBuf,
         catalog: PathBuf,
     },
+    CatalogAppend {
+        catalog: PathBuf,
+        fixture_root: PathBuf,
+        fixture_artifact_digest: Sha256Digest,
+        oci_reference: String,
+        output: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -198,6 +205,38 @@ async fn dispatch(parsed: Parsed) -> Result<Value, EvidenceError> {
                 "runCount": report.runs.len(),
             }))
         }
+        Command::CatalogAppend {
+            catalog,
+            fixture_root,
+            fixture_artifact_digest,
+            oci_reference,
+            output,
+        } => {
+            let previous: FixtureCatalog = load_json(&catalog)?;
+            previous.validate()?;
+            let (manifest, _, verification) = load_and_verify_fixture(&fixture_root, None)?;
+            let fixture_manifest_digest =
+                muriarc_release_evidence::fixture_manifest_digest(&manifest)?;
+            let mut candidate = previous.clone();
+            candidate.append(
+                &manifest,
+                fixture_artifact_digest,
+                fixture_manifest_digest,
+                oci_reference,
+            )?;
+            candidate.assert_append_only_from(&previous)?;
+            if output.exists() || output.is_symlink() {
+                return Err(EvidenceError::Io {
+                    message: "candidate Catalog output must be a new path".to_owned(),
+                });
+            }
+            write_json_atomic(&output, &candidate)?;
+            Ok(json!({
+                "entryCount": candidate.entries.len(),
+                "fixtureId": manifest.fixture_id,
+                "fixtureContentDigest": verification.fixture_content_digest,
+            }))
+        }
     }
 }
 
@@ -255,6 +294,13 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, Eviden
             definition: required_path(&args, "--definition")?,
             catalog: required_path(&args, "--catalog")?,
         },
+        Some("catalog-append") => Command::CatalogAppend {
+            catalog: required_path(&args, "--catalog")?,
+            fixture_root: required_path(&args, "--fixture-root")?,
+            fixture_artifact_digest: required_value(&args, "--fixture-artifact-digest")?.parse()?,
+            oci_reference: required_value(&args, "--oci-reference")?.to_owned(),
+            output: required_path(&args, "--candidate-output")?,
+        },
         _ => {
             return Err(EvidenceError::InvalidReport {
                 message: "unknown command; run muriarc-verifier help".to_owned(),
@@ -298,6 +344,12 @@ fn required_path(args: &[String], name: &str) -> Result<PathBuf, EvidenceError> 
         .ok_or_else(|| EvidenceError::InvalidReport {
             message: format!("{name} is required"),
         })
+}
+
+fn required_value<'a>(args: &'a [String], name: &str) -> Result<&'a str, EvidenceError> {
+    optional_value(args, name).ok_or_else(|| EvidenceError::InvalidReport {
+        message: format!("{name} is required"),
+    })
 }
 
 fn optional_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -405,5 +457,79 @@ Usage:
   muriarc-verifier run --request <run-request.json>
   muriarc-verifier report --report <verification-report.json>
   muriarc-verifier matrix --report <matrix-report.json> --definition <matrix.json> --catalog <catalog.json>
+  muriarc-verifier catalog-append --catalog <baseline.json> --fixture-root <dir> \
+    --fixture-artifact-digest sha256:... --oci-reference ghcr.io/...@sha256:... \
+    --candidate-output <new-catalog.json>
   add --output json to any command for stable machine output
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_catalog_append_with_digest_pinned_inputs() {
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let reference = format!("ghcr.io/jarxunlai/muriarc-release-fixtures@{digest}");
+        let parsed = parse_args(
+            [
+                "catalog-append",
+                "--catalog",
+                "/evidence/catalog.json",
+                "--fixture-root",
+                "/evidence/fixture",
+                "--fixture-artifact-digest",
+                &digest,
+                "--oci-reference",
+                &reference,
+                "--candidate-output",
+                "/evidence/candidate.json",
+                "--output",
+                "json",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect("catalog append arguments parse");
+        assert_eq!(parsed.output, OutputFormat::Json);
+        match parsed.command {
+            Command::CatalogAppend {
+                catalog,
+                fixture_root,
+                fixture_artifact_digest,
+                oci_reference,
+                output,
+            } => {
+                assert_eq!(catalog, PathBuf::from("/evidence/catalog.json"));
+                assert_eq!(fixture_root, PathBuf::from("/evidence/fixture"));
+                assert_eq!(fixture_artifact_digest.as_str(), digest);
+                assert_eq!(oci_reference, reference);
+                assert_eq!(output, PathBuf::from("/evidence/candidate.json"));
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_append_requires_a_valid_artifact_digest() {
+        let error = parse_args(
+            [
+                "catalog-append",
+                "--catalog",
+                "catalog.json",
+                "--fixture-root",
+                "fixture",
+                "--fixture-artifact-digest",
+                "sha256:not-a-digest",
+                "--oci-reference",
+                "ghcr.io/jarxunlai/muriarc-release-fixtures@sha256:not-a-digest",
+                "--candidate-output",
+                "candidate.json",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )
+        .expect_err("invalid digest must fail closed");
+        assert!(matches!(error, EvidenceError::InvalidDigest));
+    }
+}

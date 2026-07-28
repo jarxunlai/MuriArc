@@ -3,9 +3,9 @@
 Builds a production-mode MuriArc Windows desktop installer and signed updater artifacts.
 
 .DESCRIPTION
-Runs from a clean Windows checkout at an exact commit, pins pnpm 11.5.0,
-executes the release checks unless -SkipChecks is supplied, and publishes
-MSI/NSIS artifacts plus SHA-256 evidence outside the repository.
+Runs from a clean Windows checkout at the exact freshly fetched canonical
+origin/main commit, pins pnpm 11.5.0, always executes every release check,
+and publishes MSI/NSIS artifacts plus SHA-256 evidence outside the repository.
 
 No AI model is downloaded or invoked by this script.
 The updater Minisign private key is read only from TAURI_SIGNING_PRIVATE_KEY;
@@ -16,11 +16,6 @@ the matching public key is read from MURIARC_DESKTOP_UPDATER_PUBLIC_KEY.
   -ExpectedCommit (git rev-parse HEAD) `
   -RepoRoot (Get-Location).Path
 
-.EXAMPLE
-.\scripts\build-windows-release.ps1 `
-  -ExpectedCommit (git rev-parse HEAD) `
-  -RepoRoot (Get-Location).Path `
-  -SkipChecks
 #>
 [CmdletBinding()]
 param(
@@ -31,20 +26,22 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$RepoRoot,
 
-    [string]$BuildRoot,
-
-    [switch]$SkipChecks
+    [string]$BuildRoot
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$env:PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC;.CPL'
 
 if ([string]::IsNullOrWhiteSpace($env:MURIARC_DESKTOP_UPDATER_PUBLIC_KEY)) {
     throw 'MURIARC_DESKTOP_UPDATER_PUBLIC_KEY is required for a release build.'
 }
 if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
     throw 'TAURI_SIGNING_PRIVATE_KEY is required to produce signed updater artifacts.'
+}
+if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD)) {
+    throw 'TAURI_SIGNING_PRIVATE_KEY_PASSWORD is required for a release build.'
 }
 
 if ([string]::IsNullOrWhiteSpace($BuildRoot)) {
@@ -111,10 +108,23 @@ $env:GIT_CONFIG_COUNT = '1'
 $env:GIT_CONFIG_KEY_0 = 'safe.directory'
 $env:GIT_CONFIG_VALUE_0 = $RepoRoot
 
+$OriginUrl = (& $GitExe remote get-url origin).Trim().TrimEnd('/')
+Assert-CommandSucceeded 'git origin URL' $?
+if ($OriginUrl -notin @('https://github.com/jarxunlai/MuriArc.git', 'https://github.com/jarxunlai/MuriArc')) {
+    throw "Release source origin is not the canonical GitHub repository: $OriginUrl"
+}
+& $GitExe fetch --no-tags --prune origin '+refs/heads/main:refs/remotes/origin/main'
+Assert-CommandSucceeded 'fetch canonical origin/main' $?
+
 $ActualCommit = (& $GitExe rev-parse HEAD).Trim()
 Assert-CommandSucceeded 'git rev-parse HEAD' $?
+$OriginMain = (& $GitExe rev-parse refs/remotes/origin/main).Trim()
+Assert-CommandSucceeded 'git origin/main identity' $?
 if ($ActualCommit -ne $ExpectedCommit) {
     throw "Commit mismatch: expected $ExpectedCommit, got $ActualCommit"
+}
+if ($OriginMain -ne $ExpectedCommit) {
+    throw "Release source must equal the freshly fetched origin/main tip: expected $ExpectedCommit, got $OriginMain"
 }
 $Dirty = @(& $GitExe status --porcelain=v1 --untracked-files=all)
 Assert-CommandSucceeded 'git status' $?
@@ -128,6 +138,21 @@ $RunId = '{0}-{1}' -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $ShortCommit
 $EvidenceRoot = Join-Path $BuildRoot "desktop-evidence\$RunId"
 $env:CARGO_TARGET_DIR = Join-Path $BuildRoot 'cargo-target\windows-release-shared'
 New-Item -ItemType Directory -Force -Path $EvidenceRoot, $env:CARGO_TARGET_DIR | Out-Null
+
+$AllowedSensitiveEnvironment = @(
+    'MURIARC_DESKTOP_UPDATER_PUBLIC_KEY',
+    'TAURI_SIGNING_PRIVATE_KEY',
+    'TAURI_SIGNING_PRIVATE_KEY_PASSWORD'
+)
+$SensitiveEnvironment = @(Get-ChildItem Env: | Where-Object {
+    ($_.Name -like 'VITE_*' -or
+     $_.Name -match '(?i)(?:^|_)(?:api_?key|credential|csrf|master_?key|password|passwd|private_?key|secret|session|token)(?:$|_)') -and
+    $_.Name -notin $AllowedSensitiveEnvironment
+})
+$SanitizedEnvironmentVariableCount = $SensitiveEnvironment.Count
+$SensitiveEnvironment | ForEach-Object {
+    Remove-Item -LiteralPath "Env:$($_.Name)" -ErrorAction SilentlyContinue
+}
 
 $TranscriptPath = Join-Path $EvidenceRoot 'build.log'
 Start-Transcript -Path $TranscriptPath | Out-Null
@@ -163,28 +188,26 @@ try {
     & $PnpmExe --dir ui install --frozen-lockfile
     Assert-CommandSucceeded 'pnpm install' $?
 
-    if (-not $SkipChecks) {
-        & $CargoExe fmt --all -- --check
-        Assert-CommandSucceeded 'cargo fmt' $?
-        & $CargoExe clippy --locked --workspace --all-targets --all-features -- -D warnings
-        Assert-CommandSucceeded 'cargo clippy' $?
-        & $CargoExe test --locked --workspace --all-targets --all-features
-        Assert-CommandSucceeded 'cargo test' $?
-        & $PnpmExe --dir ui audit --audit-level=high
-        Assert-CommandSucceeded 'pnpm audit' $?
-        & $PnpmExe --dir ui run test
-        Assert-CommandSucceeded 'UI tests' $?
-        & $PnpmExe --dir ui run typecheck
-        Assert-CommandSucceeded 'UI typecheck' $?
-        & $PnpmExe --dir ui exec playwright install chromium
-        Assert-CommandSucceeded 'Playwright Chromium installation' $?
-        & $PnpmExe --dir ui run test:e2e
-        Assert-CommandSucceeded 'UI end-to-end tests' $?
-        $env:VITE_MURIARC_GATEWAY = 'local'
-        & $PnpmExe --dir ui run build
-        Assert-CommandSucceeded 'local UI production build' $?
-        Remove-Item Env:VITE_MURIARC_GATEWAY -ErrorAction SilentlyContinue
-    }
+    & $CargoExe fmt --all -- --check
+    Assert-CommandSucceeded 'cargo fmt' $?
+    & $CargoExe clippy --locked --workspace --all-targets --all-features -- -D warnings
+    Assert-CommandSucceeded 'cargo clippy' $?
+    & $CargoExe test --locked --workspace --all-targets --all-features
+    Assert-CommandSucceeded 'cargo test' $?
+    & $PnpmExe --dir ui audit --audit-level=high
+    Assert-CommandSucceeded 'pnpm audit' $?
+    & $PnpmExe --dir ui run test
+    Assert-CommandSucceeded 'UI tests' $?
+    & $PnpmExe --dir ui run typecheck
+    Assert-CommandSucceeded 'UI typecheck' $?
+    & $PnpmExe --dir ui exec playwright install chromium
+    Assert-CommandSucceeded 'Playwright Chromium installation' $?
+    & $PnpmExe --dir ui run test:e2e
+    Assert-CommandSucceeded 'UI end-to-end tests' $?
+    $env:VITE_MURIARC_GATEWAY = 'local'
+    & $PnpmExe --dir ui run build
+    Assert-CommandSucceeded 'local UI production build' $?
+    Remove-Item Env:VITE_MURIARC_GATEWAY -ErrorAction SilentlyContinue
 
     $TauriExe = Require-File (Join-Path $RepoRoot 'ui\node_modules\.bin\tauri.cmd')
     & $TauriExe build
@@ -203,6 +226,12 @@ try {
     if ($UpdaterSignatures.Count -eq 0) {
         throw "No signed updater artifact was produced under $BundleRoot"
     }
+    $UpdaterArchives = @(Get-ChildItem -LiteralPath $BundleRoot -Recurse -File | Where-Object {
+        $_.Extension -in '.zip', '.gz'
+    })
+    if ($UpdaterArchives.Count -eq 0) {
+        throw "No updater archive was produced under $BundleRoot"
+    }
     $Artifacts = @($Installers + $UpdaterSignatures + @(
         Get-ChildItem -LiteralPath $BundleRoot -Recurse -File | Where-Object {
             $_.Extension -in '.zip', '.gz' -and $_.Name -notin $UpdaterSignatures.Name
@@ -210,10 +239,16 @@ try {
     ) | Sort-Object FullName -Unique)
 
     $ArtifactRoot = Join-Path $BuildRoot "desktop-release\$RunId"
-    New-Item -ItemType Directory -Force -Path $ArtifactRoot | Out-Null
+    if (Test-Path -LiteralPath $ArtifactRoot) {
+        throw "Desktop release artifact root already exists: $ArtifactRoot"
+    }
+    New-Item -ItemType Directory -Path $ArtifactRoot | Out-Null
     $Published = foreach ($Artifact in $Artifacts) {
         $Destination = Join-Path $ArtifactRoot $Artifact.Name
-        Copy-Item -LiteralPath $Artifact.FullName -Destination $Destination -Force
+        if (Test-Path -LiteralPath $Destination) {
+            throw "Duplicate Windows release artifact name: $($Artifact.Name)"
+        }
+        Copy-Item -LiteralPath $Artifact.FullName -Destination $Destination
         Get-Item -LiteralPath $Destination
     }
 
@@ -229,13 +264,27 @@ try {
     @"
 expected_commit=$ExpectedCommit
 actual_commit=$ActualCommit
+origin_main=$OriginMain
+origin_url=$OriginUrl
 repo_root=$RepoRoot
 cargo_target=$env:CARGO_TARGET_DIR
 bundle_root=$BundleRoot
 artifact_root=$ArtifactRoot
 evidence_root=$EvidenceRoot
-checks_skipped=$($SkipChecks.IsPresent)
+checks_skipped=False
 "@ | Set-Content -LiteralPath (Join-Path $EvidenceRoot 'source-and-paths.txt') -Encoding utf8
+
+    $PostBuildDirty = @(& $GitExe status --porcelain=v1 --untracked-files=all)
+    Assert-CommandSucceeded 'post-build git status' $?
+    if ($PostBuildDirty.Count -ne 0) {
+        $PostBuildDirty | ForEach-Object { Write-Error $_ }
+        throw 'Windows release build dirtied the source tree.'
+    }
+    @"
+checks_skipped=False
+clean_tree_before_and_after=True
+sanitized_environment_variable_count=$SanitizedEnvironmentVariableCount
+"@ | Add-Content -LiteralPath (Join-Path $EvidenceRoot 'source-and-paths.txt') -Encoding utf8
 
     Write-Output 'MURIARC_DESKTOP_BUILD=PASS'
     Write-Output "artifact_root=$ArtifactRoot"
@@ -246,5 +295,6 @@ checks_skipped=$($SkipChecks.IsPresent)
     }
 }
 finally {
+    Remove-Item Env:VITE_MURIARC_GATEWAY -ErrorAction SilentlyContinue
     Stop-Transcript | Out-Null
 }

@@ -82,49 +82,56 @@ pub(super) async fn verify(
         format!("{DATABASE_FILE} must be a regular non-symlink file"),
     )?;
     let store = SqliteStore::connect_path(&database).await?;
-    store.health_check().await?;
-    let report = store.compatibility_report().await?;
-    let deployment = report.require_compatible().map_err(invalid)?.clone();
-    ensure(
-        deployment.generation_id == receipt.generation_id,
-        "deployment generation differs from the seed receipt",
-    )?;
-    ensure(
-        deployment.identity.application_version.as_str() == receipt.application_version,
-        "deployment application version differs",
-    )?;
-    ensure(
-        deployment.identity.data_epoch.as_str() == receipt.data_epoch,
-        "deployment data epoch differs",
-    )?;
-    let generation_bytes = read_regular_file(
-        &root.join(GENERATION_MANIFEST_FILE),
-        GENERATION_MANIFEST_FILE,
-    )?;
-    let generation: DeploymentGenerationManifest = serde_json::from_slice(&generation_bytes)?;
-    generation
-        .validate(&deployment)
-        .map_err(|issue| invalid(format!("{}: {}", issue.code, issue.detail)))?;
+    let result = async {
+        store.health_check().await?;
+        let report = store.compatibility_report().await?;
+        let deployment = report.require_compatible().map_err(invalid)?.clone();
+        ensure(
+            deployment.generation_id == receipt.generation_id,
+            "deployment generation differs from the seed receipt",
+        )?;
+        ensure(
+            deployment.identity.application_version.as_str() == receipt.application_version,
+            "deployment application version differs",
+        )?;
+        ensure(
+            deployment.identity.data_epoch.as_str() == receipt.data_epoch,
+            "deployment data epoch differs",
+        )?;
+        let generation_bytes = read_regular_file(
+            &root.join(GENERATION_MANIFEST_FILE),
+            GENERATION_MANIFEST_FILE,
+        )?;
+        let generation: DeploymentGenerationManifest = serde_json::from_slice(&generation_bytes)?;
+        generation
+            .validate(&deployment)
+            .map_err(|issue| invalid(format!("{}: {}", issue.code, issue.detail)))?;
 
-    verify_counts(bundle, &receipt)?;
-    verify_domain(bundle, &store, &receipt).await?;
-    verify_attachments(bundle, root, &store, &receipt).await?;
-    let inventory = store.persistent_recovery_inventory().await?;
-    ensure(
-        inventory.attachment_records
-            == u64::try_from(bundle.dataset.attachments.len())
-                .map_err(|_| invalid("count overflow"))?,
-        "persistent attachment inventory differs",
-    )?;
-    ensure(
-        inventory.audit_records > 0,
-        "seeded fixture has no Audit evidence",
-    )?;
-    ensure(
-        inventory.encrypted_secret_records == 0 && inventory.secret_reference_records == 0,
-        "synthetic fixture must not contain AI secret records",
-    )?;
-    Ok(receipt)
+        verify_counts(bundle, &receipt)?;
+        verify_domain(bundle, &store, &receipt).await?;
+        verify_attachments(bundle, root, &store, &receipt).await?;
+        let inventory = store.persistent_recovery_inventory().await?;
+        ensure(
+            inventory.attachment_records
+                == u64::try_from(bundle.dataset.attachments.len())
+                    .map_err(|_| invalid("count overflow"))?,
+            "persistent attachment inventory differs",
+        )?;
+        ensure(
+            inventory.audit_records > 0,
+            "seeded fixture has no Audit evidence",
+        )?;
+        ensure(
+            inventory.encrypted_secret_records == 0 && inventory.secret_reference_records == 0,
+            "synthetic fixture must not contain AI secret records",
+        )?;
+        Ok(receipt)
+    }
+    .await;
+    // The verifier owns this pool. Awaiting close is required before a caller
+    // can rename or archive the verified data root on Windows.
+    store.pool().close().await;
+    result
 }
 
 fn verify_counts(bundle: &FixtureBundle, receipt: &SeedReceipt) -> FixtureResult<()> {

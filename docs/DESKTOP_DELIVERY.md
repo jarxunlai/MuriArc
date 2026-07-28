@@ -90,3 +90,27 @@ A friend-testing package is separate from the formal RC/release:
 - provide the package SHA-256.
 
 Tester evidence and artifacts must never be mixed with the final `v1.0.0` artifact lock or RC report.
+
+From a fresh Windows checkout whose `HEAD` and fetched `origin/main` both equal
+the already merged commit, run:
+
+```powershell
+.\scripts\build-windows-tester.ps1 `
+  -ExpectedCommit (git rev-parse HEAD) `
+  -RepoRoot (Get-Location).Path
+```
+
+The script validates the canonical GitHub origin, freshly fetches `origin/main`,
+and fails unless it still equals `HEAD` and the expected commit. It then uses an
+isolated Tester identifier, removes updater/signing environment variables, runs
+the Windows Desktop gates, and invokes the built
+Desktop executable itself to seed and verify a fresh E0001 `standard-v1` data
+root. It then performs a temporary-copy startup smoke test, rejects reparse
+points and credential-like material, round-trip verifies the ZIP, and emits a
+package SHA-256 plus a tester-only manifest outside Git. The generated launcher
+verifies the complete file inventory, manifest identity, executable digest, and
+synthetic baseline before starting the application. The friend machine must be
+Windows 10/11 x64 with Microsoft Edge WebView2 Runtime; the unsigned package is
+not an installer and remains isolated from the formal Desktop identifier. The suggested tag is
+`tester-v1.0.0-standard-v1-<12-character-commit>` and must be created as a
+GitHub prerelease, never as the formal `v1.0.0` release.

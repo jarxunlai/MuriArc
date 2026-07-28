@@ -90,3 +90,22 @@ macOS 只有在真实设备完成同等级打包、keychain、更新、迁移与
 - 提供 package SHA-256。
 
 Tester 制品/证据不得与最终 `v1.0.0` artifact lock 或 RC 报告混用。
+
+在 Windows 上使用全新 checkout，并确认 `HEAD` 与已 fetch 的 `origin/main` 都等于同一个已合并
+commit，然后执行：
+
+```powershell
+.\scripts\build-windows-tester.ps1 `
+  -ExpectedCommit (git rev-parse HEAD) `
+  -RepoRoot (Get-Location).Path
+```
+
+脚本先验证 canonical GitHub origin，重新 fetch `origin/main`，并要求其仍与 `HEAD`、expected commit
+完全相等；随后使用独立 Tester identifier，移除 updater/signing 环境变量，执行 Windows Desktop 门禁，
+并由刚构建的 Desktop 二进制自身生成和验证全新 E0001 `standard-v1` 数据根。随后脚本使用临时数据副本
+完成启动 smoke，拒绝 reparse point 和疑似凭据，对 ZIP 解包后逐文件重验，并在 Git 外输出 package
+SHA-256 与 Tester 专用 manifest。生成的启动器会先验证完整文件清单、manifest 身份、可执行文件 digest
+和 synthetic baseline，再启动应用。朋友的机器需为装有 Microsoft Edge WebView2 Runtime 的 Windows
+10/11 x64；该未签名包不是安装程序，且与正式 Desktop identifier 隔离。建议 tag 为
+`tester-v1.0.0-standard-v1-<12-character-commit>`，必须创建为 GitHub prerelease，不得作为正式
+`v1.0.0` Release。

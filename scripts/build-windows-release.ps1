@@ -232,6 +232,12 @@ try {
     if ($UpdaterArchives.Count -eq 0) {
         throw "No updater archive was produced under $BundleRoot"
     }
+    if (@($Installers | Where-Object { $_.Extension -eq '.msi' }).Count -eq 0) {
+        throw "No MSI release artifact was produced under $BundleRoot"
+    }
+    if (@($Installers | Where-Object { $_.Extension -eq '.exe' }).Count -eq 0) {
+        throw "No NSIS release artifact was produced under $BundleRoot"
+    }
     $Artifacts = @($Installers + $UpdaterSignatures + @(
         Get-ChildItem -LiteralPath $BundleRoot -Recurse -File | Where-Object {
             $_.Extension -in '.zip', '.gz' -and $_.Name -notin $UpdaterSignatures.Name
@@ -261,6 +267,120 @@ try {
         Format-Table -AutoSize |
         Out-File -FilePath (Join-Path $EvidenceRoot 'bundle-sha256.txt') -Encoding utf8
 
+    # Build one closed, deterministic archive. The inventory is inside the
+    # archive and names every payload member exactly once; RC tooling consumes
+    # this ZIP rather than a mutable directory of unrelated bundle outputs.
+    $PackageRoot = Join-Path $EvidenceRoot 'desktop-windows-package'
+    $PayloadRoot = Join-Path $PackageRoot 'payload'
+    New-Item -ItemType Directory -Path $PackageRoot, $PayloadRoot | Out-Null
+    $InventoryEntries = @()
+    foreach ($Artifact in @($Published | Sort-Object Name)) {
+        $PayloadPath = Join-Path $PayloadRoot $Artifact.Name
+        Copy-Item -LiteralPath $Artifact.FullName -Destination $PayloadPath
+        $Hash = (Get-FileHash -LiteralPath $PayloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        $Kind = switch ($Artifact.Extension.ToLowerInvariant()) {
+            '.msi' { 'msi' }
+            '.exe' { 'nsis' }
+            '.sig' { 'tauri-updater-signature' }
+            default { 'tauri-updater-archive' }
+        }
+        $InventoryEntries += [ordered]@{
+            path = "payload/$($Artifact.Name)"
+            kind = $Kind
+            size_bytes = [int64]$Artifact.Length
+            sha256 = "sha256:$Hash"
+        }
+    }
+    $Inventory = [ordered]@{
+        format_version = 1
+        artifact_name = 'desktop-windows'
+        application_version = '1.0.0'
+        source_commit = $ExpectedCommit
+        archive_prefix = 'MuriArc-1.0.0-desktop-windows'
+        files = $InventoryEntries
+    }
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $InventoryPath = Join-Path $PackageRoot 'artifact-inventory.json'
+    $InventoryJson = ($Inventory | ConvertTo-Json -Depth 8 -Compress) + "`n"
+    [System.IO.File]::WriteAllText($InventoryPath, $InventoryJson, $Utf8NoBom)
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $FinalArchiveName = "MuriArc-1.0.0-desktop-windows-$ShortCommit.zip"
+    $FinalArchive = Join-Path $ArtifactRoot $FinalArchiveName
+    $TemporaryArchive = Join-Path $ArtifactRoot ".$FinalArchiveName.tmp-$([Guid]::NewGuid())"
+    $ArchiveStream = [System.IO.File]::Open(
+        $TemporaryArchive,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None
+    )
+    try {
+        $Archive = New-Object System.IO.Compression.ZipArchive(
+            $ArchiveStream,
+            [System.IO.Compression.ZipArchiveMode]::Create,
+            $true
+        )
+        try {
+            $FixedZipTime = [DateTimeOffset]::Parse(
+                '1980-01-01T00:00:00Z',
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::AssumeUniversal
+            )
+            $PackageFiles = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File | ForEach-Object {
+                [PSCustomObject]@{
+                    File = $_
+                    Entry = $_.FullName.Substring($PackageRoot.Length + 1).Replace('', '/')
+                }
+            } | Sort-Object Entry)
+            foreach ($PackageFile in $PackageFiles) {
+                $Entry = $Archive.CreateEntry(
+                    "MuriArc-1.0.0-desktop-windows/$($PackageFile.Entry)",
+                    [System.IO.Compression.CompressionLevel]::Optimal
+                )
+                $Entry.LastWriteTime = $FixedZipTime
+                $InputStream = [System.IO.File]::OpenRead($PackageFile.File.FullName)
+                $OutputStream = $Entry.Open()
+                try {
+                    $InputStream.CopyTo($OutputStream)
+                }
+                finally {
+                    $OutputStream.Dispose()
+                    $InputStream.Dispose()
+                }
+            }
+        }
+        finally {
+            $Archive.Dispose()
+        }
+    }
+    finally {
+        $ArchiveStream.Dispose()
+    }
+    [System.IO.File]::Move($TemporaryArchive, $FinalArchive)
+    $FinalArchiveItem = Get-Item -LiteralPath $FinalArchive
+    if ($FinalArchiveItem.Length -le 0) {
+        throw 'The final Windows release archive is empty.'
+    }
+
+    $ReadArchive = [System.IO.Compression.ZipFile]::OpenRead($FinalArchive)
+    try {
+        $ObservedEntries = @($ReadArchive.Entries | ForEach-Object { $_.FullName } | Sort-Object)
+    }
+    finally {
+        $ReadArchive.Dispose()
+    }
+    $ExpectedEntries = @(
+        'MuriArc-1.0.0-desktop-windows/artifact-inventory.json'
+        $InventoryEntries | ForEach-Object {
+            "MuriArc-1.0.0-desktop-windows/$($_.path)"
+        }
+    ) | Sort-Object
+    if ((Compare-Object -ReferenceObject $ExpectedEntries -DifferenceObject $ObservedEntries).Count -ne 0) {
+        throw 'The final Windows ZIP differs from its closed artifact inventory.'
+    }
+    $FinalArchiveHash = (Get-FileHash -LiteralPath $FinalArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+
     @"
 expected_commit=$ExpectedCommit
 actual_commit=$ActualCommit
@@ -288,6 +408,8 @@ sanitized_environment_variable_count=$SanitizedEnvironmentVariableCount
 
     Write-Output 'MURIARC_DESKTOP_BUILD=PASS'
     Write-Output "artifact_root=$ArtifactRoot"
+    Write-Output "release_artifact=$FinalArchive"
+    Write-Output "release_artifact_sha256=$FinalArchiveHash"
     $Published | ForEach-Object {
         $Hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
         Write-Output "artifact=$($_.FullName)"

@@ -57,11 +57,28 @@ class WindowsReleaseScriptTests(unittest.TestCase):
     def test_requires_installers_updater_archive_and_signature(self) -> None:
         for marker in (
             "No MSI or NSIS release artifact",
+            "No MSI release artifact",
+            "No NSIS release artifact",
             "No signed updater artifact",
             "No updater archive",
             "Duplicate Windows release artifact name",
         ):
             self.assertIn(marker, self.text)
+
+    def test_creates_closed_deterministic_final_zip(self) -> None:
+        for marker in (
+            "artifact-inventory.json",
+            "MuriArc-1.0.0-desktop-windows",
+            "1980-01-01T00:00:00Z",
+            "ZipArchiveMode]::Create",
+            "Compare-Object -ReferenceObject $ExpectedEntries",
+            "release_artifact_sha256=",
+        ):
+            self.assertIn(marker, self.text)
+        self.assertLess(
+            self.text.index("artifact-inventory.json"),
+            self.text.index("release_artifact_sha256="),
+        )
 
 
 if __name__ == "__main__":

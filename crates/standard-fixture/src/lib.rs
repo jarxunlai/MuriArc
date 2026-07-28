@@ -37,6 +37,10 @@ struct FixtureBundle {
 enum Command {
     Seed,
     Verify,
+    #[cfg(feature = "postgres")]
+    SeedPostgres,
+    #[cfg(feature = "postgres")]
+    VerifyPostgres,
 }
 
 #[derive(Debug)]
@@ -58,6 +62,25 @@ where
         Command::Seed => seed_standard_v1(&cli.fixture, &cli.output, &cli.source_commit).await?,
         Command::Verify => {
             verify_standard_v1(&cli.fixture, &cli.output, &cli.source_commit).await?
+        }
+        #[cfg(feature = "postgres")]
+        Command::SeedPostgres => {
+            let database_url = std::env::var("MURIARC_FIXTURE_DATABASE_URL")
+                .map_err(|_| invalid("MURIARC_FIXTURE_DATABASE_URL is required"))?;
+            seed_postgres_standard_v1(&cli.fixture, &cli.output, &cli.source_commit, &database_url)
+                .await?
+        }
+        #[cfg(feature = "postgres")]
+        Command::VerifyPostgres => {
+            let database_url = std::env::var("MURIARC_FIXTURE_DATABASE_URL")
+                .map_err(|_| invalid("MURIARC_FIXTURE_DATABASE_URL is required"))?;
+            verify_postgres_standard_v1(
+                &cli.fixture,
+                &cli.output,
+                &cli.source_commit,
+                &database_url,
+            )
+            .await?
         }
     };
     println!("{}", serde_json::to_string(&receipt)?);
@@ -106,6 +129,78 @@ pub async fn seed_standard_v1(
     Ok(receipt)
 }
 
+#[cfg(feature = "postgres")]
+pub async fn seed_postgres_standard_v1(
+    fixture_root: impl AsRef<Path>,
+    output_root: impl AsRef<Path>,
+    source_commit: &str,
+    database_url: &str,
+) -> FixtureResult<SeedReceipt> {
+    validate_source_commit(source_commit)?;
+    ensure(
+        !database_url.trim().is_empty(),
+        "PostgreSQL URL is required",
+    )?;
+    let bundle = load_fixture(fixture_root.as_ref())?;
+    let output = output_root.as_ref();
+    match fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(invalid("output data root must be a real directory").into());
+        }
+        Ok(_) => {
+            return verify_postgres_standard_v1(fixture_root, output, source_commit, database_url)
+                .await;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = output
+        .parent()
+        .ok_or_else(|| invalid("output data root must have a parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let parent = fs::canonicalize(parent)?;
+    let name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| invalid("output data root must have a valid final component"))?;
+    let staging = parent.join(format!(".{name}.staging-{}", Uuid::new_v4()));
+    fs::create_dir(&staging)?;
+    let result = seed::seed_postgres_into(&bundle, &staging, source_commit, database_url).await;
+    let receipt = match result {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    fs::rename(&staging, output)?;
+    verify_postgres_standard_v1(fixture_root, output, source_commit, database_url).await?;
+    Ok(receipt)
+}
+
+#[cfg(feature = "postgres")]
+pub async fn verify_postgres_standard_v1(
+    fixture_root: impl AsRef<Path>,
+    output_root: impl AsRef<Path>,
+    source_commit: &str,
+    database_url: &str,
+) -> FixtureResult<SeedReceipt> {
+    use muriarc_store_postgres::PostgresStore;
+
+    validate_source_commit(source_commit)?;
+    ensure(
+        !database_url.trim().is_empty(),
+        "PostgreSQL URL is required",
+    )?;
+    let bundle = load_fixture(fixture_root.as_ref())?;
+    let store = PostgresStore::connect(database_url).await?;
+    let result =
+        verify::verify_postgres(&bundle, output_root.as_ref(), source_commit, &store).await;
+    store.pool().close().await;
+    result
+}
+
 pub async fn verify_standard_v1(
     fixture_root: impl AsRef<Path>,
     output_root: impl AsRef<Path>,
@@ -127,8 +222,17 @@ where
     let command = match command.to_string_lossy().as_ref() {
         "seed" => Command::Seed,
         "verify" => Command::Verify,
+        #[cfg(feature = "postgres")]
+        "seed-postgres" => Command::SeedPostgres,
+        #[cfg(feature = "postgres")]
+        "verify-postgres" => Command::VerifyPostgres,
         "-h" | "--help" => return Ok(None),
-        _ => return Err(invalid("first argument must be seed or verify").into()),
+        _ => {
+            return Err(invalid(
+                "first argument must be seed, verify, seed-postgres, or verify-postgres",
+            )
+            .into());
+        }
     };
     let mut fixture = None;
     let mut output = None;

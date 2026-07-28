@@ -6,7 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Strict synthetic standard-v1 fixture producer for MuriArc Desktop"
+description = "Strict synthetic standard-v1 fixture producer for MuriArc Desktop and Server"
+
+[features]
+default = []
+postgres = ["dep:muriarc-store-postgres"]
 
 [[bin]]
 name = "muriarc-standard-fixture"
@@ -18,6 +22,7 @@ muriarc-application = { path = "../application" }
 muriarc-core = { path = "../core" }
 muriarc-data = { path = "../data" }
 muriarc-store-sqlite = { path = "../store-sqlite" }
+muriarc-store-postgres = { path = "../store-postgres", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10.9"

@@ -139,10 +139,12 @@ pnpm --dir ui exec playwright install chromium
 pnpm --dir ui run test:e2e
 VITE_MURIARC_GATEWAY=remote pnpm --dir ui run build
 cargo build --locked --release \
-  -p muriarc-server --features postgres \
+  -p muriarc-server \
   -p muriarc-upgrade-executor \
   -p muriarc-verifier \
-  -p muriarcctl
+  -p muriarc-release-fixture \
+  -p muriarcctl \
+  --features muriarc-server/postgres,muriarc-release-fixture/postgres
 
 native_root="$staging/native-system"
 python3 scripts/build_server_bundle.py \
@@ -153,6 +155,7 @@ python3 scripts/build_server_bundle.py \
   --controller "$CARGO_TARGET_DIR/release/muriarcctl" \
   --upgrade-executor "$CARGO_TARGET_DIR/release/muriarc-upgrade-executor" \
   --verifier "$CARGO_TARGET_DIR/release/muriarc-verifier" \
+  --fixture-producer "$CARGO_TARGET_DIR/release/muriarc-release-fixture" \
   --ui-dir "$repo_root/ui/dist" \
   --deploy-root "$repo_root/deploy"
 native_artifact="$artifacts/MuriArc-1.0.0-native-system-linux-amd64-${short_commit}.tar.gz"

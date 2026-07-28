@@ -36,6 +36,7 @@ fn synthetic_facts(fixture_id: Uuid, identity: ReleaseIdentity) -> ExpectedFacts
     let animal_id = Uuid::new_v4();
     let experiment_id = Uuid::new_v4();
     let observation_id = Uuid::new_v4();
+    let measurement_id = Uuid::new_v4();
     let sample_id = Uuid::new_v4();
     let attachment_id = Uuid::new_v4();
     let profile_id = Uuid::new_v4();
@@ -106,6 +107,15 @@ fn synthetic_facts(fixture_id: Uuid, identity: ReleaseIdentity) -> ExpectedFacts
             value_digest: digest(b"23.4-g"),
             signed: false,
             revision: 1,
+        }],
+        measurements: vec![MeasurementFact {
+            measurement_id,
+            experiment_id,
+            animal_id,
+            value_digest: digest(b"23.4-g"),
+            status: "signed".to_owned(),
+            signed: true,
+            revision: 2,
         }],
         samples: vec![SampleFact {
             sample_id,

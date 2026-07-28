@@ -24,17 +24,21 @@ RUN --mount=type=cache,id=muriarc-cargo-registry,target=/usr/local/cargo/registr
     --mount=type=cache,id=muriarc-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=muriarc-server-target,target=/workspace/target,sharing=locked \
     cargo build --locked --release \
-      -p muriarc-server --features postgres \
+      -p muriarc-server \
       -p muriarc-upgrade-executor \
       -p muriarc-verifier \
+      -p muriarc-release-fixture \
       -p muriarcctl \
+      --features muriarc-server/postgres,muriarc-release-fixture/postgres \
     && cp target/release/muriarc-server /tmp/muriarc-server \
     && cp target/release/muriarc-upgrade-executor /tmp/muriarc-upgrade-executor \
     && cp target/release/muriarc-verifier /tmp/muriarc-verifier \
+    && cp target/release/muriarc-release-fixture /tmp/muriarc-release-fixture \
     && cp target/release/muriarcctl /tmp/muriarcctl \
     && strip /tmp/muriarc-server \
       /tmp/muriarc-upgrade-executor \
       /tmp/muriarc-verifier \
+      /tmp/muriarc-release-fixture \
       /tmp/muriarcctl
 
 FROM debian:bookworm-slim AS runtime
@@ -49,6 +53,7 @@ RUN apt-get update \
 COPY --from=server-build --chown=root:root /tmp/muriarc-server /usr/local/bin/muriarc-server
 COPY --from=server-build --chown=root:root /tmp/muriarc-upgrade-executor /usr/local/bin/muriarc-upgrade-executor
 COPY --from=server-build --chown=root:root /tmp/muriarc-verifier /usr/local/bin/muriarc-verifier
+COPY --from=server-build --chown=root:root /tmp/muriarc-release-fixture /usr/local/bin/muriarc-release-fixture
 COPY --from=server-build --chown=root:root /tmp/muriarcctl /usr/local/bin/muriarcctl
 COPY --from=ui-build --chown=muriarc:muriarc /workspace/ui/dist/ /opt/muriarc/ui/
 

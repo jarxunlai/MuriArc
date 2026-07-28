@@ -56,6 +56,8 @@ class LinuxReleaseScriptTests(unittest.TestCase):
             "finalize_release_artifact.py",
             "native-system",
             "managed-compose",
+            "-p muriarc-release-fixture",
+            "--fixture-producer",
             '$native_root/bin/muriarc-verifier" identity',
             "release-identity.json",
         ):

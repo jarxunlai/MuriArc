@@ -23,6 +23,10 @@ fn native_bundle(root: &Path) -> ServerBundleManifest {
             BundleFileRole::UpgradeExecutor,
         ),
         ("bin/muriarc-verifier", BundleFileRole::Verifier),
+        (
+            "bin/muriarc-release-fixture",
+            BundleFileRole::FixtureProducer,
+        ),
         ("ui/index.html", BundleFileRole::UiAsset),
         ("deploy/muriarc.service", BundleFileRole::SystemdService),
         ("deploy/muriarc.sysusers", BundleFileRole::Sysusers),
@@ -109,7 +113,7 @@ fn bundle_verifier_rejects_tamper_extra_and_traversal() {
     let manifest = native_bundle(root.path());
     let (_, verified) =
         verify_server_bundle(root.path(), Some(&manifest.digest().unwrap())).unwrap();
-    assert_eq!(verified.file_count, 10);
+    assert_eq!(verified.file_count, 11);
 
     fs::write(root.path().join("extra"), b"not registered").unwrap();
     assert!(verify_server_bundle(root.path(), None).is_err());

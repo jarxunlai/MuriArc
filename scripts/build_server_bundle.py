@@ -127,12 +127,13 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
         InputFile(regular_file(cloudflare / "muriarc.yml.example", "Cloudflare Tunnel config example"), PurePosixPath("deploy/cloudflare/muriarc.yml.example"), "environment_example"),
     ]
     if args.profile == "native-system":
-        if args.server is None or args.ui_dir is None:
-            raise ValueError("native-system requires --server and --ui-dir")
+        if args.server is None or args.ui_dir is None or args.fixture_producer is None:
+            raise ValueError("native-system requires --server, --fixture-producer, and --ui-dir")
         deploy = real_directory(args.deploy_root / "native-system", "native deploy directory")
         common.extend(
             [
                 InputFile(regular_file(args.server, "server"), PurePosixPath("bin/muriarc-server"), "server", True),
+                InputFile(regular_file(args.fixture_producer, "fixture producer"), PurePosixPath("bin/muriarc-release-fixture"), "fixture_producer", True),
                 InputFile(regular_file(deploy / "muriarc.service", "systemd unit"), PurePosixPath("deploy/muriarc.service"), "systemd_service"),
                 InputFile(regular_file(deploy / "muriarc.sysusers", "sysusers file"), PurePosixPath("deploy/muriarc.sysusers"), "sysusers"),
                 InputFile(regular_file(deploy / "muriarc.tmpfiles", "tmpfiles file"), PurePosixPath("deploy/muriarc.tmpfiles"), "tmpfiles"),
@@ -244,6 +245,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--verifier", required=True, type=Path)
     result.add_argument("--deploy-root", type=Path, default=Path("deploy"))
     result.add_argument("--server", type=Path)
+    result.add_argument("--fixture-producer", type=Path)
     result.add_argument("--ui-dir", type=Path)
     result.add_argument("--server-image-archive", type=Path)
     result.add_argument("--postgres-image-archive", type=Path)

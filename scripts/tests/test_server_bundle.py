@@ -14,7 +14,7 @@ SCRIPT = REPOSITORY / "scripts" / "build_server_bundle.py"
 class ServerBundleBuilderTests(unittest.TestCase):
     def artifacts(self, root: Path) -> dict[str, Path]:
         values: dict[str, Path] = {}
-        for name in ("server", "controller", "executor", "verifier"):
+        for name in ("server", "controller", "executor", "verifier", "fixture-producer"):
             path = root / name
             path.write_bytes(f"synthetic-{name}".encode())
             values[name] = path
@@ -43,6 +43,8 @@ class ServerBundleBuilderTests(unittest.TestCase):
                 str(values["executor"]),
                 "--verifier",
                 str(values["verifier"]),
+                "--fixture-producer",
+                str(values["fixture-producer"]),
                 "--ui-dir",
                 str(values["ui"]),
                 "--deploy-root",
@@ -67,6 +69,7 @@ class ServerBundleBuilderTests(unittest.TestCase):
             paths = {item["path"] for item in manifest["files"]}
             self.assertIn("bin/muriarc-server", paths)
             self.assertIn("bin/muriarcctl", paths)
+            self.assertIn("bin/muriarc-release-fixture", paths)
             self.assertNotIn("release/release-manifest.json", paths)
             self.assertIn("ui/index.html", paths)
             self.assertIn("deploy/cloudflare/cloudflared.service", paths)
@@ -170,6 +173,8 @@ class ServerBundleBuilderTests(unittest.TestCase):
                     str(values["executor"]),
                     "--verifier",
                     str(values["verifier"]),
+                    "--fixture-producer",
+                    str(values["fixture-producer"]),
                     "--ui-dir",
                     str(values["ui"]),
                     "--deploy-root",

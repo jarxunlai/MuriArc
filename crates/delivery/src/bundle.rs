@@ -21,6 +21,7 @@ pub enum BundleFileRole {
     Controller,
     UpgradeExecutor,
     Verifier,
+    FixtureProducer,
     UiAsset,
     BundleManifest,
     SystemdService,
@@ -78,6 +79,7 @@ impl ServerBundleManifest {
                 BundleFileRole::Controller,
                 BundleFileRole::UpgradeExecutor,
                 BundleFileRole::Verifier,
+                BundleFileRole::FixtureProducer,
                 BundleFileRole::UiAsset,
                 BundleFileRole::SystemdService,
                 BundleFileRole::Sysusers,
@@ -337,6 +339,7 @@ fn copy_create_new(
                 | BundleFileRole::Controller
                 | BundleFileRole::UpgradeExecutor
                 | BundleFileRole::Verifier
+                | BundleFileRole::FixtureProducer
         );
         options.mode(if executable { 0o750 } else { 0o640 });
     }

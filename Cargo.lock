@@ -2729,6 +2729,7 @@ dependencies = [
  "muriarc-core",
  "muriarc-data",
  "muriarc-importer",
+ "muriarc-release-fixture",
  "muriarc-snapshot",
  "muriarc-standard-fixture",
  "muriarc-store-sqlite",
@@ -2778,6 +2779,27 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "muriarc-release-fixture"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "muriarc-ai",
+ "muriarc-core",
+ "muriarc-release-evidence",
+ "muriarc-server",
+ "muriarc-standard-fixture",
+ "muriarc-store-postgres",
+ "muriarc-store-sqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -2840,6 +2862,7 @@ dependencies = [
  "muriarc-application",
  "muriarc-core",
  "muriarc-data",
+ "muriarc-store-postgres",
  "muriarc-store-sqlite",
  "serde",
  "serde_json",

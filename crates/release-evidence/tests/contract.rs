@@ -507,7 +507,10 @@ async fn seven_layer_verifier_blocks_skip_and_exports_upgrade_evidence() {
 fn rc_matrix_rejects_empty_catalog_and_source_runs() {
     let definition = CompatibilityMatrixDefinition {
         format_version: 1,
-        pr_profiles: BTreeSet::from([DeliveryProfile::ManagedCompose]),
+        pr_profiles: BTreeSet::from([
+            DeliveryProfile::ManagedCompose,
+            DeliveryProfile::DesktopWindows,
+        ]),
         nightly_profiles: BTreeSet::from([
             DeliveryProfile::NativeSystem,
             DeliveryProfile::ManagedCompose,
@@ -553,6 +556,12 @@ fn rc_matrix_rejects_empty_catalog_and_source_runs() {
         runs: definition
             .rc_profiles
             .iter()
+            .filter(|profile| {
+                matches!(
+                    profile,
+                    DeliveryProfile::NativeSystem | DeliveryProfile::ManagedCompose
+                )
+            })
             .map(|profile| MatrixRun {
                 fixture_id,
                 profile: *profile,
@@ -562,6 +571,21 @@ fn rc_matrix_rejects_empty_catalog_and_source_runs() {
             })
             .collect(),
     };
+    let mut final_report = source_report.clone();
+    for run in &mut final_report.runs {
+        run.execution_kind = ArtifactExecutionKind::FinalPackage;
+    }
+    final_report.validate(&definition, &catalog).unwrap();
+
+    let mut cartesian_report = final_report.clone();
+    cartesian_report.runs.push(MatrixRun {
+        fixture_id,
+        profile: DeliveryProfile::DesktopWindows,
+        report_digest: Some(digest(b"invalid-cross-backend-run")),
+        status: LayerStatus::Pass,
+        execution_kind: ArtifactExecutionKind::FinalPackage,
+    });
+    assert!(cartesian_report.validate(&definition, &catalog).is_err());
     assert!(source_report.validate(&definition, &catalog).is_err());
 
     let weakened = CompatibilityMatrixDefinition {

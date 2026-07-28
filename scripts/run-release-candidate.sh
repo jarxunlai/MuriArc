@@ -113,6 +113,7 @@ python3 scripts/check_fixture_catalog.py \
 
 compatibility_root="$run_root/compatibility"
 export MURIARC_TARGET_ARTIFACTS="$release_manifest"
+export MURIARC_ARTIFACT_LOCK="$artifact_lock"
 scripts/run-release-compatibility.sh \
   --mode rc \
   --catalog "$candidate_catalog" \

@@ -5,7 +5,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use muriarc_core::ReleaseIdentity;
+use muriarc_core::{BackendKind, ReleaseIdentity};
 use muriarc_upgrade::{
     VerificationEvidence as UpgradeVerificationEvidence,
     VerificationLayer as UpgradeVerificationLayer, VerificationLayerEvidence,
@@ -402,6 +402,15 @@ pub struct CompatibilityMatrixDefinition {
     pub rc_requires_final_artifacts: bool,
 }
 
+fn profile_supports_backend(profile: DeliveryProfile, backend: BackendKind) -> bool {
+    matches!(
+        (profile, backend),
+        (DeliveryProfile::DesktopWindows, BackendKind::Sqlite)
+            | (DeliveryProfile::NativeSystem, BackendKind::Postgres)
+            | (DeliveryProfile::ManagedCompose, BackendKind::Postgres)
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MatrixRun {
@@ -437,8 +446,15 @@ impl CompatibilityMatrixReport {
             DeliveryProfile::ManagedCompose,
             DeliveryProfile::DesktopWindows,
         ]);
-        if definition.pr_profiles.is_empty()
-            || definition.nightly_profiles.is_empty()
+        let server_profiles = BTreeSet::from([
+            DeliveryProfile::NativeSystem,
+            DeliveryProfile::ManagedCompose,
+        ]);
+        if !definition
+            .pr_profiles
+            .contains(&DeliveryProfile::DesktopWindows)
+            || definition.pr_profiles.is_disjoint(&server_profiles)
+            || definition.nightly_profiles != all_profiles
             || definition.rc_profiles != all_profiles
             || !definition.rc_requires_all_catalog_entries
             || !definition.rc_requires_final_artifacts
@@ -477,13 +493,15 @@ impl CompatibilityMatrixReport {
                 });
             }
         }
-        let expected_pairs = self
-            .selected_fixture_ids
+        let expected_pairs = catalog
+            .entries
             .iter()
-            .flat_map(|fixture| {
+            .filter(|entry| self.selected_fixture_ids.contains(&entry.fixture_id))
+            .flat_map(|entry| {
                 required_profiles
                     .iter()
-                    .map(move |profile| (*fixture, *profile))
+                    .filter(move |profile| profile_supports_backend(**profile, entry.backend))
+                    .map(move |profile| (entry.fixture_id, *profile))
             })
             .collect::<BTreeSet<_>>();
         let observed_pairs = self

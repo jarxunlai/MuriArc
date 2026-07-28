@@ -46,67 +46,76 @@ pub(super) async fn seed_into(
     fs::create_dir(root.join("data"))?;
 
     let store = SqliteStore::connect_path(&database).await?;
-    store.migrate().await?;
-    let migration_report = store.compatibility_report().await?;
-    let deployment = migration_report
-        .require_compatible()
-        .map_err(invalid)?
-        .clone();
-    let generation_id = deployment.generation_id;
-    write_json_atomic(
-        &root.join(GENERATION_MANIFEST_FILE),
-        &DeploymentGenerationManifest::from_state(&deployment),
-    )?;
+    let result = async {
+        store.migrate().await?;
+        let migration_report = store.compatibility_report().await?;
+        let deployment = migration_report
+            .require_compatible()
+            .map_err(invalid)?
+            .clone();
+        let generation_id = deployment.generation_id;
+        write_json_atomic(
+            &root.join(GENERATION_MANIFEST_FILE),
+            &DeploymentGenerationManifest::from_state(&deployment),
+        )?;
 
-    bootstrap_local_identity(&store, bundle.dataset.fixed_timeline.starts_at).await?;
-    let audit = AuditContext {
-        actor: Actor::human(LOCAL_USER_ID, LOCAL_OPERATOR_NAME),
-        source: WriteSource::Desktop,
-        request_id: Some(format!("standard-v1-{}", &bundle.dataset_sha256[..16])),
-        reason: Some("desktop-standard-v1-fixture".to_owned()),
-    };
-    let mut ids = FixtureIds::default();
-    seed_projects_and_cages(bundle, &store, &audit, &mut ids).await?;
-    seed_direct_animals(bundle, &store, &audit, &mut ids).await?;
-    seed_genetics_and_breeding(bundle, &store, &audit, &mut ids).await?;
-    seed_experiments(bundle, &store, &audit, &mut ids).await?;
-    seed_records(bundle, &store, &audit, &mut ids).await?;
-    seed_attachments(bundle, &store, &attachments, &audit, &mut ids).await?;
-    apply_terminal_states(bundle, &store, &audit, &ids).await?;
-    assert_id_counts(bundle, &ids)?;
+        bootstrap_local_identity(&store, bundle.dataset.fixed_timeline.starts_at).await?;
+        let audit = AuditContext {
+            actor: Actor::human(LOCAL_USER_ID, LOCAL_OPERATOR_NAME),
+            source: WriteSource::Desktop,
+            request_id: Some(format!("standard-v1-{}", &bundle.dataset_sha256[..16])),
+            reason: Some("desktop-standard-v1-fixture".to_owned()),
+        };
+        let mut ids = FixtureIds::default();
+        seed_projects_and_cages(bundle, &store, &audit, &mut ids).await?;
+        seed_direct_animals(bundle, &store, &audit, &mut ids).await?;
+        seed_genetics_and_breeding(bundle, &store, &audit, &mut ids).await?;
+        seed_experiments(bundle, &store, &audit, &mut ids).await?;
+        seed_records(bundle, &store, &audit, &mut ids).await?;
+        seed_attachments(bundle, &store, &attachments, &audit, &mut ids).await?;
+        apply_terminal_states(bundle, &store, &audit, &ids).await?;
+        assert_id_counts(bundle, &ids)?;
 
-    let report = store.compatibility_report().await?;
-    ensure(
-        report.is_compatible(),
-        format!(
-            "seeded database is not compatible: {}",
-            report
-                .issues
-                .iter()
-                .map(|issue| issue.code.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    )?;
-    let receipt = SeedReceipt {
-        schema_version: 1,
-        status: "PASS".to_owned(),
-        dataset_id: bundle.dataset.dataset_id.clone(),
-        dataset_version: bundle.manifest.dataset_version.clone(),
-        dataset_sha256: bundle.dataset_sha256.clone(),
-        manifest_sha256: bundle.manifest_sha256.clone(),
-        source_commit: source_commit.to_owned(),
-        application_version: deployment.identity.application_version.as_str().to_owned(),
-        data_epoch: deployment.identity.data_epoch.as_str().to_owned(),
-        backend: "sqlite".to_owned(),
-        generation_id,
-        expected_counts: bundle.dataset.expected_counts.clone(),
-        attachment_files: bundle.manifest.files.clone(),
-        ids,
-    };
-    write_json_atomic(&root.join(RECEIPT_FILE), &receipt)?;
-    verify::verify(bundle, root, source_commit).await?;
-    Ok(receipt)
+        let report = store.compatibility_report().await?;
+        ensure(
+            report.is_compatible(),
+            format!(
+                "seeded database is not compatible: {}",
+                report
+                    .issues
+                    .iter()
+                    .map(|issue| issue.code.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )?;
+        let receipt = SeedReceipt {
+            schema_version: 1,
+            status: "PASS".to_owned(),
+            dataset_id: bundle.dataset.dataset_id.clone(),
+            dataset_version: bundle.manifest.dataset_version.clone(),
+            dataset_sha256: bundle.dataset_sha256.clone(),
+            manifest_sha256: bundle.manifest_sha256.clone(),
+            source_commit: source_commit.to_owned(),
+            application_version: deployment.identity.application_version.as_str().to_owned(),
+            data_epoch: deployment.identity.data_epoch.as_str().to_owned(),
+            backend: "sqlite".to_owned(),
+            generation_id,
+            expected_counts: bundle.dataset.expected_counts.clone(),
+            attachment_files: bundle.manifest.files.clone(),
+            ids,
+        };
+        write_json_atomic(&root.join(RECEIPT_FILE), &receipt)?;
+        verify::verify(bundle, root, source_commit).await?;
+        Ok(receipt)
+    }
+    .await;
+    // Dropping SqlitePool closes connections in the background. Windows keeps
+    // the database file handle open long enough to make the caller's atomic
+    // staging-directory rename fail with ERROR_ACCESS_DENIED. Await the close
+    // on every return path instead of relying on asynchronous Drop cleanup.
+    store.pool().close().await;
+    result
 }
 
 async fn bootstrap_local_identity(store: &SqliteStore, now: DateTime<Utc>) -> FixtureResult<()> {

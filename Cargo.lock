@@ -2730,6 +2730,7 @@ dependencies = [
  "muriarc-data",
  "muriarc-importer",
  "muriarc-snapshot",
+ "muriarc-standard-fixture",
  "muriarc-store-sqlite",
  "muriarc-upgrade",
  "serde",
@@ -2829,6 +2830,23 @@ dependencies = [
  "thiserror 2.0.19",
  "uuid",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "muriarc-standard-fixture"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "muriarc-application",
+ "muriarc-core",
+ "muriarc-data",
+ "muriarc-store-sqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

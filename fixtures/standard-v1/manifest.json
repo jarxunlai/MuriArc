@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "datasetId": "muriarc-standard-v1",
+  "datasetVersion": "standard-v1",
+  "synthetic": true,
+  "fixedTimeline": true,
+  "publicApiOnly": true,
+  "baselinePolicy": "strict",
+  "sandboxPolicy": "preserve",
+  "expectedCounts": {
+    "projects": 3,
+    "cages": 10,
+    "animals": 24,
+    "genotypingRecords": 22,
+    "breedingLines": 1,
+    "colonies": 2,
+    "breedingPairs": 2,
+    "matingEvents": 1,
+    "litters": 1,
+    "animalDrafts": 7,
+    "registeredDrafts": 6,
+    "pendingDrafts": 1,
+    "templateVersions": 4,
+    "experiments": 3,
+    "cohorts": 5,
+    "participations": 20,
+    "procedures": 8,
+    "experimentEvents": 12,
+    "observationDefinitions": 6,
+    "observations": 24,
+    "observationRevisions": 4,
+    "measurements": 53,
+    "samples": 18,
+    "attachments": 7
+  },
+  "files": {
+    "animal-cage-card.png": "befe65039fcc686acac96db5ed264b3f2c5774606888df5cdec928701aad207c",
+    "body-weight.csv": "44a0549bfe4ede9272a766ec927ff68676561cc68c8d4ef658407c851f5f590d",
+    "histology-placeholder.png": "2f17325103911195b48090c966a0c8d5e74b37979f1924895c60058f5910b61d",
+    "measurement-instrument.json": "81f633ab16885ffd03db33993ca7c2172419483cad9e119bf9126f21bca38bb1",
+    "sample-manifest.json": "5e3c6d6e3c920a17ebb77faf67b51724b69d39ecc928f2f48beb46302608bb7b",
+    "study-protocol.md": "aa2b03a26d4bfc0f8c0d3b0322ad97c418f0ed55237e88eecd7d88ae10c01f75",
+    "study-summary.pdf": "6196461795ad5742b49b2bfe31593398ec4717d78e44d5e51c3207c444f00079"
+  },
+  "knownPublicApiLimits": [
+    "No public animal status transition endpoint exists for deceased, euthanized, lost or archived.",
+    "No public experiment activation endpoint exists; standard experiments use draft, completed and cancelled."
+  ]
+}

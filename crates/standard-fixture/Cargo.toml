@@ -1,0 +1,28 @@
+[package]
+name = "muriarc-standard-fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Strict synthetic standard-v1 fixture producer for MuriArc Desktop"
+
+[[bin]]
+name = "muriarc-standard-fixture"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+muriarc-application = { path = "../application" }
+muriarc-core = { path = "../core" }
+muriarc-data = { path = "../data" }
+muriarc-store-sqlite = { path = "../store-sqlite" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"

@@ -29,6 +29,7 @@ muriarc-core = { path = "../crates/core" }
 muriarc-data = { path = "../crates/data" }
 muriarc-importer = { path = "../crates/importer" }
 muriarc-store-sqlite = { path = "../crates/store-sqlite" }
+muriarc-standard-fixture = { path = "../crates/standard-fixture" }
 muriarc-upgrade = { path = "../crates/upgrade" }
 minisign-verify = "0.2.5"
 serde = { version = "1", features = ["derive"] }
@@ -40,6 +41,7 @@ tauri-plugin-dialog = "2.7.2"
 tauri-plugin-updater = "2.10.1"
 tempfile = "3.23.0"
 thiserror.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 zeroize = "1.9.0"
 
@@ -60,4 +62,3 @@ keyring = { version = "3.6.3", features = ["linux-native"] }
 
 [dev-dependencies]
 muriarc-snapshot = { path = "../crates/snapshot" }
-tokio.workspace = true

@@ -437,8 +437,11 @@ mod tests {
 
     use super::*;
 
+    static DRIVER_PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn protocol_accepts_only_exact_typed_success_response() {
+        let _driver_process_guard = DRIVER_PROCESS_TEST_LOCK.lock().unwrap();
         let temporary = tempdir().unwrap();
         let driver = temporary.path().join("driver.sh");
         fs::write(
@@ -475,6 +478,7 @@ mod tests {
 
     #[test]
     fn protocol_rejects_symlinked_or_schema_drifting_driver() {
+        let _driver_process_guard = DRIVER_PROCESS_TEST_LOCK.lock().unwrap();
         let temporary = tempdir().unwrap();
         let target = temporary.path().join("target.sh");
         fs::write(

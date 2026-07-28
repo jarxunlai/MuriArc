@@ -2920,6 +2920,8 @@ dependencies = [
  "async-trait",
  "muriarc-core",
  "muriarc-release-evidence",
+ "muriarc-store-postgres",
+ "muriarc-store-sqlite",
  "serde",
  "serde_json",
  "tokio",

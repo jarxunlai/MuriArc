@@ -24,6 +24,7 @@ enum OutputFormat {
 #[derive(Debug)]
 enum Command {
     Help,
+    Identity,
     Asset {
         root: PathBuf,
         manifest_digest: Option<Sha256Digest>,
@@ -150,6 +151,7 @@ async fn main() -> ExitCode {
 async fn dispatch(parsed: Parsed) -> Result<Value, EvidenceError> {
     match parsed.command {
         Command::Help => Ok(json!({ "usage": HELP })),
+        Command::Identity => compiled_release_identity(),
         Command::Asset {
             root,
             manifest_digest,
@@ -235,6 +237,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, Eviden
     }
     let command = match args.first().map(String::as_str) {
         None | Some("help" | "-h" | "--help") if args.len() <= 1 => Command::Help,
+        Some("identity") if args.len() == 1 => Command::Identity,
         Some("asset") => Command::Asset {
             root: required_path(&args, "--root")?,
             manifest_digest: optional_value(&args, "--manifest-digest")
@@ -259,6 +262,34 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Parsed, Eviden
         }
     };
     Ok(Parsed { output, command })
+}
+
+fn compiled_release_identity() -> Result<Value, EvidenceError> {
+    let sqlite = muriarc_store_sqlite::SqliteStore::compiled_release_identity();
+    let postgres = muriarc_store_postgres::PostgresStore::compiled_release_identity();
+    if sqlite.application_version != postgres.application_version
+        || sqlite.data_epoch != postgres.data_epoch
+        || sqlite.gateway_contract_revision != postgres.gateway_contract_revision
+    {
+        return Err(EvidenceError::InvalidReport {
+            message: "compiled SQLite and PostgreSQL release identities diverge".to_owned(),
+        });
+    }
+    Ok(json!({
+        "format_version": 1,
+        "application_version": sqlite.application_version,
+        "data_epoch": sqlite.data_epoch,
+        "gateway_contract_revision": sqlite.gateway_contract_revision,
+        "backend_states": {
+            "sqlite": sqlite.backend_state_digest,
+            "postgres": postgres.backend_state_digest,
+        },
+        "postgres_major": 17,
+        "bootstrap_protocol_revision": 1,
+        "controller_protocol_min": 1,
+        "controller_protocol_max": 1,
+        "migration_class": "M3",
+    }))
 }
 
 fn required_path(args: &[String], name: &str) -> Result<PathBuf, EvidenceError> {
@@ -369,6 +400,7 @@ const HELP: &str = "\
 MuriArc immutable compatibility verifier
 
 Usage:
+  muriarc-verifier identity
   muriarc-verifier asset --root <fixture-dir> [--manifest-digest sha256:...]
   muriarc-verifier run --request <run-request.json>
   muriarc-verifier report --report <verification-report.json>

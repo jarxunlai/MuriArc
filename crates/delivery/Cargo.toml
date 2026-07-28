@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Verified Native/systemd and Managed Compose delivery contracts for MuriArc"
 
 [dependencies]
+async-trait.workspace = true
 chrono.workspace = true
 muriarc-core = { path = "../core" }
 muriarc-upgrade = { path = "../upgrade" }

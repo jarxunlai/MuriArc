@@ -2703,6 +2703,7 @@ dependencies = [
 name = "muriarc-delivery"
 version = "1.0.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "muriarc-core",
  "muriarc-upgrade",
@@ -2955,10 +2956,12 @@ dependencies = [
 name = "muriarcctl"
 version = "1.0.0"
 dependencies = [
+ "chrono",
  "muriarc-delivery",
  "muriarc-upgrade",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "uuid",

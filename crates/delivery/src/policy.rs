@@ -142,6 +142,7 @@ impl DeliveryConfig {
 #[serde(deny_unknown_fields)]
 pub struct DeliveryCapabilities {
     pub service_control: bool,
+    pub physical_driver: bool,
     pub postgres_major: Option<u16>,
     pub backup_restore: bool,
     pub isolated_candidate_database: bool,
@@ -155,6 +156,7 @@ pub struct DeliveryCapabilities {
 impl DeliveryCapabilities {
     pub fn require_upgrade_ready(&self) -> Result<(), DeliveryError> {
         if self.service_control
+            && self.physical_driver
             && self.postgres_major.is_some_and(|major| major >= 17)
             && self.backup_restore
             && self.isolated_candidate_database
@@ -167,7 +169,7 @@ impl DeliveryCapabilities {
             Ok(())
         } else {
             Err(DeliveryError::Prerequisite(
-                "backup restore, isolated Candidate, PostgreSQL 17, signed bundle, DDL executor, verifier, and service control are all mandatory".to_owned(),
+                "physical Driver, backup restore, isolated Candidate, PostgreSQL 17, signed bundle, DDL executor, verifier, and service control are all mandatory".to_owned(),
             ))
         }
     }

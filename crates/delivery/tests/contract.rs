@@ -198,6 +198,7 @@ fn tracked_delivery_templates_satisfy_typed_policy() {
 fn byo_capabilities_fail_closed_when_candidate_or_restore_is_missing() {
     let mut capabilities = DeliveryCapabilities {
         service_control: true,
+        physical_driver: true,
         postgres_major: Some(17),
         backup_restore: true,
         isolated_candidate_database: true,

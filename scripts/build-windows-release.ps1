@@ -330,7 +330,7 @@ try {
             $PackageFiles = @(Get-ChildItem -LiteralPath $PackageRoot -Recurse -File | ForEach-Object {
                 [PSCustomObject]@{
                     File = $_
-                    Entry = $_.FullName.Substring($PackageRoot.Length + 1).Replace('', '/')
+                    Entry = $_.FullName.Substring($PackageRoot.Length + 1).Replace([char]92, [char]47)
                 }
             } | Sort-Object Entry)
             foreach ($PackageFile in $PackageFiles) {

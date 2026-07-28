@@ -71,6 +71,7 @@ class WindowsReleaseScriptTests(unittest.TestCase):
             "MuriArc-1.0.0-desktop-windows",
             "1980-01-01T00:00:00Z",
             "ZipArchiveMode]::Create",
+            "Replace([char]92, [char]47)",
             "Compare-Object -ReferenceObject $ExpectedEntries",
             "release_artifact_sha256=",
         ):

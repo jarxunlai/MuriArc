@@ -6,7 +6,9 @@ use std::{
 };
 
 use chrono::Utc;
-use muriarc_delivery::{DeliveryConfig, PhysicalDriverClient, load_delivery_config};
+use muriarc_delivery::{
+    DeliveryConfig, PhysicalDriverClient, load_delivery_config, load_install_state,
+};
 use muriarc_upgrade::{
     BackupEvidence, DeploymentProfile, RestoreEvidence, TrustedMetadataVersions, TufVerifier,
     UpgradeError, VerificationEvidence, VerifiedRelease, verify_target_artifact,
@@ -72,9 +74,25 @@ pub(crate) struct PruneResponse {
 
 pub(crate) fn control_context() -> Result<(DeliveryConfig, PhysicalDriverClient), UpgradeError> {
     let config = load_delivery_config(&state_root()).map_err(delivery_error)?;
-    let executable = required_control_file(PHYSICAL_DRIVER_ENV)?;
-    let driver = PhysicalDriverClient::new(executable, config.profile)?;
+    let driver = physical_driver_client(&config)?;
     Ok((config, driver))
+}
+
+pub(crate) fn physical_driver_client(
+    config: &DeliveryConfig,
+) -> Result<PhysicalDriverClient, UpgradeError> {
+    let executable = if env::var_os(PHYSICAL_DRIVER_ENV).is_some() {
+        required_control_file(PHYSICAL_DRIVER_ENV)?
+    } else {
+        load_install_state(config)
+            .map_err(delivery_error)?
+            .ok_or_else(|| UpgradeError::Prerequisite {
+                message: "install receipt is missing".to_owned(),
+            })?
+            .release_path
+            .join("bin/muriarc-physical-driver")
+    };
+    PhysicalDriverClient::new(executable, config.profile)
 }
 
 pub(crate) fn load_verified_release(

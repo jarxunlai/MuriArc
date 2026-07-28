@@ -50,6 +50,23 @@ Managed Compose 使用绝对 install root、digest-pinned image、宿主机 `ser
 
 PostgreSQL 不发布 host port；Server 只绑定 loopback。不同 generation/Candidate 使用不重叠的 PostgreSQL database 与 data path；Candidate 关闭外部 Provider、后台 Job 与真实用户写入。
 
+## Physical Driver 配置
+
+`muriarcctl` 默认从经 receipt 验证的不可变安装 bundle 加载 `bin/muriarc-physical-driver`。`MURIARCCTL_PHYSICAL_DRIVER` 仅用于受控测试，必须指向绝对路径、非 symlink 的控制文件；正式生产交付保持未设置并使用已安装 Driver。
+
+运行 `muriarcctl` 的宿主机必须提供 位于 `/usr/lib/postgresql/17/bin/pg_dump` 和 `/usr/lib/postgresql/17/bin/pg_restore` 的 PostgreSQL 17+ clients，并配置：
+
+| 变量 | 要求 |
+|---|---|
+| `MURIARCCTL_BACKUP_RECIPIENT_FILE` | age 加密 recipient 文件的绝对路径，文件必须非空。 |
+| `MURIARCCTL_BACKUP_IDENTITY_FILE` | 私有 age identity 的绝对路径；必须是非 symlink 文件且仅所有者可读写（`0600`）。 |
+| `MURIARCCTL_AGE_EXECUTABLE` | 可选的 age 可执行文件绝对路径；默认 `/usr/bin/age`。 |
+| `MURIARCCTL_PG_DUMP_EXECUTABLE` | 可选的 PostgreSQL 17+ `pg_dump` 绝对路径；默认 `/usr/lib/postgresql/17/bin/pg_dump`。 |
+| `MURIARCCTL_PG_RESTORE_EXECUTABLE` | 可选的 PostgreSQL 17+ `pg_restore` 绝对路径；默认 `/usr/lib/postgresql/17/bin/pg_restore`。 |
+| `MURIARCCTL_POSTGRES_ADMIN_URL` | 仅 Native/systemd：用于建立、clone 和删除隔离数据库的受保护 PostgreSQL admin URL。 |
+
+Managed Compose 同样要求宿主侧 PostgreSQL clients、age、recipient 与 identity；仅有 Compose 服务正在运行不能证明 backup/restore ready。`muriarcctl doctor` 只报告 readiness 布尔值，不输出这些路径或内容。admin URL 和私有 identity 必须放在 root 控制配置中；密码、identity、Token 或任何密钥材料不得复制到工单、对话、日志或 Git。
+
 ## 升级与维护窗口
 
 固定顺序为：签名 target 验证、三锁、preflight、drain、冻结 Write Lease、联合备份、实际隔离恢复、Candidate migration、七层验证、原子激活、只读启动验证、开放新 Write Lease。

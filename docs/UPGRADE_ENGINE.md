@@ -97,6 +97,12 @@ handoff on other platforms.
 Private signing keys, database URLs, passwords, tokens, cookies, API keys, and
 real recovery content never enter the Journal or Git.
 
+## Physical execution prerequisites
+
+The installed Server bundle contains the profile-aware `muriarc-physical-driver`; normal operation resolves it from the verified install receipt. Before any backup, upgrade, verification, or recovery command, `muriarcctl doctor` requires host `/usr/lib/postgresql/17/bin/pg_dump` and `/usr/lib/postgresql/17/bin/pg_restore`, an age executable (`MURIARCCTL_AGE_EXECUTABLE`, default `/usr/bin/age`), `MURIARCCTL_BACKUP_RECIPIENT_FILE`, and the owner-only `MURIARCCTL_BACKUP_IDENTITY_FILE`. Native/systemd also requires the protected `MURIARCCTL_POSTGRES_ADMIN_URL`. Compose service activity is not a substitute for these host capabilities.
+
+These variables carry paths or protected connection material. Doctor exposes only readiness, and public diagnostics suppress command output. Operators inspect and provision the files locally; private identity, password, Token, Session, CSRF, or key content must never be pasted into chat or committed.
+
 ## CLI surface
 
     muriarcctl install --profile native-system|managed-compose

@@ -114,6 +114,7 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
     cloudflare = real_directory(args.deploy_root / "cloudflare-public", "Cloudflare deploy directory")
     common = [
         InputFile(regular_file(args.controller, "controller"), PurePosixPath("bin/muriarcctl"), "controller", True),
+        InputFile(regular_file(args.physical_driver, "physical driver"), PurePosixPath("bin/muriarc-physical-driver"), "physical_driver", True),
         InputFile(
             regular_file(args.upgrade_executor, "upgrade executor"),
             PurePosixPath("bin/muriarc-upgrade-executor"),
@@ -241,6 +242,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--version", required=True)
     result.add_argument("--output", required=True, type=Path)
     result.add_argument("--controller", required=True, type=Path)
+    result.add_argument("--physical-driver", required=True, type=Path)
     result.add_argument("--upgrade-executor", required=True, type=Path)
     result.add_argument("--verifier", required=True, type=Path)
     result.add_argument("--deploy-root", type=Path, default=Path("deploy"))

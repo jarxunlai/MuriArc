@@ -2768,6 +2768,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "muriarc-physical-driver"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "flate2",
+ "fs2",
+ "muriarc-core",
+ "muriarc-delivery",
+ "muriarc-store-postgres",
+ "muriarc-upgrade",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tar",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "muriarc-release-evidence"
 version = "1.0.0"
 dependencies = [

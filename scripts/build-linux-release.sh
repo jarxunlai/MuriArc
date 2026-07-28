@@ -144,6 +144,7 @@ cargo build --locked --release \
   -p muriarc-verifier \
   -p muriarc-release-fixture \
   -p muriarcctl \
+  -p muriarc-physical-driver \
   --features muriarc-server/postgres,muriarc-release-fixture/postgres
 
 native_root="$staging/native-system"
@@ -153,6 +154,7 @@ python3 scripts/build_server_bundle.py \
   --output "$native_root" \
   --server "$CARGO_TARGET_DIR/release/muriarc-server" \
   --controller "$CARGO_TARGET_DIR/release/muriarcctl" \
+  --physical-driver "$CARGO_TARGET_DIR/release/muriarc-physical-driver" \
   --upgrade-executor "$CARGO_TARGET_DIR/release/muriarc-upgrade-executor" \
   --verifier "$CARGO_TARGET_DIR/release/muriarc-verifier" \
   --fixture-producer "$CARGO_TARGET_DIR/release/muriarc-release-fixture" \
@@ -259,6 +261,7 @@ python3 scripts/build_server_bundle.py \
   --version 1.0.0 \
   --output "$managed_root" \
   --controller "$CARGO_TARGET_DIR/release/muriarcctl" \
+  --physical-driver "$CARGO_TARGET_DIR/release/muriarc-physical-driver" \
   --upgrade-executor "$CARGO_TARGET_DIR/release/muriarc-upgrade-executor" \
   --verifier "$CARGO_TARGET_DIR/release/muriarc-verifier" \
   --deploy-root "$repo_root/deploy" \

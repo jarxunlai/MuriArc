@@ -1,0 +1,36 @@
+[package]
+name = "muriarc-physical-driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Physical Native/systemd and Managed Compose upgrade side-effect driver"
+
+[[bin]]
+name = "muriarc-physical-driver"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+chrono.workspace = true
+flate2 = "1.1.9"
+fs2 = "0.4.3"
+muriarc-core = { path = "../core" }
+muriarc-delivery = { path = "../delivery" }
+muriarc-store-postgres = { path = "../store-postgres" }
+muriarc-upgrade = { path = "../upgrade" }
+percent-encoding = "2.3.2"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+sqlx = { workspace = true, features = ["postgres"] }
+tar = "0.4.46"
+tokio = { workspace = true, features = ["process", "time"] }
+url = "2.5.8"
+uuid.workspace = true
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

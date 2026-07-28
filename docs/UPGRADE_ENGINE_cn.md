@@ -65,6 +65,12 @@ Trust client 验证 TUF Root/Timestamp/Snapshot/Targets chain，包括 Ed25519 t
 
 私钥、数据库 URL、密码、Token、Cookie、API Key 和真实恢复内容永不进入 Journal 或 Git。
 
+## 物理执行前置条件
+
+已安装 Server bundle 包含按 Profile 工作的 `muriarc-physical-driver`，正常运行时从已验证 install receipt 解析该 Driver。任何 backup、upgrade、verify 或 recovery 命令前，`muriarcctl doctor` 都要求宿主机提供 PostgreSQL 17+ clients（可用 `MURIARCCTL_PG_DUMP_EXECUTABLE` / `MURIARCCTL_PG_RESTORE_EXECUTABLE` 覆盖默认 `/usr/lib/postgresql/17/bin` 路径）、age 可执行文件（`MURIARCCTL_AGE_EXECUTABLE`，默认 `/usr/bin/age`）、`MURIARCCTL_BACKUP_RECIPIENT_FILE` 和仅所有者可访问的 `MURIARCCTL_BACKUP_IDENTITY_FILE`。Native/systemd 还必须设置受保护的 `MURIARCCTL_POSTGRES_ADMIN_URL`；Compose 服务 active 不能替代这些宿主能力。
+
+这些变量携带路径或受保护连接信息。Doctor 只输出 readiness，公共诊断抑制命令输出。操作者只能在本机检查和配置文件；私有 identity、密码、Token、Session、CSRF 或密钥内容不得粘贴到对话，也不得提交到 Git。
+
 ## CLI surface
 
 ```text

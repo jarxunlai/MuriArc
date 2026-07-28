@@ -39,6 +39,8 @@ class ServerBundleBuilderTests(unittest.TestCase):
                 str(values["server"]),
                 "--controller",
                 str(values["controller"]),
+                "--physical-driver",
+                str(values["controller"]),
                 "--upgrade-executor",
                 str(values["executor"]),
                 "--verifier",
@@ -69,6 +71,7 @@ class ServerBundleBuilderTests(unittest.TestCase):
             paths = {item["path"] for item in manifest["files"]}
             self.assertIn("bin/muriarc-server", paths)
             self.assertIn("bin/muriarcctl", paths)
+            self.assertIn("bin/muriarc-physical-driver", paths)
             self.assertIn("bin/muriarc-release-fixture", paths)
             self.assertNotIn("release/release-manifest.json", paths)
             self.assertIn("ui/index.html", paths)
@@ -106,6 +109,8 @@ class ServerBundleBuilderTests(unittest.TestCase):
                 "--output",
                 str(output),
                 "--controller",
+                str(values["controller"]),
+                "--physical-driver",
                 str(values["controller"]),
                 "--upgrade-executor",
                 str(values["executor"]),
@@ -168,6 +173,8 @@ class ServerBundleBuilderTests(unittest.TestCase):
                     "--server",
                     str(values["server"]),
                     "--controller",
+                    str(values["controller"]),
+                    "--physical-driver",
                     str(values["controller"]),
                     "--upgrade-executor",
                     str(values["executor"]),

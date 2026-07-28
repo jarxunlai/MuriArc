@@ -13,16 +13,15 @@ use std::{
 
 use cli::{CommandResponse, CtlCommand, HELP, OutputFormat, ParsedCommand, parse_args};
 use formal::{
-    OperationSelection, PHYSICAL_DRIVER_ENV, PruneResponse, ReadOnlyVerificationResponse,
-    RestoreOperationResponse, VerifiedBackupResponse, control_context, load_verified_release,
+    OperationSelection, PruneResponse, ReadOnlyVerificationResponse, RestoreOperationResponse,
+    VerifiedBackupResponse, control_context, load_verified_release, physical_driver_client,
     valid_digest,
 };
 use muriarc_delivery::{
     CommandRunner, CommandSpec, DELIVERY_CONFIG_FORMAT, DeliveryCapabilities, DeliveryConfig,
-    DeliveryError, DeliveryPaths, PhysicalDriverClient, ProcessCommandRunner,
-    ServerServiceController, VerifiedServerBundle, install_server_bundle, load_delivery_config,
-    load_install_state, validate_compose_policy, validate_digest_pinned_image,
-    verify_server_bundle,
+    DeliveryError, DeliveryPaths, ProcessCommandRunner, ServerServiceController,
+    VerifiedServerBundle, install_server_bundle, load_delivery_config, load_install_state,
+    validate_compose_policy, validate_digest_pinned_image, verify_server_bundle,
 };
 use muriarc_upgrade::{
     ActiveGeneration, BackupEvidence, DeploymentProfile, HostUpgradeLock, RecoveryPointCatalog,
@@ -623,9 +622,7 @@ async fn doctor() -> Result<Value, DeliveryError> {
         DeploymentProfile::ManagedCompose => program_available("/usr/bin/docker"),
         DeploymentProfile::Desktop => false,
     };
-    let physical_driver = env::var_os(PHYSICAL_DRIVER_ENV).is_some_and(|value| {
-        PhysicalDriverClient::new(PathBuf::from(value), config.profile).is_ok()
-    });
+    let physical_driver = physical_driver_client(&config).is_ok();
     let service_active = if service_control && environment_ready {
         ServerServiceController::new(config.clone(), ProcessCommandRunner)
             .and_then(|controller| controller.is_active())
@@ -639,20 +636,36 @@ async fn doctor() -> Result<Value, DeliveryError> {
     let verifier = receipt.release_path.join("bin/muriarc-verifier");
     let isolated_storage = directory_available(&config.paths.data_root)
         && directory_available(&config.paths.control_root);
-    let backup_restore = match config.profile {
-        DeploymentProfile::NativeSystem => [
-            "/usr/bin/pg_dump",
-            "/usr/bin/pg_restore",
-            "/usr/bin/createdb",
-            "/usr/bin/dropdb",
-        ]
-        .iter()
-        .all(|program| program_available(program)),
-        DeploymentProfile::ManagedCompose => service_control && service_active,
-        DeploymentProfile::Desktop => false,
-    };
+    let postgres_client_tools = [
+        (
+            "MURIARCCTL_PG_DUMP_EXECUTABLE",
+            "/usr/lib/postgresql/17/bin/pg_dump",
+        ),
+        (
+            "MURIARCCTL_PG_RESTORE_EXECUTABLE",
+            "/usr/lib/postgresql/17/bin/pg_restore",
+        ),
+    ]
+    .iter()
+    .all(|(name, default)| configured_program_available(name, Path::new(default), 17));
+    let age_executable =
+        configured_executable("MURIARCCTL_AGE_EXECUTABLE", Path::new("/usr/bin/age"));
+    let backup_recipient = configured_control_file("MURIARCCTL_BACKUP_RECIPIENT_FILE", false);
+    let backup_identity = configured_control_file("MURIARCCTL_BACKUP_IDENTITY_FILE", true);
+    let recovery_material_ready =
+        age_executable && backup_recipient && backup_identity && postgres_client_tools;
+    let backup_restore = recovery_material_ready
+        && match config.profile {
+            DeploymentProfile::NativeSystem => true,
+            DeploymentProfile::ManagedCompose => {
+                service_control && service_active && postgres_major == Some(17)
+            }
+            DeploymentProfile::Desktop => false,
+        };
+    let postgres_admin_url =
+        env::var("MURIARCCTL_POSTGRES_ADMIN_URL").is_ok_and(|value| !value.trim().is_empty());
     let candidate_database = match config.profile {
-        DeploymentProfile::NativeSystem => env::var_os("MURIARCCTL_POSTGRES_ADMIN_URL").is_some(),
+        DeploymentProfile::NativeSystem => postgres_admin_url,
         DeploymentProfile::ManagedCompose => service_active && postgres_major == Some(17),
         DeploymentProfile::Desktop => false,
     };
@@ -672,8 +685,23 @@ async fn doctor() -> Result<Value, DeliveryError> {
     if postgres_major != Some(17) {
         unavailable.insert("PostgreSQL 17 could not be verified".to_owned());
     }
+    if !postgres_client_tools {
+        unavailable.insert("PostgreSQL dump/restore clients are unavailable".to_owned());
+    }
+    if !age_executable {
+        unavailable.insert("age backup encryption executable is unavailable".to_owned());
+    }
+    if !backup_recipient {
+        unavailable.insert("backup encryption recipient file is unavailable".to_owned());
+    }
+    if !backup_identity {
+        unavailable.insert("private backup decryption identity file is unavailable".to_owned());
+    }
     if !backup_restore {
-        unavailable.insert("backup/restore tooling is unavailable".to_owned());
+        unavailable.insert("physical backup/restore prerequisites are incomplete".to_owned());
+    }
+    if config.profile == DeploymentProfile::NativeSystem && !postgres_admin_url {
+        unavailable.insert("Native PostgreSQL admin URL is unavailable".to_owned());
     }
     if !candidate_database {
         unavailable.insert("isolated Candidate database capability is unavailable".to_owned());
@@ -702,6 +730,13 @@ async fn doctor() -> Result<Value, DeliveryError> {
         "currentReleaseMatchesReceipt": current_matches,
         "environmentReady": environment_ready,
         "serviceActive": service_active,
+        "physicalPrerequisites": {
+            "postgresClientTools": postgres_client_tools,
+            "ageExecutable": age_executable,
+            "backupRecipient": backup_recipient,
+            "backupIdentity": backup_identity,
+            "nativePostgresAdminUrl": config.profile != DeploymentProfile::NativeSystem || postgres_admin_url,
+        },
         "capabilities": capabilities,
         "note": "doctor proves prerequisites only; every upgrade still performs a fresh backup and an actual isolated restore",
     }))
@@ -1025,6 +1060,78 @@ fn executable_file(path: &Path) -> bool {
     }
 }
 
+fn configured_program_available(name: &str, default: &Path, minimum_major: u16) -> bool {
+    let path = env::var_os(name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default.to_path_buf());
+    path.is_absolute()
+        && strict_executable_file(&path)
+        && executable_major_version(&path).is_some_and(|major| major >= minimum_major)
+}
+
+fn configured_executable(name: &str, default: &Path) -> bool {
+    let path = env::var_os(name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default.to_path_buf());
+    path.is_absolute() && strict_executable_file(&path)
+}
+
+fn executable_major_version(path: &Path) -> Option<u16> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .split_whitespace()
+        .find_map(|part| part.split('.').next()?.parse::<u16>().ok())
+}
+
+fn strict_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn configured_control_file(name: &str, owner_only: bool) -> bool {
+    let Some(path) = env::var_os(name).map(PathBuf::from) else {
+        return false;
+    };
+    control_file_available(&path, owner_only)
+}
+
+fn control_file_available(path: &Path, owner_only: bool) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn directory_available(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
@@ -1082,6 +1189,13 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn strict_executable_rejects_symlink_and_non_version_output() {
+        let shell = Path::new("/bin/sh");
+        assert!(!strict_executable_file(shell));
+        assert_eq!(executable_major_version(shell), None);
     }
 
     #[test]

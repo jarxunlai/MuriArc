@@ -19,6 +19,10 @@ fn native_bundle(root: &Path) -> ServerBundleManifest {
         ("bin/muriarc-server", BundleFileRole::Server),
         ("bin/muriarcctl", BundleFileRole::Controller),
         (
+            "bin/muriarc-physical-driver",
+            BundleFileRole::PhysicalDriver,
+        ),
+        (
             "bin/muriarc-upgrade-executor",
             BundleFileRole::UpgradeExecutor,
         ),
@@ -70,6 +74,10 @@ fn managed_bundle(root: &Path) -> ServerBundleManifest {
     let files = [
         ("bin/muriarcctl", BundleFileRole::Controller),
         (
+            "bin/muriarc-physical-driver",
+            BundleFileRole::PhysicalDriver,
+        ),
+        (
             "bin/muriarc-upgrade-executor",
             BundleFileRole::UpgradeExecutor,
         ),
@@ -113,7 +121,7 @@ fn bundle_verifier_rejects_tamper_extra_and_traversal() {
     let manifest = native_bundle(root.path());
     let (_, verified) =
         verify_server_bundle(root.path(), Some(&manifest.digest().unwrap())).unwrap();
-    assert_eq!(verified.file_count, 11);
+    assert_eq!(verified.file_count, 12);
 
     fs::write(root.path().join("extra"), b"not registered").unwrap();
     assert!(verify_server_bundle(root.path(), None).is_err());

@@ -1,0 +1,334 @@
+name: Server Docker Tester
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: server-docker-tester-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  SERVER_REPOSITORY: ghcr.io/jarxunlai/muriarc-server-tester
+  POSTGRES_IMAGE: postgres:17-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a36bd2ee7d8ca6f2ccd4c800f047b394
+  SYFT_VERSION: 1.49.0
+  GRYPE_VERSION: 0.116.0
+
+jobs:
+  build-test-promote:
+    name: Build, E2E, scan, and promote digest
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      image: ${{ steps.identity.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+      release_tag: ${{ steps.identity.outputs.release_tag }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Prove canonical main source
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF}" == refs/heads/main ]]
+          [[ "${GITHUB_REPOSITORY}" == jarxunlai/MuriArc ]]
+          [[ "$(git remote get-url origin | sed -E 's#[.]git$##')" == https://github.com/jarxunlai/MuriArc ]]
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          head=$(git rev-parse HEAD)
+          [[ "$head" == "$(git rev-parse origin/main)" ]]
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+          short=${head:0:12}
+          echo "source_commit=$head" >> "$GITHUB_OUTPUT"
+          echo "image=${SERVER_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "candidate_tag=candidate-$head" >> "$GITHUB_OUTPUT"
+          echo "version_tag=v1.0.0-standard-v1-$short" >> "$GITHUB_OUTPUT"
+          echo "release_tag=server-tester-v1.0.0-standard-v1-$short" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/amd64 candidate
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: tester-runtime
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.identity.outputs.image }}:${{ steps.identity.outputs.candidate_tag }}
+          build-args: |
+            MURIARC_IMAGE_SOURCE=https://github.com/jarxunlai/MuriArc
+            MURIARC_IMAGE_REVISION=${{ steps.identity.outputs.source_commit }}
+            MURIARC_IMAGE_VERSION=1.0.0-server-tester-${{ steps.identity.outputs.source_commit }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/jarxunlai/MuriArc
+            org.opencontainers.image.revision=${{ steps.identity.outputs.source_commit }}
+            org.opencontainers.image.version=1.0.0-server-tester-${{ steps.identity.outputs.source_commit }}
+            org.opencontainers.image.licenses=Apache-2.0
+          provenance: mode=max
+          sbom: false
+          cache-from: type=gha,scope=server-tester
+          cache-to: type=gha,mode=max,scope=server-tester
+
+      - name: Validate candidate digest and labels
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          ref="${SERVER_REPOSITORY}@${IMAGE_DIGEST}"
+          docker buildx imagetools inspect "$ref" >/dev/null
+          docker pull --platform linux/amd64 "$ref"
+          test "$(docker image inspect "$ref" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = \
+            "${{ steps.identity.outputs.source_commit }}"
+          test "$(docker image inspect "$ref" --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}')" = Apache-2.0
+
+      - name: Static Tester contracts
+        run: |
+          python3 scripts/check_server_tester.py
+          python3 -m unittest scripts.tests.test_server_tester_bundle
+          shellcheck deploy/server-tester/muriarc-tester.sh scripts/test_server_tester_e2e.sh
+
+      - name: Build digest-pinned Compose ZIP
+        id: bundle
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          dist="${RUNNER_TEMP}/server-tester-dist"
+          mkdir -p "$dist"
+          python3 scripts/build_server_tester_bundle.py \
+            --expected-commit "${{ steps.identity.outputs.source_commit }}" \
+            --server-image "${SERVER_REPOSITORY}@${IMAGE_DIGEST}" \
+            --postgres-image "${POSTGRES_IMAGE}" \
+            --output-directory "$dist" > "${RUNNER_TEMP}/bundle-output.json"
+          python3 scripts/check_server_tester.py \
+            --bundle "$(find "$dist" -maxdepth 1 -type f -name '*.zip' -print -quit)" \
+            --report "$dist/server-tester-sensitive-scan.json"
+          echo "dist=$dist" >> "$GITHUB_OUTPUT"
+
+      - name: Empty database Compose E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/e2e-empty"
+          mkdir -p "$root"
+          python3 -m zipfile -e "$(find '${{ steps.bundle.outputs.dist }}' -maxdepth 1 -type f -name '*.zip' -print -quit)" "$root"
+          bundle=$(find "$root" -mindepth 1 -maxdepth 1 -type d -print -quit)
+          chmod 0755 "$bundle/muriarc-tester.sh"
+          scripts/test_server_tester_e2e.sh --bundle-dir "$bundle" --mode empty --cleanup
+
+      - name: standard-v1 demo Compose E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${RUNNER_TEMP}/e2e-demo"
+          mkdir -p "$root"
+          python3 -m zipfile -e "$(find '${{ steps.bundle.outputs.dist }}' -maxdepth 1 -type f -name '*.zip' -print -quit)" "$root"
+          bundle=$(find "$root" -mindepth 1 -maxdepth 1 -type d -print -quit)
+          chmod 0755 "$bundle/muriarc-tester.sh"
+          scripts/test_server_tester_e2e.sh --bundle-dir "$bundle" --mode demo --cleanup
+
+      - name: Install fixed Syft and Grype
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools="${RUNNER_TEMP}/tester-tools"
+          mkdir -p "$tools"
+          syft_archive="syft_${SYFT_VERSION}_linux_amd64.tar.gz"
+          grype_archive="grype_${GRYPE_VERSION}_linux_amd64.tar.gz"
+          curl --fail --silent --show-error --location \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/${syft_archive}" -o "$tools/$syft_archive"
+          curl --fail --silent --show-error --location \
+            "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_checksums.txt" -o "$tools/syft-checksums.txt"
+          (cd "$tools" && grep "  ${syft_archive}$" syft-checksums.txt | sha256sum --check)
+          curl --fail --silent --show-error --location \
+            "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/${grype_archive}" -o "$tools/$grype_archive"
+          curl --fail --silent --show-error --location \
+            "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_checksums.txt" -o "$tools/grype-checksums.txt"
+          (cd "$tools" && grep "  ${grype_archive}$" grype-checksums.txt | sha256sum --check)
+          tar -C "$tools" -xzf "$tools/$syft_archive" syft
+          tar -C "$tools" -xzf "$tools/$grype_archive" grype
+          chmod 0755 "$tools/syft" "$tools/grype"
+          echo "$tools" >> "$GITHUB_PATH"
+
+      - name: Generate SBOM and block High/Critical vulnerabilities
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          dist="${{ steps.bundle.outputs.dist }}"
+          image="${SERVER_REPOSITORY}@${IMAGE_DIGEST}"
+          syft version
+          grype version
+          syft "$image" --output "cyclonedx-json=$dist/server-tester.sbom.cdx.json"
+          grype "sbom:$dist/server-tester.sbom.cdx.json" --fail-on high --output json \
+            > "$dist/server-tester.grype.json"
+          python3 - "$dist/server-tester.grype.json" <<'PY'
+          import json, sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          counts = {key: 0 for key in ("High", "Critical")}
+          for match in value.get("matches", []):
+              severity = match.get("vulnerability", {}).get("severity")
+              if severity in counts:
+                  counts[severity] += 1
+          if any(counts.values()):
+              raise SystemExit(f"High/Critical vulnerabilities block publication: {counts}")
+          print(json.dumps({"status": "PASS", "counts": counts}, sort_keys=True))
+          PY
+
+      - name: Promote the tested digest without latest
+        shell: bash
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          source="${SERVER_REPOSITORY}@${IMAGE_DIGEST}"
+          target="${SERVER_REPOSITORY}:${{ steps.identity.outputs.version_tag }}"
+          docker buildx imagetools create --tag "$target" "$source"
+          promoted=$(docker buildx imagetools inspect "$target" --format '{{.Manifest.Digest}}')
+          [[ "$promoted" == "$IMAGE_DIGEST" ]] || {
+            echo "version tag did not preserve the candidate digest: $promoted != $IMAGE_DIGEST" >&2
+            exit 1
+          }
+          ! docker buildx imagetools inspect "${SERVER_REPOSITORY}:latest" >/dev/null 2>&1 \
+            || { echo 'floating latest tag is forbidden' >&2; exit 1; }
+
+      - name: Upload publication inputs and evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-tester-${{ steps.identity.outputs.source_commit }}
+          path: ${{ steps.bundle.outputs.dist }}/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: docker ps --all && docker volume ls
+
+  publish-prerelease:
+    name: Anonymous GHCR gate and prerelease
+    needs: build-test-promote
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: server-tester-publication
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.build-test-promote.outputs.source_commit }}
+          fetch-depth: 1
+      - uses: docker/setup-buildx-action@v3
+      - name: Prove GHCR package is anonymously public
+        shell: bash
+        env:
+          IMAGE: ${{ needs.build-test-promote.outputs.image }}
+          DIGEST: ${{ needs.build-test-promote.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker logout ghcr.io >/dev/null 2>&1 || true
+          rm -f "${HOME}/.docker/config.json"
+          docker buildx imagetools inspect "${IMAGE}@${DIGEST}" >/dev/null
+          docker pull --platform linux/amd64 "${IMAGE}@${DIGEST}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-tester-${{ needs.build-test-promote.outputs.source_commit }}
+          path: ${{ runner.temp }}/server-tester-dist
+      - name: Verify assets before release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_COMMIT: ${{ needs.build-test-promote.outputs.source_commit }}
+          EXPECTED_DIGEST: ${{ needs.build-test-promote.outputs.digest }}
+          EXPECTED_TAG: ${{ needs.build-test-promote.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          dist="${RUNNER_TEMP}/server-tester-dist"
+          archive=$(find "$dist" -maxdepth 1 -type f -name '*.zip' -print -quit)
+          checksum=$(find "$dist" -maxdepth 1 -type f -name '*.zip.sha256' -print -quit)
+          manifest=$(find "$dist" -maxdepth 1 -type f -name '*.zip.manifest.json' -print -quit)
+          [[ -n "$archive" && -n "$checksum" && -n "$manifest" ]]
+          (cd "$dist" && sha256sum --check "$(basename "$checksum")")
+          python3 - "$manifest" <<'PY'
+          import json, os, sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert value["source"]["commit"] == os.environ["EXPECTED_COMMIT"]
+          assert value["images"]["server"]["digest"] == os.environ["EXPECTED_DIGEST"]
+          assert value["releaseTag"] == os.environ["EXPECTED_TAG"]
+          assert value["formalRelease"] is False and value["formalRcEvidence"] is False
+          PY
+          if gh release view "$EXPECTED_TAG" >/dev/null 2>&1; then
+            echo "Release already exists: $EXPECTED_TAG" >&2
+            exit 1
+          fi
+          echo "archive=$archive" >> "$GITHUB_ENV"
+          echo "checksum=$checksum" >> "$GITHUB_ENV"
+          echo "manifest=$manifest" >> "$GITHUB_ENV"
+      - name: Create Server Tester prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build-test-promote.outputs.release_tag }}
+          COMMIT: ${{ needs.build-test-promote.outputs.source_commit }}
+          IMAGE: ${{ needs.build-test-promote.outputs.image }}
+          DIGEST: ${{ needs.build-test-promote.outputs.digest }}
+        run: |
+          set -euo pipefail
+          notes="${RUNNER_TEMP}/server-tester-release.md"
+          cat > "$notes" <<EOF_NOTES
+          ## MuriArc Server Docker Tester
+
+          **unsigned / synthetic-capable / not for production / not formal RC evidence**
+
+          Linux amd64 only. The default initialization is an empty database; \`init-demo\` explicitly loads the synthetic standard-v1 fixture into brand-new volumes. Use only on a trusted local machine, LAN, or VPN. This is not the signed formal Server bundle and must not be exposed directly to the Internet.
+
+          Image: \`${IMAGE}@${DIGEST}\`
+
+          Read [Configuration](https://github.com/jarxunlai/MuriArc/blob/${COMMIT}/docs/CONFIGURATION.md) before use.
+
+          ---
+
+          **未签名 / 可选合成数据 / 非生产用途 / 不构成正式 RC 证据**
+
+          仅支持 Linux amd64（Windows x64 可通过 Docker Desktop Linux containers 使用）。默认初始化为空库；只有显式执行 \`init-demo\` 才会把 standard-v1 合成数据写入全新 volumes。仅限可信本机、局域网或 VPN；禁止直接暴露公网，也不能替代签名正式 Server 交付。
+
+          使用前请阅读[中文配置指南](https://github.com/jarxunlai/MuriArc/blob/${COMMIT}/docs/CONFIGURATION_cn.md)。
+          EOF_NOTES
+          gh release create "$TAG" --target "$COMMIT" --prerelease \
+            --title "MuriArc Server Docker Tester ${COMMIT:0:12}" \
+            --notes-file "$notes" "$archive" "$checksum" "$manifest"
+      - name: Verify published prerelease and assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build-test-promote.outputs.release_tag }}
+          COMMIT: ${{ needs.build-test-promote.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "${RUNNER_TEMP}/release.json"
+          python3 - "${RUNNER_TEMP}/release.json" <<'PY'
+          import json, os, sys
+          value = json.load(open(sys.argv[1], encoding="utf-8"))
+          assert value["prerelease"] is True and value["draft"] is False
+          names = sorted(item["name"] for item in value["assets"])
+          assert len(names) == 3, names
+          assert sum(name.endswith(".zip") for name in names) == 1
+          assert sum(name.endswith(".zip.sha256") for name in names) == 1
+          assert sum(name.endswith(".zip.manifest.json") for name in names) == 1
+          PY
+          git fetch --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          [[ "$(git rev-list -n 1 "$TAG")" == "$COMMIT" ]]

@@ -1,0 +1,107 @@
+name: ${MURIARC_COMPOSE_PROJECT_NAME:-muriarc-server-tester}
+
+services:
+  db:
+    image: @@POSTGRES_IMAGE@@
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${MURIARC_POSTGRES_DB:-muriarc}
+      POSTGRES_USER: ${MURIARC_POSTGRES_USER:-muriarc}
+      POSTGRES_PASSWORD: ${MURIARC_POSTGRES_PASSWORD:?set MURIARC_POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+
+  server:
+    image: @@SERVER_IMAGE@@
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MURIARC_DATABASE_URL: postgresql://${MURIARC_POSTGRES_USER:-muriarc}:${MURIARC_POSTGRES_PASSWORD:?set MURIARC_POSTGRES_PASSWORD}@db:5432/${MURIARC_POSTGRES_DB:-muriarc}
+      MURIARC_BIND_ADDR: 0.0.0.0:8787
+      MURIARC_UI_DIR: /opt/muriarc/ui
+      MURIARC_DATA_ROOT: ${MURIARC_DATA_ROOT:?set MURIARC_DATA_ROOT}
+      MURIARC_ATTACHMENT_ROOT: ${MURIARC_ATTACHMENT_ROOT:?set MURIARC_ATTACHMENT_ROOT}
+      MURIARC_PREVIEW_BOOTSTRAP: "false"
+      MURIARC_ACTIVATION_MODE: read-write
+      MURIARC_LAB_ID: ${MURIARC_LAB_ID:?set MURIARC_LAB_ID}
+      MURIARC_LAB_NAME: ${MURIARC_LAB_NAME:?set MURIARC_LAB_NAME}
+      MURIARC_ROOT_USER_ID: ${MURIARC_ROOT_USER_ID:?set MURIARC_ROOT_USER_ID}
+      MURIARC_ROOT_USER_EMAIL: ${MURIARC_ROOT_USER_EMAIL:?set MURIARC_ROOT_USER_EMAIL}
+      MURIARC_ROOT_USER_NAME: ${MURIARC_ROOT_USER_NAME:?set MURIARC_ROOT_USER_NAME}
+      MURIARC_ROOT_PASSWORD: ${MURIARC_ROOT_PASSWORD:?set MURIARC_ROOT_PASSWORD}
+      MURIARC_SESSION_COOKIE_SECURE: ${MURIARC_SESSION_COOKIE_SECURE:-false}
+      MURIARC_SESSION_TTL_HOURS: ${MURIARC_SESSION_TTL_HOURS:-12}
+      MURIARC_DEPLOYMENT_PROFILE: private
+      MURIARC_EXTERNAL_API_ENABLED: "false"
+      MURIARC_AI_MASTER_KEY_FILE: ${MURIARC_AI_MASTER_KEY_FILE:?set MURIARC_AI_MASTER_KEY_FILE}
+      MURIARC_AI_MASTER_KEY_VERSION: "1"
+      MURIARC_BOOTSTRAP_TOKEN: ""
+      MURIARC_BOOTSTRAP_MCP_TOKEN: ""
+      MURIARC_MCP_ALLOWED_ORIGINS: ""
+      RUST_LOG: ${RUST_LOG:-muriarc_server=info,tower_http=info}
+    ports:
+      - "127.0.0.1:${MURIARC_TESTER_SERVER_PORT:-8787}:8787"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://127.0.0.1:8787/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+    read_only: true
+    volumes:
+      - server_data:/var/lib/muriarc
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 30s
+    networks: [backend, edge]
+
+  seed-standard-v1:
+    image: @@SERVER_IMAGE@@
+    platform: linux/amd64
+    profiles: [demo-tools]
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/muriarc-standard-fixture"]
+    command:
+      - seed-postgres
+      - --fixture
+      - /opt/muriarc/fixtures/standard-v1
+      - --output
+      - /var/lib/muriarc/generation
+      - --source-commit
+      - @@SOURCE_COMMIT@@
+    environment:
+      MURIARC_FIXTURE_DATABASE_URL: postgresql://${MURIARC_POSTGRES_USER:-muriarc}:${MURIARC_POSTGRES_PASSWORD:?set MURIARC_POSTGRES_PASSWORD}@db:5432/${MURIARC_POSTGRES_DB:-muriarc}
+    read_only: true
+    volumes:
+      - server_data:/var/lib/muriarc
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [backend]
+
+volumes:
+  postgres_data:
+  server_data:
+
+networks:
+  backend:
+    internal: true
+  edge:

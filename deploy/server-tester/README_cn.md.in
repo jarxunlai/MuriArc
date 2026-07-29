@@ -1,0 +1,67 @@
+# MuriArc Server Docker Tester
+
+> [English](README.md) | 简体中文
+
+**分类：** unsigned · 可选合成数据 · 非生产用途 · 不构成正式 RC 证据
+
+本包通过不可变 GHCR digest 运行 `linux/amd64` MuriArc Server Tester，仅适合可信本机、局域网或 VPN。它不是签名 Managed Compose Server 正式包，禁止直接暴露到公网。
+
+- 源码提交：`@@SOURCE_COMMIT@@`
+- Server 镜像：`@@SERVER_IMAGE@@`
+- PostgreSQL 镜像：`@@POSTGRES_IMAGE@@`
+- Release tag：`@@RELEASE_TAG@@`
+
+## 1. 校验下载
+
+解压前先使用同一 Release 中的 `.sha256` 校验 ZIP。解压后复制一种环境模板并运行内置校验：
+
+```bash
+cp .env.empty.example .env   # 或：cp .env.demo.example .env
+# 替换全部 REPLACE_ 值；同机运行多个副本时使用不同 project name。
+./muriarc-tester.sh verify
+```
+
+PowerShell：
+
+```powershell
+Copy-Item .env.empty.example .env   # 或 .env.demo.example
+# 替换全部 REPLACE_ 值。
+.\muriarc-tester.ps1 verify
+```
+
+`verify` 校验 `CHECKSUMS.sha256`、环境变量合同、Compose 安全边界和两个 digest 固定镜像，不会输出密码。
+
+## 2. 只初始化一次
+
+只为全新 volumes 选择一种模式：
+
+```bash
+./muriarc-tester.sh init-empty  # 空数据库，默认推荐
+./muriarc-tester.sh init-demo   # 固定 standard-v1 合成演示数据
+```
+
+两个命令只要发现 PostgreSQL 或 Server 数据 volume 已存在就会拒绝执行。空库模式只在已证明为空的首次启动临时启用 preview bootstrap，随后立即以 bootstrap=false 重启。Demo 模式在 Server 启动前完成 standard-v1 seed 与再次 verify。失败会保留容器和 volumes 供诊断；禁止清库或 SQL 修补。
+
+Demo 使用固定的合成 Lab/User UUID；Environment Root 的邮箱、显示名和密码仍由你填写。Root 会获得 LabAdmin，可查看合成项目和动物。
+
+## 3. 日常操作
+
+```bash
+./muriarc-tester.sh status
+./muriarc-tester.sh logs
+./muriarc-tester.sh down   # 始终保留 volumes
+./muriarc-tester.sh up
+```
+
+未改端口时访问 `http://127.0.0.1:8787`。PostgreSQL 不发布宿主端口。本包不提供 `destroy` 命令。
+
+## 安全边界
+
+- `.env` 必须保密，禁止进入 Git、聊天、Issue 或未加密备份。
+- PostgreSQL 与 Root 使用不同且 URL-safe 的密码，不复用个人密码。
+- 每位 Server 用户在 UI 中独立配置 AI Provider 与 API Key；Provider Key 禁止写入 `.env`。
+- `MURIARC_SESSION_COOKIE_SECURE=false` 只适合本机 loopback HTTP。局域网/VPN 应使用可信私网 HTTPS 反向代理并改为 `true`。
+- PostgreSQL、`server_data`、`.env`、generation 元数据、附件和自动生成的 AI Master Key 必须联合备份与恢复。
+- 真实科研数据、公网暴露、HA、无人值守升级和生产恢复必须改用签名正式 Server 交付及完整验收流程。
+
+完整变量表和故障排查见[中文配置指南](https://github.com/jarxunlai/MuriArc/blob/@@SOURCE_COMMIT@@/docs/CONFIGURATION_cn.md)。

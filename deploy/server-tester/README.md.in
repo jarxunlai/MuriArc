@@ -1,0 +1,67 @@
+# MuriArc Server Docker Tester
+
+> English | [简体中文](README_cn.md)
+
+**Classification:** unsigned · synthetic-capable · not for production · not formal RC evidence
+
+This bundle runs the MuriArc Server Tester from an immutable GHCR digest on `linux/amd64`. It is for a trusted local machine, LAN, or VPN only. It is not the signed Managed Compose Server bundle and must not be exposed directly to the public Internet.
+
+- Source commit: `@@SOURCE_COMMIT@@`
+- Server image: `@@SERVER_IMAGE@@`
+- PostgreSQL image: `@@POSTGRES_IMAGE@@`
+- Release tag: `@@RELEASE_TAG@@`
+
+## 1. Verify the download
+
+Verify the release asset itself using the adjacent `.sha256` file before extracting. Inside the extracted directory, copy one environment template and run the bundled verifier:
+
+```bash
+cp .env.empty.example .env   # or: cp .env.demo.example .env
+# Replace every REPLACE_ value. Use a unique project name if another copy exists.
+./muriarc-tester.sh verify
+```
+
+PowerShell:
+
+```powershell
+Copy-Item .env.empty.example .env   # or .env.demo.example
+# Replace every REPLACE_ value.
+.\muriarc-tester.ps1 verify
+```
+
+`verify` checks `CHECKSUMS.sha256`, the environment contract, Compose policy, and both digest-pinned images. It never prints the configured passwords.
+
+## 2. Initialize exactly once
+
+Choose one mode for brand-new volumes:
+
+```bash
+./muriarc-tester.sh init-empty  # empty database, recommended default
+./muriarc-tester.sh init-demo   # immutable synthetic standard-v1 data
+```
+
+Both commands refuse an existing PostgreSQL or Server-data volume. Empty initialization enables preview bootstrap only for the first proven-empty start, then restarts with bootstrap disabled. Demo initialization seeds and verifies standard-v1 before the Server starts. A failure preserves the containers and volumes for diagnosis; do not clear the database or patch SQL.
+
+The demo uses fixed synthetic Lab/User UUIDs. You still provide the Environment Root email, display name, and password. The configured Root becomes LabAdmin and can view the synthetic projects and animals.
+
+## 3. Operate
+
+```bash
+./muriarc-tester.sh status
+./muriarc-tester.sh logs
+./muriarc-tester.sh down   # always preserves volumes
+./muriarc-tester.sh up
+```
+
+Open `http://127.0.0.1:8787` unless you changed the loopback port. PostgreSQL has no host port. No `destroy` command is provided.
+
+## Security boundary
+
+- Keep `.env` private and out of Git, chat, issues, and backups that are not encrypted.
+- Generate different, URL-safe PostgreSQL and Root passwords. Do not reuse a personal password.
+- Each Server user configures their own AI Provider and API Key in the UI. Never put Provider keys in `.env`.
+- `MURIARC_SESSION_COOKIE_SECURE=false` is only for direct loopback HTTP. Use a trusted private reverse proxy with HTTPS and set it to `true` for LAN/VPN access.
+- Back up PostgreSQL, `server_data`, `.env`, generation metadata, attachments, and the generated AI Master Key as one recovery set.
+- Real research data, Internet exposure, HA, unattended upgrade, and production restore require the signed formal Server delivery and its full acceptance process.
+
+See the [English configuration guide](https://github.com/jarxunlai/MuriArc/blob/@@SOURCE_COMMIT@@/docs/CONFIGURATION.md) for the complete variable table and troubleshooting steps.

@@ -81,3 +81,7 @@ test-results/
 /dos/
 backend/uploads/
 *.log
+
+# Public Server Tester templates contain placeholders only and are rendered into release ZIPs.
+!deploy/server-tester/.env.empty.example.in
+!deploy/server-tester/.env.demo.example.in

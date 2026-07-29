@@ -4,6 +4,8 @@
 
 ## Scope and status
 
+For a user-facing choice between Windows Desktop, local Docker, and a private remote Server, begin with the [Configuration guide](CONFIGURATION.md). The Server Docker Tester described there is an unsigned evaluation artifact; this document continues with source-checkout and formal-delivery boundaries.
+
 This guide covers source-checkout development of the shared Server edition. The candidate source identity is `1.0.0 / E0001 / permanent-upgrade`, but the root Compose file is not a signed release deliverable and the physical RC has not passed. Stable Native/systemd and Managed Compose contracts are documented in [Server delivery](SERVER_DELIVERY.md).
 
 MuriArc Server is Axum + PostgreSQL + the responsive Vue UI. The application port is published on loopback by default. PostgreSQL must remain private, and production TLS terminates at a trusted reverse proxy or the documented Cloudflare Tunnel profile.

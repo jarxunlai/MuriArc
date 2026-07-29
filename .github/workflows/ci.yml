@@ -83,6 +83,8 @@ jobs:
             --definition release-fixtures/matrix.json \
             --output "${RUNNER_TEMP}/compatibility-plan.json"
           python3 scripts/check_delivery_templates.py
+          python3 scripts/check_server_tester.py
+          shellcheck deploy/server-tester/muriarc-tester.sh scripts/test_server_tester_e2e.sh
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Domain, data, migration, and Store clippy
@@ -175,6 +177,20 @@ jobs:
         with:
           toolchain: "1.88"
       - uses: Swatinem/rust-cache@v2
+      - name: Server Tester PowerShell parser contract
+        shell: pwsh
+        run: |
+          $Tokens = $null
+          $Errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'deploy/server-tester/muriarc-tester.ps1'),
+            [ref]$Tokens,
+            [ref]$Errors
+          )
+          if ($Errors.Count -ne 0) {
+            $Errors | Format-List | Out-String | Write-Error
+            throw 'Server Tester PowerShell script has parser errors.'
+          }
       - name: Install UI dependencies
         working-directory: ui
         run: pnpm install --frozen-lockfile

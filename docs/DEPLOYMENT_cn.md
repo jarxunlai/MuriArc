@@ -4,6 +4,8 @@
 
 ## 范围与状态
 
+普通用户在 Windows Desktop、本机 Docker 与远程私网 Server 之间选择时，应先阅读[配置使用指南](CONFIGURATION_cn.md)。其中的 Server Docker Tester 是未签名评估制品；本文继续说明源码 checkout 与正式交付边界。
+
 本文覆盖共享 Server 形态的源码 checkout 开发。当前候选源码身份为 `1.0.0 / E0001 / permanent-upgrade`，但根目录 Compose 不是签名正式制品，真实 RC 也尚未通过。稳定 Native/systemd 和 Managed Compose 合同见 [Server 正式交付](SERVER_DELIVERY_cn.md)。
 
 MuriArc Server 由 Axum + PostgreSQL + 响应式 Vue UI 组成。应用端口默认只发布到 loopback；PostgreSQL 必须保持私有，生产 TLS 在可信反向代理或文档规定的 Cloudflare Tunnel 终止。

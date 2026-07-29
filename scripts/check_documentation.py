@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PAIR_STEMS = (
     "README",
     "docs/README",
+    "docs/CONFIGURATION",
     "docs/ARCHITECTURE",
     "docs/SECURITY",
     "docs/ENVIRONMENTS",

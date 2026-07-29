@@ -55,15 +55,26 @@ See [Security](docs/SECURITY.md) for the complete trust model.
 
 ## Quick start
 
-### Prerequisites
+Choose the runtime before downloading or configuring anything:
+
+| Entry | Use it when | Start here |
+| --- | --- | --- |
+| **Windows Desktop Tester** | One researcher wants a local Windows app with synthetic standard-v1 data | [Download Windows Tester](https://github.com/jarxunlai/MuriArc/releases/tag/tester-v1.0.0-standard-v1-fd6f4c3e25df) and read [Configuration](docs/CONFIGURATION.md#windows-desktop-first-start) |
+| **Server Docker Tester** | One or more users want to evaluate the shared Web UI on a trusted local machine, LAN, or VPN | [Find the latest Server Tester prerelease](https://github.com/jarxunlai/MuriArc/releases) and read [Configuration](docs/CONFIGURATION.md#server-docker-prerequisites) |
+| **Developer source build** | You are changing or reviewing MuriArc | Follow [Environments](docs/ENVIRONMENTS.md) and [Server deployment](docs/DEPLOYMENT.md) |
+
+> [!WARNING]
+> Both Tester deliveries are unsigned, not for production, and not formal RC evidence. The Server Tester is `linux/amd64`, defaults to an empty database, and loads synthetic standard-v1 only through explicit `init-demo`. It is not supported on the public Internet.
+
+The complete bilingual setup, environment-variable, Root account, AI Provider, backup, recovery, and troubleshooting instructions live in the **[Configuration guide](docs/CONFIGURATION.md)**. GitHub release files and container images are separate parts of the Server Tester: download the small Compose ZIP, then its built-in verifier pulls the public digest-pinned GHCR image. No floating `latest` tag is published.
+
+### Developer prerequisites and verification
 
 - Rust `1.88`
 - Node.js `>=22.13`
 - pnpm `11.5.0` through Corepack
 - PostgreSQL `17` for Server integration tests and deployments
 - Windows WebView2 and the Tauri build prerequisites for Desktop work
-
-### Developer verification
 
 ```bash
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
@@ -79,20 +90,9 @@ pnpm --dir ui run typecheck
 VITE_MURIARC_GATEWAY=remote pnpm --dir ui run build
 ```
 
-PostgreSQL Store tests require an isolated PostgreSQL 17 instance through `MURIARC_TEST_DATABASE_URL`; a skipped database suite is not a pass. Each worktree must use its own UI dependencies and runtime data. See [Environments](docs/ENVIRONMENTS.md).
+PostgreSQL Store tests require an isolated PostgreSQL 17 instance through `MURIARC_TEST_DATABASE_URL`; a skipped database suite is not a pass. Each worktree must use its own UI dependencies and runtime data.
 
-### Source-checkout deployment
-
-The root Compose file and source commands are for development validation only. Candidate startup is fail-closed by default: enable `MURIARC_PREVIEW_BOOTSTRAP=true` only for a disposable, empty local stack, never to relabel or repair existing data. Copy the example environment file, replace every placeholder, keep PostgreSQL private, and terminate TLS at a trusted reverse proxy. Do not treat a source-built Compose stack as a signed 1.0 deliverable.
-
-```bash
-cp .env.example .env
-# Edit .env locally. Never commit it or paste secrets into an issue.
-docker compose config --quiet
-docker compose up -d --build --wait
-```
-
-Follow [Server deployment](docs/DEPLOYMENT.md), [Desktop delivery](docs/DESKTOP_DELIVERY.md), and [Server delivery](docs/SERVER_DELIVERY.md) before using any non-development environment.
+The root Compose file remains a source-checkout development tool. It is not the Server Docker Tester bundle and not a signed Server release. Candidate startup is fail-closed by default; preview bootstrap is allowed only for a disposable, proven-empty local development stack.
 
 ## Data and privacy
 
@@ -106,7 +106,7 @@ Follow [Server deployment](docs/DEPLOYMENT.md), [Desktop delivery](docs/DESKTOP_
 
 Start at the [documentation index](docs/README.md). Primary public documents include:
 
-- [Architecture](docs/ARCHITECTURE.md) and [Security](docs/SECURITY.md)
+- [Configuration](docs/CONFIGURATION.md), [Architecture](docs/ARCHITECTURE.md), and [Security](docs/SECURITY.md)
 - [Environments](docs/ENVIRONMENTS.md) and [Server deployment](docs/DEPLOYMENT.md)
 - [Desktop delivery](docs/DESKTOP_DELIVERY.md) and [Server delivery](docs/SERVER_DELIVERY.md)
 - [MuriArc data migration](docs/MIGRATION.md), [Upgrade Engine](docs/UPGRADE_ENGINE.md), and [compatibility contract](docs/UPGRADE_COMPATIBILITY.md)

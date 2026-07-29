@@ -55,15 +55,26 @@ Desktop 不通过 VNC/noVNC 或浏览器远程桌面交付；Server 也不替代
 
 ## 快速开始
 
-### 前置要求
+下载或配置前先选择运行形态：
+
+| 入口 | 适用场景 | 从这里开始 |
+| --- | --- | --- |
+| **Windows Desktop Tester** | 一位研究者在 Windows 本机使用，并携带 standard-v1 合成数据 | [下载 Windows Tester](https://github.com/jarxunlai/MuriArc/releases/tag/tester-v1.0.0-standard-v1-fd6f4c3e25df)，然后阅读[配置指南](docs/CONFIGURATION_cn.md#windows-desktop-首次使用) |
+| **Server Docker Tester** | 一人或多人在可信本机、局域网或 VPN 体验共享 Web UI | [查找最新 Server Tester prerelease](https://github.com/jarxunlai/MuriArc/releases)，然后阅读[配置指南](docs/CONFIGURATION_cn.md#server-docker-前置条件) |
+| **开发者源码构建** | 修改或审查 MuriArc | 遵循[环境](docs/ENVIRONMENTS_cn.md)与[Server 部署](docs/DEPLOYMENT_cn.md) |
+
+> [!WARNING]
+> 两类 Tester 都是 unsigned、非生产用途、也不构成正式 RC 证据。Server Tester 仅支持 `linux/amd64`，默认初始化为空库；只有显式 `init-demo` 才加载 standard-v1 合成数据，并且不支持公网部署。
+
+完整的双语安装、环境变量、Root 账号、AI Provider、备份恢复和故障排查都集中在 **[配置使用指南](docs/CONFIGURATION_cn.md)**。Server Tester 的 GitHub ZIP 与容器镜像是两个交付部分：先下载小型 Compose ZIP，再由内置 verifier 拉取公开且 digest 固定的 GHCR 镜像；不发布浮动 `latest` tag。
+
+### 开发者前置条件与门禁
 
 - Rust `1.88`
 - Node.js `>=22.13`
 - 通过 Corepack 使用 pnpm `11.5.0`
-- Server 集成测试和部署使用 PostgreSQL `17`
+- Server 集成测试与部署使用 PostgreSQL `17`
 - Desktop 开发需要 Windows WebView2 与 Tauri 构建依赖
-
-### 开发门禁
 
 ```bash
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
@@ -79,20 +90,9 @@ pnpm --dir ui run typecheck
 VITE_MURIARC_GATEWAY=remote pnpm --dir ui run build
 ```
 
-PostgreSQL Store 测试必须通过 `MURIARC_TEST_DATABASE_URL` 连接独立 PostgreSQL 17；因变量缺失而 skip 不算通过。每个 worktree 必须使用自己的 UI 依赖和运行数据。详见[环境文档](docs/ENVIRONMENTS_cn.md)。
+PostgreSQL Store 测试必须通过 `MURIARC_TEST_DATABASE_URL` 连接隔离 PostgreSQL 17；缺少变量导致的 skip 不算通过。每个 worktree 必须使用自己的 UI 依赖与运行数据。
 
-### 源码 checkout 部署
-
-根目录 Compose 和源码命令只用于开发验证。候选版普通启动默认 fail closed；只有一次性、全新的本地空栈才可显式设置 `MURIARC_PREVIEW_BOOTSTRAP=true`，严禁用它重标或修补既有数据。复制示例环境文件后必须替换所有占位值、保持 PostgreSQL 私有，并在可信反向代理终止 TLS。源码构建的 Compose 不能冒充签名 1.0 制品。
-
-```bash
-cp .env.example .env
-# 只在本机编辑 .env；禁止提交或把秘密粘贴到 issue。
-docker compose config --quiet
-docker compose up -d --build --wait
-```
-
-进入非开发环境前，请阅读[Server 部署](docs/DEPLOYMENT_cn.md)、[Desktop 交付](docs/DESKTOP_DELIVERY_cn.md)和[Server 正式交付](docs/SERVER_DELIVERY_cn.md)。
+根目录 Compose 仍只用于源码 checkout 开发，不是 Server Docker Tester bundle，也不是签名 Server Release。候选版默认 fail closed；preview bootstrap 只能用于已证明为空、可丢弃的本机开发栈。
 
 ## 数据与隐私
 
@@ -106,7 +106,7 @@ docker compose up -d --build --wait
 
 从[中文文档首页](docs/README_cn.md)开始。主要公开文档包括：
 
-- [架构](docs/ARCHITECTURE_cn.md)与[安全](docs/SECURITY_cn.md)
+- [配置使用指南](docs/CONFIGURATION_cn.md)、[架构](docs/ARCHITECTURE_cn.md)与[安全](docs/SECURITY_cn.md)
 - [环境](docs/ENVIRONMENTS_cn.md)与[Server 部署](docs/DEPLOYMENT_cn.md)
 - [Desktop 交付](docs/DESKTOP_DELIVERY_cn.md)与[Server 正式交付](docs/SERVER_DELIVERY_cn.md)
 - [MuriArc 数据迁移](docs/MIGRATION_cn.md)、[Upgrade Engine](docs/UPGRADE_ENGINE_cn.md)与[兼容合同](docs/UPGRADE_COMPATIBILITY_cn.md)

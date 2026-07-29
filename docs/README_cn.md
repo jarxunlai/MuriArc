@@ -8,6 +8,7 @@ MuriArc 当前候选源码身份为 `1.0.0 / E0001 / permanent-upgrade`，但真
 
 | 文档 | 用途 |
 | --- | --- |
+| [配置使用指南](CONFIGURATION_cn.md) | 运行形态选择、下载、Desktop/Server 配置、变量、运维、备份与故障排查 |
 | [架构](ARCHITECTURE_cn.md) | 运行拓扑、分层、领域边界、事务与 adapter |
 | [安全](SECURITY_cn.md) | 信任边界、账号、秘密、AI 控制、审计与安全报告 |
 | [环境](ENVIRONMENTS_cn.md) | 支持的工具链、隔离 worktree 与本地/CI 门禁 |

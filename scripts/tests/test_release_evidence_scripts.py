@@ -22,7 +22,7 @@ def write_json(path: Path, value: object) -> None:
 def definition() -> dict[str, object]:
     return {
         "format_version": 1,
-        "pr_profiles": ["managed-compose"],
+        "pr_profiles": ["managed-compose", "desktop-windows"],
         "nightly_profiles": [
             "native-system",
             "managed-compose",
@@ -94,7 +94,11 @@ class MatrixTests(unittest.TestCase):
                 changed_files_file=None,
             )
             plan = matrix.build_plan(args)
-            self.assertEqual(len(plan["runs"]), 3)
+            self.assertEqual(len(plan["runs"]), 2)
+            self.assertEqual(
+                {run["profile"] for run in plan["runs"]},
+                {"native-system", "managed-compose"},
+            )
             self.assertEqual(
                 plan["selected_fixture_ids"],
                 ["11111111-1111-4111-8111-111111111111"],
@@ -121,6 +125,19 @@ class MatrixTests(unittest.TestCase):
             weakened["rc_requires_final_artifacts"] = False
             with self.assertRaises(matrix.MatrixError):
                 matrix.validate_definition(weakened)
+
+            missing_sqlite = definition()
+            missing_sqlite["pr_profiles"] = ["managed-compose"]
+            with self.assertRaisesRegex(matrix.MatrixError, "SQLite/Desktop"):
+                matrix.validate_definition(missing_sqlite)
+
+            missing_native = definition()
+            missing_native["nightly_profiles"] = [
+                "managed-compose",
+                "desktop-windows",
+            ]
+            with self.assertRaisesRegex(matrix.MatrixError, "Nightly"):
+                matrix.validate_definition(missing_native)
 
 
 if __name__ == "__main__":

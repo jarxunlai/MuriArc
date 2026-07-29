@@ -2703,6 +2703,7 @@ dependencies = [
 name = "muriarc-delivery"
 version = "1.0.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "muriarc-core",
  "muriarc-upgrade",
@@ -2729,6 +2730,7 @@ dependencies = [
  "muriarc-core",
  "muriarc-data",
  "muriarc-importer",
+ "muriarc-release-fixture",
  "muriarc-snapshot",
  "muriarc-standard-fixture",
  "muriarc-store-sqlite",
@@ -2766,6 +2768,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "muriarc-physical-driver"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "flate2",
+ "fs2",
+ "muriarc-core",
+ "muriarc-delivery",
+ "muriarc-store-postgres",
+ "muriarc-upgrade",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tar",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "muriarc-release-evidence"
 version = "1.0.0"
 dependencies = [
@@ -2778,6 +2806,27 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "muriarc-release-fixture"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "muriarc-ai",
+ "muriarc-core",
+ "muriarc-release-evidence",
+ "muriarc-server",
+ "muriarc-standard-fixture",
+ "muriarc-store-postgres",
+ "muriarc-store-sqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -2840,6 +2889,7 @@ dependencies = [
  "muriarc-application",
  "muriarc-core",
  "muriarc-data",
+ "muriarc-store-postgres",
  "muriarc-store-sqlite",
  "serde",
  "serde_json",
@@ -2920,6 +2970,8 @@ dependencies = [
  "async-trait",
  "muriarc-core",
  "muriarc-release-evidence",
+ "muriarc-store-postgres",
+ "muriarc-store-sqlite",
  "serde",
  "serde_json",
  "tokio",
@@ -2930,10 +2982,12 @@ dependencies = [
 name = "muriarcctl"
 version = "1.0.0"
 dependencies = [
+ "chrono",
  "muriarc-delivery",
  "muriarc-upgrade",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tokio",
  "uuid",

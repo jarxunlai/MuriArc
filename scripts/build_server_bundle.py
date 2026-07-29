@@ -114,6 +114,7 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
     cloudflare = real_directory(args.deploy_root / "cloudflare-public", "Cloudflare deploy directory")
     common = [
         InputFile(regular_file(args.controller, "controller"), PurePosixPath("bin/muriarcctl"), "controller", True),
+        InputFile(regular_file(args.physical_driver, "physical driver"), PurePosixPath("bin/muriarc-physical-driver"), "physical_driver", True),
         InputFile(
             regular_file(args.upgrade_executor, "upgrade executor"),
             PurePosixPath("bin/muriarc-upgrade-executor"),
@@ -127,12 +128,13 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
         InputFile(regular_file(cloudflare / "muriarc.yml.example", "Cloudflare Tunnel config example"), PurePosixPath("deploy/cloudflare/muriarc.yml.example"), "environment_example"),
     ]
     if args.profile == "native-system":
-        if args.server is None or args.ui_dir is None:
-            raise ValueError("native-system requires --server and --ui-dir")
+        if args.server is None or args.ui_dir is None or args.fixture_producer is None:
+            raise ValueError("native-system requires --server, --fixture-producer, and --ui-dir")
         deploy = real_directory(args.deploy_root / "native-system", "native deploy directory")
         common.extend(
             [
                 InputFile(regular_file(args.server, "server"), PurePosixPath("bin/muriarc-server"), "server", True),
+                InputFile(regular_file(args.fixture_producer, "fixture producer"), PurePosixPath("bin/muriarc-release-fixture"), "fixture_producer", True),
                 InputFile(regular_file(deploy / "muriarc.service", "systemd unit"), PurePosixPath("deploy/muriarc.service"), "systemd_service"),
                 InputFile(regular_file(deploy / "muriarc.sysusers", "sysusers file"), PurePosixPath("deploy/muriarc.sysusers"), "sysusers"),
                 InputFile(regular_file(deploy / "muriarc.tmpfiles", "tmpfiles file"), PurePosixPath("deploy/muriarc.tmpfiles"), "tmpfiles"),
@@ -145,6 +147,19 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
         )
         common.extend(tree_files(real_directory(args.ui_dir, "UI directory"), PurePosixPath("ui"), "ui_asset"))
     else:
+        required_images = {
+            "server image archive": args.server_image_archive,
+            "PostgreSQL image archive": args.postgres_image_archive,
+            "image lock": args.image_lock,
+            "server image signature": args.server_image_signature,
+            "PostgreSQL image signature": args.postgres_image_signature,
+            "image evidence directory": args.image_evidence_dir,
+        }
+        missing = [label for label, value in required_images.items() if value is None]
+        if missing:
+            raise ValueError(
+                "managed-compose requires immutable image inputs: " + ", ".join(missing)
+            )
         deploy = real_directory(args.deploy_root / "managed-compose", "Compose deploy directory")
         common.extend(
             [
@@ -154,7 +169,19 @@ def inputs(args: argparse.Namespace) -> list[InputFile]:
                 InputFile(regular_file(deploy / "active.env.example", "activation example"), PurePosixPath("deploy/active.env.example"), "environment_example"),
                 InputFile(regular_file(cloudflare / "compose.override.yaml", "Cloudflare Compose override"), PurePosixPath("deploy/cloudflare/compose.override.yaml"), "compose_file"),
                 InputFile(regular_file(cloudflare / "compose.external-api.override.yaml", "Cloudflare external API Compose override"), PurePosixPath("deploy/cloudflare/compose.external-api.override.yaml"), "compose_file"),
+                InputFile(regular_file(args.server_image_archive, "server image archive"), PurePosixPath("images/muriarc-server.docker.tar"), "container_image"),
+                InputFile(regular_file(args.postgres_image_archive, "PostgreSQL image archive"), PurePosixPath("images/postgres-17.docker.tar"), "container_image"),
+                InputFile(regular_file(args.image_lock, "image lock"), PurePosixPath("images/image-lock.json"), "image_lock"),
+                InputFile(regular_file(args.server_image_signature, "server image signature"), PurePosixPath("images/muriarc-server.cosign.bundle.json"), "signature_evidence"),
+                InputFile(regular_file(args.postgres_image_signature, "PostgreSQL image signature"), PurePosixPath("images/postgres-17.cosign.bundle.json"), "signature_evidence"),
             ]
+        )
+        common.extend(
+            tree_files(
+                real_directory(args.image_evidence_dir, "image evidence directory"),
+                PurePosixPath("images/evidence"),
+                "container_evidence",
+            )
         )
     targets = [item.target.as_posix() for item in common]
     if len(targets) != len(set(targets)):
@@ -215,11 +242,19 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--version", required=True)
     result.add_argument("--output", required=True, type=Path)
     result.add_argument("--controller", required=True, type=Path)
+    result.add_argument("--physical-driver", required=True, type=Path)
     result.add_argument("--upgrade-executor", required=True, type=Path)
     result.add_argument("--verifier", required=True, type=Path)
     result.add_argument("--deploy-root", type=Path, default=Path("deploy"))
     result.add_argument("--server", type=Path)
+    result.add_argument("--fixture-producer", type=Path)
     result.add_argument("--ui-dir", type=Path)
+    result.add_argument("--server-image-archive", type=Path)
+    result.add_argument("--postgres-image-archive", type=Path)
+    result.add_argument("--image-lock", type=Path)
+    result.add_argument("--server-image-signature", type=Path)
+    result.add_argument("--postgres-image-signature", type=Path)
+    result.add_argument("--image-evidence-dir", type=Path)
     return result
 
 

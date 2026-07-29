@@ -1,4 +1,5 @@
 mod cli;
+mod formal;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -7,23 +8,31 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, ExitCode},
+    sync::Arc,
 };
 
 use cli::{CommandResponse, CtlCommand, HELP, OutputFormat, ParsedCommand, parse_args};
+use formal::{
+    OperationSelection, PruneResponse, ReadOnlyVerificationResponse, RestoreOperationResponse,
+    VerifiedBackupResponse, control_context, load_verified_release, physical_driver_client,
+    valid_digest,
+};
 use muriarc_delivery::{
     CommandRunner, CommandSpec, DELIVERY_CONFIG_FORMAT, DeliveryCapabilities, DeliveryConfig,
     DeliveryError, DeliveryPaths, ProcessCommandRunner, ServerServiceController,
     VerifiedServerBundle, install_server_bundle, load_delivery_config, load_install_state,
     validate_compose_policy, validate_digest_pinned_image, verify_server_bundle,
 };
-use muriarc_upgrade::{DeploymentProfile, HostUpgradeLock, RecoveryPointCatalog, UpgradeError};
+use muriarc_upgrade::{
+    ActiveGeneration, BackupEvidence, DeploymentProfile, HostUpgradeLock, RecoveryPointCatalog,
+    UpgradeEngine, UpgradeError,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{Connection, PgConnection};
 
 const BUNDLE_ROOT_ENV: &str = "MURIARCCTL_BUNDLE_ROOT";
 const TRUSTED_MANIFEST_ENV: &str = "MURIARCCTL_TRUSTED_BUNDLE_MANIFEST_DIGEST";
-
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -73,9 +82,8 @@ async fn dispatch(
             Ok(ExitCode::SUCCESS)
         }
         CtlCommand::Install { profile } => {
-            let data = install(profile).map_err(|error| {
-                (parsed.output, command_name, delivery_error(error))
-            })?;
+            let data = install(profile)
+                .map_err(|error| (parsed.output, command_name, delivery_error(error)))?;
             emit(
                 parsed.output,
                 &CommandResponse {
@@ -89,9 +97,8 @@ async fn dispatch(
             Ok(ExitCode::SUCCESS)
         }
         CtlCommand::Status => {
-            let data = status().map_err(|error| {
-                (parsed.output, command_name, delivery_error(error))
-            })?;
+            let data =
+                status().map_err(|error| (parsed.output, command_name, delivery_error(error)))?;
             emit(
                 parsed.output,
                 &CommandResponse {
@@ -105,9 +112,9 @@ async fn dispatch(
             Ok(ExitCode::SUCCESS)
         }
         CtlCommand::Doctor => {
-            let report = doctor().await.map_err(|error| {
-                (parsed.output, command_name, delivery_error(error))
-            })?;
+            let report = doctor()
+                .await
+                .map_err(|error| (parsed.output, command_name, delivery_error(error)))?;
             let ready = report
                 .get("ready")
                 .and_then(Value::as_bool)
@@ -132,13 +139,273 @@ async fn dispatch(
                 ExitCode::from(2)
             })
         }
-        command => Err((
-            parsed.output,
-            command.name(),
-            UpgradeError::Prerequisite {
-                message: "the physical backup/Candidate Driver is not yet proven for this installed deployment; refusing to report a false upgrade success".to_owned(),
-            },
-        )),
+        CtlCommand::UpdateCheck => {
+            let config = load_delivery_config(&state_root())
+                .map_err(|error| (parsed.output, command_name, delivery_error(error)))?;
+            let target = load_verified_release(config.profile, None)
+                .map_err(|error| (parsed.output, command_name, error))?;
+            success(
+                parsed.output,
+                command_name,
+                "signed update metadata and final target artifact verified",
+                json!({
+                    "applicationVersion": target.manifest.application_version,
+                    "dataEpoch": target.manifest.data_epoch,
+                    "targetName": target.target_name,
+                    "targetDigest": target.target_digest,
+                    "targetLength": target.target_length,
+                    "metadataVersions": target.metadata_versions,
+                    "metadataExpiresAt": target.metadata_expires_at,
+                }),
+            )
+        }
+        CtlCommand::Upgrade { to } => {
+            require_doctor_ready()
+                .await
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let (config, driver) =
+                control_context().map_err(|error| (parsed.output, command_name, error))?;
+            let target = load_verified_release(config.profile, to.as_deref())
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let engine = UpgradeEngine::new(Arc::new(driver), state_root());
+            let snapshot = engine
+                .run(target)
+                .await
+                .map_err(|error| (parsed.output, command_name, error))?;
+            success(
+                parsed.output,
+                command_name,
+                "upgrade completed through the shared state machine and physical Driver",
+                snapshot,
+            )
+        }
+        CtlCommand::BackupCreate => {
+            require_doctor_ready()
+                .await
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let (_, driver) =
+                control_context().map_err(|error| (parsed.output, command_name, error))?;
+            let generation: ActiveGeneration = driver
+                .invoke("current_generation", json!({}))
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let backup: BackupEvidence = driver
+                .invoke(
+                    "standalone_backup_create",
+                    json!({ "source_generation": generation }),
+                )
+                .map_err(|error| (parsed.output, command_name, error))?;
+            backup
+                .validate(generation.generation_id)
+                .map_err(|error| (parsed.output, command_name, error))?;
+            success(
+                parsed.output,
+                command_name,
+                "complete recovery-set backup created; run backup verify before relying on it",
+                backup,
+            )
+        }
+        CtlCommand::BackupVerify => {
+            require_doctor_ready()
+                .await
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let (_, driver) =
+                control_context().map_err(|error| (parsed.output, command_name, error))?;
+            let verified: VerifiedBackupResponse = driver
+                .invoke("standalone_backup_verify", json!({}))
+                .map_err(|error| (parsed.output, command_name, error))?;
+            verified
+                .backup
+                .validate(verified.backup.source_generation_id)
+                .and_then(|()| verified.restore.validate(&verified.backup))
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let root = state_root();
+            let mut catalog = RecoveryPointCatalog::load(&root)
+                .map_err(|error| (parsed.output, command_name, error))?;
+            catalog
+                .register_verified(verified.backup.clone(), verified.restore.clone())
+                .and_then(|()| catalog.save_atomic(&root))
+                .map_err(|error| (parsed.output, command_name, error))?;
+            success(
+                parsed.output,
+                command_name,
+                "backup was actually restored in isolation and registered as a recovery point",
+                verified,
+            )
+        }
+        CtlCommand::VerifyReadOnly => {
+            let (_, driver) =
+                control_context().map_err(|error| (parsed.output, command_name, error))?;
+            let report: ReadOnlyVerificationResponse = driver
+                .invoke("verify_read_only", json!({}))
+                .map_err(|error| (parsed.output, command_name, error))?;
+            report
+                .verification
+                .validate()
+                .map_err(|error| (parsed.output, command_name, error))?;
+            if report.state_digest_before != report.state_digest_after
+                || !valid_digest(&report.state_digest_before)
+            {
+                return Err((
+                    parsed.output,
+                    command_name,
+                    UpgradeError::Prerequisite {
+                        message: "read-only verification changed persistent state".to_owned(),
+                    },
+                ));
+            }
+            success(
+                parsed.output,
+                command_name,
+                "all read-only verification layers passed without persistent side effects",
+                report,
+            )
+        }
+        CtlCommand::RecoveryResume { operation_id } => {
+            let (config, driver) =
+                control_context().map_err(|error| (parsed.output, command_name, error))?;
+            let operation_id = match operation_id {
+                Some(value) => value,
+                None => {
+                    driver
+                        .invoke::<OperationSelection>("latest_resumable_operation", json!({}))
+                        .map_err(|error| (parsed.output, command_name, error))?
+                        .operation_id
+                }
+            };
+            let target = load_verified_release(config.profile, None)
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let engine = UpgradeEngine::new(Arc::new(driver), state_root());
+            let snapshot = engine
+                .resume(operation_id, target)
+                .await
+                .map_err(|error| (parsed.output, command_name, error))?;
+            success(
+                parsed.output,
+                command_name,
+                "persisted upgrade operation resumed through the physical Driver",
+                snapshot,
+            )
+        }
+        CtlCommand::RecoveryRestore {
+            backup_id,
+            confirm_data_loss,
+        } => {
+            let (_, driver) =
+                control_context().map_err(|error| (parsed.output, command_name, error))?;
+            let catalog = RecoveryPointCatalog::load(&state_root())
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let backup_id = backup_id
+                .or(catalog.last_verified_backup_id)
+                .ok_or_else(|| {
+                    (
+                        parsed.output,
+                        command_name,
+                        UpgradeError::Prerequisite {
+                            message: "no verified recovery point is available".to_owned(),
+                        },
+                    )
+                })?;
+            let point = catalog.points.get(&backup_id).ok_or_else(|| {
+                (
+                    parsed.output,
+                    command_name,
+                    UpgradeError::Prerequisite {
+                        message: "requested verified recovery point does not exist".to_owned(),
+                    },
+                )
+            })?;
+            let restored: RestoreOperationResponse = driver
+                .invoke(
+                    "recovery_restore",
+                    json!({
+                        "recovery_point": point,
+                        "confirm_data_loss": confirm_data_loss,
+                    }),
+                )
+                .map_err(|error| (parsed.output, command_name, error))?;
+            if restored.backup_id != backup_id
+                || restored.backup_artifact_digest != point.backup.artifact_digest
+                || restored.restored_generation_id.is_nil()
+                || (confirm_data_loss && !restored.data_loss_confirmation_recorded)
+            {
+                return Err((
+                    parsed.output,
+                    command_name,
+                    UpgradeError::Prerequisite {
+                        message: "physical Driver returned mismatched recovery evidence".to_owned(),
+                    },
+                ));
+            }
+            success(
+                parsed.output,
+                command_name,
+                "verified recovery point restored by the physical Driver",
+                restored,
+            )
+        }
+        CtlCommand::RecoveryPrune { backup_id } => {
+            let (_, driver) =
+                control_context().map_err(|error| (parsed.output, command_name, error))?;
+            let root = state_root();
+            let mut catalog = RecoveryPointCatalog::load(&root)
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let point = catalog
+                .require_prunable(backup_id)
+                .map_err(|error| (parsed.output, command_name, error))?;
+            let pruned: PruneResponse = driver
+                .invoke("recovery_prune", json!({ "recovery_point": point }))
+                .map_err(|error| (parsed.output, command_name, error))?;
+            if pruned.backup_id != backup_id || !pruned.artifact_deleted {
+                return Err((
+                    parsed.output,
+                    command_name,
+                    UpgradeError::Prerequisite {
+                        message: "physical Driver did not prove exact recovery artifact deletion"
+                            .to_owned(),
+                    },
+                ));
+            }
+            catalog
+                .commit_pruned(backup_id)
+                .and_then(|()| catalog.save_atomic(&root))
+                .map_err(|error| (parsed.output, command_name, error))?;
+            success(
+                parsed.output,
+                command_name,
+                "older verified recovery point pruned explicitly",
+                pruned,
+            )
+        }
+    }
+}
+
+fn success<T: Serialize>(
+    format: OutputFormat,
+    command: &'static str,
+    message: &str,
+    data: T,
+) -> Result<ExitCode, (OutputFormat, &'static str, UpgradeError)> {
+    emit(
+        format,
+        &CommandResponse {
+            ok: true,
+            command,
+            code: "ok",
+            message: message.to_owned(),
+            data,
+        },
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn require_doctor_ready() -> Result<(), UpgradeError> {
+    let report = doctor().await.map_err(delivery_error)?;
+    if report.get("ready").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(UpgradeError::Prerequisite {
+            message: "muriarcctl doctor did not prove every physical upgrade capability".to_owned(),
+        })
     }
 }
 
@@ -355,6 +622,7 @@ async fn doctor() -> Result<Value, DeliveryError> {
         DeploymentProfile::ManagedCompose => program_available("/usr/bin/docker"),
         DeploymentProfile::Desktop => false,
     };
+    let physical_driver = physical_driver_client(&config).is_ok();
     let service_active = if service_control && environment_ready {
         ServerServiceController::new(config.clone(), ProcessCommandRunner)
             .and_then(|controller| controller.is_active())
@@ -368,20 +636,36 @@ async fn doctor() -> Result<Value, DeliveryError> {
     let verifier = receipt.release_path.join("bin/muriarc-verifier");
     let isolated_storage = directory_available(&config.paths.data_root)
         && directory_available(&config.paths.control_root);
-    let backup_restore = match config.profile {
-        DeploymentProfile::NativeSystem => [
-            "/usr/bin/pg_dump",
-            "/usr/bin/pg_restore",
-            "/usr/bin/createdb",
-            "/usr/bin/dropdb",
-        ]
-        .iter()
-        .all(|program| program_available(program)),
-        DeploymentProfile::ManagedCompose => service_control && service_active,
-        DeploymentProfile::Desktop => false,
-    };
+    let postgres_client_tools = [
+        (
+            "MURIARCCTL_PG_DUMP_EXECUTABLE",
+            "/usr/lib/postgresql/17/bin/pg_dump",
+        ),
+        (
+            "MURIARCCTL_PG_RESTORE_EXECUTABLE",
+            "/usr/lib/postgresql/17/bin/pg_restore",
+        ),
+    ]
+    .iter()
+    .all(|(name, default)| configured_program_available(name, Path::new(default), 17));
+    let age_executable =
+        configured_executable("MURIARCCTL_AGE_EXECUTABLE", Path::new("/usr/bin/age"));
+    let backup_recipient = configured_control_file("MURIARCCTL_BACKUP_RECIPIENT_FILE", false);
+    let backup_identity = configured_control_file("MURIARCCTL_BACKUP_IDENTITY_FILE", true);
+    let recovery_material_ready =
+        age_executable && backup_recipient && backup_identity && postgres_client_tools;
+    let backup_restore = recovery_material_ready
+        && match config.profile {
+            DeploymentProfile::NativeSystem => true,
+            DeploymentProfile::ManagedCompose => {
+                service_control && service_active && postgres_major == Some(17)
+            }
+            DeploymentProfile::Desktop => false,
+        };
+    let postgres_admin_url =
+        env::var("MURIARCCTL_POSTGRES_ADMIN_URL").is_ok_and(|value| !value.trim().is_empty());
     let candidate_database = match config.profile {
-        DeploymentProfile::NativeSystem => env::var_os("MURIARCCTL_POSTGRES_ADMIN_URL").is_some(),
+        DeploymentProfile::NativeSystem => postgres_admin_url,
         DeploymentProfile::ManagedCompose => service_active && postgres_major == Some(17),
         DeploymentProfile::Desktop => false,
     };
@@ -395,11 +679,29 @@ async fn doctor() -> Result<Value, DeliveryError> {
     if !service_active {
         unavailable.insert("service is not running".to_owned());
     }
+    if !physical_driver {
+        unavailable.insert("physical upgrade Driver is unavailable".to_owned());
+    }
     if postgres_major != Some(17) {
         unavailable.insert("PostgreSQL 17 could not be verified".to_owned());
     }
+    if !postgres_client_tools {
+        unavailable.insert("PostgreSQL dump/restore clients are unavailable".to_owned());
+    }
+    if !age_executable {
+        unavailable.insert("age backup encryption executable is unavailable".to_owned());
+    }
+    if !backup_recipient {
+        unavailable.insert("backup encryption recipient file is unavailable".to_owned());
+    }
+    if !backup_identity {
+        unavailable.insert("private backup decryption identity file is unavailable".to_owned());
+    }
     if !backup_restore {
-        unavailable.insert("backup/restore tooling is unavailable".to_owned());
+        unavailable.insert("physical backup/restore prerequisites are incomplete".to_owned());
+    }
+    if config.profile == DeploymentProfile::NativeSystem && !postgres_admin_url {
+        unavailable.insert("Native PostgreSQL admin URL is unavailable".to_owned());
     }
     if !candidate_database {
         unavailable.insert("isolated Candidate database capability is unavailable".to_owned());
@@ -409,6 +711,7 @@ async fn doctor() -> Result<Value, DeliveryError> {
     }
     let capabilities = DeliveryCapabilities {
         service_control,
+        physical_driver,
         postgres_major,
         backup_restore,
         isolated_candidate_database: candidate_database,
@@ -427,6 +730,13 @@ async fn doctor() -> Result<Value, DeliveryError> {
         "currentReleaseMatchesReceipt": current_matches,
         "environmentReady": environment_ready,
         "serviceActive": service_active,
+        "physicalPrerequisites": {
+            "postgresClientTools": postgres_client_tools,
+            "ageExecutable": age_executable,
+            "backupRecipient": backup_recipient,
+            "backupIdentity": backup_identity,
+            "nativePostgresAdminUrl": config.profile != DeploymentProfile::NativeSystem || postgres_admin_url,
+        },
         "capabilities": capabilities,
         "note": "doctor proves prerequisites only; every upgrade still performs a fresh backup and an actual isolated restore",
     }))
@@ -750,6 +1060,78 @@ fn executable_file(path: &Path) -> bool {
     }
 }
 
+fn configured_program_available(name: &str, default: &Path, minimum_major: u16) -> bool {
+    let path = env::var_os(name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default.to_path_buf());
+    path.is_absolute()
+        && strict_executable_file(&path)
+        && executable_major_version(&path).is_some_and(|major| major >= minimum_major)
+}
+
+fn configured_executable(name: &str, default: &Path) -> bool {
+    let path = env::var_os(name)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default.to_path_buf());
+    path.is_absolute() && strict_executable_file(&path)
+}
+
+fn executable_major_version(path: &Path) -> Option<u16> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .split_whitespace()
+        .find_map(|part| part.split('.').next()?.parse::<u16>().ok())
+}
+
+fn strict_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn configured_control_file(name: &str, owner_only: bool) -> bool {
+    let Some(path) = env::var_os(name).map(PathBuf::from) else {
+        return false;
+    };
+    control_file_available(&path, owner_only)
+}
+
+fn control_file_available(path: &Path, owner_only: bool) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn directory_available(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
@@ -807,6 +1189,13 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn strict_executable_rejects_symlink_and_non_version_output() {
+        let shell = Path::new("/bin/sh");
+        assert!(!strict_executable_file(shell));
+        assert_eq!(executable_major_version(shell), None);
     }
 
     #[test]

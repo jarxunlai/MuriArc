@@ -69,6 +69,8 @@ def check() -> list[str]:
         [
             "-p muriarc-upgrade-executor",
             "-p muriarc-verifier",
+            "-p muriarc-release-fixture",
+            "/usr/local/bin/muriarc-release-fixture",
             "-p muriarcctl",
             "USER 10001:10001",
             'ENTRYPOINT ["/usr/local/bin/muriarc-server"]',

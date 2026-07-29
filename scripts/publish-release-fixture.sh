@@ -41,9 +41,13 @@ done
 [[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
   die "--manifest-digest must be lowercase SHA-256"
 
-for tool in cargo oras cosign tar python3; do
+oras_tool=${MURIARC_ORAS:-oras}
+cosign_tool=${MURIARC_COSIGN:-cosign}
+for tool in cargo tar python3; do
   command -v "$tool" >/dev/null || die "required tool is missing: $tool"
 done
+[[ -x "$oras_tool" ]] || command -v "$oras_tool" >/dev/null || die "required tool is missing: $oras_tool"
+[[ -x "$cosign_tool" ]] || command -v "$cosign_tool" >/dev/null || die "required tool is missing: $cosign_tool"
 
 repo_root=$(git rev-parse --show-toplevel 2>/dev/null) ||
   die "run this script from a MuriArc worktree"
@@ -61,31 +65,8 @@ temporary=$(mktemp -d "${TMPDIR:-/tmp}/muriarc-fixture-publish.XXXXXX")
 trap 'rm -rf "$temporary"' EXIT
 archive="$temporary/fixture.tar"
 tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-  --format=posix -cf "$archive" -C "$fixture" .
-
-tag_reference="${repository}:${tag}"
-oras push "$tag_reference" \
-  --artifact-type application/vnd.muriarc.release-fixture.v1 \
-  "$archive:application/vnd.muriarc.release-fixture.layer.v1+tar" >/dev/null
-oci_digest=$(oras resolve "$tag_reference")
-[[ "$oci_digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
-  die "registry did not return a valid OCI manifest digest"
-pinned_reference="${repository}@${oci_digest}"
-
-if [[ -n "${COSIGN_KEY:-}" ]]; then
-  [[ -n "${COSIGN_PUBLIC_KEY:-}" ]] ||
-    die "COSIGN_PUBLIC_KEY is required when COSIGN_KEY is used"
-  cosign sign --yes --key "$COSIGN_KEY" "$pinned_reference" >/dev/null
-  cosign verify --key "$COSIGN_PUBLIC_KEY" "$pinned_reference" >/dev/null
-else
-  identity_regexp=${COSIGN_CERTIFICATE_IDENTITY_REGEXP:-'^https://github.com/jarxunlai/MuriArc/.github/workflows/'}
-  oidc_issuer=${COSIGN_CERTIFICATE_OIDC_ISSUER:-'https://token.actions.githubusercontent.com'}
-  cosign sign --yes "$pinned_reference" >/dev/null
-  cosign verify \
-    --certificate-identity-regexp "$identity_regexp" \
-    --certificate-oidc-issuer "$oidc_issuer" \
-    "$pinned_reference" >/dev/null
-fi
+  --format=posix --pax-option=delete=atime,delete=ctime \
+  -cf "$archive" -C "$fixture" .
 
 archive_digest=$(python3 - "$archive" <<'PY'
 import hashlib
@@ -99,6 +80,65 @@ with pathlib.Path(sys.argv[1]).open("rb") as stream:
 print("sha256:" + hasher.hexdigest())
 PY
 )
+
+tag_reference="${repository}:${tag}"
+resolve_error="$temporary/oras-resolve.err"
+existing=0
+if oci_digest=$("$oras_tool" resolve "$tag_reference" 2>"$resolve_error"); then
+  existing=1
+else
+  if ! grep -Eqi '(not found|manifest unknown|name unknown|(^|[^0-9])404([^0-9]|$))' "$resolve_error"; then
+    die "cannot prove that the immutable OCI tag is unused"
+  fi
+  "$oras_tool" push "$tag_reference" \
+    --artifact-type application/vnd.muriarc.release-fixture.v1 \
+    "$archive:application/vnd.muriarc.release-fixture.layer.v1+tar" >/dev/null
+  oci_digest=$("$oras_tool" resolve "$tag_reference")
+fi
+[[ "$oci_digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+  die "registry did not return a valid OCI manifest digest"
+pinned_reference="${repository}@${oci_digest}"
+
+if ((existing)); then
+  existing_manifest="$temporary/existing-manifest.json"
+  "$oras_tool" manifest fetch "$pinned_reference" >"$existing_manifest"
+  python3 - "$existing_manifest" "$archive_digest" <<'PY'
+import json
+import pathlib
+import sys
+
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+layers = value.get("layers") if isinstance(value, dict) else None
+if (
+    value.get("artifactType") != "application/vnd.muriarc.release-fixture.v1"
+    or not isinstance(layers, list)
+    or len(layers) != 1
+    or layers[0].get("mediaType")
+    != "application/vnd.muriarc.release-fixture.layer.v1+tar"
+    or layers[0].get("digest") != sys.argv[2]
+):
+    raise SystemExit("existing immutable Fixture tag differs from local archive")
+PY
+fi
+
+if [[ -n "${COSIGN_KEY:-}" ]]; then
+  [[ -n "${COSIGN_PUBLIC_KEY:-}" ]] ||
+    die "COSIGN_PUBLIC_KEY is required when COSIGN_KEY is used"
+  if ((!existing)); then
+    "$cosign_tool" sign --yes --key "$COSIGN_KEY" "$pinned_reference" >/dev/null
+  fi
+  "$cosign_tool" verify --key "$COSIGN_PUBLIC_KEY" "$pinned_reference" >/dev/null
+else
+  identity_regexp=${COSIGN_CERTIFICATE_IDENTITY_REGEXP:-'^https://github.com/jarxunlai/MuriArc/.github/workflows/'}
+  oidc_issuer=${COSIGN_CERTIFICATE_OIDC_ISSUER:-'https://token.actions.githubusercontent.com'}
+  if ((!existing)); then
+    "$cosign_tool" sign --yes "$pinned_reference" >/dev/null
+  fi
+  "$cosign_tool" verify \
+    --certificate-identity-regexp "$identity_regexp" \
+    --certificate-oidc-issuer "$oidc_issuer" \
+    "$pinned_reference" >/dev/null
+fi
 python3 - "$pinned_reference" "$oci_digest" "$archive_digest" "$manifest_digest" <<'PY'
 import json
 import sys

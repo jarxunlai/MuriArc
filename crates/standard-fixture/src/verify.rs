@@ -17,63 +17,7 @@ pub(super) async fn verify(
     root: &Path,
     source_commit: &str,
 ) -> FixtureResult<SeedReceipt> {
-    let metadata = fs::symlink_metadata(root)?;
-    ensure(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "output data root must be a real directory",
-    )?;
-    reject_symlinks(root, root)?;
-    ensure(
-        root.join(RECEIPT_FILE).is_file(),
-        format!("existing output is missing {RECEIPT_FILE}; refusing to modify or clear it"),
-    )?;
-    let receipt_bytes = read_regular_file(&root.join(RECEIPT_FILE), RECEIPT_FILE)?;
-    let receipt: SeedReceipt = serde_json::from_slice(&receipt_bytes)?;
-    ensure(
-        receipt.schema_version == 1,
-        "seed receipt schemaVersion must be 1",
-    )?;
-    ensure(receipt.status == "PASS", "seed receipt is not complete")?;
-    ensure(
-        receipt.dataset_id == bundle.dataset.dataset_id,
-        "seed dataset id differs",
-    )?;
-    ensure(
-        receipt.dataset_version == bundle.manifest.dataset_version,
-        "seed dataset version differs",
-    )?;
-    ensure(
-        receipt.dataset_sha256 == bundle.dataset_sha256,
-        "standard-v1 dataset digest drift; create a new generation instead",
-    )?;
-    ensure(
-        receipt.manifest_sha256 == bundle.manifest_sha256,
-        "standard-v1 manifest digest drift; create a new generation instead",
-    )?;
-    ensure(
-        receipt.source_commit == source_commit,
-        "seed source commit differs",
-    )?;
-    ensure(
-        receipt.application_version == "1.0.0",
-        "fixture is not application 1.0.0",
-    )?;
-    ensure(
-        receipt.data_epoch == "E0001",
-        "fixture is not data epoch E0001",
-    )?;
-    ensure(
-        receipt.backend == "sqlite",
-        "fixture backend must be sqlite",
-    )?;
-    ensure(
-        receipt.expected_counts == bundle.dataset.expected_counts,
-        "seed expected counts differ",
-    )?;
-    ensure(
-        receipt.attachment_files == bundle.manifest.files,
-        "seed attachment manifest differs",
-    )?;
+    let receipt = verify_receipt(bundle, root, source_commit, "sqlite")?;
 
     let database = root.join(DATABASE_FILE);
     let database_metadata = fs::symlink_metadata(&database)?;
@@ -134,6 +78,121 @@ pub(super) async fn verify(
     result
 }
 
+#[cfg(feature = "postgres")]
+pub(super) async fn verify_postgres(
+    bundle: &FixtureBundle,
+    root: &Path,
+    source_commit: &str,
+    store: &dyn MuriArcStore,
+) -> FixtureResult<SeedReceipt> {
+    let receipt = verify_receipt(bundle, root, source_commit, "postgres")?;
+    store.health_check().await?;
+    let report = store.compatibility_report().await?;
+    let deployment = report.require_compatible().map_err(invalid)?.clone();
+    ensure(
+        deployment.generation_id == receipt.generation_id,
+        "deployment generation differs from the seed receipt",
+    )?;
+    ensure(
+        deployment.identity.application_version.as_str() == receipt.application_version,
+        "deployment application version differs",
+    )?;
+    ensure(
+        deployment.identity.data_epoch.as_str() == receipt.data_epoch,
+        "deployment data epoch differs",
+    )?;
+    let generation_bytes = read_regular_file(
+        &root.join(GENERATION_MANIFEST_FILE),
+        GENERATION_MANIFEST_FILE,
+    )?;
+    let generation: DeploymentGenerationManifest = serde_json::from_slice(&generation_bytes)?;
+    generation
+        .validate(&deployment)
+        .map_err(|issue| invalid(format!("{}: {}", issue.code, issue.detail)))?;
+    verify_counts(bundle, &receipt)?;
+    verify_domain(bundle, store, &receipt).await?;
+    verify_attachments(bundle, root, store, &receipt).await?;
+    let inventory = store.persistent_recovery_inventory().await?;
+    ensure(
+        inventory.attachment_records
+            == u64::try_from(bundle.dataset.attachments.len())
+                .map_err(|_| invalid("count overflow"))?,
+        "persistent attachment inventory differs",
+    )?;
+    ensure(
+        inventory.audit_records > 0,
+        "seeded fixture has no Audit evidence",
+    )?;
+    ensure(
+        inventory.encrypted_secret_records == 0 && inventory.secret_reference_records == 0,
+        "standard-v1 base fixture must not contain AI secret records",
+    )?;
+    Ok(receipt)
+}
+
+fn verify_receipt(
+    bundle: &FixtureBundle,
+    root: &Path,
+    source_commit: &str,
+    backend: &str,
+) -> FixtureResult<SeedReceipt> {
+    let metadata = fs::symlink_metadata(root)?;
+    ensure(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "output data root must be a real directory",
+    )?;
+    reject_symlinks(root, root)?;
+    ensure(
+        root.join(RECEIPT_FILE).is_file(),
+        format!("existing output is missing {RECEIPT_FILE}; refusing to modify or clear it"),
+    )?;
+    let receipt_bytes = read_regular_file(&root.join(RECEIPT_FILE), RECEIPT_FILE)?;
+    let receipt: SeedReceipt = serde_json::from_slice(&receipt_bytes)?;
+    ensure(
+        receipt.schema_version == 1,
+        "seed receipt schemaVersion must be 1",
+    )?;
+    ensure(receipt.status == "PASS", "seed receipt is not complete")?;
+    ensure(
+        receipt.dataset_id == bundle.dataset.dataset_id,
+        "seed dataset id differs",
+    )?;
+    ensure(
+        receipt.dataset_version == bundle.manifest.dataset_version,
+        "seed dataset version differs",
+    )?;
+    ensure(
+        receipt.dataset_sha256 == bundle.dataset_sha256,
+        "standard-v1 dataset digest drift; create a new generation instead",
+    )?;
+    ensure(
+        receipt.manifest_sha256 == bundle.manifest_sha256,
+        "standard-v1 manifest digest drift; create a new generation instead",
+    )?;
+    ensure(
+        receipt.source_commit == source_commit,
+        "seed source commit differs",
+    )?;
+    ensure(
+        receipt.application_version == "1.0.0",
+        "fixture is not application 1.0.0",
+    )?;
+    ensure(
+        receipt.data_epoch == "E0001",
+        "fixture is not data epoch E0001",
+    )?;
+    ensure(receipt.backend == backend, "fixture backend differs")?;
+    ensure(
+        receipt.expected_counts == bundle.dataset.expected_counts,
+        "seed expected counts differ",
+    )?;
+    ensure(
+        receipt.attachment_files == bundle.manifest.files,
+        "seed attachment manifest differs",
+    )?;
+    Ok(receipt)
+}
+
 fn verify_counts(bundle: &FixtureBundle, receipt: &SeedReceipt) -> FixtureResult<()> {
     let checks = [
         ("projects", receipt.ids.projects.len()),
@@ -187,7 +246,7 @@ fn verify_counts(bundle: &FixtureBundle, receipt: &SeedReceipt) -> FixtureResult
 
 async fn verify_domain(
     bundle: &FixtureBundle,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     receipt: &SeedReceipt,
 ) -> FixtureResult<()> {
     let projects = store.list_projects(LOCAL_LAB_ID).await?;
@@ -440,7 +499,7 @@ async fn verify_domain(
 async fn verify_attachments(
     bundle: &FixtureBundle,
     root: &Path,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     receipt: &SeedReceipt,
 ) -> FixtureResult<()> {
     let files = AttachmentFiles::new(root.join("attachments"));

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 die() {
   printf 'run-release-compatibility: %s\n' "$*" >&2
@@ -122,6 +123,7 @@ while IFS=$'\t' read -r fixture_id profile backend reference manifest_digest; do
   "$driver" \
     --mode "$mode" \
     --fixture-id "$fixture_id" \
+    --fixture-manifest-digest "$manifest_digest" \
     --fixture-root "$fixture_root" \
     --profile "$profile" \
     --target-artifacts "$target_artifacts" \

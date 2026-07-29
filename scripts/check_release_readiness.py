@@ -430,7 +430,16 @@ def validate_matrix(
     ):
         raise ReadinessError("RC compatibility matrix must select the complete Catalog")
     profiles = set(definition["rc_profiles"])
-    expected_pairs = {(fixture_id, profile) for fixture_id in catalog_ids for profile in profiles}
+    backend_profiles = {
+        "sqlite": {"desktop-windows"},
+        "postgres": {"native-system", "managed-compose"},
+    }
+    expected_pairs = {
+        (entry["fixture_id"], profile)
+        for entry in catalog["entries"]
+        for profile in profiles
+        if profile in backend_profiles[entry["backend"]]
+    }
     runs = report["runs"]
     if not isinstance(runs, list):
         raise ReadinessError("compatibility matrix runs must be an array")

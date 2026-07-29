@@ -108,7 +108,7 @@ class ReleaseReadinessTests(unittest.TestCase):
         }
         self.matrix_definition = {
             "format_version": 1,
-            "pr_profiles": ["managed-compose"],
+            "pr_profiles": ["managed-compose", "desktop-windows"],
             "nightly_profiles": [
                 "native-system",
                 "managed-compose",
@@ -123,6 +123,16 @@ class ReleaseReadinessTests(unittest.TestCase):
             "rc_requires_final_artifacts": True,
         }
         fixture_ids = [entry["fixture_id"] for entry in self.catalog["entries"]]
+        backend_profiles = {
+            "sqlite": {"desktop-windows"},
+            "postgres": {"native-system", "managed-compose"},
+        }
+        matrix_pairs = [
+            (entry["fixture_id"], profile)
+            for entry in self.catalog["entries"]
+            for profile in self.matrix_definition["rc_profiles"]
+            if profile in backend_profiles[entry["backend"]]
+        ]
         self.matrix_report = {
             "format_version": 1,
             "mode": "rc",
@@ -135,11 +145,7 @@ class ReleaseReadinessTests(unittest.TestCase):
                     "status": "pass",
                     "execution_kind": "final_package",
                 }
-                for index, (fixture_id, profile) in enumerate(
-                    (fixture_id, profile)
-                    for fixture_id in fixture_ids
-                    for profile in self.matrix_definition["rc_profiles"]
-                )
+                for index, (fixture_id, profile) in enumerate(matrix_pairs)
             ],
         }
         self.rc_definition = json.loads(
@@ -257,6 +263,11 @@ class ReleaseReadinessTests(unittest.TestCase):
         )
         self.assertIn("Execute complete final-artifact RC gate", workflow)
         self.assertIn("MURIARC_RC_DRIVER", workflow)
+        self.assertIn("scripts/release_compatibility_driver.py", workflow)
+        self.assertIn("scripts/release_rc_driver.py", workflow)
+        self.assertIn("MURIARC_COMPATIBILITY_WINDOWS_RUNNER", workflow)
+        self.assertIn("MURIARC_RC_CLOUDFLARE_RUNNER", workflow)
+        self.assertIn("MURIARC_RELEASE_ARTIFACT_INPUTS", workflow)
         self.assertIn("MURIARC_ARTIFACT_LOCK", workflow)
         self.assertIn('--artifact-lock "${MURIARC_ARTIFACT_LOCK}"', workflow)
         self.assertIn("scripts/run-release-candidate.sh", workflow)

@@ -119,6 +119,55 @@ pub fn install_server_bundle(
     ))
 }
 
+#[cfg(unix)]
+pub fn activate_staged_release(
+    release: &Path,
+    expected: &VerifiedServerBundle,
+    config: &DeliveryConfig,
+) -> Result<InstallReceipt, DeliveryError> {
+    config.validate()?;
+    let (_, verified) = verify_server_bundle(release, Some(&expected.manifest_digest))?;
+    if &verified != expected
+        || verified.profile != config.profile
+        || release
+            != config
+                .paths
+                .release_root
+                .join(verified.application_version.as_str())
+    {
+        return Err(DeliveryError::InvalidBundle(
+            "staged release differs from the verified target bundle".to_owned(),
+        ));
+    }
+    let previous = fs::read_link(&config.paths.current_release).ok();
+    activate_release_link(release, &config.paths.current_release)?;
+    let receipt = InstallReceipt {
+        format_version: INSTALL_RECEIPT_FORMAT,
+        profile: verified.profile,
+        application_version: verified.application_version.clone(),
+        manifest_digest: verified.manifest_digest.clone(),
+        content_digest: verified.content_digest.clone(),
+        release_path: release.to_path_buf(),
+        installed_at: Utc::now(),
+    };
+    if let Err(error) = write_install_state(config, &receipt) {
+        let _ = rollback_activation(&config.paths.current_release, previous.as_deref());
+        return Err(error);
+    }
+    Ok(receipt)
+}
+
+#[cfg(not(unix))]
+pub fn activate_staged_release(
+    _release: &Path,
+    _expected: &VerifiedServerBundle,
+    _config: &DeliveryConfig,
+) -> Result<InstallReceipt, DeliveryError> {
+    Err(DeliveryError::InvalidPolicy(
+        "Server release activation requires Unix".to_owned(),
+    ))
+}
+
 pub fn load_install_state(
     config: &DeliveryConfig,
 ) -> Result<Option<InstallReceipt>, DeliveryError> {

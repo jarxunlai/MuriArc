@@ -15,6 +15,10 @@ from check_fixture_catalog import CatalogError, load_json, validate_catalog
 
 
 PROFILES = {"native-system", "managed-compose", "desktop-windows"}
+BACKEND_PROFILES = {
+    "sqlite": {"desktop-windows"},
+    "postgres": {"native-system", "managed-compose"},
+}
 LAYERS = {
     "asset_restore",
     "storage",
@@ -49,6 +53,9 @@ PERSISTENCE_PREFIXES = (
     "release-fixtures/",
     "scripts/check_fixture_catalog.py",
     "scripts/compatibility_matrix.py",
+    "scripts/release_driver_common.py",
+    "scripts/release_compatibility_driver.py",
+    "scripts/release_rc_driver.py",
     "scripts/run-release-compatibility.sh",
 )
 
@@ -69,6 +76,13 @@ def validate_definition(definition: dict[str, Any]) -> None:
             or not set(values).issubset(PROFILES)
         ):
             raise MatrixError(f"{key} must be a non-empty unique profile list")
+    pr_profiles = set(definition["pr_profiles"])
+    if "desktop-windows" not in pr_profiles or not pr_profiles.intersection(
+        {"native-system", "managed-compose"}
+    ):
+        raise MatrixError("PR must cover both SQLite/Desktop and PostgreSQL/Server")
+    if set(definition["nightly_profiles"]) != PROFILES:
+        raise MatrixError("Nightly must cover Native, Managed Compose, and Desktop")
     if set(definition["rc_profiles"]) != PROFILES:
         raise MatrixError("RC must cover Native, Managed Compose, and Desktop")
     if definition["rc_requires_all_catalog_entries"] is not True:
@@ -123,11 +137,20 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         raise MatrixError("RC cannot run with an empty stable Fixture Catalog")
     selected = select_fixture_ids(args.mode, catalog, changed_paths(args))
     profiles = definition[f"{args.mode}_profiles"]
+    entries = {entry["fixture_id"]: entry for entry in catalog["entries"]}
     runs = [
         {"fixture_id": fixture_id, "profile": profile}
         for fixture_id in selected
         for profile in profiles
+        if profile in BACKEND_PROFILES[entries[fixture_id]["backend"]]
     ]
+    missing = [
+        fixture_id
+        for fixture_id in selected
+        if not any(run["fixture_id"] == fixture_id for run in runs)
+    ]
+    if missing:
+        raise MatrixError("selected Fixture has no backend-compatible delivery profile")
     return {
         "format_version": 1,
         "mode": args.mode,

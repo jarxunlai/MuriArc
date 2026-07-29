@@ -32,8 +32,17 @@ provenance 流程签名和消费。Release Manifest 不嵌入其描述的 bundle
 ```bash
 export MURIARC_VERIFIER=/absolute/path/muriarc-verifier
 export MURIARC_FIXTURE_PRODUCER=/absolute/path/real-final-artifact-fixture-producer
-export MURIARC_COMPATIBILITY_DRIVER=/absolute/path/real-compatibility-driver
-export MURIARC_RC_DRIVER=/absolute/path/real-systemd-docker-windows-cloudflare-driver
+export MURIARC_COMPATIBILITY_DRIVER="$PWD/scripts/release_compatibility_driver.py"
+export MURIARC_COMPATIBILITY_NATIVE_RUNNER=/absolute/path/native-compatibility-runner
+export MURIARC_COMPATIBILITY_COMPOSE_RUNNER=/absolute/path/compose-compatibility-runner
+export MURIARC_COMPATIBILITY_WINDOWS_RUNNER=/absolute/path/windows-compatibility-runner
+export MURIARC_RC_DRIVER="$PWD/scripts/release_rc_driver.py"
+export MURIARC_RC_NATIVE_RUNNER=/absolute/path/native-rc-runner
+export MURIARC_RC_COMPOSE_RUNNER=/absolute/path/compose-rc-runner
+export MURIARC_RC_WINDOWS_RUNNER=/absolute/path/windows-rc-runner
+export MURIARC_RC_CLOUDFLARE_RUNNER=/absolute/path/cloudflare-rc-runner
+export MURIARC_RELEASE_ARTIFACT_INPUTS=/absolute/path/artifact-inputs.json
+export COSIGN_PUBLIC_KEY=/absolute/path/cosign.pub
 export MURIARC_FIXTURE_CACHE=/absolute/path/outside-git/fixture-cache
 
 scripts/run-release-candidate.sh \
@@ -52,6 +61,42 @@ Cloudflare Public overlay、故障注入、激活前回退/首次写入后拒绝
 `artifact-lock.json` 不是可选的旁路文件：RC evidence 必须同时引用它的 SHA-256，且其中每个制品的
 digest、size、provenance 与 signature evidence 必须和 RC Driver 报告逐项一致。Fixture producer
 也必须读取同一份 lock，不能从未受信任的运行参数自行填写 source provenance。
+
+### 物理 Runner 闭合协议
+
+仓库内的 `scripts/release_compatibility_driver.py` 和 `scripts/release_rc_driver.py` 是最终的
+fail-closed 编排边界，不是物理环境替身。它们首先重新验证 Release Manifest、artifact lock、
+release/artifact provenance、Cosign evidence、最终制品字节和由最终 commit 编译的 verifier；
+只有随后调用的外部 runner 才可以操作真实 systemd、Docker、Windows 或 Cloudflare staging。
+所有 runner 环境变量必须指向绝对路径的普通可执行文件，缺失时直接失败，不能降级为源码运行或
+模拟 PASS。
+
+Fixture 与交付形态按物理 backend 固定映射：
+
+| Fixture backend | 允许的 profile |
+|---|---|
+| SQLite | `desktop-windows` |
+| PostgreSQL | `native-system`、`managed-compose` |
+
+矩阵编排器从 append-only Catalog 读取 `fixture_manifest_digest`，下载时验证一次，并通过
+`--fixture-manifest-digest` 原样传入 Compatibility Driver。Driver 再把该值写入 verifier request
+的 `expected_manifest_digest`；不得使用 `null` 或从已恢复目录重新猜测 Catalog 身份。
+
+每个 Compatibility runner 必须在新的外部 evidence 目录内只生成以下六个普通、非 symlink JSON：
+`storage.json`、`store_application.json`、`api.json`、`remote_ui.json`、
+`continue_write.json` 和 `read_only_no_side_effects.json`，并生成闭合 schema 的
+`runner-result.json`。结果必须绑定 Fixture、backend、profile、Release Manifest、artifact lock
+和最终制品 digest/size，声明 `final_package`、`pass`、零 `FAIL/SKIP`；目录缺文件、多文件、
+symlink 或任一 digest 漂移都会失败。资产恢复层始终由最终 verifier 自己执行，从而形成七层报告。
+
+RC Driver 串行执行 `rc-gate.json` 的 14 个场景。环境与 runner 变量固定为：
+`linux-systemd → MURIARC_RC_NATIVE_RUNNER`、`linux-docker → MURIARC_RC_COMPOSE_RUNNER`、
+`windows-installer → MURIARC_RC_WINDOWS_RUNNER`、`cloudflare-staging →
+MURIARC_RC_CLOUDFLARE_RUNNER`。每个场景必须返回 Driver 内固定的完整检查集合，并在指定
+evidence 目录为每个 check 写入 `<check_id>.json`；场景根目录只能包含该 evidence 目录和
+`scenario-evidence.json`。未知、缺失、额外或 symlink 文件，重复检查或 evidence digest，
+越界时间戳，非最终制品或任何 `FAIL/SKIP` 都会阻断最终 `rc-evidence.json`。证据内容、凭据和
+密钥留在受保护的仓库外运行目录，不进入 CI 日志或 Git。
 
 当前候选源码已切换为 `1.0.0 / E0001 / permanent-upgrade`，但这只满足源码身份条件，不代表 readiness 或 RC 已通过。
 只有同一 release commit 构建的最终签名制品实际生成双后端 E0001 Fixture，且其

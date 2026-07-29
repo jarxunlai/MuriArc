@@ -27,6 +27,8 @@ use muriarc_core::{
     RecordMeta, RecordStatus, User, WriteSource,
 };
 use muriarc_data::AttachmentFiles;
+#[cfg(feature = "postgres")]
+use muriarc_store_postgres::PostgresStore;
 use muriarc_store_sqlite::SqliteStore;
 use uuid::Uuid;
 
@@ -47,65 +49,8 @@ pub(super) async fn seed_into(
 
     let store = SqliteStore::connect_path(&database).await?;
     let result = async {
-        store.migrate().await?;
-        let migration_report = store.compatibility_report().await?;
-        let deployment = migration_report
-            .require_compatible()
-            .map_err(invalid)?
-            .clone();
-        let generation_id = deployment.generation_id;
-        write_json_atomic(
-            &root.join(GENERATION_MANIFEST_FILE),
-            &DeploymentGenerationManifest::from_state(&deployment),
-        )?;
-
-        bootstrap_local_identity(&store, bundle.dataset.fixed_timeline.starts_at).await?;
-        let audit = AuditContext {
-            actor: Actor::human(LOCAL_USER_ID, LOCAL_OPERATOR_NAME),
-            source: WriteSource::Desktop,
-            request_id: Some(format!("standard-v1-{}", &bundle.dataset_sha256[..16])),
-            reason: Some("desktop-standard-v1-fixture".to_owned()),
-        };
-        let mut ids = FixtureIds::default();
-        seed_projects_and_cages(bundle, &store, &audit, &mut ids).await?;
-        seed_direct_animals(bundle, &store, &audit, &mut ids).await?;
-        seed_genetics_and_breeding(bundle, &store, &audit, &mut ids).await?;
-        seed_experiments(bundle, &store, &audit, &mut ids).await?;
-        seed_records(bundle, &store, &audit, &mut ids).await?;
-        seed_attachments(bundle, &store, &attachments, &audit, &mut ids).await?;
-        apply_terminal_states(bundle, &store, &audit, &ids).await?;
-        assert_id_counts(bundle, &ids)?;
-
-        let report = store.compatibility_report().await?;
-        ensure(
-            report.is_compatible(),
-            format!(
-                "seeded database is not compatible: {}",
-                report
-                    .issues
-                    .iter()
-                    .map(|issue| issue.code.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        )?;
-        let receipt = SeedReceipt {
-            schema_version: 1,
-            status: "PASS".to_owned(),
-            dataset_id: bundle.dataset.dataset_id.clone(),
-            dataset_version: bundle.manifest.dataset_version.clone(),
-            dataset_sha256: bundle.dataset_sha256.clone(),
-            manifest_sha256: bundle.manifest_sha256.clone(),
-            source_commit: source_commit.to_owned(),
-            application_version: deployment.identity.application_version.as_str().to_owned(),
-            data_epoch: deployment.identity.data_epoch.as_str().to_owned(),
-            backend: "sqlite".to_owned(),
-            generation_id,
-            expected_counts: bundle.dataset.expected_counts.clone(),
-            attachment_files: bundle.manifest.files.clone(),
-            ids,
-        };
-        write_json_atomic(&root.join(RECEIPT_FILE), &receipt)?;
+        let receipt =
+            seed_store_into(bundle, root, source_commit, &store, &attachments, "sqlite").await?;
         verify::verify(bundle, root, source_commit).await?;
         Ok(receipt)
     }
@@ -118,7 +63,110 @@ pub(super) async fn seed_into(
     result
 }
 
-async fn bootstrap_local_identity(store: &SqliteStore, now: DateTime<Utc>) -> FixtureResult<()> {
+#[cfg(feature = "postgres")]
+pub(super) async fn seed_postgres_into(
+    bundle: &FixtureBundle,
+    root: &Path,
+    source_commit: &str,
+    database_url: &str,
+) -> FixtureResult<SeedReceipt> {
+    let attachments = AttachmentFiles::new(root.join("attachments"));
+    attachments.initialize().await?;
+    fs::create_dir(root.join("data"))?;
+
+    let store = PostgresStore::connect(database_url).await?;
+    let result = async {
+        let receipt = seed_store_into(
+            bundle,
+            root,
+            source_commit,
+            &store,
+            &attachments,
+            "postgres",
+        )
+        .await?;
+        verify::verify_postgres(bundle, root, source_commit, &store).await?;
+        Ok(receipt)
+    }
+    .await;
+    store.pool().close().await;
+    result
+}
+
+async fn seed_store_into(
+    bundle: &FixtureBundle,
+    root: &Path,
+    source_commit: &str,
+    store: &dyn MuriArcStore,
+    attachments: &AttachmentFiles,
+    backend: &str,
+) -> FixtureResult<SeedReceipt> {
+    store.migrate().await?;
+    let migration_report = store.compatibility_report().await?;
+    let deployment = migration_report
+        .require_compatible()
+        .map_err(invalid)?
+        .clone();
+    let generation_id = deployment.generation_id;
+    write_json_atomic(
+        &root.join(GENERATION_MANIFEST_FILE),
+        &DeploymentGenerationManifest::from_state(&deployment),
+    )?;
+
+    bootstrap_local_identity(store, bundle.dataset.fixed_timeline.starts_at).await?;
+    let audit = AuditContext {
+        actor: Actor::human(LOCAL_USER_ID, LOCAL_OPERATOR_NAME),
+        source: WriteSource::Desktop,
+        request_id: Some(format!("standard-v1-{}", &bundle.dataset_sha256[..16])),
+        reason: Some("desktop-standard-v1-fixture".to_owned()),
+    };
+    let mut ids = FixtureIds::default();
+    seed_projects_and_cages(bundle, store, &audit, &mut ids).await?;
+    seed_direct_animals(bundle, store, &audit, &mut ids).await?;
+    seed_genetics_and_breeding(bundle, store, &audit, &mut ids).await?;
+    seed_experiments(bundle, store, &audit, &mut ids).await?;
+    seed_records(bundle, store, &audit, &mut ids).await?;
+    seed_attachments(bundle, store, attachments, &audit, &mut ids).await?;
+    apply_terminal_states(bundle, store, &audit, &ids).await?;
+    assert_id_counts(bundle, &ids)?;
+
+    let report = store.compatibility_report().await?;
+    ensure(
+        report.is_compatible(),
+        format!(
+            "seeded database is not compatible: {}",
+            report
+                .issues
+                .iter()
+                .map(|issue| issue.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )?;
+    let receipt = SeedReceipt {
+        schema_version: 1,
+        status: "PASS".to_owned(),
+        dataset_id: bundle.dataset.dataset_id.clone(),
+        dataset_version: bundle.manifest.dataset_version.clone(),
+        dataset_sha256: bundle.dataset_sha256.clone(),
+        manifest_sha256: bundle.manifest_sha256.clone(),
+        source_commit: source_commit.to_owned(),
+        application_version: deployment.identity.application_version.as_str().to_owned(),
+        data_epoch: deployment.identity.data_epoch.as_str().to_owned(),
+        backend: backend.to_owned(),
+        generation_id,
+        expected_counts: bundle.dataset.expected_counts.clone(),
+        attachment_files: bundle.manifest.files.clone(),
+        ids,
+    };
+    write_json_atomic(&root.join(RECEIPT_FILE), &receipt)?;
+    Ok(receipt)
+}
+
+async fn bootstrap_local_identity(
+    store: &dyn MuriArcStore,
+    now: DateTime<Utc>,
+) -> FixtureResult<()> {
     let audit = AuditContext::system(WriteSource::Desktop);
     let mut lab = Lab::new("MuriArc standard-v1 合成实验室", now)?;
     lab.id = LOCAL_LAB_ID;
@@ -136,7 +184,7 @@ async fn bootstrap_local_identity(store: &SqliteStore, now: DateTime<Utc>) -> Fi
 
 async fn seed_projects_and_cages(
     bundle: &FixtureBundle,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     audit: &AuditContext,
     ids: &mut FixtureIds,
 ) -> FixtureResult<()> {
@@ -178,7 +226,7 @@ async fn seed_projects_and_cages(
 
 async fn seed_direct_animals(
     bundle: &FixtureBundle,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     audit: &AuditContext,
     ids: &mut FixtureIds,
 ) -> FixtureResult<()> {
@@ -234,7 +282,7 @@ async fn seed_direct_animals(
 
 async fn seed_genetics_and_breeding(
     bundle: &FixtureBundle,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     audit: &AuditContext,
     ids: &mut FixtureIds,
 ) -> FixtureResult<()> {
@@ -486,7 +534,7 @@ async fn seed_genetics_and_breeding(
 
 async fn seed_experiments(
     bundle: &FixtureBundle,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     audit: &AuditContext,
     ids: &mut FixtureIds,
 ) -> FixtureResult<()> {
@@ -605,7 +653,7 @@ async fn seed_experiments(
 
 async fn seed_records(
     bundle: &FixtureBundle,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     audit: &AuditContext,
     ids: &mut FixtureIds,
 ) -> FixtureResult<()> {
@@ -763,7 +811,7 @@ async fn seed_records(
 
 async fn seed_attachments(
     bundle: &FixtureBundle,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     files: &AttachmentFiles,
     audit: &AuditContext,
     ids: &mut FixtureIds,
@@ -823,7 +871,7 @@ async fn seed_attachments(
 
 async fn apply_terminal_states(
     bundle: &FixtureBundle,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     audit: &AuditContext,
     ids: &FixtureIds,
 ) -> FixtureResult<()> {
@@ -903,7 +951,7 @@ async fn apply_terminal_states(
 
 async fn assign_animal(
     _bundle: &FixtureBundle,
-    store: &SqliteStore,
+    store: &dyn MuriArcStore,
     audit: &AuditContext,
     ids: &mut FixtureIds,
     animal_key: &str,

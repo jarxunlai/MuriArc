@@ -1,0 +1,42 @@
+[package]
+name = "muriarc-release-fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Final-artifact release fixture producer for MuriArc compatibility RC"
+
+[features]
+default = []
+postgres = [
+  "muriarc-standard-fixture/postgres",
+  "dep:muriarc-ai",
+  "dep:muriarc-server",
+  "dep:muriarc-store-postgres",
+  "dep:sqlx",
+]
+
+[[bin]]
+name = "muriarc-release-fixture"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+muriarc-core = { path = "../core" }
+muriarc-ai = { path = "../ai", optional = true }
+muriarc-release-evidence = { path = "../release-evidence" }
+muriarc-server = { path = "../server", features = ["postgres"], optional = true }
+muriarc-standard-fixture = { path = "../standard-fixture" }
+muriarc-store-postgres = { path = "../store-postgres", optional = true }
+muriarc-store-sqlite = { path = "../store-sqlite" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10.9"
+sqlx = { workspace = true, optional = true, features = ["postgres"] }
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"

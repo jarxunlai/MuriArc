@@ -41,6 +41,16 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Returns the exact release identity compiled into this adapter without
+    /// opening or mutating a database. Formal artifact tooling uses this to
+    /// bind Release Manifest state to the shipped verifier binary.
+    pub fn compiled_release_identity() -> ReleaseIdentity {
+        ReleaseIdentity::current(
+            BackendKind::Sqlite,
+            &upgrade_compatibility::compiled_migrations(),
+        )
+    }
+
     pub async fn connect(database_url: &str) -> StoreResult<Self> {
         let options = SqliteConnectOptions::from_str(database_url)
             .map_err(map_sqlx)?

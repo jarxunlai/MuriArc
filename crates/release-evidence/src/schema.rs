@@ -230,6 +230,18 @@ pub struct ObservationFact {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct MeasurementFact {
+    pub measurement_id: Uuid,
+    pub experiment_id: Uuid,
+    pub animal_id: Uuid,
+    pub value_digest: Sha256Digest,
+    pub status: String,
+    pub signed: bool,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SampleFact {
     pub sample_id: Uuid,
     pub experiment_id: Uuid,
@@ -363,6 +375,7 @@ pub struct ExpectedFacts {
     pub breeding: Vec<BreedingFact>,
     pub experiments: Vec<ExperimentFact>,
     pub observations: Vec<ObservationFact>,
+    pub measurements: Vec<MeasurementFact>,
     pub samples: Vec<SampleFact>,
     pub attachments: Vec<AttachmentFact>,
     pub ai_history: AiHistoryFact,
@@ -385,6 +398,7 @@ impl ExpectedFacts {
             || self.breeding.is_empty()
             || self.experiments.is_empty()
             || self.observations.is_empty()
+            || self.measurements.is_empty()
             || self.samples.is_empty()
             || self.attachments.is_empty()
             || self.animals.iter().any(|fact| {
@@ -401,6 +415,10 @@ impl ExpectedFacts {
                 fact.animal_ids.is_empty() || fact.status.trim().is_empty() || fact.revision < 1
             })
             || self.observations.iter().any(|fact| fact.revision < 1)
+            || self
+                .measurements
+                .iter()
+                .any(|fact| fact.status.trim().is_empty() || fact.revision < 1)
             || self
                 .samples
                 .iter()
@@ -447,6 +465,10 @@ impl ExpectedFacts {
         require_unique_ids(
             self.observations.iter().map(|fact| fact.observation_id),
             "observations",
+        )?;
+        require_unique_ids(
+            self.measurements.iter().map(|fact| fact.measurement_id),
+            "measurements",
         )?;
         require_unique_ids(self.samples.iter().map(|fact| fact.sample_id), "samples")?;
         require_unique_ids(
@@ -523,6 +545,10 @@ impl ExpectedFacts {
                 !experiments.contains(&observation.experiment_id)
                     || !animals.contains(&observation.animal_id)
             })
+            || self.measurements.iter().any(|measurement| {
+                !experiments.contains(&measurement.experiment_id)
+                    || !animals.contains(&measurement.animal_id)
+            })
             || self.samples.iter().any(|sample| {
                 !experiments.contains(&sample.experiment_id) || !animals.contains(&sample.animal_id)
             })
@@ -535,6 +561,7 @@ impl ExpectedFacts {
             .chain(self.breeding.iter().map(|fact| &fact.breeding_id))
             .chain(experiments.iter())
             .chain(self.observations.iter().map(|fact| &fact.observation_id))
+            .chain(self.measurements.iter().map(|fact| &fact.measurement_id))
             .chain(self.samples.iter().map(|fact| &fact.sample_id))
             .copied()
             .collect::<BTreeSet<_>>();

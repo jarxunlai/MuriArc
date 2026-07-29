@@ -37,6 +37,32 @@ jobs:
       MURIARC_TEST_DATABASE_URL: postgresql://muriarc_test:muriarc-test-password@127.0.0.1:5432/muriarc_test
     steps:
       - uses: actions/checkout@v4
+      - name: Install PostgreSQL 17 client and age
+        run: |
+          curl --fail --silent --show-error --location \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            --output "${RUNNER_TEMP}/ACCC4CF8.asc"
+          echo "0144068502a1eddd2a0280ede10ef607d1ec592ce819940991203941564e8e76  ${RUNNER_TEMP}/ACCC4CF8.asc" | sha256sum --check
+          sudo install -d -m 0755 /usr/share/postgresql-common/pgdg
+          sudo install -m 0644 "${RUNNER_TEMP}/ACCC4CF8.asc" \
+            /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | \
+            sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+            postgresql-client-17 age
+          /usr/lib/postgresql/17/bin/pg_dump --version | grep --extended-regexp ' 17([.]|$)'
+          /usr/lib/postgresql/17/bin/pg_restore --version | grep --extended-regexp ' 17([.]|$)'
+          install -d -m 0700 "${RUNNER_TEMP}/muriarc-age"
+          age-keygen --output "${RUNNER_TEMP}/muriarc-age/identity.txt" >/dev/null 2>&1
+          age-keygen -y "${RUNNER_TEMP}/muriarc-age/identity.txt" > \
+            "${RUNNER_TEMP}/muriarc-age/recipients.txt"
+          chmod 0600 "${RUNNER_TEMP}/muriarc-age/identity.txt"
+          {
+            echo "MURIARCCTL_AGE_EXECUTABLE=/usr/bin/age"
+            echo "MURIARCCTL_BACKUP_IDENTITY_FILE=${RUNNER_TEMP}/muriarc-age/identity.txt"
+            echo "MURIARCCTL_BACKUP_RECIPIENT_FILE=${RUNNER_TEMP}/muriarc-age/recipients.txt"
+          } >> "${GITHUB_ENV}"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.88"
@@ -69,7 +95,7 @@ jobs:
       - name: Server clippy
         run: cargo clippy --locked -p muriarc-server --all-targets --all-features -- -D warnings
       - name: Upgrade control-plane clippy
-        run: cargo clippy --locked -p muriarc-upgrade -p muriarcctl -p muriarc-delivery -p muriarc-upgrade-executor --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked -p muriarc-upgrade -p muriarcctl -p muriarc-delivery -p muriarc-upgrade-executor -p muriarc-physical-driver --all-targets --all-features -- -D warnings
       - name: Release evidence clippy
         run: cargo clippy --locked -p muriarc-release-evidence -p muriarc-verifier --all-targets --all-features -- -D warnings
       - name: Domain, data, migration, and dual Store tests
@@ -82,7 +108,7 @@ jobs:
       - name: Server, MCP, Environment Root, and API tests
         run: cargo test --locked -p muriarc-server --all-targets --all-features
       - name: Upgrade state machine, trust, CLI, and PostgreSQL fencing tests
-        run: cargo test --locked -p muriarc-upgrade -p muriarcctl -p muriarc-delivery -p muriarc-upgrade-executor --all-targets --all-features
+        run: cargo test --locked -p muriarc-upgrade -p muriarcctl -p muriarc-delivery -p muriarc-upgrade-executor -p muriarc-physical-driver --all-targets --all-features
       - name: Immutable Fixture and seven-layer verifier tests
         run: cargo test --locked -p muriarc-release-evidence -p muriarc-verifier --all-targets --all-features
 

@@ -8,7 +8,7 @@ async fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => {
             eprintln!(
-                "usage: muriarc-standard-fixture <seed|verify> --fixture <standard-v1-dir> --output <new-data-root> --source-commit <40-hex>"
+                "usage: muriarc-standard-fixture <seed|verify|seed-postgres|verify-postgres> --fixture <standard-v1-dir> --output <new-data-root> --source-commit <40-hex>"
             );
             ExitCode::from(2)
         }

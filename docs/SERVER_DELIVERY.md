@@ -50,6 +50,23 @@ Managed Compose uses an absolute install root, digest-pinned images, host-owned 
 
 PostgreSQL has no host-published port; Server binds loopback. Each generation and Candidate uses non-overlapping PostgreSQL/database and data paths. Candidate disables external Providers, background jobs, and real-user writes.
 
+## Physical Driver configuration
+
+`muriarcctl` normally loads `bin/muriarc-physical-driver` from the immutable, receipt-verified installed bundle. `MURIARCCTL_PHYSICAL_DRIVER` is an absolute, non-symlink control-file override for controlled testing; formal production delivery leaves it unset.
+
+The host that runs `muriarcctl` must provide PostgreSQL 17+ clients at `/usr/lib/postgresql/17/bin/pg_dump` and `/usr/lib/postgresql/17/bin/pg_restore`, and:
+
+| Variable | Requirement |
+|---|---|
+| `MURIARCCTL_BACKUP_RECIPIENT_FILE` | Absolute path to a non-empty age recipients file used for encryption. |
+| `MURIARCCTL_BACKUP_IDENTITY_FILE` | Absolute path to the private age identity, a non-symlink file with owner-only permissions (`0600`). |
+| `MURIARCCTL_AGE_EXECUTABLE` | Optional absolute age executable; defaults to `/usr/bin/age`. |
+| `MURIARCCTL_PG_DUMP_EXECUTABLE` | Optional absolute PostgreSQL 17+ `pg_dump`; defaults to `/usr/lib/postgresql/17/bin/pg_dump`. |
+| `MURIARCCTL_PG_RESTORE_EXECUTABLE` | Optional absolute PostgreSQL 17+ `pg_restore`; defaults to `/usr/lib/postgresql/17/bin/pg_restore`. |
+| `MURIARCCTL_POSTGRES_ADMIN_URL` | Native/systemd only: protected PostgreSQL admin URL used to create, clone, and drop isolated databases. |
+
+Managed Compose requires the same host-side PostgreSQL clients, age executable, recipient, and identity. A running Compose service alone does not make backup/restore ready. `muriarcctl doctor` reports only readiness booleans and never prints these paths or their contents. Keep the admin URL and private identity in root-controlled configuration; never copy passwords, identities, tokens, or key material into tickets, chat, logs, or Git.
+
 ## Upgrade and maintenance window
 
 The fixed order is signed-target verification, three locks, preflight, drain, Write Lease freeze, joint backup, actual isolated restore, Candidate migration, seven-layer verification, atomic activation, read-only startup verification, and new Write Lease.

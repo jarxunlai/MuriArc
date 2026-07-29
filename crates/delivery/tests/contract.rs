@@ -19,10 +19,18 @@ fn native_bundle(root: &Path) -> ServerBundleManifest {
         ("bin/muriarc-server", BundleFileRole::Server),
         ("bin/muriarcctl", BundleFileRole::Controller),
         (
+            "bin/muriarc-physical-driver",
+            BundleFileRole::PhysicalDriver,
+        ),
+        (
             "bin/muriarc-upgrade-executor",
             BundleFileRole::UpgradeExecutor,
         ),
         ("bin/muriarc-verifier", BundleFileRole::Verifier),
+        (
+            "bin/muriarc-release-fixture",
+            BundleFileRole::FixtureProducer,
+        ),
         ("ui/index.html", BundleFileRole::UiAsset),
         ("deploy/muriarc.service", BundleFileRole::SystemdService),
         ("deploy/muriarc.sysusers", BundleFileRole::Sysusers),
@@ -65,6 +73,10 @@ fn native_bundle(root: &Path) -> ServerBundleManifest {
 fn managed_bundle(root: &Path) -> ServerBundleManifest {
     let files = [
         ("bin/muriarcctl", BundleFileRole::Controller),
+        (
+            "bin/muriarc-physical-driver",
+            BundleFileRole::PhysicalDriver,
+        ),
         (
             "bin/muriarc-upgrade-executor",
             BundleFileRole::UpgradeExecutor,
@@ -109,7 +121,7 @@ fn bundle_verifier_rejects_tamper_extra_and_traversal() {
     let manifest = native_bundle(root.path());
     let (_, verified) =
         verify_server_bundle(root.path(), Some(&manifest.digest().unwrap())).unwrap();
-    assert_eq!(verified.file_count, 10);
+    assert_eq!(verified.file_count, 12);
 
     fs::write(root.path().join("extra"), b"not registered").unwrap();
     assert!(verify_server_bundle(root.path(), None).is_err());
@@ -194,6 +206,7 @@ fn tracked_delivery_templates_satisfy_typed_policy() {
 fn byo_capabilities_fail_closed_when_candidate_or_restore_is_missing() {
     let mut capabilities = DeliveryCapabilities {
         service_control: true,
+        physical_driver: true,
         postgres_major: Some(17),
         backup_restore: true,
         isolated_candidate_database: true,

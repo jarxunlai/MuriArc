@@ -29,6 +29,7 @@ muriarc-core = { path = "../crates/core" }
 muriarc-data = { path = "../crates/data" }
 muriarc-importer = { path = "../crates/importer" }
 muriarc-store-sqlite = { path = "../crates/store-sqlite" }
+muriarc-release-fixture = { path = "../crates/release-fixture" }
 muriarc-standard-fixture = { path = "../crates/standard-fixture" }
 muriarc-upgrade = { path = "../crates/upgrade" }
 minisign-verify = "0.2.5"

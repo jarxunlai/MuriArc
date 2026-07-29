@@ -19,8 +19,10 @@ pub const SERVER_BUNDLE_MANIFEST: &str = "bundle-manifest.json";
 pub enum BundleFileRole {
     Server,
     Controller,
+    PhysicalDriver,
     UpgradeExecutor,
     Verifier,
+    FixtureProducer,
     UiAsset,
     BundleManifest,
     SystemdService,
@@ -76,8 +78,10 @@ impl ServerBundleManifest {
             DeploymentProfile::NativeSystem => BTreeSet::from([
                 BundleFileRole::Server,
                 BundleFileRole::Controller,
+                BundleFileRole::PhysicalDriver,
                 BundleFileRole::UpgradeExecutor,
                 BundleFileRole::Verifier,
+                BundleFileRole::FixtureProducer,
                 BundleFileRole::UiAsset,
                 BundleFileRole::SystemdService,
                 BundleFileRole::Sysusers,
@@ -87,6 +91,7 @@ impl ServerBundleManifest {
             ]),
             DeploymentProfile::ManagedCompose => BTreeSet::from([
                 BundleFileRole::Controller,
+                BundleFileRole::PhysicalDriver,
                 BundleFileRole::UpgradeExecutor,
                 BundleFileRole::Verifier,
                 BundleFileRole::ComposeFile,
@@ -335,8 +340,10 @@ fn copy_create_new(
             role,
             BundleFileRole::Server
                 | BundleFileRole::Controller
+                | BundleFileRole::PhysicalDriver
                 | BundleFileRole::UpgradeExecutor
                 | BundleFileRole::Verifier
+                | BundleFileRole::FixtureProducer
         );
         options.mode(if executable { 0o750 } else { 0o640 });
     }

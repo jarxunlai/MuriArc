@@ -98,8 +98,14 @@ jobs:
         if: steps.gate.outputs.mode != 'rc'
         env:
           MURIARC_VERIFIER: ${{ github.workspace }}/target/release/muriarc-verifier
-          MURIARC_COMPATIBILITY_DRIVER: ${{ vars.MURIARC_COMPATIBILITY_DRIVER }}
+          MURIARC_COMPATIBILITY_DRIVER: ${{ github.workspace }}/scripts/release_compatibility_driver.py
+          MURIARC_COMPATIBILITY_NATIVE_RUNNER: ${{ vars.MURIARC_COMPATIBILITY_NATIVE_RUNNER }}
+          MURIARC_COMPATIBILITY_COMPOSE_RUNNER: ${{ vars.MURIARC_COMPATIBILITY_COMPOSE_RUNNER }}
+          MURIARC_COMPATIBILITY_WINDOWS_RUNNER: ${{ vars.MURIARC_COMPATIBILITY_WINDOWS_RUNNER }}
           MURIARC_TARGET_ARTIFACTS: ${{ vars.MURIARC_TARGET_ARTIFACTS }}
+          MURIARC_ARTIFACT_LOCK: ${{ vars.MURIARC_ARTIFACT_LOCK }}
+          MURIARC_RELEASE_ARTIFACT_INPUTS: ${{ vars.MURIARC_RELEASE_ARTIFACT_INPUTS }}
+          COSIGN_PUBLIC_KEY: ${{ vars.COSIGN_PUBLIC_KEY }}
           MURIARC_FIXTURE_CACHE: ${{ runner.temp }}/muriarc-fixture-cache
         run: |
           scripts/run-release-compatibility.sh \
@@ -112,10 +118,19 @@ jobs:
         env:
           MURIARC_VERIFIER: ${{ github.workspace }}/target/release/muriarc-verifier
           MURIARC_FIXTURE_PRODUCER: ${{ vars.MURIARC_FIXTURE_PRODUCER }}
-          MURIARC_COMPATIBILITY_DRIVER: ${{ vars.MURIARC_COMPATIBILITY_DRIVER }}
-          MURIARC_RC_DRIVER: ${{ vars.MURIARC_RC_DRIVER }}
+          MURIARC_COMPATIBILITY_DRIVER: ${{ github.workspace }}/scripts/release_compatibility_driver.py
+          MURIARC_COMPATIBILITY_NATIVE_RUNNER: ${{ vars.MURIARC_COMPATIBILITY_NATIVE_RUNNER }}
+          MURIARC_COMPATIBILITY_COMPOSE_RUNNER: ${{ vars.MURIARC_COMPATIBILITY_COMPOSE_RUNNER }}
+          MURIARC_COMPATIBILITY_WINDOWS_RUNNER: ${{ vars.MURIARC_COMPATIBILITY_WINDOWS_RUNNER }}
+          MURIARC_RC_DRIVER: ${{ github.workspace }}/scripts/release_rc_driver.py
+          MURIARC_RC_NATIVE_RUNNER: ${{ vars.MURIARC_RC_NATIVE_RUNNER }}
+          MURIARC_RC_COMPOSE_RUNNER: ${{ vars.MURIARC_RC_COMPOSE_RUNNER }}
+          MURIARC_RC_WINDOWS_RUNNER: ${{ vars.MURIARC_RC_WINDOWS_RUNNER }}
+          MURIARC_RC_CLOUDFLARE_RUNNER: ${{ vars.MURIARC_RC_CLOUDFLARE_RUNNER }}
           MURIARC_TARGET_ARTIFACTS: ${{ vars.MURIARC_TARGET_ARTIFACTS }}
           MURIARC_ARTIFACT_LOCK: ${{ vars.MURIARC_ARTIFACT_LOCK }}
+          MURIARC_RELEASE_ARTIFACT_INPUTS: ${{ vars.MURIARC_RELEASE_ARTIFACT_INPUTS }}
+          COSIGN_PUBLIC_KEY: ${{ vars.COSIGN_PUBLIC_KEY }}
           MURIARC_FIXTURE_CACHE: ${{ runner.temp }}/muriarc-fixture-cache
         run: |
           scripts/run-release-candidate.sh \

@@ -892,6 +892,8 @@ async function demoArtifact(kind: DataArtifact['kind'], fileName: string, mediaT
 export function createDataGateway(domainGateway: MuriArcGateway): MuriArcDataGateway {
   if (domainGateway instanceof LocalTauriGateway) return new LocalDataGateway()
   if (domainGateway instanceof RemoteHttpGateway) return new RemoteDataGateway()
-  if (domainGateway instanceof DemoGateway) return new DemoDataGateway(domainGateway)
+  if (__MURIARC_DEMO_GATEWAY__ && domainGateway instanceof DemoGateway) {
+    return new DemoDataGateway(domainGateway)
+  }
   throw new Error('无法识别 MuriArc 数据 transport')
 }

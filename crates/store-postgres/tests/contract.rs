@@ -216,8 +216,7 @@ async fn assert_corrupted_second_evidence_rolls_back(
 
 #[tokio::test]
 async fn postgres_store_obeys_shared_contract_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!("skipping PostgreSQL contract: MURIARC_TEST_DATABASE_URL is not set");
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -226,10 +225,7 @@ async fn postgres_store_obeys_shared_contract_when_configured() {
 
 #[tokio::test]
 async fn postgres_store_obeys_ai_model_profile_contract_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL AI model profile contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -238,10 +234,7 @@ async fn postgres_store_obeys_ai_model_profile_contract_when_configured() {
 
 #[tokio::test]
 async fn postgres_store_obeys_ai_conversation_contract_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL AI conversation contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -250,10 +243,7 @@ async fn postgres_store_obeys_ai_conversation_contract_when_configured() {
 
 #[tokio::test]
 async fn postgres_store_enforces_ai_source_quota_and_retention_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL AI source retention contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -262,10 +252,7 @@ async fn postgres_store_enforces_ai_source_quota_and_retention_when_configured()
 
 #[tokio::test]
 async fn postgres_store_atomically_archives_import_sources_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL import source archive contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -274,8 +261,7 @@ async fn postgres_store_atomically_archives_import_sources_when_configured() {
 
 #[tokio::test]
 async fn postgres_legacy_conversations_reject_messages_and_autonomy_changes_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!("skipping PostgreSQL legacy AI read-only contract: database is not configured");
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -587,10 +573,7 @@ async fn postgres_legacy_conversations_reject_messages_and_autonomy_changes_when
 
 #[tokio::test]
 async fn postgres_store_obeys_research_extensions_contract_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL research extensions contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -601,10 +584,7 @@ async fn postgres_store_obeys_research_extensions_contract_when_configured() {
 
 #[tokio::test]
 async fn postgres_store_obeys_genotyping_batch_contract_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL genotyping batch contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -613,10 +593,7 @@ async fn postgres_store_obeys_genotyping_batch_contract_when_configured() {
 
 #[tokio::test]
 async fn postgres_store_obeys_ai_experiment_grouping_contract_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL AI experiment grouping contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -625,10 +602,7 @@ async fn postgres_store_obeys_ai_experiment_grouping_contract_when_configured() 
 
 #[tokio::test]
 async fn postgres_store_preserves_ai_measurement_provider_provenance_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL AI measurement provenance contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -637,10 +611,7 @@ async fn postgres_store_preserves_ai_measurement_provider_provenance_when_config
 
 #[tokio::test]
 async fn postgres_store_atomically_commits_ai_import_resolution_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL AI import atomicity contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();
@@ -649,10 +620,7 @@ async fn postgres_store_atomically_commits_ai_import_resolution_when_configured(
 
 #[tokio::test]
 async fn postgres_audit_reader_accepts_security_lifecycle_entries_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL audit compatibility contract: MURIARC_TEST_DATABASE_URL is not set"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();

@@ -9013,16 +9013,9 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_control_plane_adoption_accepts_the_compatible_winner() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-            eprintln!(
-                "skipping PostgreSQL concurrent adoption contract: MURIARC_TEST_DATABASE_URL is not set"
-            );
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(
-            database_url.contains("muriarc_test"),
-            "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-        );
         let base_options = PgConnectOptions::from_str(&database_url)
             .expect("MURIARC_TEST_DATABASE_URL must be a PostgreSQL URL");
         let admin_pool = PgPoolOptions::new()
@@ -9056,16 +9049,9 @@ mod tests {
 
     #[tokio::test]
     async fn migrations_support_fresh_and_incremental_databases() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-            eprintln!(
-                "skipping PostgreSQL migration contract: MURIARC_TEST_DATABASE_URL is not set"
-            );
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(
-            database_url.contains("muriarc_test"),
-            "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-        );
         let base_options = PgConnectOptions::from_str(&database_url)
             .expect("MURIARC_TEST_DATABASE_URL must be a PostgreSQL URL");
         let admin_pool = PgPoolOptions::new()

@@ -31,5 +31,6 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
+muriarc-core = { path = "../core", features = ["test-support"] }
 muriarc-store-postgres = { path = "../store-postgres" }
 tempfile = "3.24.0"

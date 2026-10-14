@@ -1066,13 +1066,9 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_sessions_and_external_tokens_are_hashed_scoped_and_revocable() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(
-            database_url.contains("muriarc_test"),
-            "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-        );
         let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
         store.migrate().await.unwrap();
         let password = "integration session password";
@@ -1235,10 +1231,9 @@ mod tests {
 
     #[tokio::test]
     async fn public_policy_marks_legacy_credentials_and_persists_hmac_backoff() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(database_url.contains("muriarc_test"));
         let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
         store.migrate().await.unwrap();
         let legacy_password = "legacy public password";
@@ -1352,10 +1347,9 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_password_change_clears_forced_state_and_revokes_other_sessions() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(database_url.contains("muriarc_test"));
         let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
         store.migrate().await.unwrap();
 

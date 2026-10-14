@@ -4756,13 +4756,9 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn model_management_routes_use_authenticated_user_scoped_postgres_store() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(
-            database_url.contains("muriarc_test"),
-            "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-        );
         let postgres = PostgresStore::connect(&database_url).await.unwrap();
         postgres.migrate().await.unwrap();
         let sqlite = Arc::new(SqliteStore::in_memory().await.unwrap());

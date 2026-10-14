@@ -90,7 +90,7 @@ jobs:
       - name: Domain, data, migration, and Store clippy
         run: >-
           cargo clippy --locked
-          -p muriarc-core -p muriarc-ai
+          -p muriarc-core -p muriarc-application -p muriarc-ai
           -p muriarc-store-sqlite -p muriarc-store-postgres
           -p muriarc-importer -p muriarc-data -p muriarc-snapshot
           --all-targets --all-features -- -D warnings
@@ -103,7 +103,7 @@ jobs:
       - name: Domain, data, migration, and dual Store tests
         run: >-
           cargo test --locked
-          -p muriarc-core -p muriarc-ai
+          -p muriarc-core -p muriarc-application -p muriarc-ai
           -p muriarc-store-sqlite -p muriarc-store-postgres
           -p muriarc-importer -p muriarc-data -p muriarc-snapshot
           --all-targets --all-features

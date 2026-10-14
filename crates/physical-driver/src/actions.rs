@@ -1647,16 +1647,9 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn physical_postgres_journal_freeze_and_first_write_guard_are_real() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-            eprintln!(
-                "skipping Physical Driver PostgreSQL integration: MURIARC_TEST_DATABASE_URL is not set"
-            );
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(
-            database_url.contains("muriarc_test"),
-            "Physical Driver integration requires the disposable muriarc_test server"
-        );
         let source_database = format!("muriarc_recovery_{}", Uuid::new_v4().simple());
         let candidate_database = format!("muriarc_candidate_{}", Uuid::new_v4().simple());
         let temporary = tempdir().expect("Physical Driver test root must be created");

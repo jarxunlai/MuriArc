@@ -44,3 +44,5 @@ pub use workspace::*;
 
 #[cfg(feature = "test-support")]
 pub mod store_contract;
+#[cfg(feature = "test-support")]
+pub mod test_database;

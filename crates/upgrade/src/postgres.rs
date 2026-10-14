@@ -644,16 +644,9 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_control_plane_enforces_locks_journal_and_fencing() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-            eprintln!(
-                "skipping PostgreSQL upgrade control test: MURIARC_TEST_DATABASE_URL is not set"
-            );
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(
-            database_url.contains("muriarc_test"),
-            "upgrade control test requires a disposable muriarc_test database"
-        );
         let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
         store.migrate().await.unwrap();
         let repository = PostgresUpgradeRepository::new(store.pool().clone());

@@ -1,11 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
-
 use axum::{Json, Router, extract::State, routing::get};
+use muriarc_application::{
+    AnimalAuditEntry, AnimalDetailQuery, AnimalPedigreeDirection, AnimalPedigreeEntry,
+    MAX_ANIMAL_DETAIL_PROJECTS, animal_project_refs, load_animal_detail,
+};
 use muriarc_core::{
-    Animal, AnimalEvent, AnimalFilter, AnimalOverview, AnimalProjectRef, AnimalStatus, AuditAction,
-    AuditFilter, EntityType, Experiment, Measurement, MeasurementFilter, ParentType, Participation,
-    ParticipationFilter, ParticipationStatus, Permission, ProvenanceFilter, ProvenanceSource,
-    RecordStatus, Sample, SampleFilter, Sex, WriteSource,
+    Animal, AnimalEvent, AnimalFilter, AnimalOverview, AnimalProjectRef, AnimalStatus, Attachment,
+    AuditAction, Experiment, Measurement, ParentType, Participation, ParticipationStatus,
+    Permission, ProvenanceSource, RecordStatus, Sample, Sex, WriteSource,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -13,12 +14,10 @@ use uuid::Uuid;
 use crate::{ApiError, AppState, AuthPrincipal, RequestMetadata};
 
 use super::{
-    ApiPath, ApiQuery, CollectionResponse, ItemResponse, collection, item, scope, store,
-    validation::{collection_limit, truncate, validation},
+    ApiPath, ApiQuery, CollectionResponse, ItemResponse, application, collection, item, scope,
+    store,
+    validation::{collection_limit, validation},
 };
-
-const MAX_PROJECTS_PER_ANIMAL: usize = 64;
-const MAX_PEDIGREE_EDGES: usize = 500;
 
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -326,25 +325,15 @@ async fn get_detail(
     let limit = collection_limit(query.limit, &metadata)?;
     let projects =
         detail_projects(&state, &principal, &metadata, &animal, query.project_id).await?;
-    if projects.len() > MAX_PROJECTS_PER_ANIMAL {
+    // Reject oversized scopes before issuing one permission check per project.
+    if projects.len() > MAX_ANIMAL_DETAIL_PROJECTS {
         return Err(validation(
             format!(
-                "animal is linked to more than {MAX_PROJECTS_PER_ANIMAL} projects; select a project context"
+                "animal is linked to more than {MAX_ANIMAL_DETAIL_PROJECTS} projects; select a project context"
             ),
             &metadata,
         ));
     }
-
-    let mut events = store(state.store.list_animal_events(animal_id), &metadata).await?;
-    if let Some(project_id) = query.project_id {
-        events.retain(|event| event.project_id == Some(project_id));
-    }
-    events.reverse();
-    truncate(&mut events, limit);
-
-    let mut experiments = Vec::new();
-    let mut measurements: Vec<MeasurementView> = Vec::new();
-    let mut samples: Vec<SampleView> = Vec::new();
     for project in &projects {
         scope::project_with_permission(
             &state,
@@ -354,152 +343,69 @@ async fn get_detail(
             Permission::ReadExperiment,
         )
         .await?;
-        let participations = store(
-            state.store.list_participations(&ParticipationFilter {
-                project_id: project.id,
-                experiment_id: None,
-                animal_id: Some(animal_id),
-                cohort_id: None,
-            }),
-            &metadata,
-        )
-        .await?;
-        for participation in participations {
-            if experiments.len() >= limit {
-                break;
-            }
-            let experiment = store(
-                state.store.get_experiment(participation.experiment_id),
-                &metadata,
-            )
-            .await?;
-            if experiment.lab_id != principal.lab_id || experiment.project_id != project.id {
-                return Err(ApiError::not_found("experiment was not found")
-                    .with_request_id(metadata.request_id.clone()));
-            }
-            let cohort = match participation.cohort_id {
-                Some(cohort_id) => store(state.store.list_cohorts(experiment.id), &metadata)
-                    .await?
-                    .into_iter()
-                    .find(|cohort| cohort.id == cohort_id)
-                    .map(|cohort| CohortSummary {
-                        id: cohort.id,
-                        name: cohort.name,
-                    }),
-                None => None,
-            };
-            experiments.push(AnimalExperimentView {
-                project: project.clone(),
-                experiment: experiment.into(),
-                participation: participation.into(),
-                cohort,
-            });
-        }
-
-        if measurements.len() < limit
-            && principal.can(Permission::ReadMeasurement, Some(project.id))
-        {
-            let mut rows = store(
-                state.store.list_measurements(&MeasurementFilter {
-                    project_id: project.id,
-                    experiment_id: None,
-                    animal_id: Some(animal_id),
-                }),
-                &metadata,
-            )
-            .await?;
-            rows.reverse();
-            measurements.extend(rows.into_iter().map(Into::into));
-            truncate(&mut measurements, limit);
-        }
-        if samples.len() < limit && principal.can(Permission::ReadSample, Some(project.id)) {
-            let mut rows = store(
-                state.store.list_samples(&SampleFilter {
-                    project_id: project.id,
-                    experiment_id: None,
-                    animal_id: Some(animal_id),
-                }),
-                &metadata,
-            )
-            .await?;
-            rows.reverse();
-            samples.extend(rows.into_iter().map(Into::into));
-            truncate(&mut samples, limit);
-        }
     }
-    experiments.sort_by(|left, right| {
-        right
-            .participation
-            .enrolled_at
-            .cmp(&left.participation.enrolled_at)
-    });
-    truncate(&mut experiments, limit);
-    measurements.sort_by_key(|measurement| std::cmp::Reverse(measurement.measured_at));
-    samples.sort_by_key(|sample| std::cmp::Reverse(sample.collected_at));
-
-    let pedigree =
-        pedigree_view(&state, &principal, &metadata, animal_id, query.project_id).await?;
-
-    let attachments = if principal.can(Permission::ReadAttachment, query.project_id) {
-        let mut rows = store(
-            state
-                .store
-                .list_attachments(principal.lab_id, "animal", animal_id),
-            &metadata,
-        )
-        .await?;
-        rows.retain(|attachment| match query.project_id {
-            Some(project_id) => attachment.project_id == Some(project_id),
-            None => true,
-        });
-        rows.reverse();
-        truncate(&mut rows, limit);
-        rows.into_iter()
-            .map(|attachment| AttachmentMetadataView {
-                id: attachment.id,
-                project_id: attachment.project_id,
-                entity_type: attachment.entity_type,
-                entity_id: attachment.entity_id,
-                file_name: attachment.file_name,
-                media_type: attachment.media_type,
-                size_bytes: attachment.size_bytes,
-                sha256: attachment.sha256,
-                version: attachment.version,
-                content_href: format!("/api/v1/attachments/{}/content", attachment.id),
-                created_at: attachment.meta.created_at,
-                revision: attachment.meta.revision,
-            })
+    let readable = |permission| {
+        projects
+            .iter()
+            .filter(|project| principal.can(permission, Some(project.id)))
+            .map(|project| project.id)
             .collect()
-    } else {
-        Vec::new()
     };
-
     let audit_visible = principal.can(Permission::ReadAudit, query.project_id);
-    let (audits, provenance) = if audit_visible {
-        audit_views(
-            &state,
-            &principal,
-            &metadata,
-            animal_id,
-            query.project_id,
-            limit,
-        )
-        .await?
-    } else {
-        (Vec::new(), Vec::new())
+    let detail_query = AnimalDetailQuery {
+        lab_id: principal.lab_id,
+        animal_id,
+        project_id: query.project_id,
+        measurement_project_ids: readable(Permission::ReadMeasurement),
+        sample_project_ids: readable(Permission::ReadSample),
+        projects,
+        include_attachments: principal.can(Permission::ReadAttachment, query.project_id),
+        include_audit: audit_visible,
+        limit,
     };
+    let detail = application(
+        load_animal_detail(state.store.as_ref(), &detail_query),
+        &metadata,
+    )
+    .await?;
 
     Ok(item(
         AnimalDetailView {
-            events,
-            experiments,
-            measurements,
-            pedigree,
-            samples,
-            attachments,
+            events: detail.events,
+            experiments: detail
+                .experiments
+                .into_iter()
+                .map(|entry| AnimalExperimentView {
+                    project: entry.project,
+                    experiment: entry.experiment.into(),
+                    participation: entry.participation.into(),
+                    cohort: entry.cohort.map(|cohort| CohortSummary {
+                        id: cohort.id,
+                        name: cohort.name,
+                    }),
+                })
+                .collect(),
+            measurements: detail.measurements.into_iter().map(Into::into).collect(),
+            pedigree: detail.pedigree.into_iter().map(pedigree_view).collect(),
+            samples: detail.samples.into_iter().map(Into::into).collect(),
+            attachments: detail
+                .attachments
+                .into_iter()
+                .map(attachment_view)
+                .collect(),
             audit_visible,
-            audits,
-            provenance,
+            audits: detail.audits.into_iter().map(audit_view).collect(),
+            provenance: detail
+                .provenance
+                .into_iter()
+                .map(|entry| ProvenanceSummaryView {
+                    id: entry.record.id,
+                    source: entry.record.source,
+                    actor: entry.actor_name,
+                    recorded_at: entry.record.recorded_at,
+                    request_id: entry.record.request_id,
+                })
+                .collect(),
         },
         &metadata,
     ))
@@ -526,169 +432,59 @@ async fn detail_projects(
             name: project.name,
         }]);
     }
-
-    let candidates = store(
-        state.store.list_animal_overviews(
-            &AnimalFilter {
-                lab_id: principal.lab_id,
-                query: Some(animal.display_id.clone()),
-                ..AnimalFilter::default()
-            },
-            0,
-            500,
-        ),
+    application(
+        animal_project_refs(state.store.as_ref(), principal.lab_id, animal),
         metadata,
     )
-    .await?;
-    Ok(candidates
-        .into_iter()
-        .find(|candidate| candidate.animal.id == animal.id)
-        .map(|candidate| candidate.projects)
-        .unwrap_or_default())
+    .await
 }
 
-async fn pedigree_view(
-    state: &AppState,
-    principal: &AuthPrincipal,
-    metadata: &RequestMetadata,
-    animal_id: Uuid,
-    project_id: Option<Uuid>,
-) -> Result<Vec<PedigreeRelationView>, ApiError> {
-    let relations = store(state.store.list_related_pedigrees(animal_id), metadata).await?;
-    if relations.len() > MAX_PEDIGREE_EDGES {
-        return Err(validation(
-            format!("pedigree contains more than {MAX_PEDIGREE_EDGES} active edges"),
-            metadata,
-        ));
+fn pedigree_view(entry: AnimalPedigreeEntry) -> PedigreeRelationView {
+    let animal = entry.related_animal;
+    PedigreeRelationView {
+        id: entry.relation.id,
+        direction: match entry.direction {
+            AnimalPedigreeDirection::Parent => PedigreeDirection::Parent,
+            AnimalPedigreeDirection::Offspring => PedigreeDirection::Offspring,
+        },
+        parent_type: entry.relation.parent_type,
+        related_animal: RelatedAnimalView {
+            id: animal.id,
+            display_id: animal.display_id,
+            sex: animal.sex,
+            strain: animal.strain,
+            current_status: animal.current_status,
+        },
+        revision: entry.relation.meta.revision,
     }
-    let related_ids = relations
-        .iter()
-        .map(|relation| {
-            if relation.animal_id == animal_id {
-                relation.parent_id
-            } else {
-                relation.animal_id
-            }
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let related = store(
-        state
-            .store
-            .list_animals_by_ids(principal.lab_id, project_id, &related_ids),
-        metadata,
-    )
-    .await?
-    .into_iter()
-    .map(|animal| (animal.id, animal))
-    .collect::<BTreeMap<_, _>>();
-
-    Ok(relations
-        .into_iter()
-        .filter_map(|relation| {
-            let (direction, related_id) = if relation.animal_id == animal_id {
-                (PedigreeDirection::Parent, relation.parent_id)
-            } else {
-                (PedigreeDirection::Offspring, relation.animal_id)
-            };
-            let animal = related.get(&related_id)?;
-            Some(PedigreeRelationView {
-                id: relation.id,
-                direction,
-                parent_type: relation.parent_type,
-                related_animal: RelatedAnimalView {
-                    id: animal.id,
-                    display_id: animal.display_id.clone(),
-                    sex: animal.sex,
-                    strain: animal.strain.clone(),
-                    current_status: animal.current_status,
-                },
-                revision: relation.meta.revision,
-            })
-        })
-        .collect())
 }
 
-async fn audit_views(
-    state: &AppState,
-    principal: &AuthPrincipal,
-    metadata: &RequestMetadata,
-    animal_id: Uuid,
-    project_id: Option<Uuid>,
-    limit: usize,
-) -> Result<(Vec<AuditSummaryView>, Vec<ProvenanceSummaryView>), ApiError> {
-    let mut audit_rows = store(
-        state.store.list_audit_entries(&AuditFilter {
-            lab_id: principal.lab_id,
-            project_id,
-            entity_id: Some(animal_id),
-        }),
-        metadata,
-    )
-    .await?;
-    audit_rows.reverse();
-    truncate(&mut audit_rows, limit);
-    let actor_names = audit_rows
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .actor
-                .user_id
-                .map(|id| (id, entry.actor.display_name.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
-    let audits = audit_rows
-        .into_iter()
-        .map(|entry| {
-            let revision = entry
-                .after
-                .as_ref()
-                .or(entry.before.as_ref())
-                .and_then(record_revision);
-            AuditSummaryView {
-                id: entry.id,
-                action: entry.action,
-                actor: entry.actor.display_name,
-                source: entry.source,
-                reason: entry.reason,
-                occurred_at: entry.occurred_at,
-                revision,
-            }
-        })
-        .collect();
-
-    let mut provenance_rows = store(
-        state.store.list_provenance(&ProvenanceFilter {
-            lab_id: principal.lab_id,
-            project_id,
-            entity_type: Some(EntityType::Animal),
-            entity_id: Some(animal_id),
-            source: None,
-        }),
-        metadata,
-    )
-    .await?;
-    provenance_rows.reverse();
-    truncate(&mut provenance_rows, limit);
-    let provenance = provenance_rows
-        .into_iter()
-        .map(|entry| ProvenanceSummaryView {
-            id: entry.id,
-            source: entry.source,
-            actor: entry
-                .actor_user_id
-                .and_then(|actor_id| actor_names.get(&actor_id).cloned()),
-            recorded_at: entry.recorded_at,
-            request_id: entry.request_id,
-        })
-        .collect();
-    Ok((audits, provenance))
+fn attachment_view(attachment: Attachment) -> AttachmentMetadataView {
+    AttachmentMetadataView {
+        id: attachment.id,
+        project_id: attachment.project_id,
+        entity_type: attachment.entity_type,
+        entity_id: attachment.entity_id,
+        file_name: attachment.file_name,
+        media_type: attachment.media_type,
+        size_bytes: attachment.size_bytes,
+        sha256: attachment.sha256,
+        version: attachment.version,
+        content_href: format!("/api/v1/attachments/{}/content", attachment.id),
+        created_at: attachment.meta.created_at,
+        revision: attachment.meta.revision,
+    }
 }
 
-fn record_revision(value: &serde_json::Value) -> Option<i64> {
-    value
-        .get("meta")
-        .and_then(|meta| meta.get("revision"))
-        .and_then(serde_json::Value::as_i64)
+fn audit_view(audit: AnimalAuditEntry) -> AuditSummaryView {
+    let entry = audit.entry;
+    AuditSummaryView {
+        id: entry.id,
+        action: entry.action,
+        actor: entry.actor.display_name,
+        source: entry.source,
+        reason: entry.reason,
+        occurred_at: entry.occurred_at,
+        revision: audit.revision,
+    }
 }

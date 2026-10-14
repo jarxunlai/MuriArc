@@ -29,6 +29,8 @@ Application service 规范化输入并编排跨 Domain/Store port 的用例。�
 
 典型职责包括动物登记与转笼、项目动物分配、繁育状态转换、实验发布/入组、测量草稿、导入确认、Snapshot、AI 会话和人工审批。
 
+共享读模型遵循同一规则：`load_animal_detail` 用同一套作用域校验、上限和排序组装动物详情（事件、实验参与、测量、样本、系谱、附件、审计）；各 transport 只负责授权可见的项目与分区，并把结果映射为各自的传输 DTO。
+
 ### Core 与 Domain
 
 Core 不依赖 Tauri、Axum、SQLx 具体数据库或模型 Provider，包含：

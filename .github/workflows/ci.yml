@@ -266,6 +266,38 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"email":"ci-root@example.org","password":"ci-environment-root-password-not-for-production"}' \
             http://127.0.0.1:8787/api/v1/auth/login
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.0
+          standalone: true
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Install UI test dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+      - name: Install Playwright browser
+        working-directory: ui
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Real Server browser smoke
+        working-directory: ui
+        env:
+          MURIARC_E2E_BASE_URL: http://127.0.0.1:8787
+          MURIARC_E2E_EMAIL: ${{ env.MURIARC_ROOT_USER_EMAIL }}
+          MURIARC_E2E_PASSWORD: ${{ env.MURIARC_ROOT_PASSWORD }}
+        run: pnpm exec playwright test -c playwright.server.config.ts
+      - name: Upload Server smoke report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-smoke-playwright
+          path: |
+            ui/playwright-report/server
+            ui/test-results/server
+          retention-days: 7
       - name: Compose diagnostics
         if: always()
         run: docker compose ps && docker compose logs --no-color

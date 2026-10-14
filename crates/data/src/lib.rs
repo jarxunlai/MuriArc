@@ -2,6 +2,7 @@
 
 mod ai_source_cleanup;
 mod ai_source_import;
+mod ai_source_policy;
 mod attachment_files;
 mod attachment_inspection;
 mod source_material;
@@ -12,6 +13,11 @@ pub use ai_source_cleanup::{
 pub use ai_source_import::{
     AiSourceImportValidationError, ValidatedAiSourceImport, ai_source_import_idempotency_key,
     validate_ai_source_import,
+};
+pub use ai_source_policy::{
+    AI_SOURCE_RETENTION_DAYS, AiSourcePolicyError, MAX_AI_SOURCE_FILE_NAME_BYTES,
+    MAX_AI_SOURCE_MEDIA_TYPE_BYTES, classify_ai_source, normalize_ai_source_file_name,
+    normalize_ai_source_media_type,
 };
 pub use attachment_files::{
     AttachmentFileError, AttachmentFiles, MAX_ATTACHMENT_BYTES, StoredAttachmentObject,

@@ -2,19 +2,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use muriarc_application::{
-    CreateAlleleCommand, CreateGeneLocusCommand, CreateGenotypeCommand, CreatePedigreeCommand,
-    CreateSampleCommand, GeneticsArchiveCommand, archive_allele as archive_allele_use_case,
+    AnimalDetailQuery, AnimalPedigreeDirection, CreateAlleleCommand, CreateGeneLocusCommand,
+    CreateGenotypeCommand, CreatePedigreeCommand, CreateSampleCommand, GeneticsArchiveCommand,
+    animal_project_refs, archive_allele as archive_allele_use_case,
     archive_gene_locus as archive_gene_locus_use_case, create_allele as create_allele_use_case,
     create_gene_locus as create_gene_locus_use_case, create_genotype as create_genotype_use_case,
     create_pedigree as create_pedigree_use_case, create_sample as create_sample_use_case,
-    restore_allele as restore_allele_use_case, restore_gene_locus as restore_gene_locus_use_case,
+    load_animal_detail, restore_allele as restore_allele_use_case,
+    restore_gene_locus as restore_gene_locus_use_case,
 };
 use muriarc_core::{
-    Allele, Animal, AnimalEvent, AnimalEventKind, AnimalFilter, AnimalProjectRef, AnimalStatus,
-    Attachment, AuditAction, AuditFilter, GeneLocus, GeneticsReferenceCounts, Genotype,
-    Measurement, MeasurementFilter, MeasurementValue, MuriArcStore, ParentType,
-    ParticipationFilter, ParticipationStatus, ProvenanceFilter, ProvenanceSource, RecordStatus,
-    Sample, SampleFilter, Sex, WriteSource,
+    Allele, Animal, AnimalEvent, AnimalEventKind, AnimalProjectRef, AnimalStatus, Attachment,
+    AuditAction, GeneLocus, GeneticsReferenceCounts, Genotype, Measurement, MeasurementValue,
+    MuriArcStore, ParentType, ParticipationStatus, ProvenanceSource, RecordStatus, Sample, Sex,
+    WriteSource,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -23,7 +24,6 @@ use crate::application::{DesktopError, DesktopState};
 use crate::research_extensions::GeneticsArchiveInput;
 
 const DETAIL_LIMIT: usize = 500;
-const MAX_PROJECTS_PER_ANIMAL: usize = 64;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -325,12 +325,26 @@ impl DesktopState {
             .into());
         }
         let projects = animal_projects(self, &animal, project_id).await?;
-        if projects.len() > MAX_PROJECTS_PER_ANIMAL {
-            return Err(muriarc_core::StoreError::Validation(format!(
-                "动物关联项目超过 {MAX_PROJECTS_PER_ANIMAL} 个，请选择项目上下文"
-            ))
-            .into());
-        }
+        // The local operator holds every permission, so every section is visible.
+        let all_project_ids = projects
+            .iter()
+            .map(|project| project.id)
+            .collect::<BTreeSet<_>>();
+        let detail = load_animal_detail(
+            self.read_store(),
+            &AnimalDetailQuery {
+                lab_id: self.lab_id(),
+                animal_id,
+                project_id,
+                projects,
+                measurement_project_ids: all_project_ids.clone(),
+                sample_project_ids: all_project_ids,
+                include_attachments: true,
+                include_audit: true,
+                limit: DETAIL_LIMIT,
+            },
+        )
+        .await?;
 
         let cages = self
             .read_store()
@@ -344,171 +358,82 @@ impl DesktopState {
             .get_user(self.user_id())
             .await?
             .display_name;
-        let mut events = self.read_store().list_animal_events(animal_id).await?;
-        if let Some(project_id) = project_id {
-            events.retain(|event| event.project_id == Some(project_id));
-        }
-        events.reverse();
-        events.truncate(DETAIL_LIMIT);
-        let timeline = events
+        let timeline = detail
+            .events
             .into_iter()
             .map(|event| timeline_event(event, &cages, self.user_id(), &operator))
             .collect();
-
-        let mut experiments = Vec::new();
-        let mut measurements = Vec::new();
-        let mut samples = Vec::new();
-        for project in &projects {
-            for participation in self
-                .read_store()
-                .list_participations(&ParticipationFilter {
-                    project_id: project.id,
-                    experiment_id: None,
-                    animal_id: Some(animal_id),
-                    cohort_id: None,
-                })
-                .await?
-            {
-                if experiments.len() >= DETAIL_LIMIT {
-                    break;
-                }
-                let experiment = self
-                    .read_store()
-                    .get_experiment(participation.experiment_id)
-                    .await?;
-                let cohort = match participation.cohort_id {
-                    Some(cohort_id) => self
-                        .read_store()
-                        .list_cohorts(experiment.id)
-                        .await?
-                        .into_iter()
-                        .find(|cohort| cohort.id == cohort_id),
-                    None => None,
-                };
-                experiments.push(AnimalExperimentView {
-                    project_id: project.id.to_string(),
-                    project_name: project.name.clone(),
-                    experiment_id: experiment.id.to_string(),
-                    experiment_name: experiment.name,
-                    experiment_status: format!("{:?}", experiment.status).to_ascii_lowercase(),
-                    cohort_id: cohort.as_ref().map(|cohort| cohort.id.to_string()),
-                    cohort_name: cohort.map(|cohort| cohort.name),
-                    participation_id: participation.id.to_string(),
-                    participation_status: participation_status(participation.status),
-                    enrolled_at: participation.enrolled_at.to_rfc3339(),
-                    exited_at: participation.exited_at.map(|value| value.to_rfc3339()),
-                    revision: participation.meta.revision,
-                });
-            }
-
-            let mut project_measurements = self
-                .read_store()
-                .list_measurements(&MeasurementFilter {
-                    project_id: project.id,
-                    experiment_id: None,
-                    animal_id: Some(animal_id),
-                })
-                .await?;
-            project_measurements.reverse();
-            measurements.extend(project_measurements.into_iter().map(measurement_view));
-            measurements.truncate(DETAIL_LIMIT);
-
-            let mut project_samples = self
-                .read_store()
-                .list_samples(&SampleFilter {
-                    project_id: project.id,
-                    experiment_id: None,
-                    animal_id: Some(animal_id),
-                })
-                .await?;
-            project_samples.reverse();
-            samples.extend(project_samples.into_iter().map(sample_view));
-            samples.truncate(DETAIL_LIMIT);
-        }
-        experiments.sort_by(|left, right| right.enrolled_at.cmp(&left.enrolled_at));
-        measurements.sort_by(|left, right| right.measured_at.cmp(&left.measured_at));
-        samples.sort_by(|left, right| right.collected_at.cmp(&left.collected_at));
-
-        let pedigree = pedigree_views(self, animal_id, project_id).await?;
-        let mut attachments = self
-            .read_store()
-            .list_attachments(self.lab_id(), "animal", animal_id)
-            .await?;
-        attachments.retain(|attachment| match project_id {
-            Some(project_id) => attachment.project_id == Some(project_id),
-            None => true,
-        });
-        attachments.reverse();
-        attachments.truncate(DETAIL_LIMIT);
-
-        let mut audit_rows = self
-            .read_store()
-            .list_audit_entries(&AuditFilter {
-                lab_id: self.lab_id(),
-                project_id,
-                entity_id: Some(animal_id),
-            })
-            .await?;
-        audit_rows.reverse();
-        audit_rows.truncate(DETAIL_LIMIT);
-        let actor_names = audit_rows
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .actor
-                    .user_id
-                    .map(|id| (id, entry.actor.display_name.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let audits = audit_rows
+        let experiments = detail
+            .experiments
             .into_iter()
-            .map(|entry| AuditSummaryView {
-                id: entry.id.to_string(),
-                action: entry.action,
-                actor: entry.actor.display_name,
-                source: entry.source,
-                reason: entry.reason,
-                occurred_at: entry.occurred_at.to_rfc3339(),
-                revision: entry
-                    .after
-                    .as_ref()
-                    .or(entry.before.as_ref())
-                    .and_then(record_revision),
+            .map(|entry| AnimalExperimentView {
+                project_id: entry.project.id.to_string(),
+                project_name: entry.project.name,
+                experiment_id: entry.experiment.id.to_string(),
+                experiment_name: entry.experiment.name,
+                experiment_status: format!("{:?}", entry.experiment.status).to_ascii_lowercase(),
+                cohort_id: entry.cohort.as_ref().map(|cohort| cohort.id.to_string()),
+                cohort_name: entry.cohort.map(|cohort| cohort.name),
+                participation_id: entry.participation.id.to_string(),
+                participation_status: participation_status(entry.participation.status),
+                enrolled_at: entry.participation.enrolled_at.to_rfc3339(),
+                exited_at: entry
+                    .participation
+                    .exited_at
+                    .map(|value| value.to_rfc3339()),
+                revision: entry.participation.meta.revision,
             })
             .collect();
-
-        let mut provenance_rows = self
-            .read_store()
-            .list_provenance(&ProvenanceFilter {
-                lab_id: self.lab_id(),
-                project_id,
-                entity_type: Some(muriarc_core::EntityType::Animal),
-                entity_id: Some(animal_id),
-                source: None,
+        let pedigree = detail
+            .pedigree
+            .into_iter()
+            .map(|entry| PedigreeRelationView {
+                id: entry.relation.id.to_string(),
+                direction: match entry.direction {
+                    AnimalPedigreeDirection::Parent => PedigreeDirection::Parent,
+                    AnimalPedigreeDirection::Offspring => PedigreeDirection::Offspring,
+                },
+                parent_type: entry.relation.parent_type,
+                related_animal: related_animal(&entry.related_animal),
+                revision: entry.relation.meta.revision,
             })
-            .await?;
-        provenance_rows.reverse();
-        provenance_rows.truncate(DETAIL_LIMIT);
-        let provenance = provenance_rows
+            .collect();
+        let audits = detail
+            .audits
+            .into_iter()
+            .map(|audit| AuditSummaryView {
+                id: audit.entry.id.to_string(),
+                action: audit.entry.action,
+                actor: audit.entry.actor.display_name,
+                source: audit.entry.source,
+                reason: audit.entry.reason,
+                occurred_at: audit.entry.occurred_at.to_rfc3339(),
+                revision: audit.revision,
+            })
+            .collect();
+        let provenance = detail
+            .provenance
             .into_iter()
             .map(|entry| ProvenanceSummaryView {
-                id: entry.id.to_string(),
-                source: entry.source,
-                actor: entry
-                    .actor_user_id
-                    .and_then(|actor_id| actor_names.get(&actor_id).cloned()),
-                recorded_at: entry.recorded_at.to_rfc3339(),
-                request_id: entry.request_id,
+                id: entry.record.id.to_string(),
+                source: entry.record.source,
+                actor: entry.actor_name,
+                recorded_at: entry.record.recorded_at.to_rfc3339(),
+                request_id: entry.record.request_id,
             })
             .collect();
 
         Ok(AnimalDetailView {
             timeline,
             experiments,
-            measurements,
+            measurements: detail
+                .measurements
+                .into_iter()
+                .map(measurement_view)
+                .collect(),
             pedigree,
-            samples,
-            attachments: attachments.into_iter().map(Into::into).collect(),
+            samples: detail.samples.into_iter().map(sample_view).collect(),
+            attachments: detail.attachments.into_iter().map(Into::into).collect(),
             audit_visible: true,
             audits,
             provenance,
@@ -869,27 +794,9 @@ async fn animal_projects(
     animal: &Animal,
     project_id: Option<Uuid>,
 ) -> Result<Vec<AnimalProjectRef>, DesktopError> {
-    let overview = state
-        .read_store()
-        .list_animal_overviews(
-            &AnimalFilter {
-                lab_id: state.lab_id(),
-                query: Some(animal.display_id.clone()),
-                ..AnimalFilter::default()
-            },
-            0,
-            500,
-        )
-        .await?
-        .into_iter()
-        .find(|candidate| candidate.animal.id == animal.id)
-        .ok_or(muriarc_core::StoreError::NotFound {
-            entity: "animal",
-            id: animal.id,
-        })?;
+    let projects = animal_project_refs(state.read_store(), state.lab_id(), animal).await?;
     match project_id {
-        Some(project_id) => overview
-            .projects
+        Some(project_id) => projects
             .into_iter()
             .find(|project| project.id == project_id)
             .map(|project| vec![project])
@@ -900,53 +807,8 @@ async fn animal_projects(
                 }
                 .into()
             }),
-        None => Ok(overview.projects),
+        None => Ok(projects),
     }
-}
-
-async fn pedigree_views(
-    state: &DesktopState,
-    animal_id: Uuid,
-    project_id: Option<Uuid>,
-) -> Result<Vec<PedigreeRelationView>, DesktopError> {
-    let relations = state.read_store().list_related_pedigrees(animal_id).await?;
-    let related_ids = relations
-        .iter()
-        .map(|relation| {
-            if relation.animal_id == animal_id {
-                relation.parent_id
-            } else {
-                relation.animal_id
-            }
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let animals = state
-        .read_store()
-        .list_animals_by_ids(state.lab_id(), project_id, &related_ids)
-        .await?
-        .into_iter()
-        .map(|animal| (animal.id, animal))
-        .collect::<BTreeMap<_, _>>();
-    Ok(relations
-        .into_iter()
-        .filter_map(|relation| {
-            let (direction, related_id) = if relation.animal_id == animal_id {
-                (PedigreeDirection::Parent, relation.parent_id)
-            } else {
-                (PedigreeDirection::Offspring, relation.animal_id)
-            };
-            let animal = animals.get(&related_id)?;
-            Some(PedigreeRelationView {
-                id: relation.id.to_string(),
-                direction,
-                parent_type: relation.parent_type,
-                related_animal: related_animal(animal),
-                revision: relation.meta.revision,
-            })
-        })
-        .collect())
 }
 
 fn related_animal(animal: &Animal) -> RelatedAnimalView {
@@ -1169,13 +1031,6 @@ async fn validate_animal_scope(
     Ok(())
 }
 
-fn record_revision(value: &serde_json::Value) -> Option<i64> {
-    value
-        .get("meta")
-        .and_then(|meta| meta.get("revision"))
-        .and_then(serde_json::Value::as_i64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,7 +1038,10 @@ mod tests {
         AnimalIdentifierScopeInput, CreateAnimalInput, CreateExperimentInput, CreateProjectInput,
         CreateTemplateInput, EnrollAnimalInput,
     };
-    use muriarc_core::{EntityType, FieldValueType, LOCAL_LAB_ID, LOCAL_USER_ID, ProvenanceFilter};
+    use muriarc_core::{
+        AuditFilter, EntityType, FieldValueType, LOCAL_LAB_ID, LOCAL_USER_ID, ProvenanceFilter,
+        SampleFilter,
+    };
     use serde::Serialize;
     use tempfile::{TempDir, tempdir};
 

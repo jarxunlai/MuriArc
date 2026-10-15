@@ -29,6 +29,8 @@ Application services normalize inputs and orchestrate use cases across domain an
 
 Typical responsibilities include animal registration and transfer, project assignment, breeding transitions, experiment publication/enrollment, measurement drafts, import confirmation, snapshot creation, AI conversation workflows, and human approval.
 
+Shared read models follow the same rule. `load_animal_detail` assembles the animal detail (events, participation, measurements, samples, pedigree, attachments, audit) with one set of scope checks, bounds and ordering; each transport only authorizes which projects and sections are visible and maps the result to its wire DTO.
+
 ### Core and domain
 
 Core has no dependency on Tauri, Axum, SQLx database implementations, or model Providers. It contains:

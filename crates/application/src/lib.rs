@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod animal;
+mod animal_detail;
 mod breeding;
 mod business_read;
 mod cage;
@@ -18,6 +19,7 @@ pub use animal::{
     CreateAnimalCommand, CreateAnimalIdentifierScope, InitialGenotypingRecordInput,
     MAX_ANIMAL_DISPLAY_ID_CHARS, MAX_ANIMAL_STRAIN_CHARS, create_animal,
 };
+pub use animal_detail::*;
 pub use breeding::*;
 pub use business_read::*;
 pub use cage::{

@@ -132,9 +132,14 @@ git worktree add -b <branch_name> <worktree_path>
 
 - **严禁**回到 main 工作树编译/测试该 worktree 的改动；**严禁**把主仓或其它树的 `./target` / `node_modules` 链进 worktree。
 - **cwd 必须是该 worktree 绝对路径**；先 `source "$HOME/.cargo/env"`（若存在），再确认 `command -v cargo`。
-- **Cargo 产物**必须在仓库外，并按分支分流：有 `/mnt/e/Muriarc` 时默认 `/mnt/e/Muriarc/builds/cargo-target/<branch-slug>`，否则 `$HOME/.cache/muriarc-cargo-target/<branch-slug>`。完整引导脚本见 `AGENTS.md`。
+- **Cargo 产物**必须在仓库外；本项目默认让 main 与所有 worktree 串行共享
+  `/mnt/e/Muriarc/builds/cargo-target/shared`，没有 E 盘时回退到
+  `$HOME/.cache/muriarc-cargo-target/shared`。禁止并行写该目录、直接运行其中的裸二进制或未经
+  授权执行 `cargo clean`；完整规则见 `AGENTS.md`。
 - **前端**：在该 worktree 内执行一次 `pnpm --dir ui install`（勿链回主仓）。
 - 不要把 `target/`、`node_modules` 移出 `.gitignore`；不要共用可写测试数据库/附件目录。
+- **CodeGraph**：若本机 CodeGraph 可用，则每个新 worktree 必须在自身根目录独立初始化索引；
+  不得复制、链接或借用 main 的 `.codegraph/`。
 
 ---
 

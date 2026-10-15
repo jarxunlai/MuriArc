@@ -864,32 +864,54 @@ fn decrypt_archive(context: &DriverContext, backup_id: Uuid, output: &Path) -> R
     let artifact = backup_artifact_path(context, backup_id);
     require_regular_file(&artifact, "encrypted backup artifact")?;
     let identity = context.backup_identity_file()?;
-    let mut child = Command::new(context.age_executable()?)
+    let mut command = Command::new(context.age_executable()?);
+    command
         .args(["--decrypt", "--identity"])
         .arg(identity)
-        .arg(artifact)
+        .arg(artifact);
+    unpack_archive_stream(command, output)
+}
+
+/// Unpacks the tar archive that `command` writes to stdout into `output`.
+///
+/// tar stops reading at its end-of-archive marker while the writer (age) may
+/// still be flushing trailing bytes. Closing the pipe at that point made the
+/// writer fail with EPIPE, so restores failed intermittently; the rest of the
+/// stream is therefore drained before the exit status is checked.
+fn unpack_archive_stream(mut command: Command, output: &Path) -> Result<()> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
     let stdout = child.stdout.take().context("age stdout is unavailable")?;
     let mut archive = tar::Archive::new(stdout);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        validate_relative_path(&path)?;
-        let kind = entry.header().entry_type();
-        anyhow::ensure!(
-            kind.is_file() || kind.is_dir(),
-            "recovery archive contains unsupported entry"
-        );
-        anyhow::ensure!(
-            entry.unpack_in(output)?,
-            "recovery archive entry escaped output"
-        );
+    let unpacked = (|| {
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.into_owned();
+            validate_relative_path(&path)?;
+            let kind = entry.header().entry_type();
+            anyhow::ensure!(
+                kind.is_file() || kind.is_dir(),
+                "recovery archive contains unsupported entry"
+            );
+            anyhow::ensure!(
+                entry.unpack_in(output)?,
+                "recovery archive entry escaped output"
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    })();
+    if let Err(error) = unpacked {
+        // A rejected archive is not read further.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
     }
-    drop(archive);
+    let drained = std::io::copy(&mut archive.into_inner(), &mut std::io::sink());
     let status = child.wait()?;
+    drained.context("backup decryption stream could not be drained")?;
     anyhow::ensure!(status.success(), "backup decryption failed");
     Ok(())
 }
@@ -1017,6 +1039,40 @@ mod tests {
         assert_eq!(
             normalized_database_dump_digest(&first).unwrap(),
             normalized_database_dump_digest(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn restore_stream_drains_trailing_data_so_the_writer_exits_cleanly() {
+        let root = tempfile::tempdir().unwrap();
+        let tar_path = root.path().join("backup.tar");
+        {
+            let mut builder = tar::Builder::new(File::create(&tar_path).unwrap());
+            let payload = b"synthetic recovery payload";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o600);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "data/state.txt", &payload[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let output = root.path().join("restore");
+        fs::create_dir(&output).unwrap();
+
+        // Like age, the writer keeps emitting bytes after tar's end-of-archive marker;
+        // 1 MiB exceeds any pipe buffer, so closing the pipe early fails the writer.
+        let mut writer = Command::new("sh");
+        writer
+            .arg("-c")
+            .arg(r#"cat "$1" && head -c 1048576 /dev/zero"#)
+            .arg("sh")
+            .arg(&tar_path);
+        unpack_archive_stream(writer, &output).expect("trailing stream data must be drained");
+        assert_eq!(
+            fs::read(output.join("data/state.txt")).unwrap(),
+            b"synthetic recovery payload"
         );
     }
 }

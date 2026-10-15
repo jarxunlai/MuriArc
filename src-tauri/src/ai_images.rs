@@ -7,15 +7,15 @@ use muriarc_ai::{
     MAX_VISION_TOTAL_BASE64_BYTES, PreparedAssistantImage, ProviderCredentials,
     extract_data_cell_vision, sanitize_vision_input,
 };
+use muriarc_application::{ApplicationError, ai_data_cell_in_experiment_scope};
 use muriarc_core::{
     Actor, AiExtractionApprovalInput, AiExtractionApprovalSelection, AiExtractionDraft,
     AiExtractionEvidence, AiExtractionItem, AiExtractionModelTrace, AiExtractionRejectionInput,
     AiExtractionStatus, AiModelProfileBinding, AiModelProfileStore, AiModelPurpose,
     AiObservationDataCell, AppliedAiExtraction, Attachment, AttachmentDerivative, AuditContext,
     DerivativeKind, DerivativeStatus, LOCAL_LAB_ID, LOCAL_USER_ID, MuriArcStore, Observation,
-    ObservationSubjectType, ObservationValueData, ObservationValueRecord, ParticipationFilter,
-    PrivateAiImage, PrivateImageFilter, PrivateImageStatus, RecordMeta, StoreError, WorkspaceStore,
-    WriteSource,
+    ObservationSubjectType, ObservationValueData, ObservationValueRecord, PrivateAiImage,
+    PrivateImageFilter, PrivateImageStatus, RecordMeta, StoreError, WorkspaceStore, WriteSource,
 };
 use muriarc_data::{
     AttachmentContentKind, AttachmentFileError, AttachmentFiles, inspect_attachment,
@@ -684,29 +684,21 @@ impl DesktopAiImages {
         experiment_id: Uuid,
         cell: &AiObservationDataCell,
     ) -> Result<(), DesktopAiError> {
-        let valid = match cell.subject_type {
-            ObservationSubjectType::Experiment => cell.subject_id == experiment_id,
-            ObservationSubjectType::Animal => !self
-                .store
-                .list_participations(&ParticipationFilter {
-                    project_id,
-                    experiment_id: Some(experiment_id),
-                    animal_id: Some(cell.subject_id),
-                    cohort_id: None,
-                })
-                .await?
-                .is_empty(),
-            ObservationSubjectType::Sample => {
-                let sample = self.store.get_sample(cell.subject_id).await?;
-                (sample.lab_id, sample.project_id, sample.experiment_id)
-                    == (LOCAL_LAB_ID, project_id, Some(experiment_id))
-            }
-            ObservationSubjectType::Artifact => {
-                let attachment = self.store.get_attachment(cell.subject_id).await?;
-                (attachment.lab_id, attachment.project_id) == (LOCAL_LAB_ID, Some(project_id))
-            }
-        };
-        valid.then_some(()).ok_or(DesktopAiError::InvalidExtraction)
+        let in_scope = ai_data_cell_in_experiment_scope(
+            self.store.as_ref(),
+            LOCAL_LAB_ID,
+            project_id,
+            experiment_id,
+            cell,
+        )
+        .await
+        .map_err(|error| match error {
+            ApplicationError::Store(error) => DesktopAiError::Store(error),
+            _ => DesktopAiError::InvalidExtraction,
+        })?;
+        in_scope
+            .then_some(())
+            .ok_or(DesktopAiError::InvalidExtraction)
     }
 }
 

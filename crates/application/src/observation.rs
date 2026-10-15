@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use muriarc_core::{
-    AuditContext, ExperimentEvent, MuriArcStore, Observation, ObservationDefinition,
-    ObservationPolicy, ObservationSubjectType, ObservationValueData, ObservationValueRecord,
-    ObservationValueType,
+    AiObservationDataCell, AuditContext, ExperimentEvent, MuriArcStore, Observation,
+    ObservationDefinition, ObservationPolicy, ObservationSubjectType, ObservationValueData,
+    ObservationValueRecord, ObservationValueType, ParticipationFilter, StoreError,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -142,6 +142,46 @@ pub struct RecordObservationCommand {
 pub struct RecordedObservation {
     pub observation: Observation,
     pub value: ObservationValueRecord,
+}
+
+/// Whether an AI extraction data cell targets a subject inside the selected
+/// project experiment. Missing subjects count as out of scope, so callers never
+/// reveal whether an identifier exists in another project or lab.
+pub async fn ai_data_cell_in_experiment_scope(
+    store: &dyn MuriArcStore,
+    lab_id: Uuid,
+    project_id: Uuid,
+    experiment_id: Uuid,
+    cell: &AiObservationDataCell,
+) -> ApplicationResult<bool> {
+    let in_scope = match cell.subject_type {
+        ObservationSubjectType::Experiment => cell.subject_id == experiment_id,
+        ObservationSubjectType::Animal => !store
+            .list_participations(&ParticipationFilter {
+                project_id,
+                experiment_id: Some(experiment_id),
+                animal_id: Some(cell.subject_id),
+                cohort_id: None,
+            })
+            .await?
+            .is_empty(),
+        ObservationSubjectType::Sample => match store.get_sample(cell.subject_id).await {
+            Ok(sample) => {
+                (sample.lab_id, sample.project_id, sample.experiment_id)
+                    == (lab_id, project_id, Some(experiment_id))
+            }
+            Err(StoreError::NotFound { .. }) => false,
+            Err(error) => return Err(error.into()),
+        },
+        ObservationSubjectType::Artifact => match store.get_attachment(cell.subject_id).await {
+            Ok(attachment) => {
+                (attachment.lab_id, attachment.project_id) == (lab_id, Some(project_id))
+            }
+            Err(StoreError::NotFound { .. }) => false,
+            Err(error) => return Err(error.into()),
+        },
+    };
+    Ok(in_scope)
 }
 
 pub async fn record_observation(

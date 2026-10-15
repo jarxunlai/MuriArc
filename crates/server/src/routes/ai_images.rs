@@ -22,14 +22,15 @@ use muriarc_ai::{
     MAX_SANITIZED_VISION_INPUT_BYTES, MAX_VISION_TOTAL_BASE64_BYTES, PreparedAssistantImage,
     ProviderCredentials, extract_data_cell_vision, sanitize_vision_input,
 };
+use muriarc_application::ai_data_cell_in_experiment_scope;
 use muriarc_core::{
     AiExtractionApprovalInput, AiExtractionApprovalSelection, AiExtractionDraft,
     AiExtractionEvidence, AiExtractionItem, AiExtractionModelTrace, AiExtractionRejectionInput,
     AiExtractionStatus, AiModelPurpose, AiObservationDataCell, AppliedAiExtraction, Attachment,
     AttachmentDerivative, AuditAction, DerivativeKind, DerivativeStatus, EntityType, Observation,
-    ObservationSubjectType, ObservationValueData, ObservationValueRecord, ParticipationFilter,
-    Permission, PrivateAiImage, PrivateImageFilter, PrivateImageStats, PrivateImageStatus,
-    RecordMeta, StoreError,
+    ObservationSubjectType, ObservationValueData, ObservationValueRecord, Permission,
+    PrivateAiImage, PrivateImageFilter, PrivateImageStats, PrivateImageStatus, RecordMeta,
+    StoreError,
 };
 use muriarc_data::{
     AttachmentContentKind, AttachmentFileError, AttachmentFiles, AttachmentInspectionError,
@@ -762,50 +763,19 @@ async fn validate_extraction_data_cell_scope(
     experiment_id: Uuid,
     cell: &AiObservationDataCell,
 ) -> Result<(), ApiError> {
-    let valid = match cell.subject_type {
-        ObservationSubjectType::Experiment => cell.subject_id == experiment_id,
-        ObservationSubjectType::Animal => !state
-            .store
-            .list_participations(&ParticipationFilter {
-                project_id,
-                experiment_id: Some(experiment_id),
-                animal_id: Some(cell.subject_id),
-                cohort_id: None,
-            })
-            .await
-            .map_err(|error| {
-                ApiError::from_store(error).with_request_id(metadata.request_id.clone())
-            })?
-            .is_empty(),
-        ObservationSubjectType::Sample => {
-            let sample = state
-                .store
-                .get_sample(cell.subject_id)
-                .await
-                .map_err(|error| data_cell_store_error(error, metadata))?;
-            (sample.lab_id, sample.project_id, sample.experiment_id)
-                == (principal.lab_id, project_id, Some(experiment_id))
-        }
-        ObservationSubjectType::Artifact => {
-            let attachment = state
-                .store
-                .get_attachment(cell.subject_id)
-                .await
-                .map_err(|error| data_cell_store_error(error, metadata))?;
-            (attachment.lab_id, attachment.project_id) == (principal.lab_id, Some(project_id))
-        }
-    };
-    if valid {
+    let in_scope = ai_data_cell_in_experiment_scope(
+        state.store.as_ref(),
+        principal.lab_id,
+        project_id,
+        experiment_id,
+        cell,
+    )
+    .await
+    .map_err(|error| ApiError::from(error).with_request_id(metadata.request_id.clone()))?;
+    if in_scope {
         Ok(())
     } else {
         Err(data_cell_invalid(metadata))
-    }
-}
-
-fn data_cell_store_error(error: StoreError, metadata: &RequestMetadata) -> ApiError {
-    match error {
-        StoreError::NotFound { .. } => data_cell_invalid(metadata),
-        error => ApiError::from_store(error).with_request_id(metadata.request_id.clone()),
     }
 }
 

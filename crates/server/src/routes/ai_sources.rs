@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -13,11 +13,11 @@ use muriarc_core::{
     AiConversationSourceStatus, Attachment, Permission, RecordMeta,
 };
 use muriarc_data::{
-    AttachmentContentKind, AttachmentFiles, AttachmentInspection, AttachmentInspectionError,
-    DEFAULT_MAX_UPLOAD_BYTES, extract_ai_source_material, inspect_attachment,
+    AI_SOURCE_RETENTION_DAYS, AiSourcePolicyError, AttachmentFiles, AttachmentInspectionError,
+    DEFAULT_MAX_UPLOAD_BYTES, classify_ai_source, extract_ai_source_material, inspect_attachment,
+    normalize_ai_source_file_name, normalize_ai_source_media_type,
 };
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::{ApiError, AppState, AuthPrincipal, RequestMetadata};
@@ -29,10 +29,6 @@ use super::{
     },
     collection, item, scope, store,
 };
-
-const RETENTION_DAYS: i64 = 30;
-const MAX_FILE_NAME_BYTES: usize = 255;
-const MAX_MEDIA_TYPE_BYTES: usize = 127;
 
 pub(super) fn router() -> Router<AppState> {
     let upload = Router::new()
@@ -122,13 +118,16 @@ async fn upload(
         true,
     )
     .await?;
-    let file_name = valid_file_name(query.file_name, &metadata)?;
+    let file_name = normalize_ai_source_file_name(query.file_name)
+        .map_err(|error| policy_error(error, &metadata))?;
     let header_media_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .filter(|value| *value != "application/octet-stream")
         .map(str::to_owned);
-    let declared_media_type = valid_media_type(query.media_type.or(header_media_type), &metadata)?;
+    let declared_media_type =
+        normalize_ai_source_media_type(query.media_type.or(header_media_type))
+            .map_err(|error| policy_error(error, &metadata))?;
 
     let root = attachment_root(&state, &metadata)?;
     let attachment_id = Uuid::new_v4();
@@ -149,20 +148,6 @@ async fn upload(
             return Err(inspection_error(error, &metadata));
         }
     };
-    let (kind, media_type) = match classify_source(
-        &object.absolute_path,
-        &file_name,
-        declared_media_type.as_deref(),
-        inspected,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            cleanup_object(root, &object, attachment_id, &metadata).await;
-            return Err(error.with_request_id(metadata.request_id));
-        }
-    };
     let bytes = match tokio::fs::read(&object.absolute_path).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -174,6 +159,18 @@ async fn upload(
                 "failed to read an installed AI source for validation"
             );
             return Err(ApiError::internal().with_request_id(metadata.request_id));
+        }
+    };
+    let (kind, media_type) = match classify_ai_source(
+        &file_name,
+        declared_media_type.as_deref(),
+        inspected,
+        &bytes,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            cleanup_object(root, &object, attachment_id, &metadata).await;
+            return Err(policy_error(error, &metadata));
         }
     };
     if let Err(error) = extract_ai_source_material(kind, &file_name, Some(&media_type), &bytes) {
@@ -213,7 +210,7 @@ async fn upload(
         kind,
         status: AiConversationSourceStatus::Ready,
         last_activity_at: now,
-        expires_at: now + Duration::days(RETENTION_DAYS),
+        expires_at: now + Duration::days(AI_SOURCE_RETENTION_DAYS),
         archived_at: None,
         error_code: None,
         meta: RecordMeta::new(now),
@@ -489,149 +486,23 @@ async fn owned_source(
     Ok(source)
 }
 
-async fn classify_source(
-    path: &Path,
-    file_name: &str,
-    declared_media_type: Option<&str>,
-    inspection: AttachmentInspection,
-) -> Result<(AiConversationSourceKind, String), ApiError> {
-    let extension = Path::new(file_name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .ok_or_else(unsupported_source)?;
-    let declared = declared_media_type
-        .map(|value| value.split(';').next().unwrap_or(value).trim())
-        .filter(|value| !value.is_empty());
-    let (kind, canonical_media_type, allowed_media_types): (
-        AiConversationSourceKind,
-        &'static str,
-        &'static [&'static str],
-    ) = match extension.as_str() {
-        "xlsx" if inspection.kind == AttachmentContentKind::Opaque && has_zip_magic(path).await => {
-            (
-                AiConversationSourceKind::Spreadsheet,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                &[
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "application/zip",
-                ],
-            )
-        }
-        "csv" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::DelimitedText,
-            "text/csv",
-            &["text/csv", "application/csv", "text/plain"],
+/// Maps the shared AI source policy onto the stable REST error contract.
+fn policy_error(error: AiSourcePolicyError, metadata: &RequestMetadata) -> ApiError {
+    let error = match error {
+        AiSourcePolicyError::Unsupported => ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_ai_source",
+            error.to_string(),
         ),
-        "tsv" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::DelimitedText,
-            "text/tab-separated-values",
-            &["text/tab-separated-values", "text/plain"],
-        ),
-        "txt" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::Text,
-            "text/plain",
-            &["text/plain"],
-        ),
-        "md" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::Text,
-            "text/markdown",
-            &["text/markdown", "text/plain"],
-        ),
-        "json" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::Text,
-            "application/json",
-            &["application/json", "text/json", "text/plain"],
-        ),
-        "pdf" if inspection.kind == AttachmentContentKind::Pdf => (
-            AiConversationSourceKind::Pdf,
-            "application/pdf",
-            &["application/pdf"],
-        ),
-        "png" if inspection.kind == AttachmentContentKind::Png => {
-            (AiConversationSourceKind::Image, "image/png", &["image/png"])
-        }
-        "jpg" | "jpeg" if inspection.kind == AttachmentContentKind::Jpeg => (
-            AiConversationSourceKind::Image,
-            "image/jpeg",
-            &["image/jpeg"],
-        ),
-        "tif" | "tiff" if inspection.kind == AttachmentContentKind::Tiff => (
-            AiConversationSourceKind::Image,
-            "image/tiff",
-            &["image/tiff"],
-        ),
-        _ => return Err(unsupported_source()),
-    };
-    if declared.is_some_and(|value| {
-        value != "application/octet-stream" && !allowed_media_types.contains(&value)
-    }) {
-        return Err(ApiError::new(
+        AiSourcePolicyError::MediaTypeMismatch => ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "source_media_type_mismatch",
-            "the declared media type does not match the AI source file extension",
-        ));
-    }
-    Ok((
-        kind,
-        inspection
-            .media_type
-            .filter(|value| value != "application/octet-stream")
-            .unwrap_or_else(|| canonical_media_type.to_owned()),
-    ))
-}
-
-async fn has_zip_magic(path: &Path) -> bool {
-    let Ok(mut file) = tokio::fs::File::open(path).await else {
-        return false;
+            error.to_string(),
+        ),
+        AiSourcePolicyError::InvalidFileName => ApiError::validation("file_name is invalid"),
+        AiSourcePolicyError::InvalidMediaType => ApiError::validation("media_type is invalid"),
     };
-    let mut prefix = [0_u8; 4];
-    matches!(file.read(&mut prefix).await, Ok(4))
-        && matches!(
-            prefix,
-            [b'P', b'K', 3, 4] | [b'P', b'K', 5, 6] | [b'P', b'K', 7, 8]
-        )
-}
-
-fn unsupported_source() -> ApiError {
-    ApiError::new(
-        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        "unsupported_ai_source",
-        "AI sources accept XLSX, CSV, TSV, TXT, MD, JSON, PDF, PNG, JPEG, and TIFF only",
-    )
-}
-
-fn valid_file_name(value: String, metadata: &RequestMetadata) -> Result<String, ApiError> {
-    let value = value.trim().to_owned();
-    if value.is_empty()
-        || value.len() > MAX_FILE_NAME_BYTES
-        || matches!(value.as_str(), "." | "..")
-        || value
-            .chars()
-            .any(|character| matches!(character, '/' | '\\' | '\0') || character.is_control())
-    {
-        return Err(ApiError::validation("file_name is invalid")
-            .with_request_id(metadata.request_id.clone()));
-    }
-    Ok(value)
-}
-
-fn valid_media_type(
-    value: Option<String>,
-    metadata: &RequestMetadata,
-) -> Result<Option<String>, ApiError> {
-    let value = value
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    if value.as_ref().is_some_and(|value| {
-        value.len() > MAX_MEDIA_TYPE_BYTES
-            || !value.is_ascii()
-            || value.chars().any(char::is_control)
-    }) {
-        return Err(ApiError::validation("media_type is invalid")
-            .with_request_id(metadata.request_id.clone()));
-    }
-    Ok(value)
+    error.with_request_id(metadata.request_id.clone())
 }
 
 fn ensure_human(principal: &AuthPrincipal, metadata: &RequestMetadata) -> Result<(), ApiError> {
@@ -726,23 +597,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn whitelist_rejects_unlisted_extensions_before_persistence() {
+    fn policy_errors_keep_the_rest_error_contract() {
         use axum::response::IntoResponse as _;
 
-        assert_eq!(
-            unsupported_source().into_response().status(),
-            StatusCode::UNSUPPORTED_MEDIA_TYPE
-        );
-    }
-
-    #[test]
-    fn file_names_are_plain_names() {
         let metadata = RequestMetadata {
             request_id: "test".to_owned(),
             reason: None,
         };
-        assert!(valid_file_name("source.csv".to_owned(), &metadata).is_ok());
-        assert!(valid_file_name("../source.csv".to_owned(), &metadata).is_err());
+        for (error, status) in [
+            (
+                AiSourcePolicyError::Unsupported,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                AiSourcePolicyError::MediaTypeMismatch,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                AiSourcePolicyError::InvalidFileName,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                AiSourcePolicyError::InvalidMediaType,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            assert_eq!(
+                policy_error(error, &metadata).into_response().status(),
+                status,
+                "{error:?}"
+            );
+        }
+        assert!(
+            normalize_ai_source_file_name("../source.csv".to_owned())
+                .map_err(|error| policy_error(error, &metadata))
+                .is_err()
+        );
     }
 
     #[test]

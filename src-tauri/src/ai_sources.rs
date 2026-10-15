@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use chrono::{Duration, Utc};
 use muriarc_core::{
     Actor, AiConversationSource, AiConversationSourceFilter, AiConversationSourceKind,
@@ -7,15 +5,14 @@ use muriarc_core::{
     LOCAL_LAB_ID, LOCAL_USER_ID, MuriArcStore, RecordMeta, StoreError, WorkspaceStore, WriteSource,
 };
 use muriarc_data::{
-    AttachmentContentKind, AttachmentInspection, DEFAULT_MAX_UPLOAD_BYTES,
-    extract_ai_source_material, inspect_attachment,
+    AI_SOURCE_RETENTION_DAYS, AiSourcePolicyError, DEFAULT_MAX_UPLOAD_BYTES, classify_ai_source,
+    extract_ai_source_material, inspect_attachment, normalize_ai_source_file_name,
+    normalize_ai_source_media_type,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::data::{DesktopDataError, DesktopDataState};
-
-const RETENTION_DAYS: i64 = 30;
 
 impl DesktopDataState {
     pub(crate) async fn upload_ai_source(
@@ -33,8 +30,9 @@ impl DesktopDataState {
         let project_id = self
             .source_context(Some(conversation_id), requested_project_id, true)
             .await?;
-        let file_name = valid_source_file_name(input.file_name)?;
-        let declared_media_type = valid_source_media_type(input.media_type)?;
+        let file_name = normalize_ai_source_file_name(input.file_name).map_err(policy_error)?;
+        let declared_media_type =
+            normalize_ai_source_media_type(input.media_type).map_err(policy_error)?;
         if input.bytes.len() as u64 > DEFAULT_MAX_UPLOAD_BYTES {
             return Err(muriarc_data::AttachmentFileError::TooLarge.into());
         }
@@ -60,11 +58,11 @@ impl DesktopDataState {
                 return Err(error.into());
             }
         };
-        let (kind, media_type) = match classify_source(
-            &input.bytes,
+        let (kind, media_type) = match classify_ai_source(
             &file_name,
             declared_media_type.as_deref(),
             inspected,
+            &input.bytes,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -72,7 +70,7 @@ impl DesktopDataState {
                     .attachments_ref()
                     .remove_installed_object(&object)
                     .await;
-                return Err(error);
+                return Err(policy_error(error));
             }
         };
         if let Err(error) =
@@ -111,7 +109,7 @@ impl DesktopDataState {
             kind,
             status: AiConversationSourceStatus::Ready,
             last_activity_at: now,
-            expires_at: now + Duration::days(RETENTION_DAYS),
+            expires_at: now + Duration::days(AI_SOURCE_RETENTION_DAYS),
             archived_at: None,
             error_code: None,
             meta: RecordMeta::new(now),
@@ -430,134 +428,8 @@ impl AiSourceView {
     }
 }
 
-fn classify_source(
-    bytes: &[u8],
-    file_name: &str,
-    declared_media_type: Option<&str>,
-    inspection: AttachmentInspection,
-) -> Result<(AiConversationSourceKind, String), DesktopDataError> {
-    let extension = Path::new(file_name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .ok_or_else(unsupported_source)?;
-    let declared = declared_media_type
-        .map(|value| value.split(';').next().unwrap_or(value).trim())
-        .filter(|value| !value.is_empty());
-    let (kind, canonical_media_type, allowed_media_types): (
-        AiConversationSourceKind,
-        &'static str,
-        &'static [&'static str],
-    ) = match extension.as_str() {
-        "xlsx"
-            if inspection.kind == AttachmentContentKind::Opaque
-                && matches!(
-                    bytes.get(..4),
-                    Some([b'P', b'K', 3, 4]) | Some([b'P', b'K', 5, 6]) | Some([b'P', b'K', 7, 8])
-                ) =>
-        {
-            (
-                AiConversationSourceKind::Spreadsheet,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                &[
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    "application/zip",
-                ],
-            )
-        }
-        "csv" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::DelimitedText,
-            "text/csv",
-            &["text/csv", "application/csv", "text/plain"],
-        ),
-        "tsv" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::DelimitedText,
-            "text/tab-separated-values",
-            &["text/tab-separated-values", "text/plain"],
-        ),
-        "txt" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::Text,
-            "text/plain",
-            &["text/plain"],
-        ),
-        "md" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::Text,
-            "text/markdown",
-            &["text/markdown", "text/plain"],
-        ),
-        "json" if inspection.kind == AttachmentContentKind::Opaque => (
-            AiConversationSourceKind::Text,
-            "application/json",
-            &["application/json", "text/json", "text/plain"],
-        ),
-        "pdf" if inspection.kind == AttachmentContentKind::Pdf => (
-            AiConversationSourceKind::Pdf,
-            "application/pdf",
-            &["application/pdf"],
-        ),
-        "png" if inspection.kind == AttachmentContentKind::Png => {
-            (AiConversationSourceKind::Image, "image/png", &["image/png"])
-        }
-        "jpg" | "jpeg" if inspection.kind == AttachmentContentKind::Jpeg => (
-            AiConversationSourceKind::Image,
-            "image/jpeg",
-            &["image/jpeg"],
-        ),
-        "tif" | "tiff" if inspection.kind == AttachmentContentKind::Tiff => (
-            AiConversationSourceKind::Image,
-            "image/tiff",
-            &["image/tiff"],
-        ),
-        _ => return Err(unsupported_source()),
-    };
-    if declared.is_some_and(|value| {
-        value != "application/octet-stream" && !allowed_media_types.contains(&value)
-    }) {
-        return Err(StoreError::Validation(
-            "the declared media type does not match the AI source file extension".to_owned(),
-        )
-        .into());
-    }
-    Ok((
-        kind,
-        inspection
-            .media_type
-            .filter(|value| value != "application/octet-stream")
-            .unwrap_or_else(|| canonical_media_type.to_owned()),
-    ))
-}
-
-fn valid_source_file_name(value: String) -> Result<String, DesktopDataError> {
-    let value = value.trim().to_owned();
-    if value.is_empty()
-        || value.len() > 255
-        || matches!(value.as_str(), "." | "..")
-        || value
-            .chars()
-            .any(|character| matches!(character, '/' | '\\' | '\0') || character.is_control())
-    {
-        return Err(StoreError::Validation("AI source file name is invalid".to_owned()).into());
-    }
-    Ok(value)
-}
-
-fn valid_source_media_type(value: Option<String>) -> Result<Option<String>, DesktopDataError> {
-    let value = value
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    if value.as_ref().is_some_and(|value| {
-        value.len() > 127 || !value.is_ascii() || value.chars().any(char::is_control)
-    }) {
-        return Err(StoreError::Validation("AI source media type is invalid".to_owned()).into());
-    }
-    Ok(value)
-}
-
-fn unsupported_source() -> DesktopDataError {
-    StoreError::Validation(
-        "AI sources accept XLSX, CSV, TSV, TXT, MD, JSON, PDF, PNG, JPEG, and TIFF only".to_owned(),
-    )
-    .into()
+fn policy_error(error: AiSourcePolicyError) -> DesktopDataError {
+    StoreError::Validation(error.to_string()).into()
 }
 
 fn parse_source_id(field: &'static str, value: &str) -> Result<Uuid, DesktopDataError> {
@@ -574,6 +446,8 @@ fn ensure_local_source_lab(lab_id: Uuid) -> Result<(), DesktopDataError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::application::DesktopState;
     use muriarc_core::{

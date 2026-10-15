@@ -3633,6 +3633,41 @@ async fn ai_sources_are_validated_owner_scoped_archived_and_soft_discarded() {
         .unwrap();
     assert_eq!(archived_delete.status(), StatusCode::CONFLICT);
 
+    // The shared AI source policy rejects files before any source metadata is written.
+    for (file_name, media_type, status, code) in [
+        (
+            "data.xml",
+            "application%2Foctet-stream",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_ai_source",
+        ),
+        (
+            "animals.csv",
+            "text%2Fmarkdown",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "source_media_type_mismatch",
+        ),
+    ] {
+        let rejected = fixture
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/api/v1/ai/sources/upload?file_name={file_name}&media_type={media_type}&conversation_id={}",
+                        lab_conversation.id
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                    .body(Body::from("animal,value\nM-1,12\n"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), status, "{file_name}");
+        assert_eq!(response_json(rejected).await["error"]["code"], code);
+    }
+
     let second = fixture
         .app
         .clone()

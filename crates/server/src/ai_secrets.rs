@@ -6069,13 +6069,9 @@ mod postgres {
 
         #[tokio::test]
         async fn model_management_lifecycle_is_versioned_isolated_and_audited() {
-            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
                 return;
             };
-            assert!(
-                database_url.contains("muriarc_test"),
-                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-            );
             let postgres = PostgresStore::connect(&database_url).await.unwrap();
             postgres.migrate().await.unwrap();
             let now = Utc::now();
@@ -6391,13 +6387,9 @@ mod postgres {
         async fn unsaved_model_validation_uses_local_mock_without_persisting() {
             use axum::{Json, Router, routing::post};
 
-            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
                 return;
             };
-            assert!(
-                database_url.contains("muriarc_test"),
-                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-            );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let mock = Router::new()
@@ -6784,13 +6776,9 @@ mod postgres {
         async fn root_editor_and_viewer_provider_settings_are_strictly_isolated() {
             use muriarc_ai::AiProvider;
 
-            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
                 return;
             };
-            assert!(
-                database_url.contains("muriarc_test"),
-                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-            );
             let postgres = PostgresStore::connect(&database_url).await.unwrap();
             postgres.migrate().await.unwrap();
             let now = Utc::now();
@@ -6971,13 +6959,9 @@ mod postgres {
         async fn new_user_save_materializes_defaults_versions_secrets_and_turn_binding() {
             use muriarc_ai::AiProvider;
 
-            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
                 return;
             };
-            assert!(
-                database_url.contains("muriarc_test"),
-                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-            );
             let postgres = PostgresStore::connect(&database_url).await.unwrap();
             postgres.migrate().await.unwrap();
             let now = Utc::now();
@@ -7293,13 +7277,9 @@ mod postgres {
 
         #[tokio::test]
         async fn https_local_http_transport_round_trips_and_resolves_exactly() {
-            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
                 return;
             };
-            assert!(
-                database_url.contains("muriarc_test"),
-                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-            );
             let postgres = PostgresStore::connect(&database_url).await.unwrap();
             postgres.migrate().await.unwrap();
             let now = Utc::now();
@@ -7365,13 +7345,9 @@ mod postgres {
         async fn legacy_save_appends_versions_and_old_binding_resolves_original_config() {
             use muriarc_ai::AiProvider;
 
-            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
                 return;
             };
-            assert!(
-                database_url.contains("muriarc_test"),
-                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-            );
             let postgres = PostgresStore::connect(&database_url).await.unwrap();
             postgres.migrate().await.unwrap();
             let now = Utc::now();
@@ -7452,13 +7428,9 @@ mod postgres {
 
         #[tokio::test]
         async fn startup_migrates_text_and_vision_secrets_idempotently_without_leaking() {
-            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
                 return;
             };
-            assert!(
-                database_url.contains("muriarc_test"),
-                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-            );
             let postgres = PostgresStore::connect(&database_url).await.unwrap();
             postgres.migrate().await.unwrap();
             let now = Utc::now();
@@ -7658,13 +7630,9 @@ mod postgres {
 
         #[tokio::test]
         async fn postgres_save_and_clear_are_atomically_audited_without_sensitive_settings() {
-            let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
                 return;
             };
-            assert!(
-                database_url.contains("muriarc_test"),
-                "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-            );
             let postgres = PostgresStore::connect(&database_url).await.unwrap();
             postgres.migrate().await.unwrap();
             let now = Utc::now();

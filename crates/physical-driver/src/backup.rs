@@ -1058,10 +1058,7 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn encrypted_joint_restore_is_idempotent_and_detects_database_drift() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-            eprintln!(
-                "skipping encrypted Physical Driver recovery integration: MURIARC_TEST_DATABASE_URL is not set"
-            );
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
         for name in [
@@ -1222,16 +1219,9 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn physical_dump_restore_and_candidate_clone_leave_no_databases() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-            eprintln!(
-                "skipping Physical Driver dump/restore integration: MURIARC_TEST_DATABASE_URL is not set"
-            );
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(
-            database_url.contains("muriarc_test"),
-            "Physical Driver integration requires the disposable muriarc_test server"
-        );
         let source_database = format!("muriarc_recovery_{}", Uuid::new_v4().simple());
         let restore_database = format!("muriarc_restore_{}", Uuid::new_v4().simple());
         let candidate_database = format!("muriarc_candidate_{}", Uuid::new_v4().simple());

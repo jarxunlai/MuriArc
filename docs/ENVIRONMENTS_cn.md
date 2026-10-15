@@ -45,7 +45,7 @@ WSL/Linux 缺少 GTK/WebKit 开发库时，Desktop strict Clippy/tests 使用固
 
 ## PostgreSQL 门禁
 
-`MURIARC_TEST_DATABASE_URL` 必须指向一次性 PostgreSQL 17，不能与人工 Server、其他 worktree 或真实数据共用。测试角色需能创建/删除隔离测试数据库；测试结束后核对无残留。因配置缺失导致 PostgreSQL suite skip 不算通过。
+`MURIARC_TEST_DATABASE_URL` 必须指向一次性 PostgreSQL 17，不能与人工 Server、其他 worktree 或真实数据共用。测试角色需能创建/删除隔离测试数据库；测试结束后核对无残留。因配置缺失导致 PostgreSQL suite skip 不算通过。设置 `CI` 或 `MURIARC_REQUIRE_POSTGRES_TESTS=1` 时，缺少 URL 或 URL 不指向 `muriarc_test` 会让这些测试直接失败而不是 skip；作为验证依据的本地运行应设置 `MURIARC_REQUIRE_POSTGRES_TESTS=1`。
 
 自动 migration 测试不得指向验收或生产 volume。
 

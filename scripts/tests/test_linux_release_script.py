@@ -22,6 +22,18 @@ class LinuxReleaseScriptTests(unittest.TestCase):
         ):
             self.assertIn(marker, self.text)
 
+    def test_postgres_suites_are_required_before_rust_tests(self) -> None:
+        for marker in (
+            '"${MURIARC_TEST_DATABASE_URL-}" == *muriarc_test*',
+            "command -v pg_dump",
+            "export MURIARC_REQUIRE_POSTGRES_TESTS=1",
+        ):
+            self.assertIn(marker, self.text)
+        self.assertLess(
+            self.text.index("export MURIARC_REQUIRE_POSTGRES_TESTS=1"),
+            self.text.index("cargo test --locked --workspace"),
+        )
+
     def test_source_and_account_are_locked_before_registry_writes(self) -> None:
         for marker in (
             "refs/remotes/origin/main",

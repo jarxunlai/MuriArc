@@ -483,13 +483,9 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_seed_is_atomic_audited_and_idempotent_when_test_database_is_configured() {
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(
-            database_url.contains("muriarc_test"),
-            "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-        );
         let store = PostgresStore::connect(&database_url).await.unwrap();
         store.migrate().await.unwrap();
         let password_hash = crate::hash_password("bootstrap test password").unwrap();

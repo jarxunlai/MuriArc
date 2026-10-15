@@ -45,10 +45,7 @@ fn image_fixture(
 
 #[tokio::test]
 async fn postgres_private_image_rejects_missing_foreign_and_legacy_conversations_atomically() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!(
-            "skipping PostgreSQL private image conversation test: database is not configured"
-        );
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();

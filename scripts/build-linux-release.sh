@@ -109,6 +109,12 @@ command -v cargo >/dev/null || die "cargo is unavailable"
 command -v docker >/dev/null || die "docker is unavailable"
 command -v gh >/dev/null || die "gh is unavailable"
 command -v corepack >/dev/null || die "corepack is unavailable"
+[[ "${MURIARC_TEST_DATABASE_URL-}" == *muriarc_test* ]] ||
+  die "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test PostgreSQL 17 database"
+command -v pg_dump >/dev/null && command -v pg_restore >/dev/null ||
+  die "PostgreSQL 17 client tools are required by recovery integration tests"
+# PostgreSQL-gated tests fail instead of skipping; a release gate has no skip path.
+export MURIARC_REQUIRE_POSTGRES_TESTS=1
 if [[ -d /mnt/e/Muriarc ]]; then
   export CARGO_TARGET_DIR=/mnt/e/Muriarc/builds/cargo-target/shared
 else

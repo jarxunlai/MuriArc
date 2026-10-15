@@ -45,7 +45,7 @@ On WSL/Linux without GTK/WebKit development packages, Desktop strict Clippy/test
 
 ## PostgreSQL verification
 
-Set `MURIARC_TEST_DATABASE_URL` to a disposable PostgreSQL 17 instance that is not shared with a manual Server, another worktree, or real data. The test role must be able to create/drop isolated test databases. After tests, verify there are no leftover test databases. Missing configuration that causes a PostgreSQL suite to skip is not a pass.
+Set `MURIARC_TEST_DATABASE_URL` to a disposable PostgreSQL 17 instance that is not shared with a manual Server, another worktree, or real data. The test role must be able to create/drop isolated test databases. After tests, verify there are no leftover test databases. Missing configuration that causes a PostgreSQL suite to skip is not a pass. When `CI` or `MURIARC_REQUIRE_POSTGRES_TESTS=1` is set, a missing or non-`muriarc_test` URL makes those tests fail instead of skip; set `MURIARC_REQUIRE_POSTGRES_TESTS=1` for any local run that counts as verification.
 
 Never point automated migration tests at an acceptance or production volume.
 

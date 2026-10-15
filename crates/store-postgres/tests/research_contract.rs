@@ -10,8 +10,7 @@ fn postgres_timestamp_now() -> chrono::DateTime<Utc> {
 
 #[tokio::test]
 async fn postgres_persists_research_entities_when_configured() {
-    let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
-        eprintln!("skipping PostgreSQL research contract: MURIARC_TEST_DATABASE_URL is not set");
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
         return;
     };
     let store = PostgresStore::connect(&database_url).await.unwrap();

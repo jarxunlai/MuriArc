@@ -745,10 +745,9 @@ mod tests {
     async fn policy_only_root_reconciliation_preserves_password_change_time() {
         use chrono::TimeZone;
 
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(database_url.contains("muriarc_test"));
         let store = PostgresStore::connect(&database_url).await.unwrap();
         muriarc_core::MuriArcStore::migrate(&store).await.unwrap();
 
@@ -808,13 +807,9 @@ mod tests {
 
         use crate::{AuthError, NewSession, PostgresAuthBackend, SessionBackend, token_hash};
 
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(
-            database_url.contains("muriarc_test"),
-            "MURIARC_TEST_DATABASE_URL must point to a disposable muriarc_test database"
-        );
         let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
         muriarc_core::MuriArcStore::migrate(store.as_ref())
             .await
@@ -956,10 +951,9 @@ mod tests {
     async fn postgres_root_sync_rejects_duplicate_cross_lab_and_soft_deleted_identities() {
         use std::sync::Arc;
 
-        let Ok(database_url) = std::env::var("MURIARC_TEST_DATABASE_URL") else {
+        let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
             return;
         };
-        assert!(database_url.contains("muriarc_test"));
         let store = Arc::new(PostgresStore::connect(&database_url).await.unwrap());
         muriarc_core::MuriArcStore::migrate(store.as_ref())
             .await

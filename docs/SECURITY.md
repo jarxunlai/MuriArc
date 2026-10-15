@@ -18,7 +18,7 @@ Desktop's passwordless local entry is only operator confirmation within a truste
 - Session and external-token plaintext is shown only where the protocol requires it. PostgreSQL stores digests, not reusable plaintext.
 - Browser sessions use HttpOnly, SameSite cookies and a session-derived CSRF value. Production uses Secure cookies behind HTTPS.
 - User, credential, membership, expiration, revocation, suspension, soft deletion, and forced-password-change state are read live, so governance changes take effect immediately.
-- Login backoff is HMAC-keyed and bounded. Public endpoints must not reveal whether an email exists.
+- Public endpoints must not reveal whether an email exists. Account login backoff is HMAC-keyed and bounded, and is enabled only by the Cloudflare Public profile (`MURIARC_AUTH_RATE_LIMIT_KEY_FILE`). The Private profile has no application-level login throttling and must stay on a trusted network or behind a proxy that rate-limits `POST /api/v1/auth/login`.
 
 `EnvironmentRoot` is declared by deployment configuration and reconciled transactionally. Its password is changed through deployment-secret rotation and restart, not a UI that can expose the existing credential. Root authority does not bypass project/lab data authorization.
 

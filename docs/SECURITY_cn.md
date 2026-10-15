@@ -18,7 +18,7 @@ Desktop 的无密码本地入口只在可信 OS 账号内确认操作者；Serve
 - Session/外部 Token 明文只在协议必需时出现，PostgreSQL 只保存不可复用 digest。
 - 浏览器 Session 使用 HttpOnly、SameSite Cookie 和会话派生 CSRF；生产环境必须在 HTTPS 后启用 Secure Cookie。
 - 身份验证实时读取 User、Credential、Membership、到期、撤销、停用、软删除和强制改密状态，治理变更立即生效。
-- 登录退避使用 HMAC 键控且有上限；公共端点不能泄露邮箱是否存在。
+- 公共端点不能泄露邮箱是否存在。账号级登录退避使用 HMAC 键控且有上限，仅在 Cloudflare Public profile（`MURIARC_AUTH_RATE_LIMIT_KEY_FILE`）下启用；Private profile 没有应用层登录限流，必须部署在可信网络内，或由对 `POST /api/v1/auth/login` 限流的代理保护。
 
 `EnvironmentRoot` 由部署配置声明并在事务中核对。Root 密码通过宿主秘密轮换和重启修改，不能由读取现有凭据的 UI 修改。Root 治理权限也不能绕过 Lab/Project 数据授权。
 

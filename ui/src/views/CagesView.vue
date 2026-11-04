@@ -13,7 +13,6 @@ import {
   NProgress,
   NSelect,
   NSpin,
-  NTag,
   useMessage,
 } from 'naive-ui'
 import { Plus, RefreshCw, Search, UsersRound } from '@lucide/vue'
@@ -151,10 +150,13 @@ watch(currentProjectId, () => {
       当前为项目范围视图，只显示本项目动物身份；笼位中的其他项目动物及实验室总占用不会展示。
     </n-alert>
 
-    <div v-if="attentionCount" class="attention-bar">
-      <span><strong>{{ attentionCount }}</strong> 个笼位需要关注</span>
-      <span>·</span><span>当前共 {{ totalAnimals }} 只动物</span>
-      <button type="button" @click="attentionOnly = !attentionOnly">{{ attentionOnly ? '显示全部' : '仅看需关注' }}</button>
+    <div class="cage-summary" aria-label="笼位概况">
+      <span><b>{{ cages.length }}</b> 个笼位</span>
+      <span><b>{{ totalAnimals }}</b> 只动物</span>
+      <button
+        v-if="attentionCount" type="button" class="attention-filter" :aria-pressed="attentionOnly"
+        @click="attentionOnly = !attentionOnly"
+      ><i aria-hidden="true" />需关注 <b>{{ attentionCount }}</b></button>
     </div>
 
     <section class="toolbar surface">
@@ -173,13 +175,11 @@ watch(currentProjectId, () => {
           @dragover.prevent @drop.prevent="onDrop($event, cage.id)"
         >
           <header>
-            <div><span class="cage-code">{{ cage.code }}</span><small>{{ cage.room }} · {{ cage.rack }}</small></div>
-            <n-tag :type="cage.status === 'attention' ? 'warning' : cage.status === 'empty' ? 'default' : 'success'" size="small" round :bordered="false">
-              {{ cage.status === 'attention' ? '需关注' : cage.status === 'empty' ? '空笼' : '正常' }}
-            </n-tag>
+            <div><span class="cage-code muri-id">{{ cage.code }}</span><small>{{ cage.room }} · {{ cage.rack }}</small></div>
+            <span class="cage-status" :class="`is-${cage.status}`"><i aria-hidden="true" />{{ cage.status === 'attention' ? '需关注' : cage.status === 'empty' ? '空笼' : '正常' }}</span>
           </header>
           <div class="capacity-row"><span>{{ cage.summary }}</span><strong>{{ canManageCages ? `${cage.animalIds.length} / ${cage.capacity}` : `项目内 ${cage.animalIds.length} 只` }}</strong></div>
-          <n-progress type="line" :percentage="Math.round(cage.animalIds.length / cage.capacity * 100)" :show-indicator="false" :height="5" :color="cage.status === 'attention' ? '#d98216' : '#0f5faa'" />
+          <n-progress type="line" :percentage="Math.round(cage.animalIds.length / cage.capacity * 100)" :show-indicator="false" :height="3" color="var(--muri-text-secondary)" rail-color="var(--muri-surface-sunken)" />
 
           <div v-if="cage.animalIds.length" class="animal-list">
             <button
@@ -187,7 +187,7 @@ watch(currentProjectId, () => {
               :draggable="canManageCages" @dragstart="onDragStart($event, animalId)" @click="openAnimal(animalId)"
             >
               <n-checkbox v-if="canManageCages" :checked="selectedAnimalIds.includes(animalId)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animalId] : selectedAnimalIds.filter((id) => id !== animalId)" />
-              <span>{{ animalLabel(animalId) }}</span>
+              <span class="muri-id">{{ animalLabel(animalId) }}</span>
               <small>{{ animalById.get(animalId)?.sex === 'male' ? '♂' : '♀' }} · {{ animalById.get(animalId)?.genotype }}</small>
             </button>
           </div>
@@ -196,11 +196,11 @@ watch(currentProjectId, () => {
         </article>
 
         <article v-if="unassignedAnimals.length" class="cage-card unassigned-card surface">
-          <header><div><span class="cage-code">未分配笼位</span><small>当前项目动物</small></div><n-tag size="small" :bordered="false">{{ unassignedAnimals.length }} 只</n-tag></header>
+          <header><div><span class="cage-code">未分配笼位</span><small>当前项目动物</small></div><span class="cage-status is-empty"><i aria-hidden="true" />{{ unassignedAnimals.length }} 只</span></header>
           <div class="animal-list">
             <button v-for="animal in unassignedAnimals" :key="animal.id" type="button" class="animal-chip" @click="openAnimal(animal.id)">
               <n-checkbox v-if="canManageCages" :checked="selectedAnimalIds.includes(animal.id)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animal.id] : selectedAnimalIds.filter((id) => id !== animal.id)" />
-              <span>{{ animal.code }}</span><small>{{ animal.sex === 'male' ? '♂' : animal.sex === 'female' ? '♀' : '？' }} · {{ animal.genotype }}</small>
+              <span class="muri-id">{{ animal.code }}</span><small>{{ animal.sex === 'male' ? '♂' : animal.sex === 'female' ? '♀' : '？' }} · {{ animal.genotype }}</small>
             </button>
           </div>
         </article>
@@ -236,32 +236,36 @@ watch(currentProjectId, () => {
 
 <style scoped>
 .project-scope-note { margin-bottom: 12px; }
-.attention-bar { display: flex; align-items: center; gap: 7px; min-height: 38px; margin-bottom: 12px; padding: 8px 13px; border: 1px solid var(--muri-warning-border); border-radius: var(--muri-radius); color: var(--muri-warning-text); background: var(--muri-warning-soft); font-size: 13px; }
-.attention-bar button { margin-left: auto; border: 0; color: var(--muri-warning-text); background: transparent; cursor: pointer; font-weight: 600; }
+.cage-summary { display: flex; align-items: center; gap: 18px; margin-bottom: 12px; color: var(--muri-text-secondary); font-size: 13px; }
+.cage-summary b { color: var(--muri-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.attention-filter { display: inline-flex; align-items: center; gap: 6px; height: 28px; margin-left: auto; padding: 0 10px; border: 1px solid var(--muri-border-strong); border-radius: 999px; color: var(--muri-warning-text); background: var(--muri-surface); font-size: 13px; cursor: pointer; }
+.attention-filter i, .cage-status i { width: 6px; height: 6px; border-radius: 50%; background: var(--muri-warning); }
+.attention-filter b { color: inherit; }
+.attention-filter[aria-pressed="true"] { border-color: var(--muri-warning); background: var(--muri-warning-soft); font-weight: 500; }
 .toolbar { display: grid; grid-template-columns: minmax(260px, 430px) 180px 1fr; align-items: center; gap: 10px; margin-bottom: 14px; padding: 10px; }
 .result-count { justify-self: end; padding-right: 4px; color: var(--muri-text-tertiary); font-size: 12px; }
 .cage-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(285px, 1fr)); gap: 13px; min-height: 180px; }
 .cage-card { position: relative; min-height: 230px; padding: 15px; overflow: hidden; transition: border-color var(--muri-transition-fast), box-shadow var(--muri-transition-fast), transform var(--muri-transition-fast); }
-.cage-card:hover { border-color: var(--muri-border-strong); box-shadow: var(--muri-shadow); transform: translateY(-1px); }
-.cage-card::before { position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--muri-primary); content: ''; }
-.cage-card.status-attention::before { background: var(--muri-warning); }
-.cage-card.status-empty::before { background: var(--muri-border-strong); }
-.cage-card.unassigned-card::before { background: var(--muri-text-tertiary); }
+.cage-card:hover { border-color: var(--muri-border-strong); }
+.cage-status { display: inline-flex; align-items: center; gap: 6px; color: var(--muri-text-secondary); font-size: 12px; white-space: nowrap; }
+.cage-status.is-normal i { background: var(--muri-success); }
+.cage-status.is-empty i { background: var(--muri-neutral-dot); }
+.cage-status.is-attention { color: var(--muri-warning-text); }
 .cage-card.highlighted { border-color: var(--muri-primary); box-shadow: 0 0 0 3px rgba(15,95,170,.14); }
 .cage-card header { display: flex; align-items: flex-start; justify-content: space-between; }
 .cage-card header > div { display: flex; flex-direction: column; }
-.cage-code { font-size: 18px; font-weight: 700; }
+.cage-code { font-size: 16px; font-weight: 600; }
 .cage-card header small { margin-top: 2px; color: var(--muri-text-tertiary); }
 .capacity-row { display: flex; justify-content: space-between; gap: 8px; margin: 14px 0 7px; color: var(--muri-text-secondary); font-size: 12px; }
-.capacity-row strong { color: var(--muri-text); }
+.capacity-row strong { color: var(--muri-text); font-weight: 500; font-variant-numeric: tabular-nums; }
 .animal-list { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 12px; }
-.animal-chip { display: grid; grid-template-columns: 18px 1fr; column-gap: 5px; min-width: 0; padding: 7px; text-align: left; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); cursor: grab; transition: border-color var(--muri-transition-fast), background var(--muri-transition-fast); }
-.animal-chip:hover { border-color: var(--muri-primary-border); background: var(--muri-primary-soft); }
+.animal-chip { display: grid; grid-template-columns: 18px 1fr; column-gap: 5px; min-width: 0; padding: 7px; text-align: left; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: var(--muri-surface); cursor: grab; transition: border-color var(--muri-transition-fast), background var(--muri-transition-fast); }
+.animal-chip:hover { border-color: var(--muri-border-strong); background: var(--muri-surface-hover); }
 .animal-chip:active { cursor: grabbing; }
-.animal-chip > span { overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; }
+.animal-chip > span { overflow: hidden; font-size: 12px; font-weight: 500; text-overflow: ellipsis; }
 .animal-chip small { grid-column: 2; overflow: hidden; color: var(--muri-text-tertiary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .empty-cage { display: flex; height: 88px; align-items: center; justify-content: center; flex-direction: column; gap: 5px; margin-top: 12px; border: 1px dashed var(--muri-border-strong); border-radius: var(--muri-radius-sm); color: var(--muri-text-tertiary); }
-.cage-card footer { margin: 12px -15px -15px; padding: 8px 15px; color: var(--muri-warning-text); background: var(--muri-warning-soft); font-size: 11px; }
+.cage-card footer { margin-top: 10px; color: var(--muri-warning-text); font-size: 12px; }
 .empty-result { padding: 70px 0; }
 .selection-bar { position: fixed; z-index: 40; inset: auto 24px 22px calc(var(--muri-sidebar-width) + 24px); display: flex; width: fit-content; max-width: calc(100% - var(--muri-sidebar-width) - 48px); margin: auto; align-items: center; gap: 9px; padding: 9px 10px 9px 15px; border: 1px solid var(--muri-border-strong); border-radius: var(--muri-radius); background: white; box-shadow: var(--muri-shadow); }
 .selection-enter-active,.selection-leave-active { transition: opacity var(--muri-transition-panel), transform var(--muri-transition-panel); }
@@ -273,8 +277,7 @@ watch(currentProjectId, () => {
 @media (max-width: 900px) {
   .toolbar { grid-template-columns: 1fr 130px; }
   .result-count { display: none; }
-  .attention-bar { flex-wrap: wrap; }
-  .attention-bar button { width: 100%; margin-left: 0; text-align: left; }
+  .cage-summary { gap: 12px; }
   .cage-grid { grid-template-columns: 1fr; }
   .cage-card:hover { transform: none; }
   .animal-chip { cursor: pointer; }

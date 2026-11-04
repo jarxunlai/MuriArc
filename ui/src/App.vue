@@ -64,7 +64,6 @@ const projectOptions = computed(() => [
   ...availableProjects.value.map((project) => ({ label: project.name, value: project.id })),
 ])
 const selectedProjectValue = computed(() => currentProjectId.value ?? LAB_REGISTRY)
-const pageTitle = computed(() => String(route.meta.title ?? branding.productName))
 const operatorName = computed(() => gateway.mode === 'local'
   ? '本地'
   : (currentAuthSession.value?.user.displayName || '共享用户'))
@@ -121,8 +120,8 @@ async function changeProject(value: string) {
         <div class="workspace">
           <header class="topbar">
             <div class="mobile-brand mobile-only"><img :src="branding.logoMarkPath" alt="" /><strong>{{ branding.productName }}</strong></div>
-            <div class="desktop-only"><span class="section">{{ route.meta.section ?? branding.productName }}</span><strong>{{ pageTitle }}</strong></div>
-            <div class="topbar-meta">
+            <!-- The page header owns the title; the top bar carries working context only. -->
+            <div class="topbar-context">
               <n-select
                 v-if="gateway.mode === 'remote' && projectOptions.length"
                 class="project-switcher"
@@ -130,8 +129,11 @@ async function changeProject(value: string) {
                 :value="selectedProjectValue"
                 :options="projectOptions"
                 size="small"
+                aria-label="项目范围"
                 @update:value="changeProject"
               />
+            </div>
+            <div class="topbar-meta">
               <span class="connection"><i />{{ gateway.mode === 'local' ? '本地模式' : '共享模式' }}</span><span class="operator-name desktop-only">{{ operatorName }}</span><span class="avatar" :title="operatorName">{{ avatarInitial }}</span>
             </div>
           </header>
@@ -167,8 +169,8 @@ nav { padding: 13px 10px; }
 .nav-label { padding: 7px 10px 6px; color: var(--muri-text-tertiary); font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
 .nav-gap { margin-top: 8px; }
 .nav-item { display: flex; align-items: center; gap: 11px; min-height: 40px; margin: 2px 0; padding: 0 11px; border-radius: var(--muri-radius-sm); color: var(--muri-text-secondary); font-weight: 500; transition: color var(--muri-transition-fast), background var(--muri-transition-fast); }
-.nav-item:hover { color: var(--muri-primary); background: var(--muri-surface-hover); }
-.nav-item.active { color: var(--muri-primary); background: var(--muri-primary-soft); }
+.nav-item:hover { color: var(--muri-text); background: var(--muri-surface-hover); }
+.nav-item.active { color: var(--muri-text); background: var(--muri-surface-sunken); font-weight: 500; }
 .sidebar-footer { margin-top: auto; padding: 10px; border-top: 1px solid var(--muri-border); }
 .mode-card { display: flex; align-items: center; gap: 9px; margin: 7px 4px 1px; padding: 9px; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .mode-dot, .connection i { width: 7px; height: 7px; border-radius: 50%; background: var(--muri-success); box-shadow: 0 0 0 3px rgba(56, 134, 107, 0.12); }
@@ -178,14 +180,12 @@ nav { padding: 13px 10px; }
 .workspace { display: flex; width: calc(100% - var(--muri-sidebar-width)); min-height: 100vh; margin-left: var(--muri-sidebar-width); flex-direction: column; }
 .topbar { position: sticky; z-index: 15; top: 0; display: flex; height: var(--muri-topbar-height); align-items: center; justify-content: space-between; padding: 0 24px; border-bottom: 1px solid var(--muri-border); background: rgba(255, 255, 255, 0.94); backdrop-filter: blur(10px); }
 .topbar > div { display: flex; align-items: center; gap: 9px; }
-.topbar .section { color: var(--muri-text-tertiary); font-size: 12px; }
-.topbar strong { font-size: 14px; }
 .topbar-meta { gap: 16px !important; }
 .project-switcher { width: min(260px, 30vw); }
 .connection { display: flex; align-items: center; gap: 7px; color: var(--muri-text-secondary); font-size: 12px; }
 .operator-name { max-width: 150px; overflow: hidden; color: var(--muri-text-secondary); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .connection i { display: inline-block; width: 6px; height: 6px; }
-.avatar { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 50%; color: var(--muri-surface); background: var(--muri-primary); font-size: 12px; }
+.avatar { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 50%; color: var(--muri-text-secondary); background: var(--muri-surface-sunken); font-size: 12px; font-weight: 500; }
 .main-content { flex: 1; min-width: 0; }
 .bottom-nav { display: none; }
 @media (max-width: 900px) {

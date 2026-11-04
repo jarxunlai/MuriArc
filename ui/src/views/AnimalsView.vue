@@ -383,7 +383,7 @@ function closeAnimal() {
 
 const columns = computed<DataTableColumns<Animal>>(() => [
   ...(projectBatchAvailable.value ? [{ type: 'selection' as const, width: 42 }] : []),
-  { title: '编号', key: 'code', width: 130, render: (row) => h('button', { class: 'table-link', onClick: () => openAnimal(row) }, row.code) },
+  { title: '编号', key: 'code', width: 130, render: (row) => h('button', { class: 'table-link muri-id', onClick: () => openAnimal(row) }, row.code) },
   { title: '性别', key: 'sex', width: 70, render: (row) => sexLabel(row.sex) },
   { title: '品系', key: 'strain', minWidth: 130 },
   { title: '基因型', key: 'genotype', minWidth: 130, render: (row) => h(NTag, { size: 'small', bordered: false, type: row.genotype === '待确认' ? 'warning' : 'default' }, { default: () => row.genotype }) },
@@ -760,7 +760,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 
     <section class="mobile-list mobile-only" aria-label="小鼠卡片列表">
       <button v-for="animal in filtered" :key="animal.id" type="button" class="animal-card surface" :aria-label="`查看动物 ${animal.code}`" @click="openAnimal(animal)">
-        <div class="card-title"><span><n-checkbox v-if="projectBatchAvailable" :checked="selectedAnimalIds.includes(animal.id)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animal.id] : selectedAnimalIds.filter((id) => id !== animal.id)" /><strong>{{ animal.code }}</strong></span><n-tag :type="statusMeta[animal.status].type" size="small" round :bordered="false">{{ statusMeta[animal.status].label }}</n-tag></div>
+        <div class="card-title"><span><n-checkbox v-if="projectBatchAvailable" :checked="selectedAnimalIds.includes(animal.id)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animal.id] : selectedAnimalIds.filter((id) => id !== animal.id)" /><strong class="muri-id">{{ animal.code }}</strong></span><n-tag :type="statusMeta[animal.status].type" size="small" round :bordered="false">{{ statusMeta[animal.status].label }}</n-tag></div>
         <div class="card-grid"><span>性别</span><b>{{ sexLabel(animal.sex) }}</b><span>基因型</span><b>{{ animal.genotype }}</b><span>笼位</span><b>{{ animal.cageId ? cages.get(animal.cageId) : '未分配' }}</b></div>
         <small>{{ animal.strain }} · {{ animal.projectNames.join('、') || '未关联项目' }}</small>
       </button>
@@ -874,7 +874,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
       <n-drawer-content v-if="selected" closable :native-scrollbar="false">
         <template #header>
           <div class="detail-title">
-            <div><strong>{{ selected.code }}</strong><span>{{ selected.strain }} · {{ selected.genotype }}</span></div>
+            <div><strong class="muri-id">{{ selected.code }}</strong><span>{{ selected.strain }} · {{ selected.genotype }}</span></div>
             <n-tag :type="statusMeta[selected.status].type" round :bordered="false">{{ statusMeta[selected.status].label }}</n-tag>
           </div>
         </template>

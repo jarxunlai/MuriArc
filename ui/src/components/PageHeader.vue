@@ -40,12 +40,12 @@ const ai = useAiAssistant()
 .heading { min-width: 0; }
 .breadcrumb { display: flex; align-items: center; gap: 4px; margin-bottom: 5px; color: var(--muri-text-tertiary); font-size: 12px; }
 .breadcrumb strong { color: var(--muri-text-secondary); font-weight: 500; }
-h1 { margin: 0; font-size: 24px; line-height: 1.35; letter-spacing: -0.02em; }
+h1 { margin: 0; font-size: 20px; font-weight: 600; line-height: 1.35; letter-spacing: -0.01em; }
 p { margin: 5px 0 0; color: var(--muri-text-secondary); line-height: 1.5; }
 .actions { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; }
 @media (max-width: 900px) {
   .page-header { align-items: flex-start; margin-bottom: 14px; }
-  h1 { font-size: 20px; }
+  h1 { font-size: 18px; }
   .heading p { font-size: 13px; }
   .ask-ai :deep(.n-button__content) { font-size: 0; }
   .ask-ai { width: 38px; padding: 0; }

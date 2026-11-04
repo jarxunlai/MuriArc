@@ -194,8 +194,6 @@ const stubs = {
   Spin: { template: '<div><slot /></div>' },
   Tag: { template: '<span><slot /></span>' },
   Progress: true,
-  RadioGroup: { template: '<div><slot /></div>' },
-  RadioButton: { template: '<button><slot /></button>' },
   Empty: true,
 }
 
@@ -239,6 +237,25 @@ describe('ExperimentsView project roles', () => {
     expect(gatewayMock.listExperiments).toHaveBeenCalledOnce()
     expect(wrapper.text()).toContain('Project experiment')
     expect(wrapper.text()).not.toContain('创建实验')
+  })
+
+  it('filters the list with status chips that show per-status counts', async () => {
+    currentAuthSession.value = session('viewer')
+    gatewayMock.listExperiments.mockResolvedValue([
+      experiment,
+      { ...experiment, id: 'experiment-2', code: 'EXP-002', name: 'Draft experiment', status: 'draft' },
+    ])
+    const wrapper = mount(ExperimentsView, { global: { stubs } })
+    await flushPromises()
+
+    const chips = wrapper.findAll('.filter-chip')
+    expect(chips.map((chip) => chip.text())).toEqual(['全部2', '进行中1', '草稿1', '已完成0', '已取消0'])
+    expect(chips[0]!.attributes('aria-pressed')).toBe('true')
+
+    await chips[2]!.trigger('click')
+    expect(chips[2]!.attributes('aria-pressed')).toBe('true')
+    expect(wrapper.text()).toContain('Draft experiment')
+    expect(wrapper.text()).not.toContain('Project experiment')
   })
 
   it('renders the same scoped list with write actions for a Project Editor', async () => {

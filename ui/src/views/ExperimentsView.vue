@@ -28,8 +28,6 @@ import {
   NModal,
   NPopconfirm,
   NProgress,
-  NRadioButton,
-  NRadioGroup,
   NSelect,
   NSpace,
   NSpin,
@@ -201,6 +199,19 @@ const observationValueForm = reactive({
 })
 
 const filtered = computed(() => filter.value === 'all' ? experiments.value : experiments.value.filter((item) => item.status === filter.value))
+const statusFilters = computed(() => ([
+  ['all', '全部'], ['active', '进行中'], ['draft', '草稿'], ['completed', '已完成'], ['cancelled', '已取消'],
+] as const).map(([value, label]) => ({
+  value,
+  label,
+  count: value === 'all' ? experiments.value.length : experiments.value.filter((item) => item.status === value).length,
+})))
+const sectionCounts = computed<Partial<Record<(typeof detailSections)[number]['key'], number>>>(() => ({
+  design: observationDefinitions.value.length,
+  animals: participations.value.length,
+  execution: procedures.value.length,
+  data: observations.value.length,
+}))
 const projectOptions = computed(() => projects.value
   .filter((item) => !currentProjectId.value || item.id === currentProjectId.value)
   .map((item) => ({ label: item.name, value: item.id })))
@@ -1323,7 +1334,11 @@ onMounted(loadRoute)
       <div class="surface"><CalendarClock :size="19" /><span>待执行步骤</span><strong>{{ experiments.reduce((n, e) => n + Math.max(0, e.totalSteps - e.completedSteps), 0) }}</strong></div>
       <div class="surface"><CheckCircle2 :size="19" /><span>已完成实验</span><strong>{{ experiments.filter((e) => e.status === 'completed').length }}</strong></div>
     </section>
-    <div class="filter-row"><n-radio-group v-model:value="filter" size="small"><n-radio-button value="all">全部</n-radio-button><n-radio-button value="active">进行中</n-radio-button><n-radio-button value="draft">草稿</n-radio-button><n-radio-button value="completed">已完成</n-radio-button><n-radio-button value="cancelled">已取消</n-radio-button></n-radio-group></div>
+    <div class="filter-row" role="group" aria-label="按状态筛选">
+      <button v-for="item in statusFilters" :key="item.value" type="button" class="filter-chip" :aria-pressed="filter === item.value" @click="filter = item.value">
+        {{ item.label }}<span class="filter-count">{{ item.count }}</span>
+      </button>
+    </div>
     <n-spin :show="loading">
       <section class="experiment-list">
         <article v-for="experiment in filtered" :key="experiment.id" class="experiment-card surface">
@@ -1331,7 +1346,7 @@ onMounted(loadRoute)
             <div class="eyebrow"><span>{{ experiment.code }}</span><n-tag :type="statusMeta[experiment.status].type" size="small" round :bordered="false">{{ statusMeta[experiment.status].label }}</n-tag></div>
             <h2>{{ experiment.name }}</h2>
             <p>{{ experiment.project }} · {{ experiment.startDate || '未设置开始日期' }} · {{ experiment.animalCount }} 只动物</p>
-            <div class="groups"><span v-for="group in experiment.groups" :key="group.name"><i :style="{ background: group.color }" />{{ group.name }} <b>{{ group.count }}</b></span><span v-if="!experiment.groups.length">尚未分组</span></div>
+            <div class="groups"><span v-for="(group, groupIndex) in experiment.groups" :key="group.name"><i :style="{ background: `var(--muri-data-${(groupIndex % 6) + 1})` }" />{{ group.name }} <b>{{ group.count }}</b></span><span v-if="!experiment.groups.length">尚未分组</span></div>
           </div>
           <div class="progress-panel">
             <span>流程进度</span><strong>{{ experiment.completedSteps }} / {{ experiment.totalSteps }}</strong>
@@ -1394,7 +1409,7 @@ onMounted(loadRoute)
               </div>
             </div>
           </div>
-          <nav class="workspace-nav" aria-label="实验工作区导航"><router-link v-for="item in detailSections" :key="item.key" :to="{ name: 'experiment-detail', params: { experimentId: selected.id, section: item.key }, query: currentRoute.query }" :class="{ active: detailSection === item.key }">{{ item.label }}</router-link></nav>
+          <nav class="workspace-nav" aria-label="实验工作区导航"><router-link v-for="item in detailSections" :key="item.key" :to="{ name: 'experiment-detail', params: { experimentId: selected.id, section: item.key }, query: currentRoute.query }" :class="{ active: detailSection === item.key }" :aria-current="detailSection === item.key ? 'page' : undefined">{{ item.label }}<span v-if="sectionCounts[item.key]" class="nav-count">{{ sectionCounts[item.key] }}</span></router-link></nav>
         </header>
 
         <section v-if="detailSection === 'overview'" class="workspace-section">
@@ -1473,7 +1488,7 @@ onMounted(loadRoute)
 
         <section v-else-if="detailSection === 'data'" class="workspace-section data-section">
           <div class="section-toolbar"><div><h2>数据工作表</h2><p>行对应参与动物，表头由采集节点和数据列组成；点击单元格即可录入或修订。</p></div><div v-if="writeAllowed && selectedIsOpen"><n-button @click="openObservationDefinition">添加数据列</n-button><n-button type="primary" :disabled="!experimentEvents.length || !observationDefinitions.length" @click="openObservation">录入实验级数据</n-button></div></div>
-          <n-tabs type="card" animated>
+          <n-tabs type="segment" size="small" class="data-view-switch">
             <n-tab-pane name="animal" tab="动物纵向数据"><div v-if="participations.length && experimentEvents.length && observationDefinitions.length" class="sheet surface"><table class="data-grid"><thead><tr><th rowspan="2" class="frozen frozen-id">动物编号</th><th rowspan="2" class="frozen frozen-group">实验组</th><th v-for="event in experimentEvents" :key="event.id" :colspan="observationDefinitions.length" class="event-heading"><strong>{{ event.label }}</strong><small>{{ formatInstant(event.occurredAt) }}</small></th></tr><tr><template v-for="event in experimentEvents" :key="event.id"><th v-for="definition in observationDefinitions" :key="event.id + '-' + definition.id"><strong>{{ definition.label }}</strong><small v-if="definition.unit">{{ definition.unit }}</small></th></template></tr></thead><tbody><tr v-for="participation in participations" :key="participation.id"><td class="frozen frozen-id"><strong>{{ animalLabels.get(participation.animalId) ?? participation.animalId }}</strong></td><td class="frozen frozen-group">{{ participation.cohortId ? cohortLabels.get(participation.cohortId) : '未分组' }}</td><template v-for="event in experimentEvents" :key="event.id"><td v-for="definition in observationDefinitions" :key="participation.id + '-' + event.id + '-' + definition.id"><button type="button" class="data-cell" :class="{ filled: !!cellObservation(participation.animalId, event.id, definition.id) }" :disabled="!writeAllowed || !selectedIsOpen" @click="editDataCell(participation, event, definition)">{{ cellDisplayValue(participation.animalId, event.id, definition.id) }}</button></td></template></tr></tbody></table></div><n-empty v-else description="请先纳入动物，并准备采集节点和数据列" /></n-tab-pane>
             <n-tab-pane name="experiment" tab="实验级记录"><div class="surface experiment-records"><div v-for="observation in experimentLevelObservations" :key="observation.id" class="compact-row"><div><strong>{{ definitionLabels.get(observation.definitionId) ?? observation.definitionId }}</strong><small>{{ eventLabels.get(observation.experimentEventId) ?? observation.experimentEventId }} · v{{ observation.currentValueVersion }}</small></div><div class="observation-actions"><b>{{ formatObservationValue(latestObservationValue(observation)?.value) }}</b><n-button text size="tiny" @click="openObservationHistory(observation)">历史</n-button><n-button v-if="writeAllowed && selectedIsOpen && observationDefinitions.find((definition) => definition.id === observation.definitionId)?.policy !== 'immutable'" text type="primary" size="tiny" @click="openObservationRevision(observation)">修订</n-button></div></div><n-empty v-if="!experimentLevelObservations.length" description="尚无实验级记录" /></div></n-tab-pane>
           </n-tabs>
@@ -1830,7 +1845,12 @@ onMounted(loadRoute)
 .metrics svg { color: var(--muri-primary); }
 .metrics span { color: var(--muri-text-secondary); }
 .metrics strong { font-size: 20px; }
-.filter-row { display: flex; justify-content: flex-end; margin-bottom: 11px; }
+.filter-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-bottom: 11px; }
+.filter-chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid var(--muri-border-strong); border-radius: 999px; color: var(--muri-text-secondary); background: var(--muri-surface); font-size: 13px; cursor: pointer; transition: border-color var(--muri-transition-fast), background var(--muri-transition-fast), color var(--muri-transition-fast); }
+.filter-chip:hover { color: var(--muri-text); border-color: var(--muri-text-tertiary); }
+.filter-chip[aria-pressed="true"] { color: var(--muri-text); border-color: var(--muri-text); background: var(--muri-surface-sunken); font-weight: 500; }
+.filter-count { color: var(--muri-text-tertiary); font-size: 12px; font-variant-numeric: tabular-nums; }
+.data-view-switch { max-width: 300px; }
 .experiment-list { display: flex; flex-direction: column; gap: 10px; }
 .experiment-card { display: grid; grid-template-columns: 1fr 300px; overflow: hidden; }
 .experiment-main { padding: 17px; }
@@ -1877,11 +1897,14 @@ h2 { margin: 7px 0 4px; font-size: 16px; }
 .workspace-title-row h1 { margin: 7px 0 4px; font-size: 24px; letter-spacing: -0.02em; }
 .workspace-title-row p { margin: 0; color: var(--muri-text-secondary); font-size: 12px; }
 .lifecycle-actions { display: flex; align-items: center; gap: 8px; }
-.workspace-nav { display: flex; gap: 4px; margin-top: 18px; padding: 0 20px; overflow-x: auto; border-top: 1px solid var(--muri-border); }
-.workspace-nav a { position: relative; padding: 13px 12px 11px; color: var(--muri-text-secondary); white-space: nowrap; }
-.workspace-nav a::after { position: absolute; inset: auto 10px 0; height: 2px; border-radius: 2px; background: transparent; content: ''; }
-.workspace-nav a.active { color: var(--muri-primary); font-weight: 600; }
-.workspace-nav a.active::after { background: var(--muri-primary); }
+.workspace-nav { display: flex; gap: 24px; margin-top: 18px; padding: 0 20px; overflow-x: auto; border-top: 1px solid var(--muri-border); scrollbar-width: none; }
+.workspace-nav::-webkit-scrollbar { display: none; }
+.workspace-nav a { position: relative; display: inline-flex; align-items: center; gap: 6px; padding: 12px 0 10px; color: var(--muri-text-secondary); white-space: nowrap; transition: color var(--muri-transition-fast); }
+.workspace-nav a:hover { color: var(--muri-text); }
+.workspace-nav a::after { position: absolute; inset: auto 0 0; height: 2px; background: transparent; content: ''; transition: background var(--muri-transition-fast); }
+.workspace-nav a.active { color: var(--muri-text); font-weight: 500; }
+.workspace-nav a.active::after { background: var(--muri-text); }
+.nav-count { color: var(--muri-text-tertiary); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums; }
 .workspace-section { min-width: 0; }
 .workspace-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .workspace-metrics article { display: flex; min-height: 106px; padding: 16px; flex-direction: column; }

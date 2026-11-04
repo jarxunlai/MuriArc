@@ -32,6 +32,13 @@ a { color: inherit; text-decoration: none; }
 
 .subtle-text { color: var(--muri-text-secondary); }
 
+/* Identifiers (animal, cage, experiment codes) align in columns and read as records. */
+.muri-id {
+  font-family: var(--muri-font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
 .visually-hidden {
   position: absolute;
   width: 1px;

@@ -54,7 +54,7 @@ describe('design tokens', () => {
   })
 
   it('defines every token referenced by components', () => {
-    const used = new Set(sources.flatMap((source) => [...source.matchAll(/var\((--muri-[a-z0-9-]+)/g)].map((match) => match[1]!)))
+    const used = new Set(sources.flatMap((source) => [...source.matchAll(/var\((--muri-[a-z0-9-]*[a-z0-9])\b(?!-)/g)].map((match) => match[1]!)))
     expect([...used].filter((token) => !(token in tokens))).toEqual([])
   })
 })

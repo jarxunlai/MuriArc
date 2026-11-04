@@ -1,28 +1,71 @@
+/*
+ * MuriArc design tokens. Restrained by default: cool neutrals carry the UI,
+ * the brand blue is reserved for primary actions and links, status hues are
+ * used as text and small dots, and the Okabe-Ito set is reserved for data
+ * (cohorts, chart series). Naive UI reads the same values from theme.ts;
+ * theme.test.ts keeps the two in sync and checks text contrast.
+ */
 :root {
   color-scheme: light;
+
+  /* Brand (branding/brand.json) */
   --muri-primary: #0f5faa;
-  --muri-primary-hover: #0b70c7;
-  --muri-primary-soft: #eaf3fb;
+  --muri-primary-hover: #1a69b3;
+  --muri-primary-pressed: #0b4c8a;
+  --muri-primary-soft: #edf3fa;
+  --muri-primary-border: #bcd3ea;
+  --muri-on-primary: #ffffff;
   --muri-accent: #009ca6;
-  --muri-warning: #d98216;
-  --muri-danger: #c34b51;
-  --muri-success: #38866b;
-  --muri-bg: #f4f6f8;
+
+  /* Neutrals */
+  --muri-bg: #f7f8fa;
   --muri-surface: #ffffff;
-  --muri-surface-muted: #f8fafb;
-  --muri-border: #dfe5eb;
-  --muri-border-strong: #cbd4de;
-  --muri-text: #1d2935;
-  --muri-text-secondary: #5e6b78;
-  --muri-text-tertiary: #87929d;
+  --muri-surface-muted: #fafbfc;
+  --muri-surface-hover: #f3f4f6;
+  --muri-surface-sunken: #f0f1f4;
+  --muri-border: #e2e4e9;
+  --muri-border-strong: #c9ccd3;
+  --muri-text: #1c2024;
+  --muri-text-secondary: #555b65;
+  --muri-text-tertiary: #697079;
+
+  /* Status: text-safe on white (WCAG AA); -soft/-border for rare tinted surfaces */
+  --muri-success: #22704e;
+  --muri-success-soft: #ecf5f0;
+  --muri-success-border: #b9dcc9;
+  --muri-warning: #9c5a00;
+  --muri-warning-text: #8a5300;
+  --muri-warning-soft: #fbf2e2;
+  --muri-warning-border: #ecd3a6;
+  --muri-danger: #b4383e;
+  --muri-danger-text: #a33039;
+  --muri-danger-soft: #fbeeee;
+  --muri-danger-border: #eccaca;
+  --muri-neutral-dot: #9aa0a9;
+
+  /* Data series (Okabe-Ito, colour-blind safe) — not for UI status */
+  --muri-data-1: #0072b2;
+  --muri-data-2: #e69f00;
+  --muri-data-3: #009e73;
+  --muri-data-4: #cc79a7;
+  --muri-data-5: #56b4e9;
+  --muri-data-6: #d55e00;
+
+  /* Type */
+  --muri-font-sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --muri-font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Shape and layout */
+  --muri-radius-xs: 4px;
   --muri-radius-sm: 6px;
   --muri-radius: 8px;
   --muri-radius-lg: 12px;
-  --muri-shadow: 0 8px 28px rgba(30, 53, 76, 0.08);
+  --muri-shadow-sm: 0 1px 3px rgba(28, 32, 36, 0.08);
+  --muri-shadow: 0 8px 28px rgba(28, 32, 36, 0.08);
   --muri-sidebar-width: 224px;
   --muri-topbar-height: 58px;
   --muri-content-max: 1480px;
-  --muri-transition-fast: 140ms ease;
+  --muri-transition-fast: 120ms ease;
   --muri-transition-panel: 180ms ease;
 }
 

@@ -87,10 +87,10 @@ async function submit() {
 .brand-block { display: flex; align-items: center; gap: 11px; margin-bottom: 28px; }
 .brand-block img { width: 48px; height: 48px; object-fit: contain; }
 .brand-block div { display: flex; flex-direction: column; }
-.brand-block strong { font-size: 21px; letter-spacing: -.03em; }
+.brand-block strong { font-size: 20px; letter-spacing: -.03em; }
 .brand-block span { color: var(--muri-text-tertiary); font-size: 11px; }
 .heading { margin-bottom: 20px; }
-.heading h1 { margin: 0 0 5px; font-size: 22px; }
+.heading h1 { margin: 0 0 5px; font-size: 20px; }
 .heading p { margin: 0; color: var(--muri-text-secondary); }
 .login-error { margin: -2px 0 15px; }
 .security-note { margin: 18px 0 0; color: var(--muri-text-tertiary); font-size: 11px; line-height: 1.6; }

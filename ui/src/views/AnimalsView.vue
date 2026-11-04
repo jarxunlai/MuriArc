@@ -1038,9 +1038,9 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .card-grid b { color: var(--muri-text); font-weight: 500; }
 .animal-card > small { display: block; margin-top: 8px; color: var(--muri-text-secondary); }
 .dialog-card { width: min(700px, calc(100vw - 28px)); }
-.selection-bar { position: fixed; z-index: 40; inset: auto 24px 22px calc(var(--muri-sidebar-width) + 24px); display: flex; width: fit-content; max-width: calc(100% - var(--muri-sidebar-width) - 48px); margin: auto; align-items: center; gap: 9px; padding: 9px 10px 9px 15px; border: 1px solid var(--muri-border-strong); border-radius: 10px; background: white; box-shadow: var(--muri-shadow); }
+.selection-bar { position: fixed; z-index: 40; inset: auto 24px 22px calc(var(--muri-sidebar-width) + 24px); display: flex; width: fit-content; max-width: calc(100% - var(--muri-sidebar-width) - 48px); margin: auto; align-items: center; gap: 9px; padding: 9px 10px 9px 15px; border: 1px solid var(--muri-border-strong); border-radius: var(--muri-radius); background: white; box-shadow: var(--muri-shadow); }
 .batch-preview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
-.batch-preview > div { display: flex; flex-direction: column; gap: 3px; padding: 11px; border-radius: 7px; background: var(--muri-surface-muted); }
+.batch-preview > div { display: flex; flex-direction: column; gap: 3px; padding: 11px; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .batch-preview span { color: var(--muri-text-tertiary); font-size: 12px; }
 .batch-preview strong { font-size: 20px; }
 .batch-preview .eligible strong { color: var(--muri-primary); }
@@ -1053,7 +1053,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .initial-genetics > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .initial-genetics > header > div { display: flex; flex-direction: column; }
 .initial-genetics > header span, .initial-genetics > small { margin-top: 3px; color: var(--muri-text-tertiary); font-size: 11px; }
-.initial-genetics-row { padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }
+.initial-genetics-row { padding: 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .initial-genetics-row + .initial-genetics-row { margin-top: 8px; }
 .initial-genetics-notes { display: flex; align-items: flex-start; gap: 8px; }
 .initial-genetics-notes .n-input { flex: 1; }
@@ -1062,7 +1062,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .detail-title strong { font-size: 18px; }
 .detail-title span { margin-top: 2px; color: var(--muri-text-secondary); font-size: 12px; font-weight: 400; }
 .detail-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
-.detail-summary > div { display: flex; padding: 10px; flex-direction: column; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }
+.detail-summary > div { display: flex; padding: 10px; flex-direction: column; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .detail-summary span { color: var(--muri-text-tertiary); font-size: 11px; }
 .detail-summary strong { margin-top: 2px; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .detail-error { margin-bottom: 12px; }
@@ -1076,7 +1076,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .tab-actions > span { color: var(--muri-text-tertiary); font-size: 12px; }
 .attachment-actions > .n-select { width: min(230px, 55%); }
 .record-list, .measurement-list, .relation-list, .attachment-list, .audit-list, .provenance-list { display: flex; flex-direction: column; gap: 8px; }
-.record-card { padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.record-card { padding: 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .record-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .record-card header > div { display: flex; min-width: 0; flex-direction: column; }
 .record-card header span { margin-top: 2px; color: var(--muri-text-tertiary); font-size: 11px; }
@@ -1084,33 +1084,33 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .record-card dt { color: var(--muri-text-tertiary); }
 .record-card dd { margin: 0; overflow: hidden; text-overflow: ellipsis; }
 .record-card > small { display: block; margin-top: 8px; color: var(--muri-text-tertiary); }
-.batch-provenance { margin-top: 9px; padding: 9px; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }.batch-provenance > header { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 7px; }.batch-provenance > header svg { color: var(--muri-primary); }.batch-provenance > header span { display: flex; min-width: 0; flex-direction: column; }.batch-provenance > header small,.batch-provenance > small { color: var(--muri-text-tertiary); font-size: 10px; }.batch-gels { display: flex; overflow-x: auto; gap: 7px; margin-top: 8px; }.batch-gels button { display: flex; width: 105px; min-width: 105px; padding: 0; overflow: hidden; border: 1px solid var(--muri-border); border-radius: 6px; background: white; cursor: pointer; flex-direction: column; }.batch-gels img,.batch-gels button > span { display: grid; width: 100%; height: 65px; place-items: center; object-fit: cover; color: var(--muri-text-tertiary); background: var(--muri-surface-muted); }.batch-gels small { width: 100%; padding: 5px 6px; overflow: hidden; color: var(--muri-text-secondary); font-size: 9px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.batch-provenance { margin-top: 9px; padding: 9px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }.batch-provenance > header { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 7px; }.batch-provenance > header svg { color: var(--muri-primary); }.batch-provenance > header span { display: flex; min-width: 0; flex-direction: column; }.batch-provenance > header small,.batch-provenance > small { color: var(--muri-text-tertiary); font-size: 11px; }.batch-gels { display: flex; overflow-x: auto; gap: 7px; margin-top: 8px; }.batch-gels button { display: flex; width: 105px; min-width: 105px; padding: 0; overflow: hidden; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: white; cursor: pointer; flex-direction: column; }.batch-gels img,.batch-gels button > span { display: grid; width: 100%; height: 65px; place-items: center; object-fit: cover; color: var(--muri-text-tertiary); background: var(--muri-surface-muted); }.batch-gels small { width: 100%; padding: 5px 6px; overflow: hidden; color: var(--muri-text-secondary); font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .legacy-genotypes { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--muri-border); }
 .legacy-genotypes > header { display: flex; flex-direction: column; margin-bottom: 9px; }
 .legacy-genotypes > header span { margin-top: 2px; color: var(--muri-text-tertiary); font-size: 11px; }
-.measurement-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.measurement-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .measurement-row > div:first-child { display: flex; flex-direction: column; }
 .measurement-row > div:first-child span { color: var(--muri-text-tertiary); font-size: 11px; }
-.measurement-row > b { align-self: center; color: var(--muri-primary); font-size: 15px; }
+.measurement-row > b { align-self: center; color: var(--muri-primary); font-size: 14px; }
 .measurement-meta { display: flex; grid-column: 1 / -1; align-items: center; gap: 8px; color: var(--muri-text-tertiary); font-size: 11px; }
 .measurement-meta small { margin-left: auto; }
-.relation-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--muri-border); border-radius: 7px; background: white; text-align: left; cursor: pointer; }
+.relation-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: white; text-align: left; cursor: pointer; }
 .relation-row > span { display: flex; min-width: 0; flex-direction: column; }
 .relation-row small { color: var(--muri-text-tertiary); }
-.relation-row > b { color: var(--muri-text-tertiary); font-size: 10px; font-weight: 400; }
-.attachment-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.relation-row > b { color: var(--muri-text-tertiary); font-size: 11px; font-weight: 400; }
+.attachment-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .attachment-row > div { display: flex; min-width: 0; flex-direction: column; }
 .attachment-row strong, .attachment-row span, .attachment-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-row span { margin-top: 2px; color: var(--muri-text-secondary); font-size: 11px; }
-.attachment-row small { margin-top: 4px; color: var(--muri-text-tertiary); font-size: 10px; }
+.attachment-row small { margin-top: 4px; color: var(--muri-text-tertiary); font-size: 11px; }
 .audit-section h3 { margin: 0 0 9px; font-size: 13px; }
 .audit-section + .audit-section { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--muri-border); }
-.audit-list article { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 10px; border-radius: 7px; background: var(--muri-surface-muted); }
+.audit-list article { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 10px; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .audit-list article > div { display: flex; flex-direction: column; }
 .audit-list article > div:nth-child(2) { align-items: flex-end; }
 .audit-list span, .audit-list small { color: var(--muri-text-tertiary); font-size: 11px; }
 .audit-list p { grid-column: 1 / -1; margin: 3px 0 0; color: var(--muri-text-secondary); font-size: 12px; }
-.provenance-list article { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; padding: 9px 10px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.provenance-list article { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; padding: 9px 10px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .provenance-list article > div { display: flex; flex-direction: column; }
 .provenance-list span, .provenance-list small { color: var(--muri-text-tertiary); font-size: 11px; }
 @media (max-width: 900px) {

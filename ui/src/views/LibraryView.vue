@@ -210,13 +210,13 @@ onMounted(async () => {
 <style scoped>
 .toolbar { display: grid; grid-template-columns: minmax(220px, 320px) auto auto 1fr; gap: 10px; align-items: center; padding: 12px; margin-bottom: 10px; }
 .toolbar > span { color: var(--muri-text-tertiary); font-size: 11px; }
-.upload { display: flex; min-height: 36px; align-items: center; gap: 7px; padding: 0 13px; border-radius: 7px; color: #fff; background: var(--muri-primary); cursor: pointer; }
+.upload { display: flex; min-height: 36px; align-items: center; gap: 7px; padding: 0 13px; border-radius: var(--muri-radius-sm); color: var(--muri-surface); background: var(--muri-primary); cursor: pointer; }
 .upload input { display: none; }
 .upload-status { padding: 10px; margin-bottom: 10px; }
 .upload-status div { display: flex; justify-content: space-between; padding: 4px; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
 .grid article { overflow: hidden; }
-.thumb { display: grid; height: 150px; place-items: center; background: #eef3f7; color: var(--muri-text-tertiary); cursor: pointer; }
+.thumb { display: grid; height: 150px; place-items: center; background: var(--muri-surface-sunken); color: var(--muri-text-tertiary); cursor: pointer; }
 .thumb img { width: 100%; height: 100%; object-fit: cover; }
 .meta { display: flex; padding: 12px; flex-direction: column; }
 .meta span,.meta small { color: var(--muri-text-tertiary); font-size: 11px; }

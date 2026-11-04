@@ -95,9 +95,9 @@ const html = computed(() => DOMPurify.sanitize(markdown.render(props.content), {
 }
 .ai-markdown :deep(code) {
   padding: 0.12em 0.32em;
-  border-radius: 4px;
-  color: #26425d;
-  background: #edf2f6;
+  border-radius: var(--muri-radius-xs);
+  color: var(--muri-text);
+  background: var(--muri-surface-sunken);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
   font-size: 0.9em;
 }
@@ -105,8 +105,8 @@ const html = computed(() => DOMPurify.sanitize(markdown.render(props.content), {
   max-width: 100%;
   padding: 10px 12px;
   border: 1px solid var(--muri-border);
-  border-radius: 7px;
-  background: #f4f7f9;
+  border-radius: var(--muri-radius-sm);
+  background: var(--muri-surface-sunken);
   overflow: auto;
 }
 .ai-markdown :deep(pre code) {

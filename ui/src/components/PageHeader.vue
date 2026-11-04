@@ -45,7 +45,7 @@ p { margin: 5px 0 0; color: var(--muri-text-secondary); line-height: 1.5; }
 .actions { display: flex; flex: 0 0 auto; align-items: center; gap: 10px; }
 @media (max-width: 900px) {
   .page-header { align-items: flex-start; margin-bottom: 14px; }
-  h1 { font-size: 21px; }
+  h1 { font-size: 20px; }
   .heading p { font-size: 13px; }
   .ask-ai :deep(.n-button__content) { font-size: 0; }
   .ask-ai { width: 38px; padding: 0; }

@@ -1026,7 +1026,6 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .initial-genetics-row + .initial-genetics-row { margin-top: 8px; }
 .initial-genetics-notes { display: flex; align-items: flex-start; gap: 8px; }
 .initial-genetics-notes .n-input { flex: 1; }
-.visually-hidden { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .detail-title { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px; }
 .detail-title > div { display: flex; flex-direction: column; }
 .detail-title strong { font-size: 18px; }

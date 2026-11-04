@@ -7,10 +7,10 @@ import { branding } from './branding'
 import { currentAuthSession, gateway } from '@/services/gateway'
 import {
   availableProjects,
+  canAdministerAi,
+  canManageMembers as sessionCanManageMembers,
   currentProjectId,
   hasLabRegistryAccess,
-  isActiveProjectAdmin,
-  isLabAdmin as sessionIsLabAdmin,
   setCurrentProject,
 } from '@/services/projectContext'
 import AiDrawer from '@/components/AiDrawer.vue'
@@ -35,9 +35,8 @@ const animalItems = computed(() => [
   ...(labRegistryAvailable.value ? [{ to: '/animal-data', label: '动物数据', icon: TableProperties }] : []),
   ...(labRegistryAvailable.value ? [{ to: '/breeding', label: '繁育管理', icon: Dna }] : []),
 ])
-const isLabAdmin = computed(() => gateway.mode === 'remote' && sessionIsLabAdmin())
-const canManageMembers = computed(() => gateway.mode === 'remote'
-  && (sessionIsLabAdmin() || isActiveProjectAdmin()))
+const canManageLabAi = computed(() => gateway.mode === 'remote' && canAdministerAi())
+const canManageMembers = computed(() => gateway.mode === 'remote' && sessionCanManageMembers())
 const experimentItems = [
   { to: '/experiments', label: '实验管理', icon: FlaskConical },
   { to: '/data', label: '数据中心', icon: TableProperties },
@@ -48,7 +47,7 @@ const toolItems = computed(() => [
   { to: '/ai', label: 'AI 助手', icon: Bot },
   { to: '/ai/images', label: '私人 AI 图片', icon: Images },
   ...(canManageMembers.value ? [{ to: '/members', label: '成员管理', icon: Users }] : []),
-  ...(isLabAdmin.value ? [
+  ...(canManageLabAi.value ? [
     { to: '/admin/ai', label: 'AI 管理', icon: Bot },
   ] : []),
 ])

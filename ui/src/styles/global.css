@@ -32,6 +32,19 @@ a { color: inherit; text-decoration: none; }
 
 .subtle-text { color: var(--muri-text-secondary); }
 
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
 .route-enter-active,
 .route-leave-active { transition: opacity var(--muri-transition-fast), transform var(--muri-transition-fast); }
 .route-enter-from { opacity: 0; transform: translateY(3px); }

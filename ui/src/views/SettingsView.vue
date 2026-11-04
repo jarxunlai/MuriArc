@@ -29,7 +29,11 @@ import type {
 import type { WorkspaceSettings } from '@/domain/models'
 import { createDataGateway } from '@/services/dataGateway'
 import { passwordPolicyError, passwordStrength } from '@/services/passwordStrength'
-import { hasLabRegistryAccess } from '@/services/projectContext'
+import {
+  canAdministerAi,
+  canManageMembers as sessionCanManageMembers,
+  hasLabRegistryAccess,
+} from '@/services/projectContext'
 import AiModelProfilesSettings from '@/components/AiModelProfilesSettings.vue'
 import PageHeader from '@/components/PageHeader.vue'
 
@@ -80,8 +84,8 @@ const localStorageAvailable = gateway.mode === 'local'
 const desktopUpdaterAvailable = gateway.mode === 'local'
   && typeof gateway.checkDesktopUpdate === 'function'
   && typeof gateway.applyDesktopUpdate === 'function'
-const canManageMembers = gateway.mode === 'remote'
-  && currentAuthSession.value?.user.labRoles.includes('lab_admin') === true
+const canManageMembers = computed(() => gateway.mode === 'remote' && sessionCanManageMembers())
+const canManageLabAi = computed(() => gateway.mode === 'remote' && canAdministerAi())
 const labRegistryAvailable = gateway.mode === 'local' || hasLabRegistryAccess()
 const menu = computed(() => [
   { key: 'workspace', label: '工作空间', icon: Database },
@@ -380,7 +384,7 @@ onMounted(() => {
       <router-link to="/operations" class="surface"><ShieldCheck :size="18" /><span>活动记录</span><ChevronRight :size="16" /></router-link>
       <router-link to="/ai/images" class="surface"><Bot :size="18" /><span>私人 AI 图片</span><ChevronRight :size="16" /></router-link>
       <router-link v-if="canManageMembers" to="/members" class="surface"><Users :size="18" /><span>成员管理</span><ChevronRight :size="16" /></router-link>
-      <router-link v-if="canManageMembers" to="/admin/ai" class="surface"><Bot :size="18" /><span>AI 管理</span><ChevronRight :size="16" /></router-link>
+      <router-link v-if="canManageLabAi" to="/admin/ai" class="surface"><Bot :size="18" /><span>AI 管理</span><ChevronRight :size="16" /></router-link>
     </section>
 
     <section class="settings-layout surface">

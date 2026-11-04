@@ -2,6 +2,11 @@ import { flushPromises, shallowMount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import SettingsView from './SettingsView.vue'
 
+const accessMock = vi.hoisted(() => ({
+  canManageMembers: vi.fn(() => false),
+  canAdministerAi: vi.fn(() => false),
+}))
+
 const gatewayMock = vi.hoisted(() => ({
   mode: 'remote' as 'local' | 'remote',
   displayName: '共享实验室',
@@ -44,6 +49,8 @@ vi.mock('@/services/projectContext', () => ({
     },
   },
   hasLabRegistryAccess: () => false,
+  canManageMembers: accessMock.canManageMembers,
+  canAdministerAi: accessMock.canAdministerAi,
 }))
 vi.mock('vue-router', () => ({ useRouter: () => ({ replace: vi.fn() }) }))
 vi.mock('naive-ui', async (importOriginal) => {
@@ -67,6 +74,20 @@ describe('SettingsView', () => {
     gatewayMock.requestLocalStorageMigration.mockReset()
     gatewayMock.requestRestoreDefaultStorage.mockReset()
     gatewayMock.openLocalStorageDirectory.mockReset()
+    accessMock.canManageMembers.mockReset().mockReturnValue(false)
+    accessMock.canAdministerAi.mockReset().mockReturnValue(false)
+  })
+
+  it('shows mobile admin links with the same rules as the desktop sidebar', async () => {
+    accessMock.canManageMembers.mockReturnValue(true)
+    const wrapper = shallowMount(SettingsView, {
+      global: { stubs: { RouterLink: { props: ['to'], template: '<a :href="to"><slot /></a>' } } },
+    })
+    await flushPromises()
+
+    const links = wrapper.findAll('.more-links a').map((link) => link.attributes('href'))
+    expect(links).toContain('/members')
+    expect(links).not.toContain('/admin/ai')
   })
 
   it('routes the AI settings tab to the multi-model list and detail component', async () => {

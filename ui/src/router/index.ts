@@ -4,10 +4,10 @@ import type { AuthSession } from '@/domain/models'
 import { hasEnteredLocalSpace } from '@/services/localWelcome'
 import {
   availableProjects,
+  canAdministerAi,
+  canManageMembers,
   hasLabRegistryAccess,
   initializeProjectContext,
-  isActiveProjectAdmin,
-  isLabAdmin,
   setCurrentProject,
 } from '@/services/projectContext'
 
@@ -101,10 +101,10 @@ router.beforeEach(async (to) => {
     if (!hasLabRegistryAccess(session) && (to.name === 'breeding' || to.meta.animalData === true)) {
       return { name: 'animals' }
     }
-    if (to.name === 'members' && !isLabAdmin(session) && !isActiveProjectAdmin(session)) {
+    if (to.name === 'members' && !canManageMembers(session)) {
       return fallback
     }
-    if (to.name === 'ai-admin' && !isLabAdmin(session)) {
+    if (to.name === 'ai-admin' && !canAdministerAi(session)) {
       return fallback
     }
     return to.name === 'login' ? safeRedirect(to.query.redirect, fallback) : true

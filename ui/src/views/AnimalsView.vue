@@ -1,7 +1,30 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Download, FileImage, Filter, Link2, Plus, Search, Upload } from '@lucide/vue'
-import { NButton, NTag, type DataTableColumns, useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NCheckbox,
+  NDataTable,
+  NDatePicker,
+  NDrawer,
+  NDrawerContent,
+  NEmpty,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NModal,
+  NSelect,
+  NSpin,
+  NTabPane,
+  NTabs,
+  NTag,
+  NTimeline,
+  NTimelineItem,
+  useMessage,
+  type DataTableColumns,
+} from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import type {
   Animal,
@@ -849,8 +872,10 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
         </div>
 
         <n-alert v-if="detailError" type="error" :show-icon="false" class="detail-error">
-          {{ detailError }}
-          <template #action><n-button size="small" @click="hydrateSelected(selected, false)">重试</n-button></template>
+          <div class="detail-error-body">
+            <span>{{ detailError }}</span>
+            <n-button size="small" @click="hydrateSelected(selected, false)">重试</n-button>
+          </div>
         </n-alert>
 
         <n-spin :show="detailLoading">
@@ -1035,6 +1060,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .detail-summary span { color: var(--muri-text-tertiary); font-size: 11px; }
 .detail-summary strong { margin-top: 2px; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .detail-error { margin-bottom: 12px; }
+.detail-error-body { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 :deep(.n-tabs-nav-scroll-content) { min-width: max-content; }
 :deep(.n-tab-pane) { min-height: 220px; padding-top: 13px; }
 :deep(.n-timeline-item-content p) { margin: 4px 0; color: var(--muri-text-secondary); }

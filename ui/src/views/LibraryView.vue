@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { useMessage } from 'naive-ui'
+import { NButton, NEmpty, NPopconfirm, NSelect, NTag, useMessage } from 'naive-ui'
 import { Camera, Download, Eye, FolderUp, RefreshCw, Trash2 } from '@lucide/vue'
 import PageHeader from '@/components/PageHeader.vue'
 import { gateway, type LibraryRecord } from '@/services/gateway'

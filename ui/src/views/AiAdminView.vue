@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NForm,
+  NFormItem,
+  NInput,
+  NSelect,
+  NSwitch,
+  NTag,
+  useMessage,
+} from 'naive-ui'
 import { ExternalLink, Plug, Save, XCircle } from '@lucide/vue'
 import PageHeader from '@/components/PageHeader.vue'
 import type { AiProviderPreset } from '@/domain/models'

@@ -1,7 +1,18 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { CheckCircle2, Download, FileImage, FileSpreadsheet, Link2, RefreshCw, Trash2, UploadCloud } from '@lucide/vue'
-import { useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NDatePicker,
+  NEmpty,
+  NForm,
+  NFormItem,
+  NInput,
+  NSelect,
+  NTag,
+  useMessage,
+} from 'naive-ui'
 import type {
   GenotypeDefinition,
   GenotypingBatch,

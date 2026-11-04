@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { NAlert, NButton } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import { Database, UserRound } from '@lucide/vue'
 import { branding } from '@/branding'

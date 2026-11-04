@@ -1,86 +1,10 @@
 import { createApp } from 'vue'
-import {
-  create,
-  NAlert,
-  NButton,
-  NCheckbox,
-  NConfigProvider,
-  NDataTable,
-  NDatePicker,
-  NDialogProvider,
-  NDrawer,
-  NDrawerContent,
-  NDropdown,
-  NEmpty,
-  NForm,
-  NFormItem,
-  NInput,
-  NInputNumber,
-  NList,
-  NListItem,
-  NMessageProvider,
-  NModal,
-  NNotificationProvider,
-  NPopconfirm,
-  NProgress,
-  NRadioButton,
-  NRadioGroup,
-  NSelect,
-  NSkeleton,
-  NSpace,
-  NSpin,
-  NSwitch,
-  NTabPane,
-  NTabs,
-  NTag,
-  NTimeline,
-  NTimelineItem,
-} from 'naive-ui'
 import App from './App.vue'
 import { router } from './router'
 import './styles/tokens.css'
 import './styles/global.css'
 
-// Register only the components MuriArc uses. Importing Naive UI's full plugin
-// makes the desktop bundle substantially larger and contradicts the small,
-// focused UI goal.
-const naive = create({
-  components: [
-    NAlert,
-    NButton,
-    NCheckbox,
-    NConfigProvider,
-    NDataTable,
-    NDatePicker,
-    NDialogProvider,
-    NDrawer,
-    NDrawerContent,
-    NDropdown,
-    NEmpty,
-    NForm,
-    NFormItem,
-    NInput,
-    NInputNumber,
-    NList,
-    NListItem,
-    NMessageProvider,
-    NModal,
-    NNotificationProvider,
-    NPopconfirm,
-    NProgress,
-    NRadioButton,
-    NRadioGroup,
-    NSelect,
-    NSkeleton,
-    NSpace,
-    NSpin,
-    NSwitch,
-    NTabPane,
-    NTabs,
-    NTag,
-    NTimeline,
-    NTimelineItem,
-  ],
-})
-
-createApp(App).use(naive).use(router).mount('#app')
+// Naive UI components are imported by each SFC that uses them, so route chunks
+// only ship the controls they render (DataTable, DatePicker, ...) instead of the
+// whole set landing in the entry bundle.
+createApp(App).use(router).mount('#app')

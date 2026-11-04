@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { NAlert, NButton, NForm, NFormItem, NInput } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import { LockKeyhole, Mail } from '@lucide/vue'
 import { branding } from '@/branding'

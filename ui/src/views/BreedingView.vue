@@ -10,7 +10,30 @@ import {
   Search,
   TestTube2,
 } from '@lucide/vue'
-import { useDialog, useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NCheckbox,
+  NDatePicker,
+  NEmpty,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NModal,
+  NPopconfirm,
+  NRadio,
+  NRadioGroup,
+  NSelect,
+  NSkeleton,
+  NSpace,
+  NSpin,
+  NTabPane,
+  NTabs,
+  NTag,
+  useDialog,
+  useMessage,
+} from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import type {
   Animal,

@@ -1,7 +1,16 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { zhCN, dateZhCN, type GlobalThemeOverrides } from 'naive-ui'
+import {
+  dateZhCN,
+  NConfigProvider,
+  NDialogProvider,
+  NMessageProvider,
+  NNotificationProvider,
+  NSelect,
+  zhCN,
+  type GlobalThemeOverrides,
+} from 'naive-ui'
 import { Bot, BookOpen, Boxes, Dna, FlaskConical, Images, Menu, Rat, ScrollText, Settings, TableProperties, Users } from '@lucide/vue'
 import { branding } from './branding'
 import { currentAuthSession, gateway } from '@/services/gateway'

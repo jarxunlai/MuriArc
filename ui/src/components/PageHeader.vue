@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { Bot, ChevronRight } from '@lucide/vue'
+import { NButton } from 'naive-ui'
 import { useRoute } from 'vue-router'
 import { useAiAssistant } from '@/composables/useAiAssistant'
 

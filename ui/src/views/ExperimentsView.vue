@@ -13,7 +13,32 @@ import {
   Upload,
   UsersRound,
 } from '@lucide/vue'
-import { useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NCheckbox,
+  NDatePicker,
+  NEmpty,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NList,
+  NListItem,
+  NModal,
+  NPopconfirm,
+  NProgress,
+  NRadioButton,
+  NRadioGroup,
+  NSelect,
+  NSpace,
+  NSpin,
+  NSwitch,
+  NTabPane,
+  NTabs,
+  NTag,
+  useMessage,
+} from 'naive-ui'
 import type {
   Animal,
   Cohort,

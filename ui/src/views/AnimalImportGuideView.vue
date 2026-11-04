@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ArrowLeft, Download, FileSpreadsheet, ShieldAlert } from '@lucide/vue'
-import { useMessage } from 'naive-ui'
+import { NAlert, NButton, NSpin, NTag, useMessage } from 'naive-ui'
 import { useRouter } from 'vue-router'
 import PageHeader from '@/components/PageHeader.vue'
 import { gateway } from '@/services/gateway'

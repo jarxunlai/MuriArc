@@ -89,19 +89,19 @@ describe('AnimalsView remote access context', () => {
         plugins: [router],
         stubs: {
           PageHeader: true,
-          NButton: true,
-          NDataTable: true,
-          NDrawer: { template: '<div><slot /></div>' },
-          NDrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
-          NEmpty: true,
-          NInput: true,
-          NSelect: true,
-          NSpin: { template: '<div><slot /></div>' },
-          NTabPane: { template: '<div><slot /></div>' },
-          NTabs: { template: '<div><slot /></div>' },
-          NTag: { template: '<span><slot /></span>' },
-          NTimeline: { template: '<div><slot /></div>' },
-          NTimelineItem: { template: '<div><slot /></div>' },
+          Button: true,
+          DataTable: true,
+          Drawer: { template: '<div><slot /></div>' },
+          DrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
+          Empty: true,
+          Input: true,
+          Select: true,
+          Spin: { template: '<div><slot /></div>' },
+          TabPane: { template: '<div><slot /></div>' },
+          Tabs: { template: '<div><slot /></div>' },
+          Tag: { template: '<span><slot /></span>' },
+          Timeline: { template: '<div><slot /></div>' },
+          TimelineItem: { template: '<div><slot /></div>' },
         },
       },
     })
@@ -173,20 +173,20 @@ describe('AnimalsView remote access context', () => {
         plugins: [router],
         stubs: {
           PageHeader: true,
-          NAlert: { template: '<div><slot /><slot name="action" /></div>' },
-          NButton: { template: '<button><slot /></button>' },
-          NDataTable: true,
-          NDrawer: { template: '<div><slot /></div>' },
-          NDrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
-          NEmpty: true,
-          NInput: true,
-          NSelect: true,
-          NSpin: { template: '<div><slot /></div>' },
-          NTabPane: { template: '<div><slot /></div>' },
-          NTabs: { template: '<div><slot /></div>' },
-          NTag: { template: '<span><slot /></span>' },
-          NTimeline: { template: '<div><slot /></div>' },
-          NTimelineItem: { template: '<div><slot /></div>' },
+          Alert: { template: '<div><slot /><slot name="action" /></div>' },
+          Button: { template: '<button><slot /></button>' },
+          DataTable: true,
+          Drawer: { template: '<div><slot /></div>' },
+          DrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
+          Empty: true,
+          Input: true,
+          Select: true,
+          Spin: { template: '<div><slot /></div>' },
+          TabPane: { template: '<div><slot /></div>' },
+          Tabs: { template: '<div><slot /></div>' },
+          Tag: { template: '<span><slot /></span>' },
+          Timeline: { template: '<div><slot /></div>' },
+          TimelineItem: { template: '<div><slot /></div>' },
         },
       },
     })
@@ -201,5 +201,36 @@ describe('AnimalsView remote access context', () => {
     expect(wrapper.text()).toContain('来源批次 PCR-20260725-01')
     expect(wrapper.text()).toContain('24 条记录')
     expect(wrapper.text()).toContain('gel-01.png')
+  })
+
+  it('offers a retry inside the detail error alert', async () => {
+    gatewayMock.getAnimalDetail.mockReset()
+      .mockRejectedValueOnce(new Error('读取小鼠详情失败'))
+      .mockResolvedValue(detail)
+    const router = testRouter(`/animals?animal=${animal.id}`)
+    await router.isReady()
+
+    const wrapper = mount(AnimalsView, {
+      global: {
+        plugins: [router],
+        stubs: {
+          PageHeader: true,
+          DataTable: true,
+          Drawer: { template: '<div><slot /></div>' },
+          DrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
+        },
+      },
+    })
+    await flushPromises()
+
+    const alert = wrapper.get('.detail-error')
+    expect(alert.text()).toContain('读取小鼠详情失败')
+    const retry = alert.findAll('button').find((button) => button.text() === '重试')
+    expect(retry).toBeDefined()
+    await retry!.trigger('click')
+    await flushPromises()
+
+    expect(gatewayMock.getAnimalDetail).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('.detail-error').exists()).toBe(false)
   })
 })

@@ -40,11 +40,11 @@ const libraryEntry: LibraryRecord = {
 
 const stubs = {
   PageHeader: { template: '<header><slot name="actions" /></header>' },
-  NButton: { template: '<button><slot name="icon" /><slot /></button>' },
-  NSelect: true,
-  NTag: { template: '<span><slot /></span>' },
-  NPopconfirm: { template: '<span><slot name="trigger" /><slot /></span>' },
-  NEmpty: true,
+  Button: { template: '<button><slot name="icon" /><slot /></button>' },
+  Select: true,
+  Tag: { template: '<span><slot /></span>' },
+  Popconfirm: { template: '<span><slot name="trigger" /><slot /></span>' },
+  Empty: true,
 }
 
 describe('LibraryView', () => {

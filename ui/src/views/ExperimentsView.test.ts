@@ -182,21 +182,21 @@ function session(role: ProjectRole): AuthSession {
 
 const stubs = {
   PageHeader: { template: '<header><slot name="actions" /></header>' },
-  NButton: { template: '<button><slot /></button>' },
-  NDrawer: { props: ['show'], template: '<div v-if="show"><slot /></div>' },
-  NDrawerContent: { template: '<div><slot /></div>' },
-  NModal: {
+  Button: { template: '<button><slot /></button>' },
+  Drawer: { props: ['show'], template: '<div v-if="show"><slot /></div>' },
+  DrawerContent: { template: '<div><slot /></div>' },
+  Modal: {
     name: 'NModal',
     props: ['show', 'closable', 'maskClosable', 'closeOnEsc'],
     template: '<div v-if="show"><slot /><slot name="footer" /></div>',
   },
-  NPopconfirm: { template: '<span><slot name="trigger" /><slot /></span>' },
-  NSpin: { template: '<div><slot /></div>' },
-  NTag: { template: '<span><slot /></span>' },
-  NProgress: true,
-  NRadioGroup: { template: '<div><slot /></div>' },
-  NRadioButton: { template: '<button><slot /></button>' },
-  NEmpty: true,
+  Popconfirm: { template: '<span><slot name="trigger" /><slot /></span>' },
+  Spin: { template: '<div><slot /></div>' },
+  Tag: { template: '<span><slot /></span>' },
+  Progress: true,
+  RadioGroup: { template: '<div><slot /></div>' },
+  RadioButton: { template: '<button><slot /></button>' },
+  Empty: true,
 }
 
 describe('ExperimentsView project roles', () => {

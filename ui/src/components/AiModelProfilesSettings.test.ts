@@ -102,6 +102,13 @@ type SettingsVm = {
   archiveProfile: () => void
 }
 
+// Shallow stubs drop component methods; keep the focus() call the form uses after opening a profile.
+const inputStub = { template: '<input>', methods: { focus() {} } }
+
+function mountSettings() {
+  return shallowMount(AiModelProfilesSettings, { global: { stubs: { Input: inputStub } } })
+}
+
 describe('AiModelProfilesSettings', () => {
   let profiles: AiModelProfileView[]
   let defaults: AiModelDefaultsView
@@ -175,7 +182,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('loads a model list with independent credential and default status', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
 
     expect(gatewayMock.listAiModelProfiles).toHaveBeenCalledOnce()
@@ -187,7 +194,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('preserves a stored key when only free-form model ID and runtime data change', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.openProfile(vm.profiles[0]!)
@@ -205,7 +212,7 @@ describe('AiModelProfilesSettings', () => {
 
   it('allows an existing keyless cloud profile to stay keyless when identity is unchanged', async () => {
     profiles[0]!.hasKey = false
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.openProfile(vm.profiles[0]!)
@@ -219,7 +226,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('requires a new key after protocol, transport, or Base URL changes', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.openProfile(vm.profiles[0]!)
@@ -243,7 +250,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('validates the unsaved form without creating or updating a profile', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.openProfile(vm.profiles[0]!)
@@ -269,7 +276,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('can validate a new connection before the display name is chosen', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.createProfile()
@@ -293,7 +300,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('uses the shared 120-character model name limit', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.createProfile()
@@ -313,7 +320,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('uses the shared 1,000,000-token history budget limit', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.createProfile()
@@ -339,7 +346,7 @@ describe('AiModelProfilesSettings', () => {
       latencyMs: 23,
       errorCode: 'context_exceeded',
     })
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.openProfile(vm.profiles[0]!)
@@ -353,7 +360,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('updates the sole default vision model explicitly', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     const nextVision = {
@@ -376,7 +383,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('sends explicit null when the user clears a default', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.openProfile(vm.profiles[1]!)
@@ -391,7 +398,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('requires clearing the vision default before disabling vision capability', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.openProfile(vm.profiles[1]!)
@@ -403,7 +410,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('creates a cloud profile only after receiving its write-only key', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.createProfile()
@@ -428,7 +435,7 @@ describe('AiModelProfilesSettings', () => {
   })
 
   it('confirms key clearing and soft archive as separate actions', async () => {
-    const wrapper = shallowMount(AiModelProfilesSettings)
+    const wrapper = mountSettings()
     await flushPromises()
     const vm = wrapper.vm as unknown as SettingsVm
     await vm.openProfile(vm.profiles[0]!)

@@ -1,6 +1,21 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NCheckbox,
+  NEmpty,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NModal,
+  NProgress,
+  NSelect,
+  NSpin,
+  NTag,
+  useMessage,
+} from 'naive-ui'
 import { Plus, RefreshCw, Search, UsersRound } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Animal, Cage } from '@/domain/models'

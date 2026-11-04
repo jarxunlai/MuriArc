@@ -1,6 +1,20 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
-import { useDialog, useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NProgress,
+  NSelect,
+  NSpin,
+  NSwitch,
+  NTag,
+  useDialog,
+  useMessage,
+} from 'naive-ui'
 import {
   Archive,
   ArrowLeft,

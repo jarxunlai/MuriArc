@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted } from 'vue'
-import { useMessage } from 'naive-ui'
+import { NButton, useMessage } from 'naive-ui'
 import { MessageSquarePlus } from '@lucide/vue'
 import PageHeader from '@/components/PageHeader.vue'
 import AiWorkspaceShell from '@/components/AiWorkspaceShell.vue'

@@ -1,6 +1,22 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NCheckbox,
+  NCheckboxGroup,
+  NDatePicker,
+  NDynamicTags,
+  NForm,
+  NFormItem,
+  NModal,
+  NRadioButton,
+  NRadioGroup,
+  NSelect,
+  NSpin,
+  NTag,
+  useMessage,
+} from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import { Archive, BookOpen, CheckCircle2, Download, FileSpreadsheet, Plus, RefreshCw, UploadCloud, XCircle } from '@lucide/vue'
 import type { DataJob, Experiment } from '@/domain/models'

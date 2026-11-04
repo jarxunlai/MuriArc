@@ -34,7 +34,8 @@ import {
   useDialog,
   useMessage,
 } from 'naive-ui'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, type LocationQueryRaw } from 'vue-router'
+import { useQueryTab } from '@/composables/useQueryTab'
 import type {
   Animal,
   AnimalDetail,
@@ -58,14 +59,14 @@ import { gateway } from '@/services/gateway'
 import { canManageBreeding, canWriteAnimal } from '@/services/projectContext'
 import PageHeader from '@/components/PageHeader.vue'
 
-type WorkspaceTab = 'pedigree' | 'genetics' | 'lines' | 'pairs' | 'litters' | 'prediction'
+const workspaceTabs = ['pedigree', 'genetics', 'lines', 'pairs', 'litters', 'prediction'] as const
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
 
-const activeTab = ref<WorkspaceTab>('pedigree')
+const activeTab = useQueryTab(workspaceTabs, 'pedigree')
 const loading = ref(true)
 const detailLoading = ref(false)
 const busy = ref(false)
@@ -508,10 +509,10 @@ function openRelated(relation: PedigreeRelation) {
     selectAnimal(related.id)
     return
   }
-  void router.push({
-    name: 'animals',
-    query: { ...route.query, animal: relation.relatedAnimal.id },
-  })
+  // The breeding tab key means nothing on the animal drawer; don't carry it over.
+  const query: LocationQueryRaw = { ...route.query, animal: relation.relatedAnimal.id }
+  delete query.tab
+  void router.push({ name: 'animals', query })
 }
 
 async function createLocus() {

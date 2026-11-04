@@ -45,10 +45,9 @@ a { color: inherit; text-decoration: none; }
   border: 0;
 }
 
-.route-enter-active,
-.route-leave-active { transition: opacity var(--muri-transition-fast), transform var(--muri-transition-fast); }
-.route-enter-from { opacity: 0; transform: translateY(3px); }
-.route-leave-to { opacity: 0; transform: translateY(-2px); }
+/* Enter-only: with mode="out-in" a leave animation would delay every page switch. */
+.route-enter-active { transition: opacity var(--muri-transition-fast); }
+.route-enter-from { opacity: 0; }
 
 .mobile-only { display: none !important; }
 

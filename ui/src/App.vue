@@ -23,6 +23,7 @@ import {
   setCurrentProject,
 } from '@/services/projectContext'
 import AiDrawer from '@/components/AiDrawer.vue'
+import { routeViewKey } from '@/router/navigation'
 
 const route = useRoute()
 const router = useRouter()
@@ -78,6 +79,7 @@ const operatorName = computed(() => gateway.mode === 'local'
   ? '本地'
   : (currentAuthSession.value?.user.displayName || '共享用户'))
 const avatarInitial = computed(() => operatorName.value.trim().charAt(0) || '用')
+const viewKey = computed(() => routeViewKey(route, currentProjectId.value))
 const isActive = (to: string) => route.path === to || route.path.startsWith(`${to}/`)
 
 async function changeProject(value: string) {
@@ -146,7 +148,7 @@ async function changeProject(value: string) {
 
           <main class="main-content">
             <router-view v-slot="{ Component }">
-              <transition name="route" mode="out-in"><component :is="Component" :key="`${route.path}:${currentProjectId ?? 'registry'}`" /></transition>
+              <transition name="route" mode="out-in"><component :is="Component" :key="viewKey" /></transition>
             </router-view>
           </main>
         </div>

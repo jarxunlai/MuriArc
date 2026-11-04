@@ -25,7 +25,8 @@ import {
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, type LocationQueryRaw } from 'vue-router'
+import { useQueryTab } from '@/composables/useQueryTab'
 import type {
   Animal,
   AnimalDetail,
@@ -70,7 +71,8 @@ const selected = ref<Animal | null>(null)
 const detail = ref<AnimalDetail | null>(null)
 const detailLoading = ref(false)
 const detailError = ref('')
-const detailTab = ref('timeline')
+const detailTabs = ['timeline', 'genotypes', 'experiments', 'measurements', 'breeding', 'samples', 'attachments', 'audit'] as const
+const detailTab = useQueryTab(detailTabs, 'timeline')
 const showCreate = ref(false)
 const registrationDefinitionsLoading = ref(false)
 const showSampleCreate = ref(false)
@@ -326,7 +328,7 @@ async function loadGenetics(animalId: string) {
   }
 }
 
-async function hydrateSelected(animal: Animal, resetTab = true) {
+async function hydrateSelected(animal: Animal) {
   selected.value = animal
   detail.value = null
   geneLoci.value = []
@@ -335,7 +337,6 @@ async function hydrateSelected(animal: Animal, resetTab = true) {
   genotypingRecords.value = []
   clearGenotypingBatchEvidence()
   detailError.value = ''
-  if (resetTab) detailTab.value = 'timeline'
   detailLoading.value = true
   try {
     const [summary, result] = await Promise.all([
@@ -365,7 +366,9 @@ async function hydrateSelected(animal: Animal, resetTab = true) {
 
 function openAnimal(animal: Animal) {
   void hydrateSelected(animal)
-  void router.replace({ query: { ...route.query, animal: animal.id } })
+  const query: LocationQueryRaw = { ...route.query, animal: animal.id }
+  delete query.tab
+  void router.replace({ query })
 }
 
 function closeAnimal() {
@@ -374,6 +377,7 @@ function closeAnimal() {
   detailError.value = ''
   const query = { ...route.query }
   delete query.animal
+  delete query.tab
   void router.replace({ query })
 }
 
@@ -623,7 +627,7 @@ async function createSample() {
       collectedAt: newSample.collectedAt ? new Date(newSample.collectedAt).toISOString() : undefined,
     })
     showSampleCreate.value = false
-    await hydrateSelected(selected.value, false)
+    await hydrateSelected(selected.value)
     detailTab.value = 'samples'
     message.success('样本已登记')
   } catch (error) {
@@ -655,7 +659,7 @@ async function uploadAttachment(event: Event) {
       mediaType: file.type || undefined,
       content: file,
     })
-    await hydrateSelected(selected.value, false)
+    await hydrateSelected(selected.value)
     detailTab.value = 'attachments'
     message.success(`已上传 ${file.name}`)
   } catch (error) {
@@ -689,7 +693,9 @@ async function downloadAttachment(id: string, fileName: string) {
 
 function openBreeding() {
   if (!selected.value) return
-  void router.push({ name: 'breeding', query: { ...route.query, animal: selected.value.id } })
+  const query: LocationQueryRaw = { ...route.query, animal: selected.value.id }
+  delete query.tab
+  void router.push({ name: 'breeding', query })
 }
 
 function openRelatedAnimal(relation: PedigreeRelation) {
@@ -874,7 +880,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
         <n-alert v-if="detailError" type="error" :show-icon="false" class="detail-error">
           <div class="detail-error-body">
             <span>{{ detailError }}</span>
-            <n-button size="small" @click="hydrateSelected(selected, false)">重试</n-button>
+            <n-button size="small" @click="hydrateSelected(selected)">重试</n-button>
           </div>
         </n-alert>
 

@@ -10,6 +10,7 @@ import {
   initializeProjectContext,
   setCurrentProject,
 } from '@/services/projectContext'
+import { routeScrollPosition } from './navigation'
 
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/cages' },
@@ -37,7 +38,7 @@ const routes: RouteRecordRaw[] = [
 export const router = createRouter({
   history: createWebHashHistory(),
   routes,
-  scrollBehavior: () => ({ top: 0 }),
+  scrollBehavior: routeScrollPosition,
 })
 
 function defaultAuthenticatedRoute(session: AuthSession): string {

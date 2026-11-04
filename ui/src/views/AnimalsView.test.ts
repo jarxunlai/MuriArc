@@ -233,4 +233,27 @@ describe('AnimalsView remote access context', () => {
     expect(gatewayMock.getAnimalDetail).toHaveBeenCalledTimes(2)
     expect(wrapper.find('.detail-error').exists()).toBe(false)
   })
+
+  it('closes the detail drawer when the animal leaves the URL (browser back)', async () => {
+    const router = testRouter(`/animals?animal=${animal.id}&tab=samples`)
+    await router.isReady()
+    const wrapper = mount(AnimalsView, {
+      global: {
+        plugins: [router],
+        stubs: {
+          PageHeader: true,
+          DataTable: true,
+          Drawer: { props: ['show'], template: '<div v-if="show" class="drawer-stub"><slot /></div>' },
+          DrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
+        },
+      },
+    })
+    await flushPromises()
+    expect(wrapper.find('.drawer-stub').exists()).toBe(true)
+
+    await router.replace('/animals')
+    await flushPromises()
+
+    expect(wrapper.find('.drawer-stub').exists()).toBe(false)
+  })
 })

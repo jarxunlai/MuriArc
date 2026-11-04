@@ -704,7 +704,16 @@ function openRelatedAnimal(relation: PedigreeRelation) {
 }
 
 function openFromQuery(value: unknown) {
-  if (typeof value !== 'string' || selected.value?.id === value) return
+  if (typeof value !== 'string') {
+    // The animal left the URL (browser back or an outside link): close without rewriting history.
+    if (selected.value) {
+      selected.value = null
+      detail.value = null
+      detailError.value = ''
+    }
+    return
+  }
+  if (selected.value?.id === value) return
   const animal = animals.value.find((item) => item.id === value)
   if (animal) void hydrateSelected(animal)
 }

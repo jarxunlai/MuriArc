@@ -79,8 +79,12 @@ router.beforeEach(async (to) => {
   }
 
   try {
-    await gateway.getRuntimeCapabilities?.()
-    const session = await gateway.restoreSession()
+    // Fetch both in parallel, but keep reporting a capability failure first.
+    const capabilities = gateway.getRuntimeCapabilities?.()
+    const restoring = gateway.restoreSession()
+    restoring.catch(() => undefined)
+    await capabilities
+    const session = await restoring
     const fallback = defaultAuthenticatedRoute(session)
     if (session.user.mustChangePassword) {
       return to.name === 'change-password'

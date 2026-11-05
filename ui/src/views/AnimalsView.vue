@@ -894,7 +894,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
         </n-alert>
 
         <n-spin :show="detailLoading">
-          <n-tabs v-model:value="detailTab" type="line" animated>
+          <n-tabs v-model:value="detailTab" type="line">
             <n-tab-pane name="timeline" tab="时间线">
               <n-timeline v-if="detail?.timeline.length">
                 <n-timeline-item v-for="event in detail.timeline" :key="event.id" :title="event.title" :time="formatDateTime(event.at)">

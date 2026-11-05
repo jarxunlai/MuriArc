@@ -70,6 +70,10 @@ const operatorName = computed(() => gateway.mode === 'local'
 const avatarInitial = computed(() => operatorName.value.trim().charAt(0) || '用')
 const viewKey = computed(() => routeViewKey(route, currentProjectId.value))
 const isActive = (to: string) => route.path === to || route.path.startsWith(`${to}/`)
+// “更多” opens Settings, which links to every page without its own bottom tab.
+const isMobileActive = (to: string) => to === '/settings'
+  ? !mobileItems.some((item) => item.to !== '/settings' && isActive(item.to))
+  : isActive(to)
 
 async function changeProject(value: string) {
   const projectId = value === LAB_REGISTRY ? undefined : value
@@ -146,7 +150,7 @@ async function changeProject(value: string) {
         </div>
 
         <nav class="bottom-nav mobile-only" aria-label="移动端主导航">
-          <router-link v-for="item in mobileItems" :key="item.to" :to="item.to" :class="{ active: isActive(item.to) }">
+          <router-link v-for="item in mobileItems" :key="item.to" :to="item.to" :class="{ active: isMobileActive(item.to) }">
             <component :is="item.icon" :size="20" /><span>{{ item.label }}</span>
           </router-link>
         </nav>

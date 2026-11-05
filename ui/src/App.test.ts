@@ -81,4 +81,22 @@ describe('project-scoped navigation shell', () => {
       expect(wrapper.text()).not.toContain('繁育管理')
     })
   }
+
+  it('marks the mobile “更多” entry active on secondary pages it links to', async () => {
+    const router = createRouter({
+      history: createMemoryHistory(),
+      routes: ['/cages', '/animals', '/experiments', '/ai', '/settings', '/breeding']
+        .map((path) => ({ path, component: { template: '<div />' } })),
+    })
+    await router.push('/breeding')
+    await router.isReady()
+
+    const wrapper = mount(App, { global: { plugins: [naive, router] } })
+    const active = () => wrapper.findAll('.bottom-nav a.active').map((link) => link.text())
+    expect(active()).toEqual(['更多'])
+
+    await router.push('/animals')
+    await wrapper.vm.$nextTick()
+    expect(active()).toEqual(['动物'])
+  })
 })

@@ -1090,7 +1090,7 @@ onMounted(load)
       </template>
     </PageHeader>
 
-    <n-tabs v-model:value="activeTab" type="line" animated class="workspace-tabs">
+    <n-tabs v-model:value="activeTab" type="line" class="workspace-tabs">
       <n-tab-pane name="pedigree" tab="谱系">
         <section class="breeding-layout">
           <aside class="animal-browser surface">

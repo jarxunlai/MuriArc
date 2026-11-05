@@ -1596,7 +1596,7 @@ onMounted(loadRoute)
         </div>
       </n-form>
 
-      <n-tabs v-model:value="dataEntryMode" type="segment" animated>
+      <n-tabs v-model:value="dataEntryMode" type="segment">
         <n-tab-pane name="manual" tab="手工录入">
           <n-form v-if="selectedObservationDefinition" label-placement="top">
             <n-form-item

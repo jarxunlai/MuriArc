@@ -256,4 +256,32 @@ describe('AnimalsView remote access context', () => {
 
     expect(wrapper.find('.drawer-stub').exists()).toBe(false)
   })
+
+  it('renders only the compact card list on narrow screens and grows it in batches', async () => {
+    const matchMedia = window.matchMedia
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes('max-width: 900px'), media: query, onchange: null,
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      addListener: () => undefined, removeListener: () => undefined, dispatchEvent: () => false,
+    })) as typeof window.matchMedia
+    try {
+      gatewayMock.listAnimals.mockResolvedValue(Array.from({ length: 120 }, (_, index) => ({
+        ...animal, id: `animal-${index}`, code: `M-${String(index).padStart(3, '0')}`,
+      })))
+      const router = testRouter('/animals')
+      await router.isReady()
+      const wrapper = mount(AnimalsView, {
+        global: { plugins: [router], stubs: { PageHeader: true, DataTable: true } },
+      })
+      await flushPromises()
+
+      expect(wrapper.find('.table-wrap').exists()).toBe(false)
+      expect(wrapper.findAll('.animal-card')).toHaveLength(50)
+      await wrapper.get('.mobile-more').trigger('click')
+      expect(wrapper.findAll('.animal-card')).toHaveLength(100)
+      expect(wrapper.get('.mobile-more').text()).toContain('20')
+    } finally {
+      window.matchMedia = matchMedia
+    }
+  })
 })

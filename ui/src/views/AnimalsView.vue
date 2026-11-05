@@ -25,6 +25,7 @@ import {
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
+import { useIntersectionObserver, useMediaQuery } from '@vueuse/core'
 import { useRoute, useRouter, type LocationQueryRaw } from 'vue-router'
 import { useQueryTab } from '@/composables/useQueryTab'
 import type {
@@ -209,6 +210,17 @@ const filtered = computed(() => {
     || animal.genotype.toLowerCase().includes(query)
     || animal.strain.toLowerCase().includes(query)
     || animal.projectNames.some((project) => project.toLowerCase().includes(query))))
+})
+// Mirror the 900px layout breakpoint so only one list layout is in the DOM.
+const compactLayout = useMediaQuery('(max-width: 900px)')
+const MOBILE_BATCH = 50
+const mobileLimit = ref(MOBILE_BATCH)
+const mobileAnimals = computed(() => filtered.value.slice(0, mobileLimit.value))
+const mobileRemaining = computed(() => Math.max(0, filtered.value.length - mobileLimit.value))
+const mobileSentinel = ref<HTMLElement | null>(null)
+watch(filtered, () => { mobileLimit.value = MOBILE_BATCH })
+useIntersectionObserver(mobileSentinel, ([entry]) => {
+  if (entry?.isIntersecting && mobileRemaining.value) mobileLimit.value += MOBILE_BATCH
 })
 const projectBatchAssignmentByAnimal = computed(() => new Map(
   projectBatchAssignments.value.map((assignment) => [assignment.animalId, assignment]),
@@ -754,17 +766,20 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
       <span>{{ filtered.length }} 条记录</span>
     </section>
 
-    <section class="surface desktop-only table-wrap">
+    <section v-if="!compactLayout" class="surface table-wrap">
       <n-data-table :columns="columns" :data="filtered" :loading="loading" :row-key="(row: Animal) => row.id" :checked-row-keys="selectedAnimalIds" :bordered="false" :single-line="false" :pagination="{ pageSize: 12 }" @update:checked-row-keys="updateSelectedAnimalIds" />
     </section>
 
-    <section class="mobile-list mobile-only" aria-label="小鼠卡片列表">
-      <button v-for="animal in filtered" :key="animal.id" type="button" class="animal-card surface" :aria-label="`查看动物 ${animal.code}`" @click="openAnimal(animal)">
+    <section v-else class="mobile-list" aria-label="小鼠卡片列表">
+      <button v-for="animal in mobileAnimals" :key="animal.id" type="button" class="animal-card surface" :aria-label="`查看动物 ${animal.code}`" @click="openAnimal(animal)">
         <div class="card-title"><span><n-checkbox v-if="projectBatchAvailable" :checked="selectedAnimalIds.includes(animal.id)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animal.id] : selectedAnimalIds.filter((id) => id !== animal.id)" /><strong class="muri-id">{{ animal.code }}</strong></span><n-tag :type="statusMeta[animal.status].type" size="small" round :bordered="false">{{ statusMeta[animal.status].label }}</n-tag></div>
         <div class="card-grid"><span>性别</span><b>{{ sexLabel(animal.sex) }}</b><span>基因型</span><b>{{ animal.genotype }}</b><span>笼位</span><b>{{ animal.cageId ? cages.get(animal.cageId) : '未分配' }}</b></div>
         <small>{{ animal.strain }} · {{ animal.projectNames.join('、') || '未关联项目' }}</small>
       </button>
       <n-empty v-if="!loading && !filtered.length" description="没有匹配的小鼠" />
+      <button v-if="mobileRemaining" ref="mobileSentinel" type="button" class="mobile-more" @click="mobileLimit += MOBILE_BATCH">
+        显示更多（剩余 {{ mobileRemaining }} 只）
+      </button>
     </section>
 
     <transition name="selection">
@@ -1038,7 +1053,8 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .toolbar > span { justify-self: end; padding-right: 5px; color: var(--muri-text-tertiary); font-size: 12px; }
 .table-wrap { overflow: hidden; }
 :deep(.table-link) { padding: 0; border: 0; color: var(--muri-primary); background: transparent; cursor: pointer; font-weight: 600; }
-.mobile-list { display: none; flex-direction: column; gap: 9px; }
+.mobile-list { display: flex; flex-direction: column; gap: 9px; }
+.mobile-more { height: 40px; border: 1px dashed var(--muri-border-strong); border-radius: var(--muri-radius); color: var(--muri-text-secondary); background: transparent; font-size: 13px; cursor: pointer; }
 .animal-card { padding: 13px; text-align: left; background: white; }
 .card-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
 .card-title > span { display: flex; align-items: center; gap: 8px; }

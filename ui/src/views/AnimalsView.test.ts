@@ -284,4 +284,35 @@ describe('AnimalsView remote access context', () => {
       window.matchMedia = matchMedia
     }
   })
+
+  it('narrows the list with status and sex facets and counts each option', async () => {
+    gatewayMock.listAnimals.mockResolvedValue([
+      animal,
+      { ...animal, id: 'animal-2', code: 'M-002', sex: 'male' },
+      { ...animal, id: 'animal-3', code: 'M-003', sex: 'male', status: 'breeding' },
+    ])
+    const router = testRouter('/animals')
+    await router.isReady()
+    const wrapper = mount(AnimalsView, {
+      global: {
+        plugins: [router],
+        stubs: {
+          PageHeader: true,
+          DataTable: { props: ['data'], template: '<ul><li v-for="row in data" :key="row.id" class="row">{{ row.code }}</li></ul>' },
+          Popover: { template: '<div><slot name="trigger" /><slot /></div>' },
+        },
+      },
+    })
+    await flushPromises()
+
+    const [statusFacet, sexFacet] = wrapper.findAll('.facet-panel')
+    expect(sexFacet!.findAll('.facet-option').map((option) => option.text())).toEqual(['雄2', '雌1', '未知0'])
+    await sexFacet!.findAll('.facet-option')[0]!.trigger('click')
+    expect(wrapper.findAll('.row').map((row) => row.text())).toEqual(['M-002', 'M-003'])
+
+    const breeding = statusFacet!.findAll('.facet-option').find((option) => option.text().startsWith('繁育'))!
+    expect(breeding.text()).toBe('繁育1')
+    await breeding.trigger('click')
+    expect(wrapper.findAll('.row').map((row) => row.text())).toEqual(['M-003'])
+  })
 })

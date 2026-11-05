@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Download, FileImage, Filter, Link2, Plus, Search, Upload } from '@lucide/vue'
+import { Download, FileImage, Link2, Plus, Search, Upload } from '@lucide/vue'
 import {
   NAlert,
   NButton,
@@ -54,6 +54,7 @@ import {
   currentProjectId,
   hasLabRegistryAccess,
 } from '@/services/projectContext'
+import FacetedFilter, { type FacetOption } from '@/components/FacetedFilter.vue'
 import PageHeader from '@/components/PageHeader.vue'
 
 const route = useRoute()
@@ -67,7 +68,8 @@ const projects = ref<ProjectSummary[]>([])
 const loading = ref(true)
 const busy = ref(false)
 const search = ref('')
-const status = ref<AnimalStatus | null>(null)
+const statusFacet = ref<string[]>([])
+const sexFacet = ref<string[]>([])
 const selected = ref<Animal | null>(null)
 const detail = ref<AnimalDetail | null>(null)
 const detailLoading = ref(false)
@@ -154,7 +156,6 @@ const genotypingStateMeta: Record<GenotypingState, { label: string; type: 'defau
   confirmed: { label: '已确认', type: 'success' },
   rejected: { label: '已排除', type: 'error' },
 }
-const statusOptions = Object.entries(statusMeta).map(([value, meta]) => ({ value, label: meta.label }))
 const projectOptions = computed(() => projects.value.map((project) => ({ label: project.name, value: project.id })))
 const genotypeDefinitionOptions = computed(() => genotypeDefinitions.value
   .filter((definition) => !definition.archivedAt)
@@ -203,14 +204,30 @@ const currentGenotypeRows = computed(() => currentGenotypingRecords(genotypingRe
     )?.name ?? record.genotypeDefinitionId,
     sourceBatch: genotypingBatchesByRecord.value.get(record.id),
   })))
-const filtered = computed(() => {
+const searched = computed(() => {
   const query = search.value.trim().toLowerCase()
-  return animals.value.filter((animal) => (!status.value || animal.status === status.value) && (!query
-    || animal.code.toLowerCase().includes(query)
-    || animal.genotype.toLowerCase().includes(query)
-    || animal.strain.toLowerCase().includes(query)
-    || animal.projectNames.some((project) => project.toLowerCase().includes(query))))
+  return query
+    ? animals.value.filter((animal) => animal.code.toLowerCase().includes(query)
+      || animal.genotype.toLowerCase().includes(query)
+      || animal.strain.toLowerCase().includes(query)
+      || animal.projectNames.some((project) => project.toLowerCase().includes(query)))
+    : animals.value
 })
+const filtered = computed(() => searched.value.filter((animal) => (!statusFacet.value.length || statusFacet.value.includes(animal.status))
+  && (!sexFacet.value.length || sexFacet.value.includes(animal.sex))))
+// Facet counts follow the search text and the other facet, like a typical faceted filter.
+const statusFacetOptions = computed<FacetOption[]>(() => Object.entries(statusMeta).map(([value, meta]) => ({
+  value,
+  label: meta.label,
+  count: searched.value.filter((animal) => animal.status === value
+    && (!sexFacet.value.length || sexFacet.value.includes(animal.sex))).length,
+})))
+const sexFacetOptions = computed<FacetOption[]>(() => (['male', 'female', 'unknown'] as const).map((value) => ({
+  value,
+  label: sexLabel(value),
+  count: searched.value.filter((animal) => animal.sex === value
+    && (!statusFacet.value.length || statusFacet.value.includes(animal.status))).length,
+})))
 // Mirror the 900px layout breakpoint so only one list layout is in the DOM.
 const compactLayout = useMediaQuery('(max-width: 900px)')
 const MOBILE_BATCH = 50
@@ -762,7 +779,10 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 
     <section class="toolbar surface">
       <n-input v-model:value="search" clearable placeholder="搜索编号、品系、基因型或项目"><template #prefix><Search :size="16" /></template></n-input>
-      <n-select v-model:value="status" clearable :options="statusOptions" placeholder="全部状态"><template #arrow><Filter :size="15" /></template></n-select>
+      <div class="facets">
+        <FacetedFilter v-model="statusFacet" label="状态" :options="statusFacetOptions" />
+        <FacetedFilter v-model="sexFacet" label="性别" :options="sexFacetOptions" />
+      </div>
       <span>{{ filtered.length }} 条记录</span>
     </section>
 
@@ -1049,7 +1069,8 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .summary-row span { color: var(--muri-text-secondary); }
 .summary-row strong { font-size: 20px; }
 .summary-row .attention strong { color: var(--muri-warning); }
-.toolbar { display: grid; grid-template-columns: minmax(260px, 420px) 160px 1fr; align-items: center; gap: 10px; margin-bottom: 12px; padding: 10px; }
+.toolbar { display: grid; grid-template-columns: minmax(260px, 420px) auto 1fr; align-items: center; gap: 10px; margin-bottom: 12px; padding: 10px; }
+.facets { display: flex; flex-wrap: wrap; gap: 8px; }
 .toolbar > span { justify-self: end; padding-right: 5px; color: var(--muri-text-tertiary); font-size: 12px; }
 .table-wrap { overflow: hidden; }
 :deep(.table-link) { padding: 0; border: 0; color: var(--muri-primary); background: transparent; cursor: pointer; font-weight: 600; }
@@ -1143,7 +1164,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
   .summary-row > div { align-items: flex-start; padding: 10px; flex-direction: column; }
   .summary-row span { font-size: 11px; }
   .summary-row strong { margin-top: 2px; font-size: 18px; }
-  .toolbar { grid-template-columns: 1fr 130px; }
+  .toolbar { grid-template-columns: 1fr; }
   .toolbar > span { display: none; }
   :global(.n-drawer) { max-width: 100% !important; }
   .detail-summary { grid-template-columns: 1fr 1fr; }

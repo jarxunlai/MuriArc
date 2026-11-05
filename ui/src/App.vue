@@ -203,7 +203,7 @@ nav { padding: 13px 10px; }
   .avatar { display: none; }
   .bottom-nav { position: fixed; z-index: 30; inset: auto 0 0; display: flex; height: calc(62px + env(safe-area-inset-bottom)); align-items: flex-start; justify-content: space-around; padding: 6px 5px env(safe-area-inset-bottom); border-top: 1px solid var(--muri-border); background: rgba(255,255,255,.97); box-shadow: 0 -6px 22px rgba(30,53,76,.06); backdrop-filter: blur(12px); }
   .bottom-nav a { display: flex; min-width: 52px; min-height: 48px; align-items: center; justify-content: center; flex-direction: column; gap: 2px; border-radius: var(--muri-radius-sm); color: var(--muri-text-tertiary); font-size: 11px; }
-  .bottom-nav a.active { color: var(--muri-primary); background: var(--muri-primary-soft); }
+  .bottom-nav a.active { color: var(--muri-text); background: var(--muri-surface-sunken); }
 }
 @media (max-width: 430px) {
   .connection { display: none; }

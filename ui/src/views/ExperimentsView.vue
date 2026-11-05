@@ -29,6 +29,7 @@ import {
   NPopconfirm,
   NProgress,
   NSelect,
+  NSkeleton,
   NSpace,
   NSpin,
   NSwitch,
@@ -1339,7 +1340,12 @@ onMounted(loadRoute)
         {{ item.label }}<span class="filter-count">{{ item.count }}</span>
       </button>
     </div>
-    <n-spin :show="loading">
+    <section v-if="loading && !experiments.length" class="experiment-list list-skeleton" aria-busy="true" aria-label="正在加载实验">
+      <div v-for="index in 3" :key="index" class="experiment-card surface skeleton-card">
+        <n-skeleton text style="width: 22%" /><n-skeleton text style="width: 48%; margin-top: 10px" /><n-skeleton text :repeat="2" style="margin-top: 10px" />
+      </div>
+    </section>
+    <n-spin v-else :show="loading">
       <section class="experiment-list">
         <article v-for="experiment in filtered" :key="experiment.id" class="experiment-card surface">
           <div class="experiment-main">
@@ -1842,7 +1848,7 @@ onMounted(loadRoute)
 <style scoped>
 .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
 .metrics > div { display: grid; grid-template-columns: 28px 1fr auto; align-items: center; gap: 4px; padding: 13px; }
-.metrics svg { color: var(--muri-primary); }
+.metrics svg { color: var(--muri-text-secondary); }
 .metrics span { color: var(--muri-text-secondary); }
 .metrics strong { font-size: 20px; }
 .filter-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-bottom: 11px; }
@@ -1851,6 +1857,7 @@ onMounted(loadRoute)
 .filter-chip[aria-pressed="true"] { color: var(--muri-text); border-color: var(--muri-text); background: var(--muri-surface-sunken); font-weight: 500; }
 .filter-count { color: var(--muri-text-tertiary); font-size: 12px; font-variant-numeric: tabular-nums; }
 .data-view-switch { max-width: 300px; }
+.skeleton-card { display: block; padding: 18px 20px; }
 .experiment-list { display: flex; flex-direction: column; gap: 10px; }
 .experiment-card { display: grid; grid-template-columns: 1fr 300px; overflow: hidden; }
 .experiment-main { padding: 17px; }
@@ -1915,7 +1922,7 @@ h2 { margin: 7px 0 4px; font-size: 16px; }
 .overview-card,.design-panel,.trace-panel,.experiment-records { padding: 16px; }
 .section-title,.section-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .section-title > div,.section-toolbar > div:first-child { display: flex; flex-direction: column; }
-.section-title span { font-weight: 700; }
+.section-title span { font-weight: 600; }
 .section-title small,.section-toolbar p { color: var(--muri-text-tertiary); font-size: 11px; }
 .section-toolbar { margin-bottom: 12px; }
 .section-toolbar h2 { margin: 0 0 3px; font-size: 20px; }
@@ -1969,7 +1976,7 @@ h2 { margin: 7px 0 4px; font-size: 16px; }
 .data-grid th { padding: 8px 10px; background: var(--muri-surface-muted); color: var(--muri-text-secondary); font-size: 11px; }
 .data-grid th strong,.data-grid th small { display: block; }
 .data-grid th small { color: var(--muri-text-tertiary); font-weight: 400; }
-.data-grid .event-heading { color: var(--muri-primary); background: var(--muri-primary-soft); }
+.data-grid .event-heading { color: var(--muri-text); background: var(--muri-surface-sunken); }
 .data-grid .frozen { position: sticky; z-index: 2; text-align: left; }
 .data-grid th.frozen { z-index: 4; }
 .data-grid .frozen-id { left: 0; min-width: 128px; padding: 0 12px; }

@@ -12,6 +12,7 @@ import {
   NModal,
   NProgress,
   NSelect,
+  NSkeleton,
   NSpin,
   useMessage,
 } from 'naive-ui'
@@ -167,7 +168,13 @@ watch(currentProjectId, () => {
       <span class="result-count">{{ filteredCages.length }} 个笼位{{ attentionOnly ? ' · 仅需关注' : '' }}</span>
     </section>
 
-    <n-spin :show="loading">
+    <div v-if="loading && !cages.length" class="cage-grid list-skeleton" aria-busy="true" aria-label="正在加载笼位">
+      <div v-for="index in 6" :key="index" class="cage-card surface">
+        <n-skeleton text style="width: 30%" /><n-skeleton text style="width: 45%; margin-top: 6px" />
+        <n-skeleton text style="margin-top: 18px" /><n-skeleton height="56px" :sharp="false" style="margin-top: 12px" />
+      </div>
+    </div>
+    <n-spin v-else :show="loading">
       <div class="cage-grid">
         <article
           v-for="cage in filteredCages" :key="cage.id" class="cage-card surface"

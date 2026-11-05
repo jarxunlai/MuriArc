@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { Bot, ChevronRight } from '@lucide/vue'
 import { NButton } from 'naive-ui'
+import { computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAiAssistant } from '@/composables/useAiAssistant'
 
-withDefaults(defineProps<{
+const props = withDefaults(defineProps<{
   title: string
   description?: string
   section?: string
@@ -14,13 +15,16 @@ withDefaults(defineProps<{
 })
 const route = useRoute()
 const ai = useAiAssistant()
+// Pages may name their section explicitly; otherwise follow the route so breadcrumbs stay consistent.
+const breadcrumbSection = computed(() => props.section
+  ?? (typeof route.meta.section === 'string' ? route.meta.section : undefined))
 </script>
 
 <template>
   <header class="page-header">
     <div class="heading">
-      <div v-if="section" class="breadcrumb">
-        <span>{{ section }}</span><ChevronRight :size="13" /><strong>{{ title }}</strong>
+      <div v-if="breadcrumbSection" class="breadcrumb">
+        <span>{{ breadcrumbSection }}</span><ChevronRight :size="13" /><strong>{{ title }}</strong>
       </div>
       <h1>{{ title }}</h1>
       <p v-if="description">{{ description }}</p>

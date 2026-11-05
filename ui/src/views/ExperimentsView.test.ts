@@ -239,6 +239,20 @@ describe('ExperimentsView project roles', () => {
     expect(wrapper.text()).not.toContain('创建实验')
   })
 
+  it('shows list skeletons only until the first load finishes', async () => {
+    currentAuthSession.value = session('viewer')
+    let release!: (value: Experiment[]) => void
+    gatewayMock.listExperiments.mockReturnValue(new Promise<Experiment[]>((resolve) => { release = resolve }))
+    const wrapper = mount(ExperimentsView, { global: { stubs } })
+    await flushPromises()
+    expect(wrapper.find('.list-skeleton').exists()).toBe(true)
+
+    release([experiment])
+    await flushPromises()
+    expect(wrapper.find('.list-skeleton').exists()).toBe(false)
+    expect(wrapper.text()).toContain('Project experiment')
+  })
+
   it('filters the list with status chips that show per-status counts', async () => {
     currentAuthSession.value = session('viewer')
     gatewayMock.listExperiments.mockResolvedValue([

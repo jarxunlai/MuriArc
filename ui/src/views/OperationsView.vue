@@ -222,7 +222,7 @@ onMounted(() => {
 .activity-row { display: grid; grid-template-columns: 116px 14px minmax(0, 1fr); gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--muri-border); }
 .activity-row:last-child { border-bottom: 0; }
 .activity-row time { padding-top: 2px; color: var(--muri-text-tertiary); font-size: 12px; }
-.activity-dot { width: 9px; height: 9px; margin-top: 5px; border: 2px solid white; border-radius: 50%; background: var(--muri-primary); box-shadow: 0 0 0 2px var(--muri-primary-soft); }
+.activity-dot { width: 9px; height: 9px; margin-top: 5px; border: 2px solid var(--muri-surface); border-radius: 50%; background: var(--muri-text-tertiary); box-shadow: 0 0 0 2px var(--muri-primary-soft); }
 .activity-content header { display: flex; align-items: center; gap: 7px; }
 .activity-content header strong { margin-right: auto; font-size: 14px; }
 .activity-content p { margin: 5px 0 3px; color: var(--muri-text-secondary); }

@@ -805,7 +805,7 @@ onMounted(load)
 .model-row { display: grid; width: 100%; min-width: 0; min-height: 78px; grid-template-columns: 38px minmax(0, 1fr) auto; align-items: center; gap: 11px; padding: 11px 13px; text-align: left; border: 1px solid var(--muri-border); border-radius: var(--muri-radius); color: var(--muri-text); background: white; cursor: pointer; transition: border-color var(--muri-transition-fast), box-shadow var(--muri-transition-fast), background var(--muri-transition-fast); }
 .model-row:hover { border-color: var(--muri-border-strong); background: var(--muri-surface-muted); box-shadow: 0 3px 12px rgba(30, 53, 76, .06); }
 .model-row:focus-visible, .back-button:focus-visible, .default-actions button:focus-visible { outline: 3px solid rgba(15, 95, 170, .22); outline-offset: 2px; }
-.model-icon { display: grid; width: 36px; height: 36px; place-items: center; border-radius: var(--muri-radius); color: var(--muri-primary); background: var(--muri-primary-soft); }
+.model-icon { display: grid; width: 36px; height: 36px; place-items: center; border-radius: var(--muri-radius); color: var(--muri-text-secondary); background: var(--muri-surface-sunken); }
 .model-identity, .model-name-line { display: flex; min-width: 0; }
 .model-identity { flex-direction: column; gap: 3px; }
 .model-name-line { align-items: center; flex-wrap: wrap; gap: 5px; }

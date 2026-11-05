@@ -1,7 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { RefreshCw, Search, ShieldCheck, Trash2 } from '@lucide/vue'
-import { useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NEmpty,
+  NInput,
+  NInputNumber,
+  NPopconfirm,
+  NSelect,
+  NSpin,
+  NTag,
+  useMessage,
+} from 'naive-ui'
 import PageHeader from '@/components/PageHeader.vue'
 import {
   currentAuthSession,
@@ -15,8 +26,9 @@ import { currentProjectId } from '@/services/projectContext'
 const message = useMessage()
 const loading = ref(false)
 const items = ref<OperationRecord[]>([])
-const scope = ref<string | null>(null)
-const source = ref<string | null>(null)
+// '' is the "all" option; Naive Select treats a null value as no selection and hides its label.
+const scope = ref('')
+const source = ref('')
 const search = ref('')
 const rootLogAdmin = computed(() => currentAuthSession.value?.user.isEnvironmentRoot === true
   && Boolean(gateway.getTechnicalLogPolicy))
@@ -27,14 +39,14 @@ const cleanupPreview = ref<TechnicalLogCleanupPreview>()
 const logBusy = ref(false)
 
 const scopes = [
-  { label: '全部活动', value: null },
+  { label: '全部活动', value: '' },
   { label: '动物', value: 'animal' },
   { label: '实验', value: 'experiment' },
   { label: '项目', value: 'project' },
   { label: 'AI', value: 'ai' },
 ]
 const sources = [
-  { label: '全部来源', value: null },
+  { label: '全部来源', value: '' },
   { label: 'Web', value: 'web' },
   { label: '桌面端', value: 'desktop' },
   { label: 'API', value: 'api' },
@@ -210,7 +222,7 @@ onMounted(() => {
 .activity-row { display: grid; grid-template-columns: 116px 14px minmax(0, 1fr); gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--muri-border); }
 .activity-row:last-child { border-bottom: 0; }
 .activity-row time { padding-top: 2px; color: var(--muri-text-tertiary); font-size: 12px; }
-.activity-dot { width: 9px; height: 9px; margin-top: 5px; border: 2px solid white; border-radius: 50%; background: var(--muri-primary); box-shadow: 0 0 0 2px var(--muri-primary-soft); }
+.activity-dot { width: 9px; height: 9px; margin-top: 5px; border: 2px solid var(--muri-surface); border-radius: 50%; background: var(--muri-text-tertiary); box-shadow: 0 0 0 2px var(--muri-primary-soft); }
 .activity-content header { display: flex; align-items: center; gap: 7px; }
 .activity-content header strong { margin-right: auto; font-size: 14px; }
 .activity-content p { margin: 5px 0 3px; color: var(--muri-text-secondary); }

@@ -84,18 +84,18 @@ const acceptedRow = {
 } as const
 
 const stubs = {
-  NAlert: { template: '<div><slot /><slot name="action" /></div>' },
-  NButton: {
+  Alert: { template: '<div><slot /><slot name="action" /></div>' },
+  Button: {
     props: ['disabled', 'loading'],
     emits: ['click'],
     template: '<button :disabled="disabled" @click="$emit(\'click\')"><slot name="icon" /><slot /></button>',
   },
-  NDatePicker: { template: '<input type="datetime-local">' },
-  NEmpty: { template: '<div><slot /></div>' },
-  NForm: { template: '<form><slot /></form>' },
-  NFormItem: { template: '<label><slot /></label>' },
-  NInput: { template: '<input>' },
-  NSelect: {
+  DatePicker: { template: '<input type="datetime-local">' },
+  Empty: { template: '<div><slot /></div>' },
+  Form: { template: '<form><slot /></form>' },
+  FormItem: { template: '<label><slot /></label>' },
+  Input: { template: '<input>' },
+  Select: {
     props: ['value', 'options'],
     emits: ['update:value'],
     template: `
@@ -106,7 +106,7 @@ const stubs = {
       </select>
     `,
   },
-  NTag: { template: '<span><slot /></span>' },
+  Tag: { template: '<span><slot /></span>' },
 }
 
 function mountComponent() {

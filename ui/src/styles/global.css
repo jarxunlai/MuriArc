@@ -10,7 +10,7 @@ html, body, #app {
 body {
   background: var(--muri-bg);
   color: var(--muri-text);
-  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: var(--muri-font-sans);
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
 }
@@ -32,10 +32,29 @@ a { color: inherit; text-decoration: none; }
 
 .subtle-text { color: var(--muri-text-secondary); }
 
-.route-enter-active,
-.route-leave-active { transition: opacity var(--muri-transition-fast), transform var(--muri-transition-fast); }
-.route-enter-from { opacity: 0; transform: translateY(3px); }
-.route-leave-to { opacity: 0; transform: translateY(-2px); }
+/* Identifiers (animal, cage, experiment codes) align in columns and read as records. */
+.muri-id {
+  font-family: var(--muri-font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Enter-only: with mode="out-in" a leave animation would delay every page switch. */
+.route-enter-active { transition: opacity var(--muri-transition-fast); }
+.route-enter-from { opacity: 0; }
 
 .mobile-only { display: none !important; }
 

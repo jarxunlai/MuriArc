@@ -110,7 +110,7 @@ function startDrag(event: PointerEvent) {
   align-items: center;
   padding: 0 7px 0 13px;
   border-bottom: 1px solid var(--muri-border);
-  background: #fbfcfd;
+  background: var(--muri-surface-muted);
   cursor: grab;
   user-select: none;
   touch-action: none;
@@ -120,7 +120,7 @@ function startDrag(event: PointerEvent) {
   outline: 2px solid var(--muri-primary);
   outline-offset: -2px;
 }
-.workbench-title { display: flex; min-width: 0; align-items: center; gap: 7px; }.workbench-title svg { flex: 0 0 auto; color: var(--muri-primary); }.workbench-title strong { font-size: 12px; }.workbench-title span { overflow: hidden; color: var(--muri-text-tertiary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.workbench-title { display: flex; min-width: 0; align-items: center; gap: 7px; }.workbench-title svg { flex: 0 0 auto; color: var(--muri-primary); }.workbench-title strong { font-size: 12px; }.workbench-title span { overflow: hidden; color: var(--muri-text-tertiary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .drag-indicator { color: var(--muri-border-strong); }
 .workbench-actions { display: flex; justify-content: flex-end; gap: 1px; padding: 0; }
 .workbench-actions button {
@@ -130,14 +130,14 @@ function startDrag(event: PointerEvent) {
   padding: 0;
   place-items: center;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--muri-radius-sm);
   color: var(--muri-text-secondary);
   background: transparent;
   cursor: pointer;
   transition: color var(--muri-transition-fast), background var(--muri-transition-fast);
 }
 .workbench-actions button:hover { color: var(--muri-primary); background: var(--muri-primary-soft); }
-.workbench-actions button:last-child:hover { color: var(--muri-danger); background: #fff1f2; }
+.workbench-actions button:last-child:hover { color: var(--muri-danger); background: var(--muri-danger-soft); }
 .workbench-actions button:focus-visible { outline: 2px solid var(--muri-primary); outline-offset: 1px; }
 .workbench-body { min-width: 0; min-height: 0; }
 :global(body.ai-workbench-dragging) { cursor: grabbing !important; user-select: none !important; }

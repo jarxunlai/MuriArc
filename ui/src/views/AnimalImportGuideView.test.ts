@@ -60,14 +60,14 @@ const stubs = {
     props: ['title', 'description'],
     template: '<header><h1>{{ title }}</h1><p>{{ description }}</p><slot name="actions" /></header>',
   },
-  NAlert: { template: '<div><slot /></div>' },
-  NButton: {
+  Alert: { template: '<div><slot /></div>' },
+  Button: {
     props: ['disabled'],
     emits: ['click'],
     template: '<button :disabled="disabled" @click="$emit(\'click\')"><slot name="icon" /><slot /></button>',
   },
-  NSpin: { template: '<div><slot /></div>' },
-  NTag: { template: '<span><slot /></span>' },
+  Spin: { template: '<div><slot /></div>' },
+  Tag: { template: '<span><slot /></span>' },
 }
 
 async function mountGuide() {

@@ -1,8 +1,33 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Download, FileImage, Filter, Link2, Plus, Search, Upload } from '@lucide/vue'
-import { NButton, NTag, type DataTableColumns, useMessage } from 'naive-ui'
-import { useRoute, useRouter } from 'vue-router'
+import { Download, FileImage, Link2, Plus, Search, Upload } from '@lucide/vue'
+import {
+  NAlert,
+  NButton,
+  NCheckbox,
+  NDataTable,
+  NDatePicker,
+  NDrawer,
+  NDrawerContent,
+  NEmpty,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NModal,
+  NSelect,
+  NSpin,
+  NTabPane,
+  NTabs,
+  NTag,
+  NTimeline,
+  NTimelineItem,
+  useMessage,
+  type DataTableColumns,
+} from 'naive-ui'
+import { useIntersectionObserver, useMediaQuery } from '@vueuse/core'
+import { useRoute, useRouter, type LocationQueryRaw } from 'vue-router'
+import { useQueryTab } from '@/composables/useQueryTab'
 import type {
   Animal,
   AnimalDetail,
@@ -29,6 +54,7 @@ import {
   currentProjectId,
   hasLabRegistryAccess,
 } from '@/services/projectContext'
+import FacetedFilter, { type FacetOption } from '@/components/FacetedFilter.vue'
 import PageHeader from '@/components/PageHeader.vue'
 
 const route = useRoute()
@@ -42,12 +68,14 @@ const projects = ref<ProjectSummary[]>([])
 const loading = ref(true)
 const busy = ref(false)
 const search = ref('')
-const status = ref<AnimalStatus | null>(null)
+const statusFacet = ref<string[]>([])
+const sexFacet = ref<string[]>([])
 const selected = ref<Animal | null>(null)
 const detail = ref<AnimalDetail | null>(null)
 const detailLoading = ref(false)
 const detailError = ref('')
-const detailTab = ref('timeline')
+const detailTabs = ['timeline', 'genotypes', 'experiments', 'measurements', 'breeding', 'samples', 'attachments', 'audit'] as const
+const detailTab = useQueryTab(detailTabs, 'timeline')
 const showCreate = ref(false)
 const registrationDefinitionsLoading = ref(false)
 const showSampleCreate = ref(false)
@@ -128,7 +156,6 @@ const genotypingStateMeta: Record<GenotypingState, { label: string; type: 'defau
   confirmed: { label: '已确认', type: 'success' },
   rejected: { label: '已排除', type: 'error' },
 }
-const statusOptions = Object.entries(statusMeta).map(([value, meta]) => ({ value, label: meta.label }))
 const projectOptions = computed(() => projects.value.map((project) => ({ label: project.name, value: project.id })))
 const genotypeDefinitionOptions = computed(() => genotypeDefinitions.value
   .filter((definition) => !definition.archivedAt)
@@ -177,13 +204,40 @@ const currentGenotypeRows = computed(() => currentGenotypingRecords(genotypingRe
     )?.name ?? record.genotypeDefinitionId,
     sourceBatch: genotypingBatchesByRecord.value.get(record.id),
   })))
-const filtered = computed(() => {
+const searched = computed(() => {
   const query = search.value.trim().toLowerCase()
-  return animals.value.filter((animal) => (!status.value || animal.status === status.value) && (!query
-    || animal.code.toLowerCase().includes(query)
-    || animal.genotype.toLowerCase().includes(query)
-    || animal.strain.toLowerCase().includes(query)
-    || animal.projectNames.some((project) => project.toLowerCase().includes(query))))
+  return query
+    ? animals.value.filter((animal) => animal.code.toLowerCase().includes(query)
+      || animal.genotype.toLowerCase().includes(query)
+      || animal.strain.toLowerCase().includes(query)
+      || animal.projectNames.some((project) => project.toLowerCase().includes(query)))
+    : animals.value
+})
+const filtered = computed(() => searched.value.filter((animal) => (!statusFacet.value.length || statusFacet.value.includes(animal.status))
+  && (!sexFacet.value.length || sexFacet.value.includes(animal.sex))))
+// Facet counts follow the search text and the other facet, like a typical faceted filter.
+const statusFacetOptions = computed<FacetOption[]>(() => Object.entries(statusMeta).map(([value, meta]) => ({
+  value,
+  label: meta.label,
+  count: searched.value.filter((animal) => animal.status === value
+    && (!sexFacet.value.length || sexFacet.value.includes(animal.sex))).length,
+})))
+const sexFacetOptions = computed<FacetOption[]>(() => (['male', 'female', 'unknown'] as const).map((value) => ({
+  value,
+  label: sexLabel(value),
+  count: searched.value.filter((animal) => animal.sex === value
+    && (!statusFacet.value.length || statusFacet.value.includes(animal.status))).length,
+})))
+// Mirror the 900px layout breakpoint so only one list layout is in the DOM.
+const compactLayout = useMediaQuery('(max-width: 900px)')
+const MOBILE_BATCH = 50
+const mobileLimit = ref(MOBILE_BATCH)
+const mobileAnimals = computed(() => filtered.value.slice(0, mobileLimit.value))
+const mobileRemaining = computed(() => Math.max(0, filtered.value.length - mobileLimit.value))
+const mobileSentinel = ref<HTMLElement | null>(null)
+watch(filtered, () => { mobileLimit.value = MOBILE_BATCH })
+useIntersectionObserver(mobileSentinel, ([entry]) => {
+  if (entry?.isIntersecting && mobileRemaining.value) mobileLimit.value += MOBILE_BATCH
 })
 const projectBatchAssignmentByAnimal = computed(() => new Map(
   projectBatchAssignments.value.map((assignment) => [assignment.animalId, assignment]),
@@ -303,7 +357,7 @@ async function loadGenetics(animalId: string) {
   }
 }
 
-async function hydrateSelected(animal: Animal, resetTab = true) {
+async function hydrateSelected(animal: Animal) {
   selected.value = animal
   detail.value = null
   geneLoci.value = []
@@ -312,7 +366,6 @@ async function hydrateSelected(animal: Animal, resetTab = true) {
   genotypingRecords.value = []
   clearGenotypingBatchEvidence()
   detailError.value = ''
-  if (resetTab) detailTab.value = 'timeline'
   detailLoading.value = true
   try {
     const [summary, result] = await Promise.all([
@@ -342,7 +395,9 @@ async function hydrateSelected(animal: Animal, resetTab = true) {
 
 function openAnimal(animal: Animal) {
   void hydrateSelected(animal)
-  void router.replace({ query: { ...route.query, animal: animal.id } })
+  const query: LocationQueryRaw = { ...route.query, animal: animal.id }
+  delete query.tab
+  void router.replace({ query })
 }
 
 function closeAnimal() {
@@ -351,12 +406,13 @@ function closeAnimal() {
   detailError.value = ''
   const query = { ...route.query }
   delete query.animal
+  delete query.tab
   void router.replace({ query })
 }
 
 const columns = computed<DataTableColumns<Animal>>(() => [
   ...(projectBatchAvailable.value ? [{ type: 'selection' as const, width: 42 }] : []),
-  { title: '编号', key: 'code', width: 130, render: (row) => h('button', { class: 'table-link', onClick: () => openAnimal(row) }, row.code) },
+  { title: '编号', key: 'code', width: 130, render: (row) => h('button', { class: 'table-link muri-id', onClick: () => openAnimal(row) }, row.code) },
   { title: '性别', key: 'sex', width: 70, render: (row) => sexLabel(row.sex) },
   { title: '品系', key: 'strain', minWidth: 130 },
   { title: '基因型', key: 'genotype', minWidth: 130, render: (row) => h(NTag, { size: 'small', bordered: false, type: row.genotype === '待确认' ? 'warning' : 'default' }, { default: () => row.genotype }) },
@@ -600,7 +656,7 @@ async function createSample() {
       collectedAt: newSample.collectedAt ? new Date(newSample.collectedAt).toISOString() : undefined,
     })
     showSampleCreate.value = false
-    await hydrateSelected(selected.value, false)
+    await hydrateSelected(selected.value)
     detailTab.value = 'samples'
     message.success('样本已登记')
   } catch (error) {
@@ -632,7 +688,7 @@ async function uploadAttachment(event: Event) {
       mediaType: file.type || undefined,
       content: file,
     })
-    await hydrateSelected(selected.value, false)
+    await hydrateSelected(selected.value)
     detailTab.value = 'attachments'
     message.success(`已上传 ${file.name}`)
   } catch (error) {
@@ -666,7 +722,9 @@ async function downloadAttachment(id: string, fileName: string) {
 
 function openBreeding() {
   if (!selected.value) return
-  void router.push({ name: 'breeding', query: { ...route.query, animal: selected.value.id } })
+  const query: LocationQueryRaw = { ...route.query, animal: selected.value.id }
+  delete query.tab
+  void router.push({ name: 'breeding', query })
 }
 
 function openRelatedAnimal(relation: PedigreeRelation) {
@@ -675,7 +733,16 @@ function openRelatedAnimal(relation: PedigreeRelation) {
 }
 
 function openFromQuery(value: unknown) {
-  if (typeof value !== 'string' || selected.value?.id === value) return
+  if (typeof value !== 'string') {
+    // The animal left the URL (browser back or an outside link): close without rewriting history.
+    if (selected.value) {
+      selected.value = null
+      detail.value = null
+      detailError.value = ''
+    }
+    return
+  }
+  if (selected.value?.id === value) return
   const animal = animals.value.find((item) => item.id === value)
   if (animal) void hydrateSelected(animal)
 }
@@ -712,21 +779,27 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 
     <section class="toolbar surface">
       <n-input v-model:value="search" clearable placeholder="搜索编号、品系、基因型或项目"><template #prefix><Search :size="16" /></template></n-input>
-      <n-select v-model:value="status" clearable :options="statusOptions" placeholder="全部状态"><template #arrow><Filter :size="15" /></template></n-select>
+      <div class="facets">
+        <FacetedFilter v-model="statusFacet" label="状态" :options="statusFacetOptions" />
+        <FacetedFilter v-model="sexFacet" label="性别" :options="sexFacetOptions" />
+      </div>
       <span>{{ filtered.length }} 条记录</span>
     </section>
 
-    <section class="surface desktop-only table-wrap">
+    <section v-if="!compactLayout" class="surface table-wrap">
       <n-data-table :columns="columns" :data="filtered" :loading="loading" :row-key="(row: Animal) => row.id" :checked-row-keys="selectedAnimalIds" :bordered="false" :single-line="false" :pagination="{ pageSize: 12 }" @update:checked-row-keys="updateSelectedAnimalIds" />
     </section>
 
-    <section class="mobile-list mobile-only" aria-label="小鼠卡片列表">
-      <button v-for="animal in filtered" :key="animal.id" type="button" class="animal-card surface" :aria-label="`查看动物 ${animal.code}`" @click="openAnimal(animal)">
-        <div class="card-title"><span><n-checkbox v-if="projectBatchAvailable" :checked="selectedAnimalIds.includes(animal.id)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animal.id] : selectedAnimalIds.filter((id) => id !== animal.id)" /><strong>{{ animal.code }}</strong></span><n-tag :type="statusMeta[animal.status].type" size="small" round :bordered="false">{{ statusMeta[animal.status].label }}</n-tag></div>
+    <section v-else class="mobile-list" aria-label="小鼠卡片列表">
+      <button v-for="animal in mobileAnimals" :key="animal.id" type="button" class="animal-card surface" :aria-label="`查看动物 ${animal.code}`" @click="openAnimal(animal)">
+        <div class="card-title"><span><n-checkbox v-if="projectBatchAvailable" :checked="selectedAnimalIds.includes(animal.id)" @click.stop @update:checked="(checked: boolean) => selectedAnimalIds = checked ? [...selectedAnimalIds, animal.id] : selectedAnimalIds.filter((id) => id !== animal.id)" /><strong class="muri-id">{{ animal.code }}</strong></span><n-tag :type="statusMeta[animal.status].type" size="small" round :bordered="false">{{ statusMeta[animal.status].label }}</n-tag></div>
         <div class="card-grid"><span>性别</span><b>{{ sexLabel(animal.sex) }}</b><span>基因型</span><b>{{ animal.genotype }}</b><span>笼位</span><b>{{ animal.cageId ? cages.get(animal.cageId) : '未分配' }}</b></div>
         <small>{{ animal.strain }} · {{ animal.projectNames.join('、') || '未关联项目' }}</small>
       </button>
       <n-empty v-if="!loading && !filtered.length" description="没有匹配的小鼠" />
+      <button v-if="mobileRemaining" ref="mobileSentinel" type="button" class="mobile-more" @click="mobileLimit += MOBILE_BATCH">
+        显示更多（剩余 {{ mobileRemaining }} 只）
+      </button>
     </section>
 
     <transition name="selection">
@@ -836,7 +909,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
       <n-drawer-content v-if="selected" closable :native-scrollbar="false">
         <template #header>
           <div class="detail-title">
-            <div><strong>{{ selected.code }}</strong><span>{{ selected.strain }} · {{ selected.genotype }}</span></div>
+            <div><strong class="muri-id">{{ selected.code }}</strong><span>{{ selected.strain }} · {{ selected.genotype }}</span></div>
             <n-tag :type="statusMeta[selected.status].type" round :bordered="false">{{ statusMeta[selected.status].label }}</n-tag>
           </div>
         </template>
@@ -849,12 +922,14 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
         </div>
 
         <n-alert v-if="detailError" type="error" :show-icon="false" class="detail-error">
-          {{ detailError }}
-          <template #action><n-button size="small" @click="hydrateSelected(selected, false)">重试</n-button></template>
+          <div class="detail-error-body">
+            <span>{{ detailError }}</span>
+            <n-button size="small" @click="hydrateSelected(selected)">重试</n-button>
+          </div>
         </n-alert>
 
         <n-spin :show="detailLoading">
-          <n-tabs v-model:value="detailTab" type="line" animated>
+          <n-tabs v-model:value="detailTab" type="line">
             <n-tab-pane name="timeline" tab="时间线">
               <n-timeline v-if="detail?.timeline.length">
                 <n-timeline-item v-for="event in detail.timeline" :key="event.id" :title="event.title" :time="formatDateTime(event.at)">
@@ -994,11 +1069,13 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .summary-row span { color: var(--muri-text-secondary); }
 .summary-row strong { font-size: 20px; }
 .summary-row .attention strong { color: var(--muri-warning); }
-.toolbar { display: grid; grid-template-columns: minmax(260px, 420px) 160px 1fr; align-items: center; gap: 10px; margin-bottom: 12px; padding: 10px; }
+.toolbar { display: grid; grid-template-columns: minmax(260px, 420px) auto 1fr; align-items: center; gap: 10px; margin-bottom: 12px; padding: 10px; }
+.facets { display: flex; flex-wrap: wrap; gap: 8px; }
 .toolbar > span { justify-self: end; padding-right: 5px; color: var(--muri-text-tertiary); font-size: 12px; }
 .table-wrap { overflow: hidden; }
 :deep(.table-link) { padding: 0; border: 0; color: var(--muri-primary); background: transparent; cursor: pointer; font-weight: 600; }
-.mobile-list { display: none; flex-direction: column; gap: 9px; }
+.mobile-list { display: flex; flex-direction: column; gap: 9px; }
+.mobile-more { height: 40px; border: 1px dashed var(--muri-border-strong); border-radius: var(--muri-radius); color: var(--muri-text-secondary); background: transparent; font-size: 13px; cursor: pointer; }
 .animal-card { padding: 13px; text-align: left; background: white; }
 .card-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 9px; }
 .card-title > span { display: flex; align-items: center; gap: 8px; }
@@ -1007,9 +1084,9 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .card-grid b { color: var(--muri-text); font-weight: 500; }
 .animal-card > small { display: block; margin-top: 8px; color: var(--muri-text-secondary); }
 .dialog-card { width: min(700px, calc(100vw - 28px)); }
-.selection-bar { position: fixed; z-index: 40; inset: auto 24px 22px calc(var(--muri-sidebar-width) + 24px); display: flex; width: fit-content; max-width: calc(100% - var(--muri-sidebar-width) - 48px); margin: auto; align-items: center; gap: 9px; padding: 9px 10px 9px 15px; border: 1px solid var(--muri-border-strong); border-radius: 10px; background: white; box-shadow: var(--muri-shadow); }
+.selection-bar { position: fixed; z-index: 40; inset: auto 24px 22px calc(var(--muri-sidebar-width) + 24px); display: flex; width: fit-content; max-width: calc(100% - var(--muri-sidebar-width) - 48px); margin: auto; align-items: center; gap: 9px; padding: 9px 10px 9px 15px; border: 1px solid var(--muri-border-strong); border-radius: var(--muri-radius); background: white; box-shadow: var(--muri-shadow); }
 .batch-preview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
-.batch-preview > div { display: flex; flex-direction: column; gap: 3px; padding: 11px; border-radius: 7px; background: var(--muri-surface-muted); }
+.batch-preview > div { display: flex; flex-direction: column; gap: 3px; padding: 11px; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .batch-preview span { color: var(--muri-text-tertiary); font-size: 12px; }
 .batch-preview strong { font-size: 20px; }
 .batch-preview .eligible strong { color: var(--muri-primary); }
@@ -1022,20 +1099,20 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .initial-genetics > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .initial-genetics > header > div { display: flex; flex-direction: column; }
 .initial-genetics > header span, .initial-genetics > small { margin-top: 3px; color: var(--muri-text-tertiary); font-size: 11px; }
-.initial-genetics-row { padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }
+.initial-genetics-row { padding: 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .initial-genetics-row + .initial-genetics-row { margin-top: 8px; }
 .initial-genetics-notes { display: flex; align-items: flex-start; gap: 8px; }
 .initial-genetics-notes .n-input { flex: 1; }
-.visually-hidden { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 .detail-title { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 12px; }
 .detail-title > div { display: flex; flex-direction: column; }
 .detail-title strong { font-size: 18px; }
 .detail-title span { margin-top: 2px; color: var(--muri-text-secondary); font-size: 12px; font-weight: 400; }
 .detail-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
-.detail-summary > div { display: flex; padding: 10px; flex-direction: column; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }
+.detail-summary > div { display: flex; padding: 10px; flex-direction: column; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .detail-summary span { color: var(--muri-text-tertiary); font-size: 11px; }
 .detail-summary strong { margin-top: 2px; overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
 .detail-error { margin-bottom: 12px; }
+.detail-error-body { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 :deep(.n-tabs-nav-scroll-content) { min-width: max-content; }
 :deep(.n-tab-pane) { min-height: 220px; padding-top: 13px; }
 :deep(.n-timeline-item-content p) { margin: 4px 0; color: var(--muri-text-secondary); }
@@ -1045,7 +1122,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .tab-actions > span { color: var(--muri-text-tertiary); font-size: 12px; }
 .attachment-actions > .n-select { width: min(230px, 55%); }
 .record-list, .measurement-list, .relation-list, .attachment-list, .audit-list, .provenance-list { display: flex; flex-direction: column; gap: 8px; }
-.record-card { padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.record-card { padding: 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .record-card header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .record-card header > div { display: flex; min-width: 0; flex-direction: column; }
 .record-card header span { margin-top: 2px; color: var(--muri-text-tertiary); font-size: 11px; }
@@ -1053,33 +1130,33 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .record-card dt { color: var(--muri-text-tertiary); }
 .record-card dd { margin: 0; overflow: hidden; text-overflow: ellipsis; }
 .record-card > small { display: block; margin-top: 8px; color: var(--muri-text-tertiary); }
-.batch-provenance { margin-top: 9px; padding: 9px; border: 1px solid var(--muri-border); border-radius: 7px; background: var(--muri-surface-muted); }.batch-provenance > header { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 7px; }.batch-provenance > header svg { color: var(--muri-primary); }.batch-provenance > header span { display: flex; min-width: 0; flex-direction: column; }.batch-provenance > header small,.batch-provenance > small { color: var(--muri-text-tertiary); font-size: 10px; }.batch-gels { display: flex; overflow-x: auto; gap: 7px; margin-top: 8px; }.batch-gels button { display: flex; width: 105px; min-width: 105px; padding: 0; overflow: hidden; border: 1px solid var(--muri-border); border-radius: 6px; background: white; cursor: pointer; flex-direction: column; }.batch-gels img,.batch-gels button > span { display: grid; width: 100%; height: 65px; place-items: center; object-fit: cover; color: var(--muri-text-tertiary); background: var(--muri-surface-muted); }.batch-gels small { width: 100%; padding: 5px 6px; overflow: hidden; color: var(--muri-text-secondary); font-size: 9px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
+.batch-provenance { margin-top: 9px; padding: 9px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }.batch-provenance > header { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 7px; }.batch-provenance > header svg { color: var(--muri-primary); }.batch-provenance > header span { display: flex; min-width: 0; flex-direction: column; }.batch-provenance > header small,.batch-provenance > small { color: var(--muri-text-tertiary); font-size: 11px; }.batch-gels { display: flex; overflow-x: auto; gap: 7px; margin-top: 8px; }.batch-gels button { display: flex; width: 105px; min-width: 105px; padding: 0; overflow: hidden; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: white; cursor: pointer; flex-direction: column; }.batch-gels img,.batch-gels button > span { display: grid; width: 100%; height: 65px; place-items: center; object-fit: cover; color: var(--muri-text-tertiary); background: var(--muri-surface-muted); }.batch-gels small { width: 100%; padding: 5px 6px; overflow: hidden; color: var(--muri-text-secondary); font-size: 11px; text-align: left; text-overflow: ellipsis; white-space: nowrap; }
 .legacy-genotypes { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--muri-border); }
 .legacy-genotypes > header { display: flex; flex-direction: column; margin-bottom: 9px; }
 .legacy-genotypes > header span { margin-top: 2px; color: var(--muri-text-tertiary); font-size: 11px; }
-.measurement-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.measurement-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .measurement-row > div:first-child { display: flex; flex-direction: column; }
 .measurement-row > div:first-child span { color: var(--muri-text-tertiary); font-size: 11px; }
-.measurement-row > b { align-self: center; color: var(--muri-primary); font-size: 15px; }
+.measurement-row > b { align-self: center; color: var(--muri-primary); font-size: 14px; }
 .measurement-meta { display: flex; grid-column: 1 / -1; align-items: center; gap: 8px; color: var(--muri-text-tertiary); font-size: 11px; }
 .measurement-meta small { margin-left: auto; }
-.relation-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--muri-border); border-radius: 7px; background: white; text-align: left; cursor: pointer; }
+.relation-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 10px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: white; text-align: left; cursor: pointer; }
 .relation-row > span { display: flex; min-width: 0; flex-direction: column; }
 .relation-row small { color: var(--muri-text-tertiary); }
-.relation-row > b { color: var(--muri-text-tertiary); font-size: 10px; font-weight: 400; }
-.attachment-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.relation-row > b { color: var(--muri-text-tertiary); font-size: 11px; font-weight: 400; }
+.attachment-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .attachment-row > div { display: flex; min-width: 0; flex-direction: column; }
 .attachment-row strong, .attachment-row span, .attachment-row small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-row span { margin-top: 2px; color: var(--muri-text-secondary); font-size: 11px; }
-.attachment-row small { margin-top: 4px; color: var(--muri-text-tertiary); font-size: 10px; }
+.attachment-row small { margin-top: 4px; color: var(--muri-text-tertiary); font-size: 11px; }
 .audit-section h3 { margin: 0 0 9px; font-size: 13px; }
 .audit-section + .audit-section { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--muri-border); }
-.audit-list article { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 10px; border-radius: 7px; background: var(--muri-surface-muted); }
+.audit-list article { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; padding: 10px; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .audit-list article > div { display: flex; flex-direction: column; }
 .audit-list article > div:nth-child(2) { align-items: flex-end; }
 .audit-list span, .audit-list small { color: var(--muri-text-tertiary); font-size: 11px; }
 .audit-list p { grid-column: 1 / -1; margin: 3px 0 0; color: var(--muri-text-secondary); font-size: 12px; }
-.provenance-list article { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; padding: 9px 10px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.provenance-list article { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; padding: 9px 10px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .provenance-list article > div { display: flex; flex-direction: column; }
 .provenance-list span, .provenance-list small { color: var(--muri-text-tertiary); font-size: 11px; }
 @media (max-width: 900px) {
@@ -1087,7 +1164,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
   .summary-row > div { align-items: flex-start; padding: 10px; flex-direction: column; }
   .summary-row span { font-size: 11px; }
   .summary-row strong { margin-top: 2px; font-size: 18px; }
-  .toolbar { grid-template-columns: 1fr 130px; }
+  .toolbar { grid-template-columns: 1fr; }
   .toolbar > span { display: none; }
   :global(.n-drawer) { max-width: 100% !important; }
   .detail-summary { grid-template-columns: 1fr 1fr; }

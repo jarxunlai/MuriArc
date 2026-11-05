@@ -1,9 +1,11 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { AuthSession, ProjectRole } from '@/domain/models'
 import {
+  canAdministerAi,
   canExportData,
   canImportData,
   canManageBreeding,
+  canManageMembers,
   canWriteAnimal,
   canWriteExperiment,
   clearProjectContext,
@@ -91,5 +93,27 @@ describe('current Project context', () => {
     expect(currentProjectId.value).toBe('project-2')
     setCurrentProject()
     expect(currentProjectId.value).toBeUndefined()
+  })
+
+  it('lets an active Project Admin manage members without lab AI administration', async () => {
+    const session = projectSession('project_admin')
+    await initializeProjectContext(session, async () => projects)
+
+    expect(canManageMembers(session)).toBe(true)
+    expect(canAdministerAi(session)).toBe(false)
+  })
+
+  it('reserves member and AI administration for a Lab Admin outside project roles', async () => {
+    const editor = projectSession('editor')
+    await initializeProjectContext(editor, async () => projects)
+    expect(canManageMembers(editor)).toBe(false)
+    expect(canAdministerAi(editor)).toBe(false)
+
+    const admin: AuthSession = {
+      user: { ...editor.user, id: 'admin-1', labRoles: ['lab_admin'], projectRoles: [] },
+      csrfAvailable: true,
+    }
+    expect(canManageMembers(admin)).toBe(true)
+    expect(canAdministerAi(admin)).toBe(true)
   })
 })

@@ -10,8 +10,32 @@ import {
   Search,
   TestTube2,
 } from '@lucide/vue'
-import { useDialog, useMessage } from 'naive-ui'
-import { useRoute, useRouter } from 'vue-router'
+import {
+  NAlert,
+  NButton,
+  NCheckbox,
+  NDatePicker,
+  NEmpty,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NModal,
+  NPopconfirm,
+  NRadio,
+  NRadioGroup,
+  NSelect,
+  NSkeleton,
+  NSpace,
+  NSpin,
+  NTabPane,
+  NTabs,
+  NTag,
+  useDialog,
+  useMessage,
+} from 'naive-ui'
+import { useRoute, useRouter, type LocationQueryRaw } from 'vue-router'
+import { useQueryTab } from '@/composables/useQueryTab'
 import type {
   Animal,
   AnimalDetail,
@@ -35,14 +59,14 @@ import { gateway } from '@/services/gateway'
 import { canManageBreeding, canWriteAnimal } from '@/services/projectContext'
 import PageHeader from '@/components/PageHeader.vue'
 
-type WorkspaceTab = 'pedigree' | 'genetics' | 'lines' | 'pairs' | 'litters' | 'prediction'
+const workspaceTabs = ['pedigree', 'genetics', 'lines', 'pairs', 'litters', 'prediction'] as const
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
 
-const activeTab = ref<WorkspaceTab>('pedigree')
+const activeTab = useQueryTab(workspaceTabs, 'pedigree')
 const loading = ref(true)
 const detailLoading = ref(false)
 const busy = ref(false)
@@ -485,10 +509,10 @@ function openRelated(relation: PedigreeRelation) {
     selectAnimal(related.id)
     return
   }
-  void router.push({
-    name: 'animals',
-    query: { ...route.query, animal: relation.relatedAnimal.id },
-  })
+  // The breeding tab key means nothing on the animal drawer; don't carry it over.
+  const query: LocationQueryRaw = { ...route.query, animal: relation.relatedAnimal.id }
+  delete query.tab
+  void router.push({ name: 'animals', query })
 }
 
 async function createLocus() {
@@ -1066,7 +1090,7 @@ onMounted(load)
       </template>
     </PageHeader>
 
-    <n-tabs v-model:value="activeTab" type="line" animated class="workspace-tabs">
+    <n-tabs v-model:value="activeTab" type="line" class="workspace-tabs">
       <n-tab-pane name="pedigree" tab="谱系">
         <section class="breeding-layout">
           <aside class="animal-browser surface">
@@ -1851,7 +1875,7 @@ onMounted(load)
 .breeding-layout { display: grid; grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); gap: 12px; align-items: start; }
 .animal-browser { position: sticky; top: 12px; padding: 11px; }
 .animal-results { display: flex; min-height: 180px; max-height: calc(100vh - 290px); margin-top: 10px; overflow: auto; flex-direction: column; gap: 5px; }
-.animal-option,.select-row { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; text-align: left; cursor: pointer; transition: background-color 140ms ease, border-color 140ms ease; }
+.animal-option,.select-row { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 10px; border: 1px solid transparent; border-radius: var(--muri-radius-sm); background: transparent; text-align: left; cursor: pointer; transition: background-color 140ms ease, border-color 140ms ease; }
 .animal-option:hover,.select-row:hover { background: var(--muri-surface-muted); }
 .animal-option.selected,.select-row.selected { border-color: color-mix(in srgb, var(--muri-primary) 35%, white); background: color-mix(in srgb, var(--muri-primary) 8%, white); }
 .animal-option > span,.select-row > span { display: flex; min-width: 0; flex-direction: column; }
@@ -1864,8 +1888,8 @@ onMounted(load)
 .pedigree-heading h2 { margin: 2px 0 0; font-size: 20px; }
 .pedigree-heading p { margin: 3px 0 0; color: var(--muri-text-secondary); font-size: 12px; }
 .pedigree-counts { display: flex; gap: 8px; }
-.pedigree-counts span { display: flex; min-width: 62px; padding: 7px 9px; flex-direction: column; border-radius: 7px; background: var(--muri-surface-muted); color: var(--muri-text-tertiary); font-size: 11px; }
-.pedigree-counts strong { color: var(--muri-text); font-size: 17px; }
+.pedigree-counts span { display: flex; min-width: 62px; padding: 7px 9px; flex-direction: column; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); color: var(--muri-text-tertiary); font-size: 11px; }
+.pedigree-counts strong { color: var(--muri-text); font-size: 16px; }
 .relationship-section { padding: 15px 0 5px; }
 .relationship-section + .relationship-section { border-top: 1px solid var(--muri-border); }
 .section-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
@@ -1873,7 +1897,7 @@ onMounted(load)
 .section-title span { margin-top: 2px; color: var(--muri-text-tertiary); font-size: 11px; }
 .section-title b { display: grid; min-width: 24px; height: 24px; place-items: center; border-radius: 999px; background: var(--muri-surface-muted); font-size: 12px; }
 .relation-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
-.relation-card { display: flex; min-width: 0; padding: 11px; align-items: flex-start; flex-direction: column; border: 1px solid var(--muri-border); border-radius: 7px; background: white; text-align: left; cursor: pointer; transition: border-color 140ms ease, box-shadow 140ms ease; }
+.relation-card { display: flex; min-width: 0; padding: 11px; align-items: flex-start; flex-direction: column; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); background: white; text-align: left; cursor: pointer; transition: border-color 140ms ease, box-shadow 140ms ease; }
 .relation-card:hover { border-color: var(--muri-border-strong); box-shadow: var(--muri-shadow-sm); }
 .relation-card strong { margin-top: 8px; color: var(--muri-primary); }
 .relation-card span { margin-top: 2px; color: var(--muri-text-secondary); font-size: 12px; }
@@ -1888,21 +1912,21 @@ onMounted(load)
 .card-heading span { display: flex; min-width: 0; flex-direction: column; }
 .card-heading small { margin-top: 2px; color: var(--muri-text-tertiary); font-size: 11px; font-weight: 400; }
 .entity-list { display: flex; flex-direction: column; gap: 7px; }
-.entity-row { display: flex; padding: 10px; align-items: flex-start; justify-content: space-between; gap: 10px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.entity-row { display: flex; padding: 10px; align-items: flex-start; justify-content: space-between; gap: 10px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .entity-row > div { display: flex; min-width: 0; flex-direction: column; }
 .entity-row span { margin-top: 2px; color: var(--muri-text-secondary); font-size: 12px; overflow-wrap: anywhere; }
 .entity-row small { margin-top: 5px; color: var(--muri-text-tertiary); font-size: 11px; }
 .entity-row.archived,.entity-row.voided,.catalog-locus.archived,.allele-chips > span.archived { background: var(--muri-surface-muted); opacity: .72; }
 .entity-row > .row-actions { align-items: flex-end; flex: none; gap: 5px; }
 .catalog-list { display: flex; flex-direction: column; gap: 7px; }
-.catalog-locus { padding: 9px 10px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.catalog-locus { padding: 9px 10px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .catalog-locus > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .catalog-locus > header > span { display: flex; flex-direction: column; }
-.catalog-locus small { color: var(--muri-text-tertiary); font-size: 10px; }
+.catalog-locus small { color: var(--muri-text-tertiary); font-size: 11px; }
 .allele-chips { display: flex; margin-top: 7px; flex-wrap: wrap; gap: 5px; }
-.allele-chips > span { display: inline-flex; padding: 3px 6px; align-items: center; gap: 4px; border-radius: 5px; background: color-mix(in srgb, var(--muri-primary) 7%, white); color: var(--muri-text-secondary); font-size: 11px; }
+.allele-chips > span { display: inline-flex; padding: 3px 6px; align-items: center; gap: 4px; border-radius: var(--muri-radius-xs); background: color-mix(in srgb, var(--muri-primary) 7%, white); color: var(--muri-text-secondary); font-size: 11px; }
 .member-grid,.draft-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 8px; }
-.member-grid > div,.draft-card { display: flex; padding: 10px; align-items: flex-start; flex-direction: column; gap: 5px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.member-grid > div,.draft-card { display: flex; padding: 10px; align-items: flex-start; flex-direction: column; gap: 5px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .member-grid small,.draft-card small { color: var(--muri-text-tertiary); font-size: 11px; }
 .draft-card { justify-content: space-between; }
 .draft-card > div { display: flex; flex-direction: column; }
@@ -1914,14 +1938,14 @@ onMounted(load)
 .prediction-locus { margin-top: 16px; }
 .prediction-locus h3 { margin: 0 0 8px; font-size: 14px; }
 .outcome-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
-.outcome-grid > div { display: flex; padding: 10px; align-items: center; justify-content: space-between; border: 1px solid var(--muri-border); border-radius: 7px; }
+.outcome-grid > div { display: flex; padding: 10px; align-items: center; justify-content: space-between; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .outcome-grid span { color: var(--muri-primary); font-weight: 600; }
 .small-dialog { width: min(480px, calc(100vw - 28px)); }
 .wide-dialog { width: min(760px, calc(100vw - 28px)); }
 .small-dialog :deep(.n-alert),.wide-dialog :deep(.n-alert) { margin-bottom: 14px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.component-editor { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; margin-bottom: 10px; padding: 10px; border: 1px solid var(--muri-border); border-radius: 7px; }
+.component-editor { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; margin-bottom: 10px; padding: 10px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .component-editor > strong { align-self: center; }
 .component-editor > button { justify-self: end; }
 .draft-editor-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }

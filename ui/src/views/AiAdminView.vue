@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NForm,
+  NFormItem,
+  NInput,
+  NSelect,
+  NSwitch,
+  NTag,
+  useMessage,
+} from 'naive-ui'
 import { ExternalLink, Plug, Save, XCircle } from '@lucide/vue'
 import PageHeader from '@/components/PageHeader.vue'
 import type { AiProviderPreset } from '@/domain/models'
@@ -291,7 +301,7 @@ onMounted(load)
 <style scoped>
 .cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 14px 0; }
 .cards article { display: flex; padding: 16px; flex-direction: column; }
-.cards strong { font-size: 25px; }
+.cards strong { font-size: 24px; }
 .cards span, .cards small, .policy span, .endpoint-row span, .boundary p { color: var(--muri-text-tertiary); }
 .policy, .preset-catalog, .endpoint-editor, .boundary { padding: 18px; }
 .policy { display: grid; gap: 16px; margin-bottom: 12px; }
@@ -299,8 +309,8 @@ onMounted(load)
 .policy-row > div { display: flex; flex-direction: column; }
 .autonomy-select { width: 150px; }
 .section-title { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-.section-title h2 { margin: 0; font-size: 17px; }
-.preset-catalog, .endpoint-editor { margin-bottom: 12px; }.catalog-intro { margin: -4px 0 14px; color: var(--muri-text-tertiary); }.preset-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }.preset-card { display: flex; min-width: 0; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; }.preset-card > div { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }.preset-card code, .preset-card span { overflow-wrap: anywhere; color: var(--muri-text-secondary); font-size: 11px; }.preset-card a { display: inline-flex; width: fit-content; align-items: center; gap: 4px; color: var(--muri-primary); text-decoration: none; }
+.section-title h2 { margin: 0; font-size: 16px; }
+.preset-catalog, .endpoint-editor { margin-bottom: 12px; }.catalog-intro { margin: -4px 0 14px; color: var(--muri-text-tertiary); }.preset-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }.preset-card { display: flex; min-width: 0; flex-direction: column; gap: 6px; padding: 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }.preset-card > div { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }.preset-card code, .preset-card span { overflow-wrap: anywhere; color: var(--muri-text-secondary); font-size: 11px; }.preset-card a { display: inline-flex; width: fit-content; align-items: center; gap: 4px; color: var(--muri-primary); text-decoration: none; }
 .endpoint-form { display: grid; grid-template-columns: 220px 1fr 120px; gap: 0 14px; align-items: end; }
 .endpoint-form .full-row { grid-column: 1 / -1; }
 .button-row, .row-actions { display: flex; gap: 8px; flex-wrap: wrap; }

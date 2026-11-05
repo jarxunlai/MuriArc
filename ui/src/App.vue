@@ -1,32 +1,32 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { zhCN, dateZhCN, type GlobalThemeOverrides } from 'naive-ui'
+import {
+  dateZhCN,
+  NConfigProvider,
+  NDialogProvider,
+  NMessageProvider,
+  NNotificationProvider,
+  NSelect,
+  zhCN,
+} from 'naive-ui'
 import { Bot, BookOpen, Boxes, Dna, FlaskConical, Images, Menu, Rat, ScrollText, Settings, TableProperties, Users } from '@lucide/vue'
 import { branding } from './branding'
 import { currentAuthSession, gateway } from '@/services/gateway'
 import {
   availableProjects,
+  canAdministerAi,
+  canManageMembers as sessionCanManageMembers,
   currentProjectId,
   hasLabRegistryAccess,
-  isActiveProjectAdmin,
-  isLabAdmin as sessionIsLabAdmin,
   setCurrentProject,
 } from '@/services/projectContext'
 import AiDrawer from '@/components/AiDrawer.vue'
+import { routeViewKey } from '@/router/navigation'
+import { themeOverrides } from '@/styles/theme'
 
 const route = useRoute()
 const router = useRouter()
-const themeOverrides: GlobalThemeOverrides = {
-  common: {
-    primaryColor: branding.primaryColor, primaryColorHover: '#0b70c7', primaryColorPressed: '#0a4e8a',
-    infoColor: branding.primaryColor, successColor: '#38866b', warningColor: '#d98216', errorColor: '#c34b51',
-    borderRadius: '8px', fontSize: '14px', textColorBase: '#1d2935', bodyColor: '#f4f6f8',
-  },
-  Button: { heightMedium: '36px', borderRadiusMedium: '7px' },
-  Input: { heightMedium: '36px', borderRadius: '7px' },
-  Card: { borderRadius: '8px' },
-}
 
 const labRegistryAvailable = computed(() => gateway.mode === 'local' || hasLabRegistryAccess())
 const animalItems = computed(() => [
@@ -35,9 +35,8 @@ const animalItems = computed(() => [
   ...(labRegistryAvailable.value ? [{ to: '/animal-data', label: '动物数据', icon: TableProperties }] : []),
   ...(labRegistryAvailable.value ? [{ to: '/breeding', label: '繁育管理', icon: Dna }] : []),
 ])
-const isLabAdmin = computed(() => gateway.mode === 'remote' && sessionIsLabAdmin())
-const canManageMembers = computed(() => gateway.mode === 'remote'
-  && (sessionIsLabAdmin() || isActiveProjectAdmin()))
+const canManageLabAi = computed(() => gateway.mode === 'remote' && canAdministerAi())
+const canManageMembers = computed(() => gateway.mode === 'remote' && sessionCanManageMembers())
 const experimentItems = [
   { to: '/experiments', label: '实验管理', icon: FlaskConical },
   { to: '/data', label: '数据中心', icon: TableProperties },
@@ -48,7 +47,7 @@ const toolItems = computed(() => [
   { to: '/ai', label: 'AI 助手', icon: Bot },
   { to: '/ai/images', label: '私人 AI 图片', icon: Images },
   ...(canManageMembers.value ? [{ to: '/members', label: '成员管理', icon: Users }] : []),
-  ...(isLabAdmin.value ? [
+  ...(canManageLabAi.value ? [
     { to: '/admin/ai', label: 'AI 管理', icon: Bot },
   ] : []),
 ])
@@ -65,12 +64,16 @@ const projectOptions = computed(() => [
   ...availableProjects.value.map((project) => ({ label: project.name, value: project.id })),
 ])
 const selectedProjectValue = computed(() => currentProjectId.value ?? LAB_REGISTRY)
-const pageTitle = computed(() => String(route.meta.title ?? branding.productName))
 const operatorName = computed(() => gateway.mode === 'local'
   ? '本地'
   : (currentAuthSession.value?.user.displayName || '共享用户'))
 const avatarInitial = computed(() => operatorName.value.trim().charAt(0) || '用')
+const viewKey = computed(() => routeViewKey(route, currentProjectId.value))
 const isActive = (to: string) => route.path === to || route.path.startsWith(`${to}/`)
+// “更多” opens Settings, which links to every page without its own bottom tab.
+const isMobileActive = (to: string) => to === '/settings'
+  ? !mobileItems.some((item) => item.to !== '/settings' && isActive(item.to))
+  : isActive(to)
 
 async function changeProject(value: string) {
   const projectId = value === LAB_REGISTRY ? undefined : value
@@ -121,8 +124,8 @@ async function changeProject(value: string) {
         <div class="workspace">
           <header class="topbar">
             <div class="mobile-brand mobile-only"><img :src="branding.logoMarkPath" alt="" /><strong>{{ branding.productName }}</strong></div>
-            <div class="desktop-only"><span class="section">{{ route.meta.section ?? branding.productName }}</span><strong>{{ pageTitle }}</strong></div>
-            <div class="topbar-meta">
+            <!-- The page header owns the title; the top bar carries working context only. -->
+            <div class="topbar-context">
               <n-select
                 v-if="gateway.mode === 'remote' && projectOptions.length"
                 class="project-switcher"
@@ -130,21 +133,24 @@ async function changeProject(value: string) {
                 :value="selectedProjectValue"
                 :options="projectOptions"
                 size="small"
+                aria-label="项目范围"
                 @update:value="changeProject"
               />
+            </div>
+            <div class="topbar-meta">
               <span class="connection"><i />{{ gateway.mode === 'local' ? '本地模式' : '共享模式' }}</span><span class="operator-name desktop-only">{{ operatorName }}</span><span class="avatar" :title="operatorName">{{ avatarInitial }}</span>
             </div>
           </header>
 
           <main class="main-content">
             <router-view v-slot="{ Component }">
-              <transition name="route" mode="out-in"><component :is="Component" :key="`${route.path}:${currentProjectId ?? 'registry'}`" /></transition>
+              <transition name="route" mode="out-in"><component :is="Component" :key="viewKey" /></transition>
             </router-view>
           </main>
         </div>
 
         <nav class="bottom-nav mobile-only" aria-label="移动端主导航">
-          <router-link v-for="item in mobileItems" :key="item.to" :to="item.to" :class="{ active: isActive(item.to) }">
+          <router-link v-for="item in mobileItems" :key="item.to" :to="item.to" :class="{ active: isMobileActive(item.to) }">
             <component :is="item.icon" :size="20" /><span>{{ item.label }}</span>
           </router-link>
         </nav>
@@ -157,35 +163,33 @@ async function changeProject(value: string) {
 <style scoped>
 .app-shell { display: flex; min-height: 100vh; background: var(--muri-bg); }
 .auth-shell { min-height: 100vh; }
-.sidebar { position: fixed; z-index: 20; inset: 0 auto 0 0; display: flex; width: var(--muri-sidebar-width); flex-direction: column; border-right: 1px solid var(--muri-border); background: #fff; }
+.sidebar { position: fixed; z-index: 20; inset: 0 auto 0 0; display: flex; width: var(--muri-sidebar-width); flex-direction: column; border-right: 1px solid var(--muri-border); background: var(--muri-surface); }
 .brand { display: flex; align-items: center; gap: 10px; height: 74px; padding: 13px 17px; border-bottom: 1px solid var(--muri-border); }
 .brand img { width: 44px; height: 44px; object-fit: contain; }
 .brand div { display: flex; min-width: 0; flex-direction: column; }
 .brand strong { font-size: 20px; letter-spacing: -0.03em; }
-.brand span { overflow: hidden; color: var(--muri-text-tertiary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.brand span { overflow: hidden; color: var(--muri-text-tertiary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 nav { padding: 13px 10px; }
 .nav-label { padding: 7px 10px 6px; color: var(--muri-text-tertiary); font-size: 11px; font-weight: 600; letter-spacing: 0.08em; }
 .nav-gap { margin-top: 8px; }
-.nav-item { display: flex; align-items: center; gap: 11px; min-height: 40px; margin: 2px 0; padding: 0 11px; border-radius: 7px; color: var(--muri-text-secondary); font-weight: 500; transition: color var(--muri-transition-fast), background var(--muri-transition-fast); }
-.nav-item:hover { color: var(--muri-primary); background: #f5f8fb; }
-.nav-item.active { color: var(--muri-primary); background: var(--muri-primary-soft); }
+.nav-item { display: flex; align-items: center; gap: 11px; min-height: 40px; margin: 2px 0; padding: 0 11px; border-radius: var(--muri-radius-sm); color: var(--muri-text-secondary); font-weight: 500; transition: color var(--muri-transition-fast), background var(--muri-transition-fast); }
+.nav-item:hover { color: var(--muri-text); background: var(--muri-surface-hover); }
+.nav-item.active { color: var(--muri-text); background: var(--muri-surface-sunken); font-weight: 500; }
 .sidebar-footer { margin-top: auto; padding: 10px; border-top: 1px solid var(--muri-border); }
-.mode-card { display: flex; align-items: center; gap: 9px; margin: 7px 4px 1px; padding: 9px; border-radius: 7px; background: var(--muri-surface-muted); }
+.mode-card { display: flex; align-items: center; gap: 9px; margin: 7px 4px 1px; padding: 9px; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }
 .mode-dot, .connection i { width: 7px; height: 7px; border-radius: 50%; background: var(--muri-success); box-shadow: 0 0 0 3px rgba(56, 134, 107, 0.12); }
 .mode-card div { display: flex; flex-direction: column; }
 .mode-card strong { font-size: 12px; }
-.mode-card small { color: var(--muri-text-tertiary); font-size: 10px; }
+.mode-card small { color: var(--muri-text-tertiary); font-size: 11px; }
 .workspace { display: flex; width: calc(100% - var(--muri-sidebar-width)); min-height: 100vh; margin-left: var(--muri-sidebar-width); flex-direction: column; }
 .topbar { position: sticky; z-index: 15; top: 0; display: flex; height: var(--muri-topbar-height); align-items: center; justify-content: space-between; padding: 0 24px; border-bottom: 1px solid var(--muri-border); background: rgba(255, 255, 255, 0.94); backdrop-filter: blur(10px); }
 .topbar > div { display: flex; align-items: center; gap: 9px; }
-.topbar .section { color: var(--muri-text-tertiary); font-size: 12px; }
-.topbar strong { font-size: 14px; }
 .topbar-meta { gap: 16px !important; }
 .project-switcher { width: min(260px, 30vw); }
 .connection { display: flex; align-items: center; gap: 7px; color: var(--muri-text-secondary); font-size: 12px; }
 .operator-name { max-width: 150px; overflow: hidden; color: var(--muri-text-secondary); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
 .connection i { display: inline-block; width: 6px; height: 6px; }
-.avatar { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 50%; color: #fff; background: var(--muri-primary); font-size: 12px; }
+.avatar { display: grid; width: 30px; height: 30px; place-items: center; border-radius: 50%; color: var(--muri-text-secondary); background: var(--muri-surface-sunken); font-size: 12px; font-weight: 500; }
 .main-content { flex: 1; min-width: 0; }
 .bottom-nav { display: none; }
 @media (max-width: 900px) {
@@ -193,13 +197,13 @@ nav { padding: 13px 10px; }
   .topbar { height: 54px; padding: 0 14px; }
   .mobile-brand { gap: 7px !important; }
   .mobile-brand img { width: 30px; height: 30px; object-fit: contain; }
-  .mobile-brand strong { font-size: 17px; }
+  .mobile-brand strong { font-size: 16px; }
   .connection { font-size: 11px; }
   .project-switcher { width: min(210px, 44vw); }
   .avatar { display: none; }
   .bottom-nav { position: fixed; z-index: 30; inset: auto 0 0; display: flex; height: calc(62px + env(safe-area-inset-bottom)); align-items: flex-start; justify-content: space-around; padding: 6px 5px env(safe-area-inset-bottom); border-top: 1px solid var(--muri-border); background: rgba(255,255,255,.97); box-shadow: 0 -6px 22px rgba(30,53,76,.06); backdrop-filter: blur(12px); }
-  .bottom-nav a { display: flex; min-width: 52px; min-height: 48px; align-items: center; justify-content: center; flex-direction: column; gap: 2px; border-radius: 7px; color: var(--muri-text-tertiary); font-size: 10px; }
-  .bottom-nav a.active { color: var(--muri-primary); background: var(--muri-primary-soft); }
+  .bottom-nav a { display: flex; min-width: 52px; min-height: 48px; align-items: center; justify-content: center; flex-direction: column; gap: 2px; border-radius: var(--muri-radius-sm); color: var(--muri-text-tertiary); font-size: 11px; }
+  .bottom-nav a.active { color: var(--muri-text); background: var(--muri-surface-sunken); }
 }
 @media (max-width: 430px) {
   .connection { display: none; }

@@ -89,19 +89,19 @@ describe('AnimalsView remote access context', () => {
         plugins: [router],
         stubs: {
           PageHeader: true,
-          NButton: true,
-          NDataTable: true,
-          NDrawer: { template: '<div><slot /></div>' },
-          NDrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
-          NEmpty: true,
-          NInput: true,
-          NSelect: true,
-          NSpin: { template: '<div><slot /></div>' },
-          NTabPane: { template: '<div><slot /></div>' },
-          NTabs: { template: '<div><slot /></div>' },
-          NTag: { template: '<span><slot /></span>' },
-          NTimeline: { template: '<div><slot /></div>' },
-          NTimelineItem: { template: '<div><slot /></div>' },
+          Button: true,
+          DataTable: true,
+          Drawer: { template: '<div><slot /></div>' },
+          DrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
+          Empty: true,
+          Input: true,
+          Select: true,
+          Spin: { template: '<div><slot /></div>' },
+          TabPane: { template: '<div><slot /></div>' },
+          Tabs: { template: '<div><slot /></div>' },
+          Tag: { template: '<span><slot /></span>' },
+          Timeline: { template: '<div><slot /></div>' },
+          TimelineItem: { template: '<div><slot /></div>' },
         },
       },
     })
@@ -173,20 +173,20 @@ describe('AnimalsView remote access context', () => {
         plugins: [router],
         stubs: {
           PageHeader: true,
-          NAlert: { template: '<div><slot /><slot name="action" /></div>' },
-          NButton: { template: '<button><slot /></button>' },
-          NDataTable: true,
-          NDrawer: { template: '<div><slot /></div>' },
-          NDrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
-          NEmpty: true,
-          NInput: true,
-          NSelect: true,
-          NSpin: { template: '<div><slot /></div>' },
-          NTabPane: { template: '<div><slot /></div>' },
-          NTabs: { template: '<div><slot /></div>' },
-          NTag: { template: '<span><slot /></span>' },
-          NTimeline: { template: '<div><slot /></div>' },
-          NTimelineItem: { template: '<div><slot /></div>' },
+          Alert: { template: '<div><slot /><slot name="action" /></div>' },
+          Button: { template: '<button><slot /></button>' },
+          DataTable: true,
+          Drawer: { template: '<div><slot /></div>' },
+          DrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
+          Empty: true,
+          Input: true,
+          Select: true,
+          Spin: { template: '<div><slot /></div>' },
+          TabPane: { template: '<div><slot /></div>' },
+          Tabs: { template: '<div><slot /></div>' },
+          Tag: { template: '<span><slot /></span>' },
+          Timeline: { template: '<div><slot /></div>' },
+          TimelineItem: { template: '<div><slot /></div>' },
         },
       },
     })
@@ -201,5 +201,118 @@ describe('AnimalsView remote access context', () => {
     expect(wrapper.text()).toContain('来源批次 PCR-20260725-01')
     expect(wrapper.text()).toContain('24 条记录')
     expect(wrapper.text()).toContain('gel-01.png')
+  })
+
+  it('offers a retry inside the detail error alert', async () => {
+    gatewayMock.getAnimalDetail.mockReset()
+      .mockRejectedValueOnce(new Error('读取小鼠详情失败'))
+      .mockResolvedValue(detail)
+    const router = testRouter(`/animals?animal=${animal.id}`)
+    await router.isReady()
+
+    const wrapper = mount(AnimalsView, {
+      global: {
+        plugins: [router],
+        stubs: {
+          PageHeader: true,
+          DataTable: true,
+          Drawer: { template: '<div><slot /></div>' },
+          DrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
+        },
+      },
+    })
+    await flushPromises()
+
+    const alert = wrapper.get('.detail-error')
+    expect(alert.text()).toContain('读取小鼠详情失败')
+    const retry = alert.findAll('button').find((button) => button.text() === '重试')
+    expect(retry).toBeDefined()
+    await retry!.trigger('click')
+    await flushPromises()
+
+    expect(gatewayMock.getAnimalDetail).toHaveBeenCalledTimes(2)
+    expect(wrapper.find('.detail-error').exists()).toBe(false)
+  })
+
+  it('closes the detail drawer when the animal leaves the URL (browser back)', async () => {
+    const router = testRouter(`/animals?animal=${animal.id}&tab=samples`)
+    await router.isReady()
+    const wrapper = mount(AnimalsView, {
+      global: {
+        plugins: [router],
+        stubs: {
+          PageHeader: true,
+          DataTable: true,
+          Drawer: { props: ['show'], template: '<div v-if="show" class="drawer-stub"><slot /></div>' },
+          DrawerContent: { template: '<div><slot name="header" /><slot /></div>' },
+        },
+      },
+    })
+    await flushPromises()
+    expect(wrapper.find('.drawer-stub').exists()).toBe(true)
+
+    await router.replace('/animals')
+    await flushPromises()
+
+    expect(wrapper.find('.drawer-stub').exists()).toBe(false)
+  })
+
+  it('renders only the compact card list on narrow screens and grows it in batches', async () => {
+    const matchMedia = window.matchMedia
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes('max-width: 900px'), media: query, onchange: null,
+      addEventListener: () => undefined, removeEventListener: () => undefined,
+      addListener: () => undefined, removeListener: () => undefined, dispatchEvent: () => false,
+    })) as typeof window.matchMedia
+    try {
+      gatewayMock.listAnimals.mockResolvedValue(Array.from({ length: 120 }, (_, index) => ({
+        ...animal, id: `animal-${index}`, code: `M-${String(index).padStart(3, '0')}`,
+      })))
+      const router = testRouter('/animals')
+      await router.isReady()
+      const wrapper = mount(AnimalsView, {
+        global: { plugins: [router], stubs: { PageHeader: true, DataTable: true } },
+      })
+      await flushPromises()
+
+      expect(wrapper.find('.table-wrap').exists()).toBe(false)
+      expect(wrapper.findAll('.animal-card')).toHaveLength(50)
+      await wrapper.get('.mobile-more').trigger('click')
+      expect(wrapper.findAll('.animal-card')).toHaveLength(100)
+      expect(wrapper.get('.mobile-more').text()).toContain('20')
+    } finally {
+      window.matchMedia = matchMedia
+    }
+  })
+
+  it('narrows the list with status and sex facets and counts each option', async () => {
+    gatewayMock.listAnimals.mockResolvedValue([
+      animal,
+      { ...animal, id: 'animal-2', code: 'M-002', sex: 'male' },
+      { ...animal, id: 'animal-3', code: 'M-003', sex: 'male', status: 'breeding' },
+    ])
+    const router = testRouter('/animals')
+    await router.isReady()
+    const wrapper = mount(AnimalsView, {
+      global: {
+        plugins: [router],
+        stubs: {
+          PageHeader: true,
+          DataTable: { props: ['data'], template: '<ul><li v-for="row in data" :key="row.id" class="row">{{ row.code }}</li></ul>' },
+          Popover: { template: '<div><slot name="trigger" /><slot /></div>' },
+        },
+      },
+    })
+    await flushPromises()
+
+    const [statusFacet, sexFacet] = wrapper.findAll('.facet-panel')
+    expect(sexFacet!.findAll('.facet-option').map((option) => option.text())).toEqual(['雄2', '雌1', '未知0'])
+    await sexFacet!.findAll('.facet-option')[0]!.trigger('click')
+    expect(wrapper.findAll('.row').map((row) => row.text())).toEqual(['M-002', 'M-003'])
+
+    const breeding = statusFacet!.findAll('.facet-option').find((option) => option.text().startsWith('繁育'))!
+    expect(breeding.text()).toBe('繁育1')
+    await breeding.trigger('click')
+    expect(wrapper.findAll('.row').map((row) => row.text())).toEqual(['M-003'])
   })
 })

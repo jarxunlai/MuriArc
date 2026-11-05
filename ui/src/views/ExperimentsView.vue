@@ -13,7 +13,31 @@ import {
   Upload,
   UsersRound,
 } from '@lucide/vue'
-import { useMessage } from 'naive-ui'
+import {
+  NAlert,
+  NButton,
+  NCheckbox,
+  NDatePicker,
+  NEmpty,
+  NForm,
+  NFormItem,
+  NInput,
+  NInputNumber,
+  NList,
+  NListItem,
+  NModal,
+  NPopconfirm,
+  NProgress,
+  NSelect,
+  NSkeleton,
+  NSpace,
+  NSpin,
+  NSwitch,
+  NTabPane,
+  NTabs,
+  NTag,
+  useMessage,
+} from 'naive-ui'
 import type {
   Animal,
   Cohort,
@@ -176,6 +200,19 @@ const observationValueForm = reactive({
 })
 
 const filtered = computed(() => filter.value === 'all' ? experiments.value : experiments.value.filter((item) => item.status === filter.value))
+const statusFilters = computed(() => ([
+  ['all', '全部'], ['active', '进行中'], ['draft', '草稿'], ['completed', '已完成'], ['cancelled', '已取消'],
+] as const).map(([value, label]) => ({
+  value,
+  label,
+  count: value === 'all' ? experiments.value.length : experiments.value.filter((item) => item.status === value).length,
+})))
+const sectionCounts = computed<Partial<Record<(typeof detailSections)[number]['key'], number>>>(() => ({
+  design: observationDefinitions.value.length,
+  animals: participations.value.length,
+  execution: procedures.value.length,
+  data: observations.value.length,
+}))
 const projectOptions = computed(() => projects.value
   .filter((item) => !currentProjectId.value || item.id === currentProjectId.value)
   .map((item) => ({ label: item.name, value: item.id })))
@@ -1298,15 +1335,24 @@ onMounted(loadRoute)
       <div class="surface"><CalendarClock :size="19" /><span>待执行步骤</span><strong>{{ experiments.reduce((n, e) => n + Math.max(0, e.totalSteps - e.completedSteps), 0) }}</strong></div>
       <div class="surface"><CheckCircle2 :size="19" /><span>已完成实验</span><strong>{{ experiments.filter((e) => e.status === 'completed').length }}</strong></div>
     </section>
-    <div class="filter-row"><n-radio-group v-model:value="filter" size="small"><n-radio-button value="all">全部</n-radio-button><n-radio-button value="active">进行中</n-radio-button><n-radio-button value="draft">草稿</n-radio-button><n-radio-button value="completed">已完成</n-radio-button><n-radio-button value="cancelled">已取消</n-radio-button></n-radio-group></div>
-    <n-spin :show="loading">
+    <div class="filter-row" role="group" aria-label="按状态筛选">
+      <button v-for="item in statusFilters" :key="item.value" type="button" class="filter-chip" :aria-pressed="filter === item.value" @click="filter = item.value">
+        {{ item.label }}<span class="filter-count">{{ item.count }}</span>
+      </button>
+    </div>
+    <section v-if="loading && !experiments.length" class="experiment-list list-skeleton" aria-busy="true" aria-label="正在加载实验">
+      <div v-for="index in 3" :key="index" class="experiment-card surface skeleton-card">
+        <n-skeleton text style="width: 22%" /><n-skeleton text style="width: 48%; margin-top: 10px" /><n-skeleton text :repeat="2" style="margin-top: 10px" />
+      </div>
+    </section>
+    <n-spin v-else :show="loading">
       <section class="experiment-list">
         <article v-for="experiment in filtered" :key="experiment.id" class="experiment-card surface">
           <div class="experiment-main">
             <div class="eyebrow"><span>{{ experiment.code }}</span><n-tag :type="statusMeta[experiment.status].type" size="small" round :bordered="false">{{ statusMeta[experiment.status].label }}</n-tag></div>
             <h2>{{ experiment.name }}</h2>
             <p>{{ experiment.project }} · {{ experiment.startDate || '未设置开始日期' }} · {{ experiment.animalCount }} 只动物</p>
-            <div class="groups"><span v-for="group in experiment.groups" :key="group.name"><i :style="{ background: group.color }" />{{ group.name }} <b>{{ group.count }}</b></span><span v-if="!experiment.groups.length">尚未分组</span></div>
+            <div class="groups"><span v-for="(group, groupIndex) in experiment.groups" :key="group.name"><i :style="{ background: `var(--muri-data-${(groupIndex % 6) + 1})` }" />{{ group.name }} <b>{{ group.count }}</b></span><span v-if="!experiment.groups.length">尚未分组</span></div>
           </div>
           <div class="progress-panel">
             <span>流程进度</span><strong>{{ experiment.completedSteps }} / {{ experiment.totalSteps }}</strong>
@@ -1369,7 +1415,7 @@ onMounted(loadRoute)
               </div>
             </div>
           </div>
-          <nav class="workspace-nav" aria-label="实验工作区导航"><router-link v-for="item in detailSections" :key="item.key" :to="{ name: 'experiment-detail', params: { experimentId: selected.id, section: item.key }, query: currentRoute.query }" :class="{ active: detailSection === item.key }">{{ item.label }}</router-link></nav>
+          <nav class="workspace-nav" aria-label="实验工作区导航"><router-link v-for="item in detailSections" :key="item.key" :to="{ name: 'experiment-detail', params: { experimentId: selected.id, section: item.key }, query: currentRoute.query }" :class="{ active: detailSection === item.key }" :aria-current="detailSection === item.key ? 'page' : undefined">{{ item.label }}<span v-if="sectionCounts[item.key]" class="nav-count">{{ sectionCounts[item.key] }}</span></router-link></nav>
         </header>
 
         <section v-if="detailSection === 'overview'" class="workspace-section">
@@ -1448,7 +1494,7 @@ onMounted(loadRoute)
 
         <section v-else-if="detailSection === 'data'" class="workspace-section data-section">
           <div class="section-toolbar"><div><h2>数据工作表</h2><p>行对应参与动物，表头由采集节点和数据列组成；点击单元格即可录入或修订。</p></div><div v-if="writeAllowed && selectedIsOpen"><n-button @click="openObservationDefinition">添加数据列</n-button><n-button type="primary" :disabled="!experimentEvents.length || !observationDefinitions.length" @click="openObservation">录入实验级数据</n-button></div></div>
-          <n-tabs type="card" animated>
+          <n-tabs type="segment" size="small" class="data-view-switch">
             <n-tab-pane name="animal" tab="动物纵向数据"><div v-if="participations.length && experimentEvents.length && observationDefinitions.length" class="sheet surface"><table class="data-grid"><thead><tr><th rowspan="2" class="frozen frozen-id">动物编号</th><th rowspan="2" class="frozen frozen-group">实验组</th><th v-for="event in experimentEvents" :key="event.id" :colspan="observationDefinitions.length" class="event-heading"><strong>{{ event.label }}</strong><small>{{ formatInstant(event.occurredAt) }}</small></th></tr><tr><template v-for="event in experimentEvents" :key="event.id"><th v-for="definition in observationDefinitions" :key="event.id + '-' + definition.id"><strong>{{ definition.label }}</strong><small v-if="definition.unit">{{ definition.unit }}</small></th></template></tr></thead><tbody><tr v-for="participation in participations" :key="participation.id"><td class="frozen frozen-id"><strong>{{ animalLabels.get(participation.animalId) ?? participation.animalId }}</strong></td><td class="frozen frozen-group">{{ participation.cohortId ? cohortLabels.get(participation.cohortId) : '未分组' }}</td><template v-for="event in experimentEvents" :key="event.id"><td v-for="definition in observationDefinitions" :key="participation.id + '-' + event.id + '-' + definition.id"><button type="button" class="data-cell" :class="{ filled: !!cellObservation(participation.animalId, event.id, definition.id) }" :disabled="!writeAllowed || !selectedIsOpen" @click="editDataCell(participation, event, definition)">{{ cellDisplayValue(participation.animalId, event.id, definition.id) }}</button></td></template></tr></tbody></table></div><n-empty v-else description="请先纳入动物，并准备采集节点和数据列" /></n-tab-pane>
             <n-tab-pane name="experiment" tab="实验级记录"><div class="surface experiment-records"><div v-for="observation in experimentLevelObservations" :key="observation.id" class="compact-row"><div><strong>{{ definitionLabels.get(observation.definitionId) ?? observation.definitionId }}</strong><small>{{ eventLabels.get(observation.experimentEventId) ?? observation.experimentEventId }} · v{{ observation.currentValueVersion }}</small></div><div class="observation-actions"><b>{{ formatObservationValue(latestObservationValue(observation)?.value) }}</b><n-button text size="tiny" @click="openObservationHistory(observation)">历史</n-button><n-button v-if="writeAllowed && selectedIsOpen && observationDefinitions.find((definition) => definition.id === observation.definitionId)?.policy !== 'immutable'" text type="primary" size="tiny" @click="openObservationRevision(observation)">修订</n-button></div></div><n-empty v-if="!experimentLevelObservations.length" description="尚无实验级记录" /></div></n-tab-pane>
           </n-tabs>
@@ -1556,7 +1602,7 @@ onMounted(loadRoute)
         </div>
       </n-form>
 
-      <n-tabs v-model:value="dataEntryMode" type="segment" animated>
+      <n-tabs v-model:value="dataEntryMode" type="segment">
         <n-tab-pane name="manual" tab="手工录入">
           <n-form v-if="selectedObservationDefinition" label-placement="top">
             <n-form-item
@@ -1802,15 +1848,21 @@ onMounted(loadRoute)
 <style scoped>
 .metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 16px; }
 .metrics > div { display: grid; grid-template-columns: 28px 1fr auto; align-items: center; gap: 4px; padding: 13px; }
-.metrics svg { color: var(--muri-primary); }
+.metrics svg { color: var(--muri-text-secondary); }
 .metrics span { color: var(--muri-text-secondary); }
 .metrics strong { font-size: 20px; }
-.filter-row { display: flex; justify-content: flex-end; margin-bottom: 11px; }
+.filter-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; margin-bottom: 11px; }
+.filter-chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; border: 1px solid var(--muri-border-strong); border-radius: 999px; color: var(--muri-text-secondary); background: var(--muri-surface); font-size: 13px; cursor: pointer; transition: border-color var(--muri-transition-fast), background var(--muri-transition-fast), color var(--muri-transition-fast); }
+.filter-chip:hover { color: var(--muri-text); border-color: var(--muri-text-tertiary); }
+.filter-chip[aria-pressed="true"] { color: var(--muri-text); border-color: var(--muri-text); background: var(--muri-surface-sunken); font-weight: 500; }
+.filter-count { color: var(--muri-text-tertiary); font-size: 12px; font-variant-numeric: tabular-nums; }
+.data-view-switch { max-width: 300px; }
+.skeleton-card { display: block; padding: 18px 20px; }
 .experiment-list { display: flex; flex-direction: column; gap: 10px; }
 .experiment-card { display: grid; grid-template-columns: 1fr 300px; overflow: hidden; }
 .experiment-main { padding: 17px; }
 .eyebrow { display: flex; align-items: center; gap: 8px; color: var(--muri-primary); font-size: 12px; font-weight: 600; }
-h2 { margin: 7px 0 4px; font-size: 17px; }
+h2 { margin: 7px 0 4px; font-size: 16px; }
 .experiment-main > p { margin: 0; color: var(--muri-text-secondary); font-size: 12px; }
 .groups { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
 .groups span { padding: 5px 8px; border: 1px solid var(--muri-border); border-radius: 999px; font-size: 11px; }
@@ -1819,23 +1871,23 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .progress-panel { display: grid; grid-template-columns: 1fr auto; align-content: center; gap: 7px 12px; padding: 17px; border-left: 1px solid var(--muri-border); background: var(--muri-surface-muted); }
 .progress-panel > span { color: var(--muri-text-secondary); font-size: 12px; }
 .progress-panel > :deep(.n-progress), .progress-panel > p, .progress-panel > button { grid-column: 1 / -1; }
-.progress-panel p { display: flex; align-items: center; gap: 5px; margin: 2px 0; color: #8a5c1e; font-size: 11px; }
+.progress-panel p { display: flex; align-items: center; gap: 5px; margin: 2px 0; color: var(--muri-warning-text); font-size: 11px; }
 .progress-panel p.completed { color: var(--muri-success); }
 .progress-panel button { justify-self: end; }
 .dialog-card { width: min(620px, calc(100vw - 28px)); }
 .data-entry-dialog { width: min(760px, calc(100vw - 28px)); }
 .data-cell-form { margin-top: 14px; }
-.ai-entry-boundary { display: flex; align-items: flex-start; gap: 7px; margin: 10px 0 12px; padding: 9px 11px; border: 1px solid #c8deef; border-radius: 8px; color: var(--muri-text-secondary); background: var(--muri-primary-soft); font-size: 11px; line-height: 1.55; }.ai-entry-boundary svg { flex: 0 0 auto; margin-top: 1px; color: var(--muri-primary); }
+.ai-entry-boundary { display: flex; align-items: flex-start; gap: 7px; margin: 10px 0 12px; padding: 9px 11px; border: 1px solid var(--muri-primary-border); border-radius: var(--muri-radius); color: var(--muri-text-secondary); background: var(--muri-primary-soft); font-size: 11px; line-height: 1.55; }.ai-entry-boundary svg { flex: 0 0 auto; margin-top: 1px; color: var(--muri-primary); }
 .ai-entry-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 9px; }.ai-entry-toolbar > span { color: var(--muri-text-tertiary); font-size: 11px; }
-.data-entry-images { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }.data-entry-images article { display: grid; min-width: 0; grid-template-columns: 58px minmax(0, 1fr) 32px; align-items: center; gap: 8px; padding: 7px; border: 1px solid var(--muri-border); border-radius: 8px; background: var(--muri-surface-muted); }.data-entry-images img { width: 58px; height: 58px; border-radius: 6px; object-fit: cover; }.data-entry-images article > div { display: flex; min-width: 0; flex-direction: column; }.data-entry-images strong,.data-entry-images small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.data-entry-images strong { font-size: 11px; }.data-entry-images small { color: var(--muri-text-tertiary); font-size: 10px; }.data-entry-images small.image-error { color: var(--muri-danger); }.data-entry-images button { display: grid; width: 32px; height: 32px; padding: 0; place-items: center; border: 0; border-radius: 6px; color: var(--muri-text-tertiary); background: transparent; cursor: pointer; transition: color var(--muri-transition-fast), background var(--muri-transition-fast); }.data-entry-images button:hover { color: var(--muri-danger); background: #fff1f1; }.data-entry-images button:focus-visible { outline: 3px solid rgba(15, 95, 170, .22); outline-offset: 1px; }.data-entry-images button:disabled { cursor: wait; opacity: .55; }
-.vision-model-field { margin-top: 12px; }.candidate-review { display: grid; gap: 10px; margin-top: 4px; padding: 13px; border: 1px solid #e1cfaa; border-radius: 9px; background: #fffaf2; }.candidate-review header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }.candidate-review header > div { display: flex; min-width: 0; flex-direction: column; }.candidate-review header span { display: flex; align-items: center; gap: 6px; color: var(--muri-text); font-weight: 650; }.candidate-review header span svg { color: var(--muri-primary); }.candidate-review header small { color: var(--muri-text-tertiary); font-size: 10px; }.candidate-review :deep(.n-form-item:last-child) { margin-bottom: 0; }.data-entry-error { margin: 10px 0 0; color: var(--muri-danger); font-size: 11px; line-height: 1.5; }
+.data-entry-images { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }.data-entry-images article { display: grid; min-width: 0; grid-template-columns: 58px minmax(0, 1fr) 32px; align-items: center; gap: 8px; padding: 7px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius); background: var(--muri-surface-muted); }.data-entry-images img { width: 58px; height: 58px; border-radius: var(--muri-radius-sm); object-fit: cover; }.data-entry-images article > div { display: flex; min-width: 0; flex-direction: column; }.data-entry-images strong,.data-entry-images small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.data-entry-images strong { font-size: 11px; }.data-entry-images small { color: var(--muri-text-tertiary); font-size: 11px; }.data-entry-images small.image-error { color: var(--muri-danger); }.data-entry-images button { display: grid; width: 32px; height: 32px; padding: 0; place-items: center; border: 0; border-radius: var(--muri-radius-sm); color: var(--muri-text-tertiary); background: transparent; cursor: pointer; transition: color var(--muri-transition-fast), background var(--muri-transition-fast); }.data-entry-images button:hover { color: var(--muri-danger); background: var(--muri-danger-soft); }.data-entry-images button:focus-visible { outline: 3px solid rgba(15, 95, 170, .22); outline-offset: 1px; }.data-entry-images button:disabled { cursor: wait; opacity: .55; }
+.vision-model-field { margin-top: 12px; }.candidate-review { display: grid; gap: 10px; margin-top: 4px; padding: 13px; border: 1px solid var(--muri-warning-border); border-radius: var(--muri-radius); background: var(--muri-warning-soft); }.candidate-review header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }.candidate-review header > div { display: flex; min-width: 0; flex-direction: column; }.candidate-review header span { display: flex; align-items: center; gap: 6px; color: var(--muri-text); font-weight: 650; }.candidate-review header span svg { color: var(--muri-primary); }.candidate-review header small { color: var(--muri-text-tertiary); font-size: 11px; }.candidate-review :deep(.n-form-item:last-child) { margin-bottom: 0; }.data-entry-error { margin: 10px 0 0; color: var(--muri-danger); font-size: 11px; line-height: 1.5; }
 .small-dialog { width: min(480px, calc(100vw - 28px)); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .dialog-actions,.detail-actions { display: flex; justify-content: flex-end; gap: 9px; }
 .detail-actions { flex-wrap: wrap; margin-bottom: 14px; }
 .participation-actions { display: flex; align-items: center; gap: 7px; }
 .snapshot-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
-.snapshot-tags > span { color: var(--muri-text-tertiary); font-size: 10px; }
+.snapshot-tags > span { color: var(--muri-text-tertiary); font-size: 11px; }
 .observation-definition-strip { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .observation-definition-strip > span { color: var(--muri-text-tertiary); font-size: 11px; }
 .observation-value { display: block; max-width: 420px; margin-top: 5px; overflow: hidden; color: var(--muri-primary); font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
@@ -1852,11 +1904,14 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .workspace-title-row h1 { margin: 7px 0 4px; font-size: 24px; letter-spacing: -0.02em; }
 .workspace-title-row p { margin: 0; color: var(--muri-text-secondary); font-size: 12px; }
 .lifecycle-actions { display: flex; align-items: center; gap: 8px; }
-.workspace-nav { display: flex; gap: 4px; margin-top: 18px; padding: 0 20px; overflow-x: auto; border-top: 1px solid var(--muri-border); }
-.workspace-nav a { position: relative; padding: 13px 12px 11px; color: var(--muri-text-secondary); white-space: nowrap; }
-.workspace-nav a::after { position: absolute; inset: auto 10px 0; height: 2px; border-radius: 2px; background: transparent; content: ''; }
-.workspace-nav a.active { color: var(--muri-primary); font-weight: 600; }
-.workspace-nav a.active::after { background: var(--muri-primary); }
+.workspace-nav { display: flex; gap: 24px; margin-top: 18px; padding: 0 20px; overflow-x: auto; border-top: 1px solid var(--muri-border); scrollbar-width: none; }
+.workspace-nav::-webkit-scrollbar { display: none; }
+.workspace-nav a { position: relative; display: inline-flex; align-items: center; gap: 6px; padding: 12px 0 10px; color: var(--muri-text-secondary); white-space: nowrap; transition: color var(--muri-transition-fast); }
+.workspace-nav a:hover { color: var(--muri-text); }
+.workspace-nav a::after { position: absolute; inset: auto 0 0; height: 2px; background: transparent; content: ''; transition: background var(--muri-transition-fast); }
+.workspace-nav a.active { color: var(--muri-text); font-weight: 500; }
+.workspace-nav a.active::after { background: var(--muri-text); }
+.nav-count { color: var(--muri-text-tertiary); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums; }
 .workspace-section { min-width: 0; }
 .workspace-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .workspace-metrics article { display: flex; min-height: 106px; padding: 16px; flex-direction: column; }
@@ -1867,7 +1922,7 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .overview-card,.design-panel,.trace-panel,.experiment-records { padding: 16px; }
 .section-title,.section-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
 .section-title > div,.section-toolbar > div:first-child { display: flex; flex-direction: column; }
-.section-title span { font-weight: 700; }
+.section-title span { font-weight: 600; }
 .section-title small,.section-toolbar p { color: var(--muri-text-tertiary); font-size: 11px; }
 .section-toolbar { margin-bottom: 12px; }
 .section-toolbar h2 { margin: 0 0 3px; font-size: 20px; }
@@ -1879,13 +1934,13 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .compact-row small,.design-item small { color: var(--muri-text-tertiary); }
 .compact-meta { align-items: flex-end; }
 .readiness-list { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 18px 0; }
-.readiness-list span { padding: 12px; border-radius: 7px; color: var(--muri-text-secondary); background: var(--muri-surface-muted); text-align: center; }
-.readiness-list b { display: block; color: var(--muri-text-primary); font-size: 20px; }
+.readiness-list span { padding: 12px; border-radius: var(--muri-radius-sm); color: var(--muri-text-secondary); background: var(--muri-surface-muted); text-align: center; }
+.readiness-list b { display: block; color: var(--muri-text); font-size: 20px; }
 .design-panel { min-height: 220px; }
 .design-wide { grid-column: 1 / -1; min-height: auto; }
 .design-item code { color: var(--muri-text-tertiary); font-size: 11px; }
 .timeline-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-.timeline-chips > span { display: flex; min-width: 150px; padding: 10px 12px; border: 1px solid var(--muri-border); border-radius: 8px; flex-direction: column; }
+.timeline-chips > span { display: flex; min-width: 150px; padding: 10px 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius); flex-direction: column; }
 .timeline-chips small { color: var(--muri-text-tertiary); }
 .participant-table-wrap,.sheet { overflow: auto; }
 .participant-table,.data-grid { width: 100%; border-collapse: separate; border-spacing: 0; }
@@ -1897,7 +1952,7 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .current-node span,.current-node small { color: var(--muri-text-tertiary); font-size: 11px; }
 .current-node strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .procedure-card { display: grid; grid-template-columns: 110px minmax(0, 1fr) minmax(190px, auto); align-items: center; gap: 14px; padding: 15px 17px; }
-.procedure-card h3 { margin: 0 0 3px; font-size: 15px; }
+.procedure-card h3 { margin: 0 0 3px; font-size: 14px; }
 .procedure-card p { margin: 0; color: var(--muri-text-tertiary); font-size: 11px; }
 .procedure-status { display: flex; align-items: center; gap: 7px; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muri-warning); }
@@ -1917,18 +1972,18 @@ h2 { margin: 7px 0 4px; font-size: 17px; }
 .data-section :deep(.n-tabs-nav) { margin-bottom: 10px; }
 .sheet { max-height: calc(100vh - 310px); }
 .data-grid { min-width: max-content; }
-.data-grid th,.data-grid td { min-width: 120px; height: 46px; padding: 0; border-right: 1px solid var(--muri-border); border-bottom: 1px solid var(--muri-border); background: #fff; text-align: center; }
+.data-grid th,.data-grid td { min-width: 120px; height: 46px; padding: 0; border-right: 1px solid var(--muri-border); border-bottom: 1px solid var(--muri-border); background: var(--muri-surface); text-align: center; }
 .data-grid th { padding: 8px 10px; background: var(--muri-surface-muted); color: var(--muri-text-secondary); font-size: 11px; }
 .data-grid th strong,.data-grid th small { display: block; }
 .data-grid th small { color: var(--muri-text-tertiary); font-weight: 400; }
-.data-grid .event-heading { color: var(--muri-primary); background: #edf5fc; }
+.data-grid .event-heading { color: var(--muri-text); background: var(--muri-surface-sunken); }
 .data-grid .frozen { position: sticky; z-index: 2; text-align: left; }
 .data-grid th.frozen { z-index: 4; }
 .data-grid .frozen-id { left: 0; min-width: 128px; padding: 0 12px; }
 .data-grid .frozen-group { left: 128px; min-width: 110px; padding: 0 12px; box-shadow: 5px 0 10px rgba(27,50,73,.05); }
 .data-cell { width: 100%; height: 45px; padding: 0 9px; overflow: hidden; border: 0; color: var(--muri-text-tertiary); background: transparent; cursor: pointer; text-overflow: ellipsis; white-space: nowrap; }
 .data-cell:hover:not(:disabled),.data-cell:focus-visible { outline: 2px solid var(--muri-primary); outline-offset: -2px; background: var(--muri-primary-soft); }
-.data-cell.filled { color: var(--muri-text-primary); font-weight: 600; }
+.data-cell.filled { color: var(--muri-text); font-weight: 600; }
 .data-cell:disabled { cursor: default; }
 .trace-item { position: relative; display: grid; grid-template-columns: 14px 1fr; gap: 8px; padding: 12px 0; border-bottom: 1px solid var(--muri-border); }
 .trace-marker { width: 8px; height: 8px; margin-top: 5px; border-radius: 50%; background: var(--muri-primary); box-shadow: 0 0 0 4px var(--muri-primary-soft); }

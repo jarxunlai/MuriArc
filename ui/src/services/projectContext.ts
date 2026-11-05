@@ -38,6 +38,14 @@ export function isActiveProjectAdmin(session = currentAuthSession.value): boolea
   return activeProjectRole(session) === 'project_admin'
 }
 
+export function canManageMembers(session = currentAuthSession.value): boolean {
+  return isLabAdmin(session) || isActiveProjectAdmin(session)
+}
+
+export function canAdministerAi(session = currentAuthSession.value): boolean {
+  return isLabAdmin(session)
+}
+
 export function canWriteAnimal(session = currentAuthSession.value): boolean {
   if (!session) return true
   return isLabAdmin(session)

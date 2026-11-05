@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { NAlert, NButton, NForm, NFormItem, NInput, NProgress } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import { KeyRound, LockKeyhole } from '@lucide/vue'
 import { branding } from '@/branding'
@@ -115,8 +116,8 @@ async function logout() {
 <style scoped>
 .password-page { display: grid; min-height: 100vh; padding: 24px; place-items: center; background: var(--muri-bg); }
 .password-card { width: min(100%, 440px); padding: 28px; }
-.brand-block { display: flex; align-items: center; gap: 11px; margin-bottom: 26px; }.brand-block img { width: 48px; height: 48px; object-fit: contain; }.brand-block div { display: flex; flex-direction: column; }.brand-block strong { font-size: 21px; letter-spacing: -.03em; }.brand-block span { color: var(--muri-text-tertiary); font-size: 11px; }
-.heading { margin-bottom: 20px; }.heading h1 { margin: 0 0 5px; font-size: 22px; }.heading p { margin: 0; color: var(--muri-text-secondary); line-height: 1.55; }
+.brand-block { display: flex; align-items: center; gap: 11px; margin-bottom: 26px; }.brand-block img { width: 48px; height: 48px; object-fit: contain; }.brand-block div { display: flex; flex-direction: column; }.brand-block strong { font-size: 20px; letter-spacing: -.03em; }.brand-block span { color: var(--muri-text-tertiary); font-size: 11px; }
+.heading { margin-bottom: 20px; }.heading h1 { margin: 0 0 5px; font-size: 20px; }.heading p { margin: 0; color: var(--muri-text-secondary); line-height: 1.55; }
 .strength-row { display: grid; grid-template-columns: auto minmax(100px, 1fr); align-items: center; gap: 12px; margin: -10px 0 14px; color: var(--muri-text-tertiary); font-size: 11px; }.strength-row .n-progress { width: 100%; }
 .form-alert { margin: -2px 0 14px; }.logout-button { margin-top: 14px; }
 @media (max-width: 520px) { .password-page { padding: 14px; }.password-card { padding: 22px 18px; } }

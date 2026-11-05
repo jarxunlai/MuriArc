@@ -4,12 +4,13 @@ import type { AuthSession } from '@/domain/models'
 import { hasEnteredLocalSpace } from '@/services/localWelcome'
 import {
   availableProjects,
+  canAdministerAi,
+  canManageMembers,
   hasLabRegistryAccess,
   initializeProjectContext,
-  isActiveProjectAdmin,
-  isLabAdmin,
   setCurrentProject,
 } from '@/services/projectContext'
+import { routeScrollPosition } from './navigation'
 
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/cages' },
@@ -18,16 +19,16 @@ const routes: RouteRecordRaw[] = [
   { path: '/animal-data', name: 'animal-data', component: () => import('@/views/DataCenterView.vue'), meta: { title: '动物数据', section: '动物管理', animalData: true } },
   { path: '/animal-data/import-guide', name: 'animal-import-guide', component: () => import('@/views/AnimalImportGuideView.vue'), meta: { title: '动物导入指南', section: '动物管理', animalData: true } },
   { path: '/breeding', name: 'breeding', component: () => import('@/views/BreedingView.vue'), meta: { title: '繁育管理', section: '动物管理' } },
-  { path: '/experiments', name: 'experiments', component: () => import('@/views/ExperimentsView.vue'), meta: { title: '实验管理' } },
-  { path: '/experiments/:experimentId/:section?', name: 'experiment-detail', component: () => import('@/views/ExperimentsView.vue'), meta: { title: '实验工作区', section: '实验管理' } },
-  { path: '/data', name: 'data', component: () => import('@/views/DataCenterView.vue'), meta: { title: '数据中心' } },
-  { path: '/library', name: 'library', component: () => import('@/views/LibraryView.vue'), meta: { title: '项目资料库' } },
+  { path: '/experiments', name: 'experiments', component: () => import('@/views/ExperimentsView.vue'), meta: { title: '实验管理', section: '实验与数据' } },
+  { path: '/experiments/:experimentId/:section?', name: 'experiment-detail', component: () => import('@/views/ExperimentsView.vue'), meta: { title: '实验工作区', section: '实验与数据' } },
+  { path: '/data', name: 'data', component: () => import('@/views/DataCenterView.vue'), meta: { title: '数据中心', section: '实验与数据' } },
+  { path: '/library', name: 'library', component: () => import('@/views/LibraryView.vue'), meta: { title: '项目资料库', section: '实验与数据' } },
   { path: '/operations', name: 'operations', component: () => import('@/views/OperationsView.vue'), meta: { title: '活动记录', section: '管理与工具' } },
-  { path: '/ai', name: 'ai', component: () => import('@/views/AiWorkspaceView.vue'), meta: { title: 'AI 助手' } },
-  { path: '/ai/images', name: 'ai-images', component: () => import('@/views/AiImagesView.vue'), meta: { title: '私人 AI 图片' } },
-  { path: '/admin/ai', name: 'ai-admin', component: () => import('@/views/AiAdminView.vue'), meta: { title: 'AI 管理', section: '实验室管理' } },
+  { path: '/ai', name: 'ai', component: () => import('@/views/AiWorkspaceView.vue'), meta: { title: 'AI 助手', section: '管理与工具' } },
+  { path: '/ai/images', name: 'ai-images', component: () => import('@/views/AiImagesView.vue'), meta: { title: '私人 AI 图片', section: '管理与工具' } },
+  { path: '/admin/ai', name: 'ai-admin', component: () => import('@/views/AiAdminView.vue'), meta: { title: 'AI 管理', section: '管理与工具' } },
   { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue'), meta: { title: '设置' } },
-  { path: '/members', name: 'members', component: () => import('@/views/MembersView.vue'), meta: { title: '成员管理', section: '实验室管理' } },
+  { path: '/members', name: 'members', component: () => import('@/views/MembersView.vue'), meta: { title: '成员管理', section: '管理与工具' } },
   { path: '/login', name: 'login', component: () => import('@/views/LoginView.vue'), meta: { title: '登录', authShell: true } },
   { path: '/change-password', name: 'change-password', component: () => import('@/views/ChangePasswordView.vue'), meta: { title: '修改密码', authShell: true } },
   { path: '/welcome', name: 'local-welcome', component: () => import('@/views/LocalWelcomeView.vue'), meta: { title: '进入本地空间', authShell: true } },
@@ -37,7 +38,7 @@ const routes: RouteRecordRaw[] = [
 export const router = createRouter({
   history: createWebHashHistory(),
   routes,
-  scrollBehavior: () => ({ top: 0 }),
+  scrollBehavior: routeScrollPosition,
 })
 
 function defaultAuthenticatedRoute(session: AuthSession): string {
@@ -78,8 +79,12 @@ router.beforeEach(async (to) => {
   }
 
   try {
-    await gateway.getRuntimeCapabilities?.()
-    const session = await gateway.restoreSession()
+    // Fetch both in parallel, but keep reporting a capability failure first.
+    const capabilities = gateway.getRuntimeCapabilities?.()
+    const restoring = gateway.restoreSession()
+    restoring.catch(() => undefined)
+    await capabilities
+    const session = await restoring
     const fallback = defaultAuthenticatedRoute(session)
     if (session.user.mustChangePassword) {
       return to.name === 'change-password'
@@ -101,10 +106,10 @@ router.beforeEach(async (to) => {
     if (!hasLabRegistryAccess(session) && (to.name === 'breeding' || to.meta.animalData === true)) {
       return { name: 'animals' }
     }
-    if (to.name === 'members' && !isLabAdmin(session) && !isActiveProjectAdmin(session)) {
+    if (to.name === 'members' && !canManageMembers(session)) {
       return fallback
     }
-    if (to.name === 'ai-admin' && !isLabAdmin(session)) {
+    if (to.name === 'ai-admin' && !canAdministerAi(session)) {
       return fallback
     }
     return to.name === 'login' ? safeRedirect(to.query.redirect, fallback) : true

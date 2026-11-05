@@ -5,6 +5,7 @@ const auth = vi.hoisted(() => ({
     mode: 'remote' as 'remote' | 'local',
     requiresLocalWelcome: false,
     restoreSession: vi.fn(),
+    getRuntimeCapabilities: undefined as undefined | ReturnType<typeof vi.fn>,
     listProjects: vi.fn(),
   },
 }))
@@ -37,6 +38,7 @@ describe('remote route authentication guard', () => {
     window.scrollTo = vi.fn()
     auth.gateway.mode = 'remote'
     auth.gateway.requiresLocalWelcome = false
+    auth.gateway.getRuntimeCapabilities = undefined
     sessionStorage.clear()
     auth.gateway.restoreSession.mockReset().mockRejectedValue(
       new HttpGatewayError(401, '请先登录'),
@@ -92,6 +94,34 @@ describe('remote route authentication guard', () => {
 
     expect(router.currentRoute.value.name).toBe('cages')
     expect(currentProjectId.value).toBe('project-1')
+  })
+
+  it('restores the session while runtime capabilities are still loading', async () => {
+    let releaseCapabilities!: () => void
+    auth.gateway.getRuntimeCapabilities = vi.fn(() => new Promise<void>((resolve) => { releaseCapabilities = resolve }))
+    auth.gateway.restoreSession.mockResolvedValue({
+      user: {
+        id: 'viewer-1', labId: 'lab-1', displayName: 'Viewer', labRoles: [],
+        projectRoles: [{ projectId: 'project-1', role: 'viewer' }],
+        authentication: 'session', mustChangePassword: false, isEnvironmentRoot: false,
+      },
+      csrfAvailable: true,
+    })
+
+    const navigation = router.push('/cages')
+    await vi.waitFor(() => expect(auth.gateway.getRuntimeCapabilities).toHaveBeenCalled())
+    expect(auth.gateway.restoreSession).toHaveBeenCalled()
+    releaseCapabilities()
+    await navigation
+
+    expect(router.currentRoute.value.name).toBe('cages')
+  })
+
+  it('reports a capability failure before the session result', async () => {
+    auth.gateway.getRuntimeCapabilities = vi.fn().mockRejectedValue(new HttpGatewayError(503, '能力声明无效'))
+    auth.gateway.restoreSession.mockRejectedValue(new HttpGatewayError(401, '请先登录'))
+
+    await expect(router.push('/library')).rejects.toThrow('能力声明无效')
   })
 
   it('guards every animal-data route through the shared route metadata', async () => {

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { NAlert, NButton } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
 import { Database, UserRound } from '@lucide/vue'
 import { branding } from '@/branding'
@@ -76,11 +77,11 @@ onMounted(async () => {
 .brand-block { display: flex; align-items: center; gap: 11px; margin-bottom: 28px; }
 .brand-block img { width: 48px; height: 48px; object-fit: contain; }
 .brand-block div { display: flex; flex-direction: column; }
-.brand-block strong { font-size: 21px; letter-spacing: -.03em; }
+.brand-block strong { font-size: 20px; letter-spacing: -.03em; }
 .brand-block span { color: var(--muri-text-tertiary); font-size: 11px; }
-.heading { margin-bottom: 18px; }.heading h1 { margin: 0 0 5px; font-size: 22px; }.heading p { margin: 0; color: var(--muri-text-secondary); }
+.heading { margin-bottom: 18px; }.heading h1 { margin: 0 0 5px; font-size: 20px; }.heading p { margin: 0; color: var(--muri-text-secondary); }
 .identity-list { display: grid; gap: 8px; margin-bottom: 15px; transition: opacity var(--muri-transition-fast); }.identity-list.loading { opacity: .5; }
-.identity-list > div { display: grid; grid-template-columns: 28px 82px minmax(0, 1fr); align-items: center; padding: 12px; border: 1px solid var(--muri-border); border-radius: 7px; }.identity-list svg { color: var(--muri-primary); }.identity-list span { color: var(--muri-text-tertiary); font-size: 11px; }.identity-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.identity-list > div { display: grid; grid-template-columns: 28px 82px minmax(0, 1fr); align-items: center; padding: 12px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }.identity-list svg { color: var(--muri-text-secondary); }.identity-list span { color: var(--muri-text-tertiary); font-size: 11px; }.identity-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .welcome-alert { margin-bottom: 14px; }
 @media (max-width: 520px) { .welcome-page { padding: 14px; }.welcome-card { padding: 22px 18px; }.identity-list > div { grid-template-columns: 26px 68px minmax(0, 1fr); } }
 </style>

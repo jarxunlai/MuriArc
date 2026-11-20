@@ -7,10 +7,10 @@ use chrono::{DateTime, Duration, Utc};
 
 use async_trait::async_trait;
 use muriarc_application::{
-    ActivityQueryRequest, AnimalContextRequest, AuditQueryRequest, BusinessReadAccess,
-    BusinessReadError, BusinessReadResult, BusinessReadService, BusinessSourceRef,
-    ExperimentGroupingRequest, GenotypingQueryRequest, GroupingCandidate, MAX_GROUPING_CANDIDATES,
-    ProjectContextRequest, ProvenanceQueryRequest, ResourceSearchRequest,
+    ActivityQueryRequest, AnimalContextRequest, AnimalStatisticsRequest, AuditQueryRequest,
+    BusinessReadAccess, BusinessReadError, BusinessReadResult, BusinessReadService,
+    BusinessSourceRef, ExperimentGroupingRequest, GenotypingQueryRequest, GroupingCandidate,
+    MAX_GROUPING_CANDIDATES, ProjectContextRequest, ProvenanceQueryRequest, ResourceSearchRequest,
     build_experiment_grouping_plan,
 };
 use muriarc_core::{
@@ -35,11 +35,12 @@ const MAX_LIMIT: usize = 100;
 const MAX_OFFSET: usize = 10_000;
 const MAX_QUERY_LENGTH: usize = 256;
 const MAX_SHORT_TEXT_LENGTH: usize = 128;
-const STORE_MODEL_READ_TOOLS: [ToolName; 4] = [
+const STORE_MODEL_READ_TOOLS: [ToolName; 5] = [
     ToolName::ResourceSearch,
     ToolName::GenotypingQuery,
     ToolName::AnimalContext,
     ToolName::ProjectContext,
+    ToolName::AnimalStatistics,
 ];
 
 /// Legacy V1 reads remain executable for trusted callers, but are exposed to
@@ -169,8 +170,8 @@ impl StoreToolAccessContext {
 /// Read-only implementation of MuriArc's fixed domain tools.
 ///
 /// This executor only calls `MuriArcStore` read methods. It has no raw-SQL or
-/// write API. Models see the aggregate context tools and one focused Genetics
-/// v2 query, plus `audit_query` only
+/// write API. Models see the aggregate context tools, one focused Genetics
+/// v2 query and the fixed `animal_statistics` counts, plus `audit_query` only
 /// when explicitly authorized; legacy V1 read names remain executable only for
 /// compatibility with trusted existing callers.
 #[derive(Clone)]
@@ -316,6 +317,19 @@ impl StoreDomainToolExecutor {
         let result = self
             .business_reads
             .project_context(request)
+            .await
+            .map_err(map_business_read_error)?;
+        business_read_output(result)
+    }
+
+    async fn animal_statistics(
+        &self,
+        arguments: Value,
+    ) -> Result<DomainToolOutput, ToolExecutionError> {
+        let request: AnimalStatisticsRequest = parse_arguments(arguments)?;
+        let result = self
+            .business_reads
+            .animal_statistics(request)
             .await
             .map_err(map_business_read_error)?;
         business_read_output(result)
@@ -1032,6 +1046,7 @@ impl DomainToolExecutor for StoreDomainToolExecutor {
             ToolName::GenotypingQuery => self.genotyping_query(request.arguments).await,
             ToolName::AnimalContext => self.animal_context(request.arguments).await,
             ToolName::ProjectContext => self.project_context(request.arguments).await,
+            ToolName::AnimalStatistics => self.animal_statistics(request.arguments).await,
             ToolName::ActivityQuery if self.access.activity_read => {
                 self.activity_query(request.arguments).await
             }

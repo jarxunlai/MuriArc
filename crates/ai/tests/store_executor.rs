@@ -538,6 +538,7 @@ async fn aggregate_model_tools_execute_bounded_reads_with_citations() {
             ToolName::GenotypingQuery,
             ToolName::AnimalContext,
             ToolName::ProjectContext,
+            ToolName::AnimalStatistics,
         ]
     );
     assert!(!supported.contains(&ToolName::ImportPreview));
@@ -586,6 +587,10 @@ async fn aggregate_model_tools_execute_bounded_reads_with_citations() {
             ToolName::ProjectContext,
             json!({"project_id": fixture.allowed_project_id}),
         ),
+        (
+            ToolName::AnimalStatistics,
+            json!({"project_id": fixture.allowed_project_id, "group_by": ["sex"]}),
+        ),
     ];
     for (tool, arguments) in calls {
         let (data, citations) = read_output(
@@ -612,6 +617,23 @@ async fn aggregate_model_tools_execute_bounded_reads_with_citations() {
                 assert_eq!(data["animals"]["items"].as_array().unwrap().len(), 1);
                 assert_eq!(data["cages"]["items"].as_array().unwrap().len(), 1);
             }
+            ToolName::AnimalStatistics => {
+                assert_eq!(data["animals_in_scope"], 1);
+                assert_eq!(data["matching_animals"], 1);
+                assert_eq!(
+                    data["groups"],
+                    json!([{"key": {"sex": "female"}, "animals": 1}])
+                );
+                assert_eq!(
+                    citations,
+                    vec![Citation::new(
+                        EntityType::Project,
+                        fixture.allowed_project_id,
+                        citations[0].revision,
+                    )],
+                    "aggregate counts cite the project, not individual animals"
+                );
+            }
             _ => unreachable!(),
         }
         assert!(!citations.is_empty(), "{tool:?}");
@@ -637,6 +659,26 @@ async fn aggregate_model_tools_execute_bounded_reads_with_citations() {
     assert_eq!(genotyping["items"], json!([]));
     assert_eq!(genotyping["page"]["returned"], 0);
     assert!(citations.is_empty());
+    assert_rejected(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::AnimalStatistics,
+                json!({"project_id": fixture.forbidden_project_id}),
+            ))
+            .await,
+        "project_forbidden",
+    );
+    assert_rejected(
+        fixture
+            .executor
+            .execute(request(
+                ToolName::AnimalStatistics,
+                json!({"project_id": fixture.allowed_project_id, "sql": "SELECT 1"}),
+            ))
+            .await,
+        "invalid_arguments",
+    );
     let audit_count_after = fixture
         .store
         .list_audit_entries(&audit_filter)

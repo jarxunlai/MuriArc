@@ -2738,3 +2738,421 @@ async fn explicitly_requested_tool_stays_required_after_a_recoverable_rejection(
         "grounding is satisfied only after a successful result"
     );
 }
+
+fn budget_runtime(max_input_tokens: u32) -> AssistantRuntimeConfig {
+    AssistantRuntimeConfig {
+        context_window_tokens: max_input_tokens * 2,
+        max_input_tokens,
+        max_output_tokens: 1_024,
+        history_token_budget: 2_048,
+        history_turns: 4,
+        temperature: 0.0,
+        timeout_ms: 5_000,
+    }
+}
+
+/// A page-shaped read whose rows and citations are both far larger than a
+/// small model's input budget.
+fn oversized_animal_page(ids: &[Uuid]) -> DomainToolOutput {
+    let items = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            json!({
+                "id": id,
+                "display_id": format!("M{index:04}"),
+                "notes": "n".repeat(200),
+            })
+        })
+        .collect::<Vec<_>>();
+    let citations = ids
+        .iter()
+        .map(|id| Citation::new(EntityType::Animal, *id, Some(1)))
+        .collect();
+    DomainToolOutput::read(
+        json!({
+            "items": items,
+            "page": {
+                "offset": 0,
+                "limit": ids.len(),
+                "returned": ids.len(),
+                "complete": true,
+                "has_more": false
+            }
+        }),
+        citations,
+    )
+}
+
+fn tool_payloads(request: &CompletionRequest) -> Vec<Value> {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role == ChatRole::Tool)
+        .map(|message| serde_json::from_str(&message.content).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn oversized_paged_read_is_truncated_to_the_model_input_budget_instead_of_failing() {
+    let ids = (0..600).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [
+            Ok(completion(
+                None,
+                vec![call(
+                    "call-1",
+                    ToolName::ResourceSearch.as_str(),
+                    json!({"resource": "animals", "limit": 100}),
+                )],
+            )),
+            Ok(completion(Some("partial answer"), vec![])),
+        ],
+    );
+    let probe = provider.clone();
+    let executor = TestExecutor::new({
+        let ids = ids.clone();
+        move |_| Ok(oversized_animal_page(&ids))
+    });
+    let service = AssistantService::new(provider, executor)
+        .with_runtime_config(budget_runtime(8_192))
+        .unwrap();
+
+    let response = service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), "how many animals are there?"),
+            &read_access(),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.content, "partial answer");
+    assert!(response.incomplete_reason.is_none());
+    let requests = probe.requests().unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert!(estimate_completion_input_tokens(request) <= 8_192);
+    }
+    let payload = &tool_payloads(&requests[1])[0];
+    assert_eq!(payload["kind"], "read_result");
+    assert_eq!(payload["truncated"], true);
+    assert_eq!(payload["truncation"]["reason"], "model_input_budget");
+    assert!(
+        payload["truncation"]["notice"]
+            .as_str()
+            .unwrap()
+            .contains("refine")
+    );
+    let kept = payload["data"]["items"].as_array().unwrap().len();
+    assert!(kept > 0 && kept < ids.len(), "kept {kept} rows");
+    assert_eq!(payload["truncation"]["omitted"][0]["path"], "/data/items");
+    assert_eq!(payload["truncation"]["omitted"][0]["kept"], kept);
+    assert_eq!(
+        payload["truncation"]["omitted"][0]["omitted"],
+        ids.len() - kept
+    );
+    // Page metadata must describe the rows the model actually received so it
+    // can continue from next_offset instead of trusting a stale total.
+    assert_eq!(payload["data"]["page"]["returned"], kept);
+    assert_eq!(payload["data"]["page"]["complete"], false);
+    assert_eq!(payload["data"]["page"]["has_more"], true);
+    assert_eq!(payload["data"]["page"]["next_offset"], kept);
+    // Citations are narrowed to the rows still present, never the full set.
+    let kept_citations = ids[..kept]
+        .iter()
+        .map(|id| Citation::new(EntityType::Animal, *id, Some(1)))
+        .collect::<Vec<_>>();
+    assert_eq!(payload["citations"].as_array().unwrap().len(), kept);
+    assert_eq!(response.tool_runs[0].citations, kept_citations);
+    assert_eq!(response.citations, kept_citations);
+    assert!(response.context.context_trimmed);
+    assert!(
+        response
+            .context
+            .trim_reasons
+            .iter()
+            .any(|reason| reason == "tool_result_truncated")
+    );
+}
+
+#[tokio::test]
+async fn small_read_results_are_returned_unchanged() {
+    let animal_id = Uuid::new_v4();
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [
+            Ok(completion(
+                None,
+                vec![call(
+                    "call-1",
+                    ToolName::ResourceSearch.as_str(),
+                    json!({"resource": "animals"}),
+                )],
+            )),
+            Ok(completion(Some("done"), vec![])),
+        ],
+    );
+    let probe = provider.clone();
+    let executor = TestExecutor::new(move |_| {
+        Ok(DomainToolOutput::read(
+            json!({"items": [{"id": animal_id}]}),
+            vec![Citation::new(EntityType::Animal, animal_id, Some(2))],
+        ))
+    });
+    let service = AssistantService::new(provider, executor)
+        .with_runtime_config(budget_runtime(8_192))
+        .unwrap();
+
+    let response = service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), "list animals"),
+            &read_access(),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+
+    let payload = &tool_payloads(&probe.requests().unwrap()[1])[0];
+    assert_eq!(
+        payload,
+        &json!({
+            "kind": "read_result",
+            "data": {"items": [{"id": animal_id}]},
+            "citations": [{"entity_type": "animal", "entity_id": animal_id, "revision": 2}],
+        })
+    );
+    assert!(!response.context.context_trimmed);
+}
+
+#[tokio::test]
+async fn repeated_large_results_keep_every_request_within_budget_and_favor_newer_results() {
+    let ids = (0..600).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+    let answer_id = Uuid::new_v4();
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [
+            Ok(completion(
+                None,
+                vec![
+                    call(
+                        "page-1",
+                        ToolName::ResourceSearch.as_str(),
+                        json!({"resource": "animals"}),
+                    ),
+                    call(
+                        "page-2",
+                        ToolName::ResourceSearch.as_str(),
+                        json!({"resource": "animals", "offset": 100}),
+                    ),
+                ],
+            )),
+            Ok(completion(
+                None,
+                vec![call(
+                    "page-3",
+                    ToolName::ResourceSearch.as_str(),
+                    json!({"resource": "animals", "offset": 200}),
+                )],
+            )),
+            Ok(completion(
+                None,
+                vec![call(
+                    "page-4",
+                    ToolName::ResourceSearch.as_str(),
+                    json!({"resource": "animals", "offset": 300}),
+                )],
+            )),
+            Ok(completion(
+                None,
+                vec![call(
+                    "stats",
+                    ToolName::ProjectContext.as_str(),
+                    json!({"project_id": Uuid::new_v4()}),
+                )],
+            )),
+            Ok(completion(Some("600 animals"), vec![])),
+        ],
+    );
+    let probe = provider.clone();
+    let executor = TestExecutor::new({
+        let ids = ids.clone();
+        move |request| {
+            if request.tool == ToolName::ProjectContext {
+                Ok(DomainToolOutput::read(
+                    json!({"matching_animals": 600, "project": {"id": answer_id}}),
+                    vec![Citation::new(EntityType::Project, answer_id, Some(1))],
+                ))
+            } else {
+                Ok(oversized_animal_page(&ids))
+            }
+        }
+    });
+    let service = AssistantService::new(provider, executor)
+        .with_runtime_config(budget_runtime(12_000))
+        .unwrap();
+
+    let response = service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), "count the animals"),
+            &read_access(),
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.content, "600 animals");
+    assert!(response.incomplete_reason.is_none());
+    let requests = probe.requests().unwrap();
+    assert_eq!(requests.len(), 5);
+    for request in &requests {
+        assert!(estimate_completion_input_tokens(request) <= 12_000);
+    }
+    // Parallel calls in one batch share the remaining budget: both receive rows.
+    let second = tool_payloads(&requests[1]);
+    assert_eq!(second.len(), 2);
+    for payload in &second {
+        assert!(!payload["data"]["items"].as_array().unwrap().is_empty());
+    }
+    // The newest, small aggregate result is delivered intact even after the
+    // earlier pages exhausted the budget; older pages are compacted instead.
+    let last = tool_payloads(&requests[4]);
+    assert_eq!(last.len(), 5);
+    assert_eq!(
+        last[4],
+        json!({
+            "kind": "read_result",
+            "data": {"matching_animals": 600, "project": {"id": answer_id}},
+            "citations": [{"entity_type": "project", "entity_id": answer_id, "revision": 1}],
+        })
+    );
+    assert_eq!(last[0]["truncated"], true);
+    assert_eq!(last[0]["data"], Value::Null);
+    assert_eq!(
+        last[0]["truncation"]["reason"],
+        "compacted_for_input_budget"
+    );
+    assert!(
+        response
+            .context
+            .trim_reasons
+            .iter()
+            .any(|reason| reason == "tool_result_compacted")
+    );
+    assert!(response.citations.len() <= service.limits().max_citations);
+}
+
+#[tokio::test]
+async fn oversized_write_draft_keeps_the_full_draft_but_bounds_the_model_view() {
+    let project_id = Uuid::new_v4();
+    let provider = MockProvider::new(
+        "mock",
+        "model",
+        [
+            Ok(completion(
+                None,
+                vec![call(
+                    "call-1",
+                    ToolName::ExperimentGroupingDraft.as_str(),
+                    json!({"project_id": project_id}),
+                )],
+            )),
+            Ok(completion(Some("Grouping draft ready for review."), vec![])),
+        ],
+    );
+    let probe = provider.clone();
+    let executor = TestExecutor::new(move |request| {
+        let now = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+        let changes = (0..2_000)
+            .map(|index| FieldChange {
+                path: format!("/participations/{}", Uuid::new_v4()),
+                before: None,
+                after: Some(
+                    json!({"cohort": format!("group-{}", index % 4), "padding": "p".repeat(64)}),
+                ),
+            })
+            .collect();
+        let draft = WriteDraft::new(
+            DraftKind::ResearchPlan,
+            request.tool,
+            ProposalActor::Ai {
+                user_id: request.user_id,
+                tool_run_id: request.tool_run_id,
+            },
+            Some(project_id),
+            changes,
+            json!({"operation": "apply_experiment_grouping"}),
+            now,
+            now + Duration::hours(1),
+        )
+        .unwrap();
+        Ok(DomainToolOutput::write_draft(draft, vec![]))
+    });
+    let service = AssistantService::new(provider, executor)
+        .with_runtime_config(budget_runtime(8_192))
+        .unwrap();
+    let access = AccessGrant::local_user(ScopeSet::new([ToolScope::Read, ToolScope::WriteDraft]));
+
+    let response = service
+        .run(
+            AssistantRequest::new(Uuid::new_v4(), "group the project animals"),
+            &access,
+            ProviderCredentials::none(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.drafts.len(), 1);
+    assert_eq!(response.drafts[0].changes().len(), 2_000);
+    let requests = probe.requests().unwrap();
+    for request in &requests {
+        assert!(estimate_completion_input_tokens(request) <= 8_192);
+    }
+    let payload = &tool_payloads(&requests[1])[0];
+    assert_eq!(payload["kind"], "write_draft");
+    assert_eq!(payload["draft_id"], json!(response.drafts[0].id()));
+    assert_eq!(payload["truncated"], true);
+    assert!(payload["changes"].as_array().unwrap().len() < 2_000);
+}
+
+#[test]
+fn input_budget_compacts_current_turn_tool_results_before_failing() {
+    let mut messages = vec![
+        ChatMessage::system(SYSTEM_PROMPT),
+        ChatMessage::user("current question"),
+        ChatMessage::assistant_tool_calls(
+            None,
+            vec![call("call-1", ToolName::ResourceSearch.as_str(), json!({"resource": "animals"}))],
+        ),
+        ChatMessage::tool(
+            "call-1",
+            json!({"kind": "read_result", "data": {"payload": "x".repeat(30_000)}, "citations": []})
+                .to_string(),
+        ),
+    ];
+    let mut current_user_index = 1;
+    let mut context = ContextManagementTrace::default();
+
+    let estimate = enforce_input_budget(
+        &mut messages,
+        &mut current_user_index,
+        &[],
+        budget_runtime(2_048),
+        &mut context,
+    )
+    .unwrap();
+
+    assert!(estimate <= 2_048);
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call-1"));
+    let compacted: Value = serde_json::from_str(&messages[3].content).unwrap();
+    assert_eq!(compacted["kind"], "read_result");
+    assert_eq!(compacted["truncated"], true);
+    assert_eq!(compacted["data"], Value::Null);
+    assert_eq!(context.trim_reasons, vec!["tool_result_compacted"]);
+    assert_eq!(context.trimmed_history_turns, 0);
+}

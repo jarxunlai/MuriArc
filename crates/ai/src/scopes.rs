@@ -51,6 +51,8 @@ pub enum ToolName {
     GenotypingQuery,
     AnimalContext,
     ProjectContext,
+    /// Fixed-schema counts and grouped totals; never returns animal rows.
+    AnimalStatistics,
     ActivityQuery,
     AuditQuery,
     ProvenanceQuery,
@@ -79,6 +81,7 @@ impl ToolName {
             Self::GenotypingQuery => "genotyping_query",
             Self::AnimalContext => "animal_context",
             Self::ProjectContext => "project_context",
+            Self::AnimalStatistics => "animal_statistics",
             Self::ActivityQuery => "activity_query",
             Self::AuditQuery => "audit_query",
             Self::ProvenanceQuery => "provenance_query",
@@ -105,6 +108,7 @@ impl ToolName {
             "genotyping_query" => Some(Self::GenotypingQuery),
             "animal_context" => Some(Self::AnimalContext),
             "project_context" => Some(Self::ProjectContext),
+            "animal_statistics" => Some(Self::AnimalStatistics),
             "activity_query" => Some(Self::ActivityQuery),
             "audit_query" => Some(Self::AuditQuery),
             "provenance_query" => Some(Self::ProvenanceQuery),
@@ -146,6 +150,7 @@ impl ToolName {
             | Self::GenotypingQuery
             | Self::AnimalContext
             | Self::ProjectContext
+            | Self::AnimalStatistics
             | Self::ActivityQuery
             | Self::AuditQuery
             | Self::ProvenanceQuery

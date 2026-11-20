@@ -512,7 +512,7 @@ watch(currentProjectId, () => {
       </article>
     </section>
 
-    <n-modal :show="createOpen" preset="card" title="新建共享成员" class="modal-card" :mask-closable="!creating" @update:show="(show: boolean) => { if (!show) closeCreate() }">
+    <n-modal :show="createOpen" preset="card" title="新建共享成员" class="muri-dialog-md" :mask-closable="!creating" @update:show="(show: boolean) => { if (!show) closeCreate() }">
       <n-form label-placement="top">
         <div class="form-grid">
           <n-form-item label="显示名称"><n-input v-model:value="createForm.displayName" maxlength="200" /></n-form-item>
@@ -529,7 +529,7 @@ watch(currentProjectId, () => {
       <template #footer><div class="modal-actions"><n-button @click="closeCreate">取消</n-button><n-button type="primary" :loading="creating" @click="createUser">创建账号</n-button></div></template>
     </n-modal>
 
-    <n-modal :show="Boolean(profileTarget)" preset="card" title="编辑成员账号" class="confirm-card" :mask-closable="!profileSaving" @update:show="(show: boolean) => { if (!show) closeProfile() }">
+    <n-modal :show="Boolean(profileTarget)" preset="card" title="编辑成员账号" class="muri-dialog-sm" :mask-closable="!profileSaving" @update:show="(show: boolean) => { if (!show) closeProfile() }">
       <n-form label-placement="top">
         <n-form-item label="显示名称"><n-input v-model:value="profileForm.displayName" maxlength="200" /></n-form-item>
         <n-form-item label="登录邮箱"><n-input v-model:value="profileForm.email" maxlength="320" /></n-form-item>
@@ -538,7 +538,7 @@ watch(currentProjectId, () => {
       <template #footer><div class="modal-actions"><n-button @click="closeProfile">取消</n-button><n-button type="primary" :loading="profileSaving" @click="saveProfile">保存账号</n-button></div></template>
     </n-modal>
 
-    <n-modal :show="Boolean(resetTarget)" preset="card" title="强制重置密码" class="confirm-card" :mask-closable="!resetSaving" @update:show="(show: boolean) => { if (!show) closePasswordReset() }">
+    <n-modal :show="Boolean(resetTarget)" preset="card" title="强制重置密码" class="muri-dialog-sm" :mask-closable="!resetSaving" @update:show="(show: boolean) => { if (!show) closePasswordReset() }">
       <n-alert type="warning" :bordered="false" class="reset-alert">重置会立即撤销该用户全部 Session 与 external token，并要求下次登录修改临时密码。管理员不能查看原密码。</n-alert>
       <n-form label-placement="top">
         <n-form-item label="新临时密码"><n-input v-model:value="resetTemporaryPassword" type="password" show-password-on="click" autocomplete="new-password" maxlength="1024" /></n-form-item>
@@ -548,7 +548,7 @@ watch(currentProjectId, () => {
       <template #footer><div class="modal-actions"><n-button @click="closePasswordReset">取消</n-button><n-button type="primary" :loading="resetSaving" @click="resetPassword">确认重置</n-button></div></template>
     </n-modal>
 
-    <n-modal :show="Boolean(pending)" preset="card" :title="actionTitle" class="confirm-card" :mask-closable="!applying" @update:show="(show: boolean) => { if (!show) closePending() }">
+    <n-modal :show="Boolean(pending)" preset="card" :title="actionTitle" class="muri-dialog-sm" :mask-closable="!applying" @update:show="(show: boolean) => { if (!show) closePending() }">
       <template v-if="pending?.kind === 'project-add'">
         <n-form label-placement="top">
           <n-form-item label="科研项目"><n-select v-model:value="pending.projectId" :options="projectOptions" /></n-form-item>
@@ -571,7 +571,7 @@ watch(currentProjectId, () => {
 .role-block { min-width: 0; }.role-block label,.projects-block label { display: block; margin-bottom: 5px; color: var(--muri-text-secondary); font-size: 11px; font-weight: 600; }.role-block small { display: block; margin-top: 4px; color: var(--muri-text-tertiary); font-size: 11px; }
 .block-heading { display: flex; align-items: center; justify-content: space-between; }.block-heading button { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; }.project-grants { display: flex; flex-direction: column; gap: 5px; }.project-grant { display: grid; grid-template-columns: minmax(100px, 1fr) 118px 30px; align-items: center; gap: 6px; }.project-grant > span { overflow: hidden; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }.empty-grants { color: var(--muri-text-tertiary); font-size: 11px; }
 .member-actions { display: flex; align-self: stretch; justify-content: center; flex-direction: column; gap: 6px; }.member-actions button { width: 100%; }
-.modal-card { width: min(680px, calc(100vw - 28px)); }.confirm-card { width: min(480px, calc(100vw - 28px)); }.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }.form-grid :deep(.full-row) { grid-column: 1 / -1; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }.confirm-copy { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 16px; padding: 10px; color: var(--muri-text-secondary); background: var(--muri-primary-soft); font-size: 12px; }.confirm-copy svg { flex: 0 0 auto; color: var(--muri-primary); }.reset-alert { margin-bottom: 15px; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }.form-grid :deep(.full-row) { grid-column: 1 / -1; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }.confirm-copy { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 16px; padding: 10px; color: var(--muri-text-secondary); background: var(--muri-primary-soft); font-size: 12px; }.confirm-copy svg { flex: 0 0 auto; color: var(--muri-primary); }.reset-alert { margin-bottom: 15px; }
 .password-strength { display: grid; grid-template-columns: auto minmax(100px, 1fr); align-items: center; gap: 12px; margin: -10px 0 14px; color: var(--muri-text-tertiary); font-size: 11px; }.password-strength .n-progress { width: 100%; }
 @media (max-width: 1180px) { .member-card { grid-template-columns: minmax(240px, 1fr) minmax(180px, .8fr) 130px; }.projects-block { grid-column: 1 / -1; }.member-actions { grid-column: 3; grid-row: 1; } }
 @media (max-width: 900px) { .toolbar { gap: 8px; }.member-card { grid-template-columns: 1fr; gap: 13px; }.member-actions,.projects-block { grid-column: 1; grid-row: auto; justify-self: stretch; }.member-actions { flex-direction: row; flex-wrap: wrap; }.member-actions button { width: auto; flex: 1 1 120px; }.project-grant { grid-template-columns: minmax(90px, 1fr) 112px 30px; }.form-grid { grid-template-columns: 1fr; }.form-grid :deep(.n-form-item),.form-grid :deep(.full-row) { grid-column: 1 !important; } }

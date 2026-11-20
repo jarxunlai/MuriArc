@@ -1136,7 +1136,7 @@ onUnmounted(releaseImageComposer)
       :show="Boolean(releaseTarget)"
       preset="card"
       title="释放暂存文件？"
-      class="source-release-modal"
+      class="muri-dialog-sm"
       :mask-closable="releaseTarget
         ? !ai.messageSourceReleasing(releaseTarget.sourceId)
         : true"
@@ -1177,7 +1177,7 @@ onUnmounted(releaseImageComposer)
       v-model:show="autonomyModalOpen"
       preset="card"
       :title="autonomyModalPurpose === 'start' ? '以 Full 请求开始新会话' : '请求当前会话的 Full 模式'"
-      class="autonomy-modal"
+      class="autonomy-modal muri-dialog-sm"
       @after-leave="closeFullModal"
     >
       <n-alert type="warning" :bordered="false">
@@ -1225,7 +1225,7 @@ onUnmounted(releaseImageComposer)
       v-model:show="modelSwitchModalOpen"
       preset="card"
       title="使用所选模型开始新会话？"
-      class="autonomy-modal"
+      class="autonomy-modal muri-dialog-sm"
       @after-leave="cancelModelSwitch"
     >
       <n-alert type="warning" :bordered="false">
@@ -1286,8 +1286,8 @@ onUnmounted(releaseImageComposer)
 .composer-blocked { display: flex; max-width: 760px; min-width: 0; align-items: flex-start; gap: 6px; margin: 0 auto 8px; padding: 7px 9px; border: 1px solid var(--muri-warning-border); border-radius: var(--muri-radius-sm); color: var(--muri-warning-text); background: var(--muri-warning-soft); font-size: 11px; line-height: 1.45; }.composer-blocked svg { flex: 0 0 auto; margin-top: 1px; }
 .input-wrap { display: flex; align-items: flex-end; gap: 8px; max-width: 760px; margin: 0 auto; padding: 8px; border: 1px solid var(--muri-border-strong); border-radius: var(--muri-radius); transition: border-color var(--muri-transition-fast), box-shadow var(--muri-transition-fast); }.input-wrap:focus-within { border-color: var(--muri-primary); box-shadow: 0 0 0 3px rgba(15, 95, 170, 0.1); }.input-wrap textarea { flex: 1; min-height: 42px; max-height: 130px; padding: 3px 5px; resize: none; border: 0; outline: 0; color: var(--muri-text); background: transparent; line-height: 1.5; }.safety-note { display: flex; align-items: center; justify-content: center; gap: 5px; margin-top: 7px; color: var(--muri-text-tertiary); font-size: 11px; }
 .compact .message-list { padding: 16px 14px; }.compact .composer { padding: 10px 12px 12px; }.compact .suggestions { max-width: 100%; }
-.source-release-modal { width: min(520px, calc(100vw - 28px)); }.source-release-facts { display: grid; gap: 7px; margin: 13px 0 0; }.source-release-facts > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 7px 9px; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }.source-release-facts dt { color: var(--muri-text-tertiary); font-size: 11px; }.source-release-facts dd { margin: 0; overflow-wrap: anywhere; color: var(--muri-text); font-size: 11px; }
-.autonomy-modal { width: min(520px, calc(100vw - 28px)); }.autonomy-boundary-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }.autonomy-boundary-list span { padding: 4px 8px; border-radius: 999px; color: var(--muri-primary); background: var(--muri-primary-soft); font-size: 12px; }.autonomy-modal :deep(.n-checkbox) { margin-top: 14px; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.source-release-facts { display: grid; gap: 7px; margin: 13px 0 0; }.source-release-facts > div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 7px 9px; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }.source-release-facts dt { color: var(--muri-text-tertiary); font-size: 11px; }.source-release-facts dd { margin: 0; overflow-wrap: anywhere; color: var(--muri-text); font-size: 11px; }
+.autonomy-boundary-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0; }.autonomy-boundary-list span { padding: 4px 8px; border-radius: 999px; color: var(--muri-primary); background: var(--muri-primary-soft); font-size: 12px; }.autonomy-modal .n-checkbox { margin-top: 14px; }.modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .native-confirmation-note { display: flex; align-items: flex-start; gap: 6px; margin: 0 0 2px; color: var(--muri-text-secondary); font-size: 12px; line-height: 1.5; }.native-confirmation-note svg { flex: 0 0 auto; margin-top: 2px; color: var(--muri-primary); }
 .switch-boundaries { display: grid; gap: 7px; margin: 14px 0 0; padding-left: 22px; color: var(--muri-text-secondary); line-height: 1.55; }
 @keyframes soft-pulse { 50% { opacity: 0.55; } }

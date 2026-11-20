@@ -291,7 +291,7 @@ watch(currentProjectId, () => {
       </div>
     </transition>
 
-    <n-modal v-model:show="showAdd" preset="card" title="新增笼位" class="dialog-card" :bordered="false">
+    <n-modal v-model:show="showAdd" preset="card" title="新增笼位" class="muri-dialog-sm" :bordered="false">
       <n-form label-placement="top">
         <n-form-item label="笼位编号" required><n-input v-model:value="newCage.code" placeholder="例如 A04" /></n-form-item>
         <div class="form-grid"><n-form-item label="区域"><n-input v-model:value="newCage.room" /></n-form-item><n-form-item label="笼架"><n-input v-model:value="newCage.rack" /></n-form-item></div>
@@ -300,7 +300,7 @@ watch(currentProjectId, () => {
       <template #footer><div class="dialog-actions"><n-button @click="showAdd = false">取消</n-button><n-button type="primary" :loading="busy" @click="createCage">创建笼位</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showEdit" preset="card" :title="`编辑笼位 ${editingCage?.code ?? ''}`" class="dialog-card" :bordered="false">
+    <n-modal v-model:show="showEdit" preset="card" :title="`编辑笼位 ${editingCage?.code ?? ''}`" class="muri-dialog-sm" :bordered="false">
       <n-form label-placement="top">
         <n-form-item label="容量" :feedback="`当前在笼 ${editResidents} 只，容量不能低于在笼数量`">
           <n-input-number v-model:value="editForm.capacity" :min="1" :precision="0" aria-label="容量" />
@@ -327,7 +327,7 @@ watch(currentProjectId, () => {
       </template>
     </n-modal>
 
-    <n-modal v-model:show="showMove" preset="card" title="移动小鼠" class="dialog-card" :bordered="false">
+    <n-modal v-model:show="showMove" preset="card" title="移动小鼠" class="muri-dialog-sm" :bordered="false">
       <p class="move-copy">将 {{ selectedAnimalIds.length }} 只小鼠移动到：</p>
       <n-select v-model:value="moveTarget" filterable :options="targetOptions" aria-label="目标笼位" placeholder="选择目标笼位" />
       <template #footer><div class="dialog-actions"><n-button @click="showMove = false">取消</n-button><n-button type="primary" :disabled="!moveTarget" :loading="busy" @click="move()">确认移动</n-button></div></template>
@@ -373,7 +373,6 @@ watch(currentProjectId, () => {
 .selection-bar { position: fixed; z-index: 40; inset: auto 24px 22px calc(var(--muri-sidebar-width) + 24px); display: flex; width: fit-content; max-width: calc(100% - var(--muri-sidebar-width) - 48px); margin: auto; align-items: center; gap: 9px; padding: 9px 10px 9px 15px; border: 1px solid var(--muri-border-strong); border-radius: var(--muri-radius); background: white; box-shadow: var(--muri-shadow); }
 .selection-enter-active,.selection-leave-active { transition: opacity var(--muri-transition-panel), transform var(--muri-transition-panel); }
 .selection-enter-from,.selection-leave-to { opacity: 0; transform: translateY(8px); }
-.dialog-card { width: min(480px, calc(100vw - 28px)); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
 .edit-actions-spacer { flex: 1; }

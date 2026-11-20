@@ -40,6 +40,9 @@ Project users see only explicitly assigned animals and related research records.
 
 - No raw SQL, arbitrary URL fetching, arbitrary filesystem access, account/permission mutation, migration, or deployment control is exposed to the model.
 - Tool schemas are fixed and bounded. Authorization and scope are checked again at execution time.
+- A domain-tool rejection is returned to the model only when its code is on a fixed allowlist of correctable request problems (missing or malformed arguments, unknown identifiers, stale revisions, draft preconditions). The model receives the sanitized code and fixed guidance, never the rejected arguments or executor diagnostics. Such retries are bounded per turn and count against the tool-call limit. Authorization, scope (`*_forbidden`), autonomy, capability, unknown, and unavailable failures end the turn.
+- In a project-bound conversation the orchestrator fills an omitted `project_id` with the bound project and refuses any other project before dispatch. This is argument normalization only; the executor still authorizes the project and every other identifier.
+- Tool failures use their own stable codes (`ai_tool_rejected`, `ai_tool_unavailable`), distinct from Provider outages. Technical logs record only the tool name, sanitized code, and whether it was recoverable — never arguments. Rejected calls are persisted as failed tool runs with the same sanitized code.
 - Ask/Auto/Full autonomy never overrides human permission, project scope, researcher signing, reinforced approval, or operation-specific exclusions.
 - Model writes become reviewable drafts. Animal transfer/death, deletion, bulk import, user governance, research signing, image evidence approval, and technical-log deletion remain human operations.
 - Provider/model failures return stable sanitized diagnostics without echoing credentials, bodies, or internal database errors.

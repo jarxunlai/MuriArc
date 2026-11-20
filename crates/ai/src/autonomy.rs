@@ -34,6 +34,7 @@ impl AiActionPolicy {
             | ToolName::GenotypingQuery
             | ToolName::AnimalContext
             | ToolName::ProjectContext
+            | ToolName::AnimalStatistics
             | ToolName::ActivityQuery
             | ToolName::AuditQuery
             | ToolName::ProvenanceQuery

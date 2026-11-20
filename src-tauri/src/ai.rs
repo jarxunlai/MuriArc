@@ -796,6 +796,11 @@ impl DesktopAiError {
             "tool_call_limit_exceeded" => {
                 "AI 在完成任何工具结果前达到了受控工具调用上限，请缩小问题范围后重试".to_owned()
             }
+            "ai_tool_rejected" => {
+                "AI 请求的数据工具被拒绝（权限、范围或参数无法满足），未读取或修改任何数据"
+                    .to_owned()
+            }
+            "ai_tool_unavailable" => "AI 数据工具暂时不可用，未修改任何数据，请稍后重试".to_owned(),
             "model_selection_required" => "请选择一个可用的对话模型".to_owned(),
             "vision_model_selection_required" => {
                 "当前对话模型不支持视觉，请明确选择一个可用的视觉模型".to_owned()
@@ -1073,6 +1078,34 @@ mod tests {
             let error = DesktopAiError::Workflow(AiWorkflowError::Assistant(error));
             assert_eq!(error.code(), expected);
             assert!(!error.safe_message().contains("Provider"));
+        }
+    }
+
+    #[test]
+    fn domain_tool_failures_are_not_reported_as_provider_outages() {
+        let cases = [
+            (
+                muriarc_ai::ToolExecutionError::Rejected {
+                    code: "lab_registry_forbidden".to_owned(),
+                },
+                "ai_tool_rejected",
+            ),
+            (
+                muriarc_ai::ToolExecutionError::Unavailable,
+                "ai_tool_unavailable",
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let error = DesktopAiError::Workflow(AiWorkflowError::Assistant(
+                AssistantError::ToolExecution {
+                    tool: muriarc_ai::ToolName::ResourceSearch,
+                    source,
+                },
+            ));
+            assert_eq!(error.code(), expected);
+            assert!(!error.safe_message().contains("Provider"));
+            assert!(!error.safe_message().contains("lab_registry_forbidden"));
         }
     }
 

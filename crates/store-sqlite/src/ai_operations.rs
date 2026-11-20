@@ -479,10 +479,16 @@ fn validate_ai_turn_records(
                 ToolRunStatus::Completed => {
                     tool_run.completed_at.is_some() && tool_run.error.is_none()
                 }
-                ToolRunStatus::Pending
-                | ToolRunStatus::Running
-                | ToolRunStatus::Failed
-                | ToolRunStatus::Cancelled => false,
+                // A rejected model tool call: terminal, with its sanitized
+                // failure code, and never bound to an approval.
+                ToolRunStatus::Failed => {
+                    tool_run.completed_at.is_some()
+                        && tool_run
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| !error.trim().is_empty())
+                }
+                ToolRunStatus::Pending | ToolRunStatus::Running | ToolRunStatus::Cancelled => false,
             };
         if tool_run.id.is_nil()
             || tool_run.conversation_id != Some(user_message.conversation_id)

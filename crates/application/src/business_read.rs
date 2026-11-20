@@ -21,6 +21,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod animal_statistics;
+
+pub use animal_statistics::*;
+
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 100;
 const MAX_OFFSET: u32 = 10_000;

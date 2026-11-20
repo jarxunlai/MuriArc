@@ -626,7 +626,32 @@ async fn run_turn(
         )
         .await
         .map_err(|error| workflow_error(error, &metadata))?;
+    log_tool_failures(&response, &metadata);
     Ok(item(response, &metadata))
+}
+
+/// Records sanitized tool failures of a turn that still returned a response
+/// (recovered, or incomplete with preserved progress). Only the tool name,
+/// sanitized code, and recoverability are logged — never arguments.
+fn log_tool_failures(response: &AssistantTurnResponse, metadata: &RequestMetadata) {
+    for failure in &response.tool_failures {
+        if failure.recoverable {
+            tracing::info!(
+                request_id = %metadata.request_id,
+                tool = failure.tool.as_str(),
+                code = %failure.code,
+                "AI domain tool rejection was returned to the model"
+            );
+        } else {
+            tracing::warn!(
+                request_id = %metadata.request_id,
+                tool = failure.tool.as_str(),
+                code = %failure.code,
+                incomplete_reason = ?response.incomplete_reason,
+                "AI domain tool failure ended the turn with preserved progress"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1743,6 +1768,32 @@ fn workflow_error(error: AiWorkflowError, metadata: &RequestMetadata) -> ApiErro
             "tool_call_limit_exceeded",
             "the AI reached its bounded tool-call limit before completing any tool result",
         ),
+        AiWorkflowError::Assistant(AssistantError::ToolExecution { tool, source }) => {
+            let tool_code = source.code();
+            tracing::warn!(
+                request_id = %metadata.request_id,
+                tool = tool.as_str(),
+                code = tool_code,
+                // A correctable code only ends a turn once the bounded retry
+                // budget is spent; anything else was terminal on its own.
+                retry_budget_exhausted = source.is_recoverable(),
+                "AI domain tool failure ended the turn before any tool result"
+            );
+            let details = json!({"tool": tool.as_str(), "toolCode": tool_code});
+            match source {
+                muriarc_ai::ToolExecutionError::Rejected { .. } => ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "ai_tool_rejected",
+                    "a MuriArc data tool rejected the AI request; no data was read or changed",
+                ),
+                muriarc_ai::ToolExecutionError::Unavailable => ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ai_tool_unavailable",
+                    "a MuriArc data tool is temporarily unavailable; no data was changed",
+                ),
+            }
+            .with_details(details)
+        }
         AiWorkflowError::Assistant(error) => {
             tracing::warn!(kind = ?error, "AI provider or tool execution failed");
             ApiError::new(
@@ -1905,6 +1956,26 @@ mod tests {
             "choices": [{
                 "message": {"content": content, "tool_calls": []},
                 "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+        })
+        .to_string()
+    }
+
+    fn tool_call_response(id: &str, call_id: &str, tool: ToolName, arguments: Value) -> String {
+        json!({
+            "id": id,
+            "model": "conversation-test-model",
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": tool.as_str(), "arguments": arguments.to_string()}
+                    }]
+                },
+                "finish_reason": "tool_calls"
             }],
             "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
         })
@@ -2104,6 +2175,56 @@ mod tests {
             let payload: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(payload["error"]["code"], expected_code);
             assert_eq!(payload["error"]["request_id"], "limit-request");
+        }
+    }
+
+    #[tokio::test]
+    async fn domain_tool_failures_are_not_reported_as_provider_outages() {
+        let metadata = RequestMetadata {
+            request_id: "tool-failure-request".to_owned(),
+            reason: None,
+        };
+        let cases = [
+            (
+                muriarc_ai::ToolExecutionError::Rejected {
+                    code: "lab_registry_forbidden".to_owned(),
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ai_tool_rejected",
+                "lab_registry_forbidden",
+            ),
+            (
+                muriarc_ai::ToolExecutionError::Rejected {
+                    code: "SELECT secret FROM users".to_owned(),
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "ai_tool_rejected",
+                "rejected",
+            ),
+            (
+                muriarc_ai::ToolExecutionError::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ai_tool_unavailable",
+                "tool_unavailable",
+            ),
+        ];
+        for (source, status, code, tool_code) in cases {
+            let response = workflow_error(
+                AiWorkflowError::Assistant(AssistantError::ToolExecution {
+                    tool: ToolName::ResourceSearch,
+                    source,
+                }),
+                &metadata,
+            )
+            .into_response();
+            assert_eq!(response.status(), status);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["error"]["code"], code);
+            assert_eq!(payload["error"]["request_id"], "tool-failure-request");
+            assert_eq!(payload["error"]["details"]["tool"], "resource_search");
+            assert_eq!(payload["error"]["details"]["toolCode"], tool_code);
+            assert!(!payload.to_string().contains("SELECT"));
         }
     }
 
@@ -4022,6 +4143,106 @@ mod tests {
         );
         handle.join().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn create_route_test_project(fixture: &ConversationFixture, name: &str) -> Project {
+        let project = Project::new(fixture.principal.lab_id, name, Utc::now()).unwrap();
+        fixture
+            .store
+            .create_project(&project, &AuditContext::system(WriteSource::Migration))
+            .await
+            .unwrap();
+        project
+    }
+
+    #[tokio::test]
+    async fn project_bound_turn_defaults_an_omitted_project_id_for_project_scoped_tools() {
+        let (base_url, captured, handle) = spawn_provider_sequence(vec![
+            tool_call_response(
+                "bound-search",
+                "bound-search-call",
+                ToolName::ResourceSearch,
+                json!({"resource": "animals", "query": "0714-A9"}),
+            ),
+            chat_response(
+                "bound-final",
+                "conversation-test-model",
+                "No animal named 0714-A9 is assigned to this project.",
+            ),
+        ]);
+        let fixture = ConversationFixture::with_vision_runtime(base_url, true).await;
+        let project = create_route_test_project(&fixture, "Bound route project").await;
+
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({
+                    "projectId": project.id,
+                    "message": "动物 0714-A9 的性别、出生日期、当前笼位和基因型分别是什么？"
+                })),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert!(response["data"].get("incompleteReason").is_none());
+        assert!(response["data"].get("toolFailures").is_none());
+        let tool_run = &response["data"]["toolRuns"][0];
+        assert_eq!(tool_run["tool"], "resource_search");
+        assert_eq!(tool_run["arguments"]["project_id"], project.id.to_string());
+        let tool_run_id: Uuid = tool_run["tool_run_id"].as_str().unwrap().parse().unwrap();
+        let persisted = fixture.store.get_tool_run(tool_run_id).await.unwrap();
+        assert_eq!(persisted.status, ToolRunStatus::Completed);
+        assert_eq!(persisted.input["project_id"], project.id.to_string());
+
+        let requests = captured.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("read_result"));
+    }
+
+    #[tokio::test]
+    async fn terminal_tool_rejection_returns_ai_tool_rejected_instead_of_bad_gateway() {
+        let (base_url, captured, handle) = spawn_provider_sequence(vec![tool_call_response(
+            "registry-search",
+            "registry-search-call",
+            ToolName::ResourceSearch,
+            json!({"resource": "breeding_lines"}),
+        )]);
+        let fixture = ConversationFixture::with_vision_runtime(base_url, true).await;
+        let project = create_route_test_project(&fixture, "Registry-bound project").await;
+
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(fixture.session_request(
+                Method::POST,
+                "/api/v1/ai/turns",
+                Some(json!({
+                    "projectId": project.id,
+                    "message": "List every breeding line in the lab"
+                })),
+            ))
+            .await
+            .unwrap();
+
+        // A project-bound turn never reads the lab registry. The refusal is a
+        // domain decision, not an unreachable provider.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let payload = response_json(response).await;
+        assert_eq!(payload["error"]["code"], "ai_tool_rejected");
+        assert_eq!(payload["error"]["details"]["tool"], "resource_search");
+        assert_eq!(
+            payload["error"]["details"]["toolCode"],
+            "lab_registry_forbidden"
+        );
+        let requests = captured.recv_timeout(StdDuration::from_secs(2)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(requests.len(), 1, "authorization refusals are not retried");
     }
 
     #[tokio::test]

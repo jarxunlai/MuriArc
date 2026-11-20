@@ -5760,6 +5760,26 @@ where
         error: None,
         meta: RecordMeta::new(now + Duration::milliseconds(4)),
     };
+    // A rejected model tool call is kept as a terminal failed record with a
+    // sanitized code. It never has an approval.
+    let failed_tool = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        conversation_id: Some(conversation.id),
+        lab_id: lab.id,
+        project_id: Some(project.id),
+        user_id: user.id,
+        tool_name: "resource_search".to_owned(),
+        input: serde_json::json!({"resource": "animals", "limit": 500}),
+        output: Some(serde_json::json!({
+            "failure": {"code": "limit_out_of_range", "recoverable": true},
+        })),
+        status: ToolRunStatus::Failed,
+        source: WriteSource::Ai,
+        started_at: Some(now + Duration::milliseconds(3)),
+        completed_at: Some(now + Duration::milliseconds(3)),
+        error: Some("limit_out_of_range".to_owned()),
+        meta: RecordMeta::new(now + Duration::milliseconds(3)),
+    };
     let pending_approval = Approval {
         id: uuid::Uuid::new_v4(),
         tool_run_id: awaiting_tool.id,
@@ -5802,7 +5822,11 @@ where
         .append_ai_turn_records(
             &tool_user_message,
             &tool_assistant_message,
-            &[completed_tool.clone(), awaiting_tool.clone()],
+            &[
+                completed_tool.clone(),
+                awaiting_tool.clone(),
+                failed_tool.clone(),
+            ],
             std::slice::from_ref(&pending_approval),
             2,
             &audit,
@@ -5813,6 +5837,10 @@ where
     assert_eq!(
         store.get_tool_run(completed_tool.id).await.unwrap(),
         completed_tool
+    );
+    assert_eq!(
+        store.get_tool_run(failed_tool.id).await.unwrap(),
+        failed_tool
     );
     assert_eq!(
         store.get_tool_run(awaiting_tool.id).await.unwrap(),
@@ -5837,6 +5865,7 @@ where
     for (entity_id, entity_type) in [
         (completed_tool.id, EntityType::ToolRun),
         (awaiting_tool.id, EntityType::ToolRun),
+        (failed_tool.id, EntityType::ToolRun),
         (pending_approval.id, EntityType::Approval),
     ] {
         let entries = store
@@ -5930,6 +5959,66 @@ where
             entity: "ai_tool_run",
             id,
         }) if id == missing_approval_tool.id
+    ));
+
+    // Failed turn records must be terminal and carry their failure code.
+    for invalid_failed_tool in [
+        ToolRun {
+            id: uuid::Uuid::new_v4(),
+            error: None,
+            ..failed_tool.clone()
+        },
+        ToolRun {
+            id: uuid::Uuid::new_v4(),
+            completed_at: None,
+            ..failed_tool.clone()
+        },
+        ToolRun {
+            id: uuid::Uuid::new_v4(),
+            error: Some(String::new()),
+            ..failed_tool.clone()
+        },
+    ] {
+        assert!(matches!(
+            store
+                .append_ai_turn_records(
+                    &rejected_user,
+                    &rejected_assistant,
+                    std::slice::from_ref(&invalid_failed_tool),
+                    &[],
+                    4,
+                    &audit,
+                )
+                .await,
+            Err(StoreError::Validation(_))
+        ));
+        assert!(matches!(
+            store.get_tool_run(invalid_failed_tool.id).await,
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+    // An approval can never be bound to a failed tool run.
+    let failed_with_approval = ToolRun {
+        id: uuid::Uuid::new_v4(),
+        ..failed_tool.clone()
+    };
+    let approval_for_failed = Approval {
+        id: uuid::Uuid::new_v4(),
+        tool_run_id: failed_with_approval.id,
+        ..pending_approval.clone()
+    };
+    assert!(matches!(
+        store
+            .append_ai_turn_records(
+                &rejected_user,
+                &rejected_assistant,
+                std::slice::from_ref(&failed_with_approval),
+                std::slice::from_ref(&approval_for_failed),
+                4,
+                &audit,
+            )
+            .await,
+        Err(StoreError::Validation(_))
     ));
 
     let wrong_source_tool = ToolRun {

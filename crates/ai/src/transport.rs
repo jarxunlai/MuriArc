@@ -10,7 +10,7 @@ use muriarc_core::{
 use crate::{
     ApprovalRequirement, AssistantIncompleteReason, AssistantResponse, AssistantUsage, Citation,
     ContextManagementTrace, DraftKind, DraftStatus, FieldChange, ImportCommitDraftPayload,
-    ImportDraftPreviewSummary, ToolRunTrace, WriteDraft,
+    ImportDraftPreviewSummary, ToolFailureTrace, ToolRunTrace, WriteDraft,
 };
 
 /// Stable request contract shared by Tauri commands and `/api/v1/ai/turns`.
@@ -62,6 +62,11 @@ pub struct AssistantTurnResponse {
     pub content: String,
     pub citations: Vec<Citation>,
     pub tool_runs: Vec<ToolRunTrace>,
+    /// Sanitized domain-tool rejections in dispatch order. Absent when every
+    /// call produced a result and for responses persisted by older MuriArc
+    /// versions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_failures: Vec<ToolFailureTrace>,
     pub drafts: Vec<WriteDraftSummary>,
     pub trace: AssistantTrace,
     /// Absent for complete responses and for responses persisted by older
@@ -363,6 +368,7 @@ impl AssistantTurnResponse {
             content: response.content,
             citations: response.citations,
             tool_runs: response.tool_runs,
+            tool_failures: response.tool_failures,
             drafts: response
                 .drafts
                 .iter()

@@ -594,8 +594,11 @@ export interface AiDiagnostics {
 export interface AiLabSettings {
   enabled: boolean
   customUrlApprovalRequired: boolean
+  /** Active users whose default conversation model profile is selectable at runtime. */
   configuredUserCount: number
+  /** Configured users whose default conversation model can be called (key stored or local transport). */
   enabledUserCount: number
+  /** Active users whose default vision model profile supports vision and can be called. */
   visionUserCount: number
   revision: number
   maxAutonomyMode: AiAutonomyMode

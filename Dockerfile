@@ -91,9 +91,11 @@ RUN --mount=type=cache,id=muriarc-cargo-registry,target=/usr/local/cargo/registr
 
 # The public Tester image is intentionally separate from the signed Server
 # runtime. Formal consumers continue to build the `runtime` target above
-# unchanged. Pin the minimal Alpine rootfs and add only CA roots; BusyBox wget
+# unchanged. Pin the minimal Alpine rootfs and keep only CA roots; BusyBox wget
 # provides the local readiness probe without shipping curl or a package manager
-# from a general-purpose Debian runtime.
+# from a general-purpose Debian runtime. The static musl Server uses rustls and
+# reads the CA bundle file, so after setup the stage removes apk-tools and
+# ssl_client, which also purges the unused OpenSSL libraries they pull in.
 FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce AS tester-runtime
 ARG MURIARC_IMAGE_SOURCE=https://github.com/jarxunlai/MuriArc
 ARG MURIARC_IMAGE_REVISION
@@ -105,11 +107,12 @@ LABEL org.opencontainers.image.title="MuriArc Server Docker Tester" \
       org.opencontainers.image.version="$MURIARC_IMAGE_VERSION" \
       org.opencontainers.image.licenses="Apache-2.0"
 RUN apk upgrade --no-cache \
-    && apk add --no-cache ca-certificates \
+    && apk add --no-cache ca-certificates-bundle \
     && addgroup -S -g 10001 muriarc \
     && adduser -S -D -H -u 10001 -G muriarc -s /sbin/nologin muriarc \
     && mkdir -p /opt/muriarc/ui /opt/muriarc/fixtures/standard-v1 /var/lib/muriarc \
-    && chown -R muriarc:muriarc /opt/muriarc /var/lib/muriarc
+    && chown -R muriarc:muriarc /opt/muriarc /var/lib/muriarc \
+    && apk del --no-cache --purge apk-tools ssl_client
 COPY --from=tester-build --chown=root:root /tmp/muriarc-server-tester /usr/local/bin/muriarc-server
 COPY --from=tester-build --chown=root:root /tmp/muriarc-standard-fixture-tester /usr/local/bin/muriarc-standard-fixture
 COPY --from=ui-build --chown=muriarc:muriarc /workspace/ui/dist/ /opt/muriarc/ui/

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -13,6 +14,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = ROOT / "deploy/server-tester"
 HEX64 = r"[0-9a-f]{64}"
+# The static musl Server uses rustls, so the Tester runtime keeps only the CA
+# bundle file. OpenSSL and the package manager that depends on it must be gone.
+FORBIDDEN_IMAGE_PACKAGE = re.compile(r"^(?:apk-tools|libapk\d*|ssl_client|libssl\d*|libcrypto\d*)$")
+REQUIRED_IMAGE_PACKAGES = ("busybox", "ca-certificates-bundle")
+CA_BUNDLE_PATH = "/etc/ssl/certs/ca-certificates.crt"
 SECRET_PATTERNS = {
     "private-key": re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     "github-token": re.compile(rb"gh[pousr]_[A-Za-z0-9_]{20,}"),
@@ -34,9 +40,73 @@ def forbid(text: str, tokens: list[str], label: str, errors: list[str]) -> None:
             errors.append(f"{label}: forbidden {token!r}")
 
 
+def tester_runtime_errors(dockerfile: str) -> list[str]:
+    """Check that the Tester runtime stage drops OpenSSL and the package manager."""
+    _, marker, stage = dockerfile.partition("AS tester-runtime")
+    if not marker:
+        return ["Dockerfile: missing tester-runtime stage"]
+    instructions = "\n".join(
+        line for line in stage.splitlines() if not line.lstrip().startswith("#")
+    )
+    errors: list[str] = []
+    if re.search(r"\bca-certificates\b(?!-bundle)", instructions):
+        errors.append("tester-runtime: install ca-certificates-bundle, not ca-certificates (links libcrypto3)")
+    require(instructions, [
+        "apk add --no-cache ca-certificates-bundle",
+        "apk del --no-cache --purge apk-tools ssl_client",
+    ], "tester-runtime", errors)
+    return errors
+
+
+def apk_installed_packages(installed_db: str) -> list[str]:
+    return [line[2:] for line in installed_db.splitlines() if line.startswith("P:")]
+
+
+def image_errors(installed_db: str, ca_bundle_present: bool) -> list[str]:
+    packages = apk_installed_packages(installed_db)
+    if not packages:
+        return ["image: apk database lists no packages"]
+    errors = [
+        f"image: forbidden package {name!r} is installed"
+        for name in packages
+        if FORBIDDEN_IMAGE_PACKAGE.match(name)
+    ]
+    errors.extend(
+        f"image: required package {name!r} is missing"
+        for name in REQUIRED_IMAGE_PACKAGES
+        if name not in packages
+    )
+    if not ca_bundle_present:
+        errors.append(f"image: {CA_BUNDLE_PATH} is missing or empty")
+    return errors
+
+
+def inspect_image(reference: str) -> dict[str, object]:
+    def run(*command: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["docker", "run", "--rm", "--pull", "never", "--network", "none", "--entrypoint", command[0],
+             reference, *command[1:]],
+            capture_output=True, text=True, check=False,
+        )
+
+    database = run("/bin/cat", "/lib/apk/db/installed")
+    if database.returncode != 0:
+        errors = [f"image: cannot read apk database: {database.stderr.strip()}"]
+        return {"reference": reference, "status": "FAIL", "packages": [], "errors": errors}
+    ca_bundle = run("/bin/sh", "-c", f"test -s {CA_BUNDLE_PATH}")
+    errors = image_errors(database.stdout, ca_bundle_present=ca_bundle.returncode == 0)
+    return {
+        "reference": reference,
+        "status": "PASS" if not errors else "FAIL",
+        "packages": sorted(apk_installed_packages(database.stdout)),
+        "errors": errors,
+    }
+
+
 def static_errors() -> list[str]:
     errors: list[str] = []
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    errors.extend(tester_runtime_errors(dockerfile))
     compose = (DEPLOY / "compose.yaml.in").read_text(encoding="utf-8")
     shell = (DEPLOY / "muriarc-tester.sh").read_text(encoding="utf-8")
     bootstrap = (DEPLOY / "compose.bootstrap.yaml").read_text(encoding="utf-8")
@@ -115,6 +185,7 @@ def scan_zip(path: Path) -> dict[str, object]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bundle", type=Path)
+    parser.add_argument("--image", help="locally pulled Tester image reference to inspect")
     parser.add_argument("--report", type=Path)
     return parser.parse_args()
 
@@ -132,6 +203,12 @@ def main() -> int:
         report["artifact"] = artifact
         if artifact["status"] != "PASS":
             errors.append("bundle archive security scan failed")
+            report["status"] = "FAIL"
+    if args.image:
+        image = inspect_image(args.image)
+        report["image"] = image
+        if image["status"] != "PASS":
+            errors.extend(image["errors"])
             report["status"] = "FAIL"
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)

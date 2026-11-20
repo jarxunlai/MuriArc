@@ -95,6 +95,7 @@ jobs:
           test "$(docker image inspect "$ref" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')" = \
             "${{ steps.identity.outputs.source_commit }}"
           test "$(docker image inspect "$ref" --format '{{ index .Config.Labels "org.opencontainers.image.licenses" }}')" = Apache-2.0
+          python3 scripts/check_server_tester.py --image "$ref"
 
       - name: Static Tester contracts
         run: |

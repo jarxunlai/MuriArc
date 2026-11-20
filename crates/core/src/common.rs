@@ -202,6 +202,10 @@ pub enum DomainError {
     DuplicateAnimalSelection,
     #[error("animal transfer cannot contain more than {maximum} animals")]
     TransferSelectionTooLarge { maximum: usize },
+    #[error("placing an animal into a cage must use the animal transfer command")]
+    CagePlacementRequiresTransfer,
+    #[error("moving an animal out must name the cage it currently occupies")]
+    MoveOutSourceMismatch,
     #[error("experiment can only be completed or cancelled while it is open")]
     ExperimentNotOpen,
     #[error("experiment lifecycle target must be completed or cancelled")]

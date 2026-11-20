@@ -28,6 +28,59 @@ fn event_updates_current_projection_and_revision() {
 }
 
 #[test]
+fn generic_append_only_records_moving_out_of_the_current_cage() {
+    let cage_id = Uuid::new_v4();
+    let other_cage_id = Uuid::new_v4();
+    let mut animal = Animal::new_mouse(Uuid::new_v4(), "M003", Sex::Male, now()).unwrap();
+    animal.current_cage_id = Some(cage_id);
+    let (lab_id, animal_id) = (animal.lab_id, animal.id);
+    let transfer = |from_cage_id, to_cage_id| {
+        AnimalEvent::new(
+            lab_id,
+            animal_id,
+            AnimalEventKind::Transferred {
+                from_cage_id,
+                to_cage_id,
+            },
+            now(),
+            now(),
+        )
+    };
+
+    assert_eq!(
+        transfer(Some(cage_id), None).validate_generic_append(&animal),
+        Ok(())
+    );
+    for to_cage_id in [cage_id, other_cage_id] {
+        assert_eq!(
+            transfer(Some(cage_id), Some(to_cage_id)).validate_generic_append(&animal),
+            Err(DomainError::CagePlacementRequiresTransfer)
+        );
+    }
+    for from_cage_id in [None, Some(other_cage_id)] {
+        assert_eq!(
+            transfer(from_cage_id, None).validate_generic_append(&animal),
+            Err(DomainError::MoveOutSourceMismatch)
+        );
+    }
+    animal.current_cage_id = None;
+    assert_eq!(
+        transfer(None, None).validate_generic_append(&animal),
+        Err(DomainError::MoveOutSourceMismatch)
+    );
+    let note = AnimalEvent::new(
+        animal.lab_id,
+        animal.id,
+        AnimalEventKind::Note {
+            body: "unaffected".to_owned(),
+        },
+        now(),
+        now(),
+    );
+    assert_eq!(note.validate_generic_append(&animal), Ok(()));
+}
+
+#[test]
 fn terminal_animal_cannot_be_revived() {
     let mut animal = Animal::new_mouse(Uuid::new_v4(), "M002", Sex::Female, now()).unwrap();
     let death = AnimalEvent::new(

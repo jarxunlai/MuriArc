@@ -1634,6 +1634,74 @@ pub async fn run_store_contract(store: &dyn MuriArcStore) {
             })
     );
 
+    // Placing an animal into a cage changes that cage's occupancy, so only
+    // `transfer_animals` (which locks and validates the target cage) may do
+    // it. The generic append path refuses every cage placement — including
+    // one that would overbook the now-full `target` and one into a valid
+    // empty cage — and only records a move out of the animal's current cage.
+    let unhoused_animal = Animal::new_mouse(
+        lab.id,
+        format!("M-{}", uuid::Uuid::new_v4()),
+        Sex::Female,
+        now,
+    )
+    .unwrap();
+    store.create_animal(&unhoused_animal, &audit).await.unwrap();
+    let housed_animal = store.get_animal(animal.id).await.unwrap();
+    assert_eq!(housed_animal.current_cage_id, Some(target.id));
+    let housed_event_count = store.list_animal_events(animal.id).await.unwrap().len();
+    let unhoused_event_count = store
+        .list_animal_events(unhoused_animal.id)
+        .await
+        .unwrap()
+        .len();
+    let other_lab_cage = Cage::new(
+        other_lab.id,
+        "X",
+        format!("C-{}", uuid::Uuid::new_v4()),
+        now,
+    )
+    .unwrap();
+    store.create_cage(&other_lab_cage, &audit).await.unwrap();
+    for (subject, from_cage_id, to_cage_id) in [
+        (&unhoused_animal, None, Some(target.id)),
+        (&housed_animal, Some(target.id), Some(undersized_target.id)),
+        (&housed_animal, Some(target.id), Some(target.id)),
+        (&unhoused_animal, None, Some(other_lab_cage.id)),
+        (&housed_animal, Some(undersized_target.id), None),
+        (&housed_animal, None, None),
+        (&unhoused_animal, None, None),
+    ] {
+        let event = AnimalEvent::new(
+            lab.id,
+            subject.id,
+            AnimalEventKind::Transferred {
+                from_cage_id,
+                to_cage_id,
+            },
+            now,
+            now,
+        );
+        let result = store.append_animal_event(&event, &audit).await;
+        assert!(
+            matches!(result, Err(StoreError::Validation(_))),
+            "generic append must reject transfer {from_cage_id:?} -> {to_cage_id:?}, got {result:?}"
+        );
+        assert_eq!(store.get_animal(subject.id).await.unwrap(), *subject);
+    }
+    assert_eq!(
+        store.list_animal_events(animal.id).await.unwrap().len(),
+        housed_event_count
+    );
+    assert_eq!(
+        store
+            .list_animal_events(unhoused_animal.id)
+            .await
+            .unwrap()
+            .len(),
+        unhoused_event_count
+    );
+
     let template = ExperimentTemplateVersion::draft(
         lab.id,
         format!("contract-template-{}", uuid::Uuid::new_v4()),

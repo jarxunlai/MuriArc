@@ -60,7 +60,7 @@ SQLite 和 PostgreSQL adapter 实现相同 Store contract，并运行共享合�
 - 实验入组同时保存 Participation 与当时采用的基因鉴定证据快照；
 - 批准测量或鉴定批次时保留人工审批、证据关系和 Provenance。
 
-Transport 禁止用多个无关 Store 调用模拟这些事务。
+Transport 禁止用多个无关 Store 调用模拟这些事务。通用动物事件追加也不能替代转笼：它拒绝任何把动物放入笼位的事件，移出笼位时必须写明动物当前所在笼位。
 
 ## 数据与资产边界
 

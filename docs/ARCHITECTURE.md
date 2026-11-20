@@ -60,7 +60,7 @@ One scientific intent is one transaction. For example:
 - experiment enrollment stores the participation and the genotype evidence snapshot used at that time;
 - approved measurement or genotyping-batch writes preserve human approval, evidence links, and provenance.
 
-Transport code may never emulate these transactions with a sequence of unrelated Store calls.
+Transport code may never emulate these transactions with a sequence of unrelated Store calls. The generic animal-event append is not a substitute for transfer either: it rejects any event that places an animal into a cage, and a move-out must name the cage the animal currently occupies.
 
 ## Data and asset boundaries
 

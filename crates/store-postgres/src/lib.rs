@@ -3684,6 +3684,9 @@ impl MuriArcStore for PostgresStore {
                 "animal event belongs to a different lab".to_owned(),
             ));
         }
+        event
+            .validate_generic_append(&animal)
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
         let before = snapshot(&animal)?;
         animal
             .apply_event(event)

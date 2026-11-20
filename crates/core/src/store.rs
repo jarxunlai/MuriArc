@@ -257,6 +257,12 @@ pub trait MuriArcStore: crate::WorkspaceStore + crate::AiOperationStore + Send +
         project_id: Option<Uuid>,
         ids: &[Uuid],
     ) -> StoreResult<Vec<Animal>>;
+    /// Appends one lifecycle event and advances the animal projection.
+    ///
+    /// Rejects (`StoreError::Validation`) any `Transferred` event that places
+    /// the animal into a cage; use [`MuriArcStore::transfer_animals`], which
+    /// locks and validates the target cage. A move-out (`to_cage_id: None`)
+    /// must name the animal's current cage as `from_cage_id`.
     async fn append_animal_event(
         &self,
         event: &AnimalEvent,

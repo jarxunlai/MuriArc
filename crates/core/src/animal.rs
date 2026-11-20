@@ -353,6 +353,30 @@ impl AnimalEvent {
             notes: None,
         }
     }
+
+    /// Checks an event submitted through the generic append path
+    /// (`MuriArcStore::append_animal_event`) against the animal as read inside
+    /// that write transaction.
+    ///
+    /// Placing an animal into a cage changes that cage's occupancy, so it must
+    /// use `MuriArcStore::transfer_animals`, which locks the target cage and
+    /// validates its lab, active state and capacity. The generic path only
+    /// records moving an animal out of the cage it currently occupies.
+    pub fn validate_generic_append(&self, animal: &Animal) -> Result<(), DomainError> {
+        if let AnimalEventKind::Transferred {
+            from_cage_id,
+            to_cage_id,
+        } = &self.kind
+        {
+            if to_cage_id.is_some() {
+                return Err(DomainError::CagePlacementRequiresTransfer);
+            }
+            if from_cage_id.is_none() || *from_cage_id != animal.current_cage_id {
+                return Err(DomainError::MoveOutSourceMismatch);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Atomic command for moving one or more animals into a cage.

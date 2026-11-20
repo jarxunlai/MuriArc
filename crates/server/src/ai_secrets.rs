@@ -1162,6 +1162,21 @@ mod postgres {
         }
     }
 
+    /// Credential state of the current version of one default model profile.
+    #[derive(Debug, Clone, Copy)]
+    struct DefaultProfileReadiness {
+        credential_stored: bool,
+        credential_required: bool,
+    }
+
+    impl DefaultProfileReadiness {
+        /// Mirrors the `MissingCredential` rule in `resolve_profile`: only
+        /// OpenAI-compatible transports require a stored key.
+        fn usable(self) -> bool {
+            self.credential_stored || !self.credential_required
+        }
+    }
+
     pub struct AiMasterKey {
         bytes: Zeroizing<Vec<u8>>,
         version: i32,
@@ -3020,6 +3035,81 @@ mod postgres {
             })
         }
 
+        /// Reads the default conversation (or vision) profile with the same
+        /// ownership, archive, version, and vision filters that `resolve` and
+        /// `resolve_vision` apply, without decrypting its credential.
+        async fn default_profile_readiness(
+            &self,
+            user_id: Uuid,
+            lab_id: Uuid,
+            vision: bool,
+        ) -> Result<Option<DefaultProfileReadiness>, AiProviderStoreError> {
+            let Some(row) = sqlx::query(
+                "SELECT v.transport,
+                        EXISTS(
+                            SELECT 1
+                            FROM ai_model_profile_secrets s
+                            WHERE s.profile_id = p.id AND s.profile_version = v.version
+                        ) AS credential_stored
+                 FROM ai_user_model_defaults d
+                 JOIN ai_model_profiles p
+                   ON p.id = CASE
+                       WHEN $3 THEN d.default_vision_profile_id
+                       ELSE d.default_conversation_profile_id
+                   END
+                  AND p.user_id = d.user_id
+                  AND p.lab_id = $2
+                  AND p.archived_at IS NULL
+                  AND p.deleted_at IS NULL
+                 JOIN ai_model_profile_versions v
+                   ON v.profile_id = p.id AND v.version = p.current_version
+                  AND (NOT $3 OR v.supports_vision)
+                 WHERE d.user_id = $1 AND d.deleted_at IS NULL",
+            )
+            .bind(user_id)
+            .bind(lab_id)
+            .bind(vision)
+            .fetch_optional(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)?
+            else {
+                return Ok(None);
+            };
+            let transport = Self::transport_from_db(
+                row.try_get::<String, _>("transport")
+                    .map_err(|_| AiProviderStoreError::Storage)?
+                    .as_str(),
+            )?;
+            Ok(Some(DefaultProfileReadiness {
+                credential_stored: row
+                    .try_get("credential_stored")
+                    .map_err(|_| AiProviderStoreError::Storage)?,
+                credential_required: transport == AiProviderTransport::OpenAiCompatible,
+            }))
+        }
+
+        async fn has_active_model_profile(
+            &self,
+            user_id: Uuid,
+            lab_id: Uuid,
+        ) -> Result<bool, AiProviderStoreError> {
+            sqlx::query_scalar(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM ai_model_profiles
+                    WHERE user_id = $1
+                      AND lab_id = $2
+                      AND archived_at IS NULL
+                      AND deleted_at IS NULL
+                 )",
+            )
+            .bind(user_id)
+            .bind(lab_id)
+            .fetch_one(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)
+        }
+
         async fn row(
             &self,
             user_id: Uuid,
@@ -3869,29 +3959,36 @@ mod postgres {
             if actual_lab != Some(lab_id) {
                 return Err(AiProviderStoreError::Storage);
             }
-            let row = self.row(user_id).await?;
+            // The legacy settings row only contributes its per-user switch.
+            // Provider, credential, and vision state come from the default
+            // model profiles, which is what `resolve` actually uses; legacy
+            // saves materialize those profiles, so both paths are covered.
+            let legacy_row = self.row(user_id).await?;
             let lab_enabled = self.lab_enabled(lab_id).await?;
-            let user_enabled = row
+            let user_enabled = legacy_row
                 .as_ref()
                 .and_then(|value| value.try_get("enabled").ok())
                 .unwrap_or(true);
-            let credential_configured = row
-                .as_ref()
-                .and_then(|value| {
-                    value
-                        .try_get::<Option<Vec<u8>>, _>("secret_ciphertext")
-                        .ok()
-                })
-                .flatten()
-                .is_some();
+            let conversation = self
+                .default_profile_readiness(user_id, lab_id, false)
+                .await?;
+            let vision = self
+                .default_profile_readiness(user_id, lab_id, true)
+                .await?;
             let status = if !lab_enabled {
                 "lab_disabled"
             } else if !user_enabled {
                 "user_disabled"
-            } else if !credential_configured {
-                "waiting_for_personal_api_key"
+            } else if let Some(profile) = conversation {
+                if profile.usable() {
+                    "ready"
+                } else {
+                    "waiting_for_personal_api_key"
+                }
+            } else if self.has_active_model_profile(user_id, lab_id).await? {
+                "waiting_for_default_model"
             } else {
-                "ready"
+                "waiting_for_personal_api_key"
             };
             let (local_endpoint_count, cloud_endpoint_count) = self.endpoint_counts(lab_id).await?;
             Ok(AiProviderDiagnosticsView {
@@ -3900,19 +3997,13 @@ mod postgres {
                 user_enabled,
                 provider_presets_available: true,
                 status: status.to_owned(),
-                provider_configured: row.is_some(),
+                provider_configured: conversation.is_some(),
                 provider_enabled: user_enabled,
-                credential_configured,
-                supports_vision: row
-                    .as_ref()
-                    .and_then(|value| value.try_get("supports_vision").ok())
-                    .unwrap_or(false),
-                text_model_configured: true,
-                vision_model_configured: row
-                    .as_ref()
-                    .and_then(|value| value.try_get::<Option<String>, _>("vision_model").ok())
-                    .flatten()
-                    .is_some(),
+                credential_configured: conversation
+                    .is_some_and(|profile| profile.credential_stored),
+                supports_vision: vision.is_some(),
+                text_model_configured: conversation.is_some(),
+                vision_model_configured: vision.is_some_and(DefaultProfileReadiness::usable),
                 local_endpoint_count,
                 cloud_endpoint_count,
             })
@@ -7339,6 +7430,238 @@ mod postgres {
             .unwrap();
             assert_eq!(persisted.0, "local_http");
             assert_eq!(persisted.1, base_url);
+        }
+
+        async fn diagnostics_fixture(
+            database_url: &str,
+            label: &str,
+        ) -> (PostgresStore, Lab, User, PostgresAiProviderStore) {
+            let postgres = PostgresStore::connect(database_url).await.unwrap();
+            postgres.migrate().await.unwrap();
+            let now = Utc::now();
+            let bootstrap = AuditContext::system(WriteSource::Migration);
+            let lab = Lab::new(
+                format!("AI diagnostics {label} lab {}", Uuid::new_v4()),
+                now,
+            )
+            .unwrap();
+            postgres.create_lab(&lab, &bootstrap).await.unwrap();
+            let user = User::new(
+                lab.id,
+                format!("ai-diagnostics-{label}-{}@example.test", Uuid::new_v4()),
+                "AI diagnostics researcher",
+                now,
+            )
+            .unwrap();
+            postgres.create_user(&user, &bootstrap).await.unwrap();
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
+            (postgres, lab, user, store)
+        }
+
+        async fn legacy_settings_rows(postgres: &PostgresStore, user: &User) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM ai_provider_settings WHERE user_id = $1")
+                .bind(user.id)
+                .fetch_one(postgres.pool())
+                .await
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn diagnostics_follow_default_model_profiles_without_legacy_settings() {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
+                return;
+            };
+            let (postgres, lab, user, store) =
+                diagnostics_fixture(&database_url, "profile-only").await;
+            let created = store
+                .create_model_profile(
+                    user.id,
+                    model_input(
+                        "Conversation and vision",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "deepseek-chat",
+                        Some("profile-only-diagnostics-key"),
+                        None,
+                    ),
+                    &user_audit(&user, "diagnostics-profile-only-create"),
+                )
+                .await
+                .unwrap();
+            assert!(created.has_key);
+            assert_eq!(legacy_settings_rows(&postgres, &user).await, 0);
+
+            let without_default = store.diagnostics(user.id, lab.id).await.unwrap();
+            assert_eq!(without_default.status, "waiting_for_default_model");
+            assert!(!without_default.provider_configured);
+            assert!(!without_default.credential_configured);
+            assert!(!without_default.text_model_configured);
+            assert!(!without_default.supports_vision);
+            assert!(!without_default.vision_model_configured);
+
+            store
+                .save_model_defaults(
+                    user.id,
+                    SaveAiModelDefaultsInput {
+                        default_conversation_profile_id: Some(created.id),
+                        default_vision_profile_id: Some(created.id),
+                        expected_revision: 0,
+                    },
+                    &user_audit(&user, "diagnostics-profile-only-defaults"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(legacy_settings_rows(&postgres, &user).await, 0);
+            let ready = store.diagnostics(user.id, lab.id).await.unwrap();
+            assert_eq!(ready.status, "ready");
+            assert!(ready.runtime_configured);
+            assert!(ready.lab_enabled);
+            assert!(ready.user_enabled);
+            assert!(ready.provider_configured);
+            assert!(ready.provider_enabled);
+            assert!(ready.credential_configured);
+            assert!(ready.text_model_configured);
+            assert!(ready.supports_vision);
+            assert!(ready.vision_model_configured);
+            assert!(store.resolve(user.id).await.is_ok());
+            assert!(store.resolve_vision(user.id).await.is_ok());
+
+            store
+                .clear_model_profile_key(
+                    user.id,
+                    created.id,
+                    &user_audit(&user, "diagnostics-profile-only-clear-key"),
+                )
+                .await
+                .unwrap();
+            let missing_key = store.diagnostics(user.id, lab.id).await.unwrap();
+            assert_eq!(missing_key.status, "waiting_for_personal_api_key");
+            assert!(missing_key.provider_configured);
+            assert!(!missing_key.credential_configured);
+            assert!(missing_key.text_model_configured);
+            assert!(missing_key.supports_vision);
+            assert!(!missing_key.vision_model_configured);
+            assert!(matches!(
+                store.resolve(user.id).await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+        }
+
+        #[tokio::test]
+        async fn diagnostics_follow_legacy_settings_saves() {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
+                return;
+            };
+            let (postgres, lab, user, store) =
+                diagnostics_fixture(&database_url, "legacy-only").await;
+            let saved = store
+                .save(
+                    user.id,
+                    settings_input(
+                        "deepseek",
+                        "deepseek-chat",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        Some("legacy-only-diagnostics-key"),
+                    ),
+                    &user_audit(&user, "diagnostics-legacy-only-save"),
+                )
+                .await
+                .unwrap();
+            assert!(saved.has_key);
+            assert_eq!(legacy_settings_rows(&postgres, &user).await, 1);
+            let ready = store.diagnostics(user.id, lab.id).await.unwrap();
+            assert_eq!(ready.status, "ready");
+            assert!(ready.user_enabled);
+            assert!(ready.provider_configured);
+            assert!(ready.provider_enabled);
+            assert!(ready.credential_configured);
+            assert!(ready.text_model_configured);
+            assert!(!ready.supports_vision);
+            assert!(!ready.vision_model_configured);
+
+            store
+                .clear_key(user.id, &user_audit(&user, "diagnostics-legacy-only-clear"))
+                .await
+                .unwrap();
+            let missing_key = store.diagnostics(user.id, lab.id).await.unwrap();
+            assert_eq!(missing_key.status, "waiting_for_personal_api_key");
+            assert!(missing_key.provider_configured);
+            assert!(!missing_key.credential_configured);
+            assert!(matches!(
+                store.resolve(user.id).await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+
+            let local_user = User::new(
+                lab.id,
+                format!("ai-diagnostics-local-{}@example.test", Uuid::new_v4()),
+                "AI diagnostics local researcher",
+                Utc::now(),
+            )
+            .unwrap();
+            postgres
+                .create_user(&local_user, &AuditContext::system(WriteSource::Migration))
+                .await
+                .unwrap();
+            let local_audit = user_audit(&local_user, "diagnostics-legacy-only-local-save");
+            let base_url = "http://127.0.0.1:11434/v1";
+            let endpoint = store
+                .save_provider_endpoint(
+                    lab.id,
+                    None,
+                    SaveAiProviderEndpointInput {
+                        provider_kind: ProviderKind::LocalHttp,
+                        protocol: AiProviderProtocol::OpenaiChatCompletions,
+                        label: "Diagnostics local gateway".to_owned(),
+                        base_url: base_url.to_owned(),
+                        enabled: true,
+                    },
+                    &local_audit,
+                )
+                .await
+                .unwrap();
+            let mut local_input =
+                settings_input(&endpoint.id.to_string(), "local-model", base_url, None);
+            local_input.provider_kind = ProviderKind::LocalHttp;
+            store
+                .save(local_user.id, local_input, &local_audit)
+                .await
+                .unwrap();
+            let local_ready = store.diagnostics(local_user.id, lab.id).await.unwrap();
+            assert_eq!(local_ready.status, "ready");
+            assert!(local_ready.provider_configured);
+            assert!(!local_ready.credential_configured);
+            assert!(local_ready.text_model_configured);
+            assert!(store.resolve(local_user.id).await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn diagnostics_report_unconfigured_user_without_profiles_or_legacy_settings() {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
+                return;
+            };
+            let (postgres, lab, user, store) = diagnostics_fixture(&database_url, "none").await;
+            assert_eq!(legacy_settings_rows(&postgres, &user).await, 0);
+            assert!(
+                store
+                    .list_model_profiles(user.id, true)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let diagnostics = store.diagnostics(user.id, lab.id).await.unwrap();
+            assert_eq!(diagnostics.status, "waiting_for_personal_api_key");
+            assert!(diagnostics.runtime_configured);
+            assert!(diagnostics.lab_enabled);
+            assert!(diagnostics.user_enabled);
+            assert!(!diagnostics.provider_configured);
+            assert!(!diagnostics.credential_configured);
+            assert!(!diagnostics.text_model_configured);
+            assert!(!diagnostics.supports_vision);
+            assert!(!diagnostics.vision_model_configured);
+            assert!(matches!(
+                store.resolve(user.id).await,
+                Err(AiProviderStoreError::ProviderNotSelected)
+            ));
         }
 
         #[tokio::test]

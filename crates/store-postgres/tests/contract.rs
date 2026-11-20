@@ -10,8 +10,8 @@ use muriarc_core::{
         run_ai_conversation_contract, run_ai_conversation_source_retention_contract,
         run_ai_experiment_grouping_contract, run_ai_import_commit_atomicity_contract,
         run_ai_measurement_approval_contract, run_ai_model_profile_contract,
-        run_genotyping_batch_contract, run_import_source_archive_contract,
-        run_research_extensions_contract, run_store_contract,
+        run_cage_management_contract, run_genotyping_batch_contract,
+        run_import_source_archive_contract, run_research_extensions_contract, run_store_contract,
     },
 };
 use muriarc_store_postgres::PostgresStore;
@@ -580,6 +580,15 @@ async fn postgres_store_obeys_research_extensions_contract_when_configured() {
     run_research_extensions_contract(&store).await;
     assert_corrupted_second_evidence_rolls_back(&store, "contract-atomic-approval", true).await;
     assert_corrupted_second_evidence_rolls_back(&store, "contract-atomic-rejection", false).await;
+}
+
+#[tokio::test]
+async fn postgres_store_obeys_cage_management_contract_when_configured() {
+    let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
+        return;
+    };
+    let store = PostgresStore::connect(&database_url).await.unwrap();
+    run_cage_management_contract(&store).await;
 }
 
 #[tokio::test]

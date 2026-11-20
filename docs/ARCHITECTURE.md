@@ -55,11 +55,12 @@ One scientific intent is one transaction. For example:
 
 - animal registration writes the Animal, lifecycle event, Audit, and Provenance together;
 - transfer locks and validates source/target cages, advances the Animal revision, writes the event, and records Audit atomically;
+- a cage edit or archival locks the cage, checks its revision, counts current residents under that lock (a resize may not drop below them; only an empty cage may be archived), and writes the new revision and Audit together;
 - registering an offspring draft creates the Animal, both pedigree relations, lifecycle history, Audit, and Provenance in one commit;
 - experiment enrollment stores the participation and the genotype evidence snapshot used at that time;
 - approved measurement or genotyping-batch writes preserve human approval, evidence links, and provenance.
 
-Transport code may never emulate these transactions with a sequence of unrelated Store calls.
+Transport code may never emulate these transactions with a sequence of unrelated Store calls. The generic animal-event append is not a substitute for transfer either: it rejects any event that places an animal into a cage, and a move-out must name the cage the animal currently occupies.
 
 ## Data and asset boundaries
 

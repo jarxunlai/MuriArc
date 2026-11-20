@@ -35,9 +35,9 @@ pub use measurement::{
     MeasurementImportValue, preview_measurements, preview_measurements_with_cancel,
 };
 pub use plan::{
-    CageDirectory, DirectoryError, DirectoryResolution, GeneticDirectory, ImportPlanBuildError,
-    ImportPlanContext, MeasurementImportPlanContext, build_animal_import_plan,
-    build_measurement_import_plan,
+    CageDirectory, CageOccupancy, DirectoryError, DirectoryResolution, GeneticDirectory,
+    ImportPlanBuildError, ImportPlanContext, MeasurementImportPlanContext,
+    build_animal_import_plan, build_measurement_import_plan,
 };
 
 use std::{

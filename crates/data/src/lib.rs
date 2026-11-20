@@ -53,13 +53,14 @@ use muriarc_core::{
 };
 use muriarc_importer::{
     AnimalDirectory, AnimalExportFilter, AnimalExportOptions, AnimalExportRecord, CageDirectory,
-    ExportAnimalStatus, ExportCage, ExportGenotype, ExportGenotypingState, ExportSex, FieldMapping,
-    GeneticDirectory, ImportError, ImportIssue, ImportPlanContext, ImportPreview, IssueSeverity,
-    MeasurementCatalog, MeasurementDefinition, MeasurementFieldMapping,
-    MeasurementImportPlanContext, MeasurementImportPreview, MeasurementImportValue,
-    MeasurementValueType, TabularData, build_animal_import_plan, build_measurement_import_plan,
-    export_animals_csv_with_options, export_animals_xlsx_with_options,
-    preview_animals_with_directory, preview_measurements, read_csv, read_xlsx,
+    CageOccupancy, ExportAnimalStatus, ExportCage, ExportGenotype, ExportGenotypingState,
+    ExportSex, FieldMapping, GeneticDirectory, ImportError, ImportIssue, ImportPlanContext,
+    ImportPreview, IssueSeverity, MeasurementCatalog, MeasurementDefinition,
+    MeasurementFieldMapping, MeasurementImportPlanContext, MeasurementImportPreview,
+    MeasurementImportValue, MeasurementValueType, TabularData, build_animal_import_plan,
+    build_measurement_import_plan, export_animals_csv_with_options,
+    export_animals_xlsx_with_options, preview_animals_with_directory, preview_measurements,
+    read_csv, read_xlsx,
 };
 use muriarc_snapshot::{
     BundleEntry, EntryKind, SnapshotError, SnapshotManifest, sha256_hex, write_bundle,
@@ -1080,14 +1081,21 @@ async fn animal_import_directories(
             .map(|animal| (animal.display_id.clone(), animal.id)),
     )
     .map_err(|error| DataError::Directory(error.to_string()))?;
-    let cages = CageDirectory::from_entries(
-        store
-            .list_cages(lab_id)
-            .await?
-            .into_iter()
-            .map(|cage| (cage.section, cage.display_id, cage.id)),
-    )
-    .map_err(|error| DataError::Directory(error.to_string()))?;
+    // `list_animals` returns every non-deleted animal in the lab, which is the
+    // same resident set the store's transactional capacity guard counts.
+    let mut residents = BTreeMap::<Uuid, usize>::new();
+    for cage_id in animals.iter().filter_map(|animal| animal.current_cage_id) {
+        *residents.entry(cage_id).or_default() += 1;
+    }
+    let mut cages = CageDirectory::default();
+    for cage in store.list_cages(lab_id).await? {
+        // Both schemas enforce `capacity > 0`; a non-positive value is rejected.
+        let capacity = usize::try_from(cage.capacity).unwrap_or_default();
+        let resident_count = residents.get(&cage.id).copied().unwrap_or_default();
+        CageOccupancy::new(capacity, resident_count)
+            .and_then(|occupancy| cages.insert(cage.section, cage.display_id, cage.id, occupancy))
+            .map_err(|error| DataError::Directory(error.to_string()))?;
+    }
     let loci = store.list_gene_loci(lab_id).await?;
     let mut alleles = Vec::new();
     for locus in &loci {

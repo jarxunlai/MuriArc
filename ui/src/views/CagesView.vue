@@ -10,13 +10,14 @@ import {
   NInput,
   NInputNumber,
   NModal,
+  NPopconfirm,
   NProgress,
   NSelect,
   NSkeleton,
   NSpin,
   useMessage,
 } from 'naive-ui'
-import { Plus, RefreshCw, Search, UsersRound } from '@lucide/vue'
+import { Archive, Pencil, Plus, RefreshCw, Search, UsersRound } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { Animal, Cage } from '@/domain/models'
 import { gateway } from '@/services/gateway'
@@ -40,6 +41,13 @@ const busy = ref(false)
 const highlightedCage = ref<string | null>(null)
 let highlightTimer: number | undefined
 const newCage = reactive({ code: '', room: 'SPF-A', rack: 'R1', capacity: 5 })
+const editingCage = ref<Cage | null>(null)
+const showEdit = ref(false)
+const editForm = reactive<{ capacity: number | null; rack: string; sortOrder: number | null }>({
+  capacity: null,
+  rack: '',
+  sortOrder: null,
+})
 const canManageCages = computed(() => gateway.mode === 'local' || hasLabRegistryAccess())
 const accessContext = computed(() => currentProjectId.value
   ? { projectId: currentProjectId.value }
@@ -62,6 +70,14 @@ const filteredCages = computed(() => {
 const attentionCount = computed(() => cages.value.filter((cage) => cage.status === 'attention').length)
 const totalAnimals = computed(() => cages.value.reduce((sum, cage) => sum + cage.animalIds.length, 0))
 const unassignedAnimals = computed(() => animals.value.filter((animal) => !animal.cageId))
+const editResidents = computed(() => editingCage.value?.animalIds.length ?? 0)
+const editChanged = computed(() => {
+  const cage = editingCage.value
+  if (!cage) return false
+  return editForm.capacity !== cage.capacity
+    || editForm.rack.trim() !== (cage.location ?? '')
+    || editForm.sortOrder !== (cage.sortOrder ?? 0)
+})
 
 async function load() {
   loading.value = true
@@ -128,6 +144,52 @@ async function createCage() {
   finally { busy.value = false }
 }
 
+function openEdit(cage: Cage) {
+  editingCage.value = cage
+  editForm.capacity = cage.capacity
+  editForm.rack = cage.location ?? ''
+  editForm.sortOrder = cage.sortOrder ?? 0
+  showEdit.value = true
+}
+
+async function saveCage() {
+  const cage = editingCage.value
+  if (!cage) return
+  // Only a resize is checked, mirroring the server: legacy cages that are
+  // already over capacity can still be relocated without resizing.
+  if (!editForm.capacity || (editForm.capacity !== cage.capacity && editForm.capacity < editResidents.value)) {
+    message.warning(`容量不能低于当前在笼数量（${editResidents.value}）`)
+    return
+  }
+  busy.value = true
+  try {
+    await gateway.updateCage({
+      id: cage.id,
+      expectedRevision: cage.revision,
+      capacity: editForm.capacity,
+      rack: editForm.rack.trim(),
+      sortOrder: editForm.sortOrder ?? 0,
+    })
+    showEdit.value = false
+    await load()
+    message.success(`笼位 ${cage.code} 已更新`)
+  } catch (error) { message.error(error instanceof Error ? error.message : '保存失败') }
+  finally { busy.value = false }
+}
+
+async function archiveCage() {
+  const cage = editingCage.value
+  if (!cage || editResidents.value) return
+  busy.value = true
+  try {
+    await gateway.archiveCage({ id: cage.id, expectedRevision: cage.revision })
+    showEdit.value = false
+    await load()
+    message.success(`笼位 ${cage.code} 已归档`)
+  } catch (error) { message.error(error instanceof Error ? error.message : '归档失败') }
+  finally { busy.value = false }
+}
+
 onMounted(load)
 onUnmounted(() => {
   if (highlightTimer !== undefined) window.clearTimeout(highlightTimer)
@@ -183,7 +245,12 @@ watch(currentProjectId, () => {
         >
           <header>
             <div><span class="cage-code muri-id">{{ cage.code }}</span><small>{{ cage.room }} · {{ cage.rack }}</small></div>
-            <span class="cage-status" :class="`is-${cage.status}`"><i aria-hidden="true" />{{ cage.status === 'attention' ? '需关注' : cage.status === 'empty' ? '空笼' : '正常' }}</span>
+            <div class="cage-header-side">
+              <span class="cage-status" :class="`is-${cage.status}`"><i aria-hidden="true" />{{ cage.status === 'attention' ? '需关注' : cage.status === 'empty' ? '空笼' : '正常' }}</span>
+              <n-button v-if="canManageCages" quaternary circle size="tiny" class="cage-edit" :aria-label="`编辑笼位 ${cage.code}`" :title="`编辑笼位 ${cage.code}`" @click="openEdit(cage)">
+                <template #icon><Pencil :size="14" /></template>
+              </n-button>
+            </div>
           </header>
           <div class="capacity-row"><span>{{ cage.summary }}</span><strong>{{ canManageCages ? `${cage.animalIds.length} / ${cage.capacity}` : `项目内 ${cage.animalIds.length} 只` }}</strong></div>
           <n-progress type="line" :percentage="Math.round(cage.animalIds.length / cage.capacity * 100)" :show-indicator="false" :height="3" color="var(--muri-text-secondary)" rail-color="var(--muri-surface-sunken)" />
@@ -233,6 +300,33 @@ watch(currentProjectId, () => {
       <template #footer><div class="dialog-actions"><n-button @click="showAdd = false">取消</n-button><n-button type="primary" :loading="busy" @click="createCage">创建笼位</n-button></div></template>
     </n-modal>
 
+    <n-modal v-model:show="showEdit" preset="card" :title="`编辑笼位 ${editingCage?.code ?? ''}`" class="dialog-card" :bordered="false">
+      <n-form label-placement="top">
+        <n-form-item label="容量" :feedback="`当前在笼 ${editResidents} 只，容量不能低于在笼数量`">
+          <n-input-number v-model:value="editForm.capacity" :min="1" :precision="0" aria-label="容量" />
+        </n-form-item>
+        <div class="form-grid">
+          <n-form-item label="笼架"><n-input v-model:value="editForm.rack" placeholder="留空表示未设置" aria-label="笼架" /></n-form-item>
+          <n-form-item label="排序"><n-input-number v-model:value="editForm.sortOrder" :precision="0" placeholder="0" aria-label="排序" /></n-form-item>
+        </div>
+      </n-form>
+      <template #footer>
+        <div class="dialog-actions">
+          <n-popconfirm positive-text="归档" negative-text="取消" :disabled="editResidents > 0" @positive-click="archiveCage">
+            <template #trigger>
+              <n-button quaternary size="small" class="archive-trigger" :disabled="editResidents > 0 || busy" :title="editResidents > 0 ? '请先转出笼内动物再归档' : undefined">
+                <template #icon><Archive :size="15" /></template>归档笼位
+              </n-button>
+            </template>
+            归档后该笼位不再出现在笼位视图中，历史转笼记录与审计保留。
+          </n-popconfirm>
+          <span class="edit-actions-spacer" />
+          <n-button @click="showEdit = false">取消</n-button>
+          <n-button type="primary" :disabled="!editChanged" :loading="busy" @click="saveCage">保存</n-button>
+        </div>
+      </template>
+    </n-modal>
+
     <n-modal v-model:show="showMove" preset="card" title="移动小鼠" class="dialog-card" :bordered="false">
       <p class="move-copy">将 {{ selectedAnimalIds.length }} 只小鼠移动到：</p>
       <n-select v-model:value="moveTarget" filterable :options="targetOptions" aria-label="目标笼位" placeholder="选择目标笼位" />
@@ -261,6 +355,8 @@ watch(currentProjectId, () => {
 .cage-card.highlighted { border-color: var(--muri-primary); box-shadow: 0 0 0 3px rgba(15,95,170,.14); }
 .cage-card header { display: flex; align-items: flex-start; justify-content: space-between; }
 .cage-card header > div { display: flex; flex-direction: column; }
+.cage-card header > .cage-header-side { flex-direction: row; align-items: center; gap: 4px; }
+.cage-edit { color: var(--muri-text-tertiary); }
 .cage-code { font-size: 16px; font-weight: 600; }
 .cage-card header small { margin-top: 2px; color: var(--muri-text-tertiary); }
 .capacity-row { display: flex; justify-content: space-between; gap: 8px; margin: 14px 0 7px; color: var(--muri-text-secondary); font-size: 12px; }
@@ -280,6 +376,8 @@ watch(currentProjectId, () => {
 .dialog-card { width: min(480px, calc(100vw - 28px)); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
+.edit-actions-spacer { flex: 1; }
+.archive-trigger { color: var(--muri-text-secondary); }
 .move-copy { margin: 0 0 12px; color: var(--muri-text-secondary); }
 @media (max-width: 900px) {
   .toolbar { grid-template-columns: 1fr 130px; }

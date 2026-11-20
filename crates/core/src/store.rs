@@ -6,10 +6,10 @@ use uuid::Uuid;
 
 use crate::{
     Animal, AnimalEvent, AnimalOverview, AnimalStatus, AnimalTransfer, AuditContext, AuditEntry,
-    Cage, Experiment, ExperimentStatus, ImportCommitOptions, ImportCommitResult, ImportPlan, Lab,
-    Measurement, Membership, Participation, ParticipationStatus, Pedigree, Project,
-    ProjectAnimalAssignment, ProjectAnimalAssignmentRemoval, Provenance, ProvenanceSource, Sample,
-    User,
+    Cage, CageUpdate, Experiment, ExperimentStatus, ImportCommitOptions, ImportCommitResult,
+    ImportPlan, Lab, Measurement, Membership, Participation, ParticipationStatus, Pedigree,
+    Project, ProjectAnimalAssignment, ProjectAnimalAssignmentRemoval, Provenance, ProvenanceSource,
+    Sample, User,
 };
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -26,6 +26,18 @@ pub enum StoreError {
     Database(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+}
+
+impl StoreError {
+    /// Maps a rejected cage rule. Occupancy rules depend on current residents
+    /// and are state conflicts; malformed edits remain validation errors.
+    pub fn from_cage_rule(error: crate::DomainError) -> Self {
+        match error {
+            crate::DomainError::CageCapacityBelowResidents { .. }
+            | crate::DomainError::CageNotEmpty { .. } => Self::Conflict(error.to_string()),
+            error => Self::Validation(error.to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +203,27 @@ pub trait MuriArcStore: crate::WorkspaceStore + crate::AiOperationStore + Send +
     ) -> StoreResult<Vec<ProjectAnimalAssignment>>;
 
     async fn create_cage(&self, cage: &Cage, audit: &AuditContext) -> StoreResult<()>;
+    /// Applies a housing edit to an active cage of `update.lab_id`.
+    ///
+    /// Implementations lock the cage, reject a stale `expected_revision` with
+    /// `Conflict`, count current residents under that lock, reject a changed
+    /// capacity below that count with `Conflict`, and write the revision and
+    /// Audit in one transaction. Archived or cross-lab cages are `NotFound`.
+    async fn update_cage(&self, update: &CageUpdate, audit: &AuditContext) -> StoreResult<Cage>;
+    /// Soft-deletes an active cage of `lab_id` that houses no animal.
+    ///
+    /// The resident check, revision guard and Audit share one transaction so
+    /// a concurrent transfer cannot land in an archived cage. A non-empty
+    /// cage or stale revision is `Conflict`; archived or cross-lab cages are
+    /// `NotFound`.
+    async fn archive_cage(
+        &self,
+        lab_id: Uuid,
+        id: Uuid,
+        expected_revision: i64,
+        archived_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Cage>;
     async fn get_cage(&self, id: Uuid) -> StoreResult<Cage>;
     async fn list_cages(&self, lab_id: Uuid) -> StoreResult<Vec<Cage>>;
     async fn list_cages_for_project(
@@ -224,6 +257,12 @@ pub trait MuriArcStore: crate::WorkspaceStore + crate::AiOperationStore + Send +
         project_id: Option<Uuid>,
         ids: &[Uuid],
     ) -> StoreResult<Vec<Animal>>;
+    /// Appends one lifecycle event and advances the animal projection.
+    ///
+    /// Rejects (`StoreError::Validation`) any `Transferred` event that places
+    /// the animal into a cage; use [`MuriArcStore::transfer_animals`], which
+    /// locks and validates the target cage. A move-out (`to_cage_id: None`)
+    /// must name the animal's current cage as `from_cage_id`.
     async fn append_animal_event(
         &self,
         event: &AnimalEvent,

@@ -7,8 +7,14 @@ export interface Cage {
   id: string
   code: string
   room: string
+  /** Display label for the stored location ('未设置' when empty). */
   rack: string
+  /** Stored location as persisted; `rack` is only its display label. */
+  location?: string | null
   capacity: number
+  sortOrder?: number
+  /** Optimistic-concurrency revision required by cage edits and archival. */
+  revision: number
   animalIds: string[]
   status: CageStatus
   summary: string

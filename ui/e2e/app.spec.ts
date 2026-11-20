@@ -67,6 +67,35 @@ test('可以创建空笼且刷新后的视图立即可见', async ({ page }) => 
   await expect(card).toContainText('空笼')
 })
 
+test('可以调整笼位容量与笼架，并只归档空笼', async ({ page }) => {
+  await page.goto('/#/cages')
+  const dialog = page.getByRole('dialog')
+
+  // A01 houses four animals: archival stays unavailable until they are moved out.
+  await page.getByRole('button', { name: '编辑笼位 A01' }).click()
+  await expect(dialog).toContainText('当前在笼 4 只')
+  await expect(dialog.getByRole('button', { name: '归档笼位' })).toBeDisabled()
+  await dialog.getByRole('button', { name: '取消' }).click()
+  await expect(dialog).toBeHidden()
+
+  await page.getByRole('button', { name: '编辑笼位 A03' }).click()
+  const saveButton = dialog.getByRole('button', { name: '保存' })
+  await expect(saveButton).toBeDisabled()
+  await dialog.locator('input').nth(0).fill('8')
+  await dialog.locator('input').nth(1).fill('R5')
+  await saveButton.click()
+  await expect(page.getByText('笼位 A03 已更新')).toBeVisible()
+  const card = page.locator('.cage-card').filter({ hasText: 'A03' })
+  await expect(card).toContainText('SPF-A · R5')
+  await expect(card).toContainText('0 / 8')
+
+  await page.getByRole('button', { name: '编辑笼位 A03' }).click()
+  await dialog.getByRole('button', { name: '归档笼位' }).click()
+  await page.getByRole('button', { name: '归档', exact: true }).click()
+  await expect(page.getByText('笼位 A03 已归档')).toBeVisible()
+  await expect(page.locator('.cage-card').filter({ hasText: 'A03' })).toHaveCount(0)
+})
+
 test('可以通过真实 Gateway 入口登记新动物', async ({ page }, testInfo) => {
   await page.goto('/#/animals')
   await page.getByRole('button', { name: '新增小鼠' }).click()

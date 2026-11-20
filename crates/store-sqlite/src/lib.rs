@@ -1056,6 +1056,42 @@ pub(crate) async fn insert_provenance_tx(
     Ok(())
 }
 
+/// Loads an active cage of `lab_id` inside a write transaction. Cages of other
+/// labs are reported as missing so their existence is not disclosed.
+async fn active_cage_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    lab_id: Uuid,
+    id: Uuid,
+) -> StoreResult<Cage> {
+    let row = sqlx::query(&format!(
+        "SELECT {CAGE_COLUMNS} FROM cages WHERE id = ? AND deleted_at IS NULL"
+    ))
+    .bind(id.to_string())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or(StoreError::NotFound { entity: "cage", id })?;
+    let cage = cage_from_row(&row)?;
+    if cage.lab_id != lab_id {
+        return Err(StoreError::NotFound { entity: "cage", id });
+    }
+    Ok(cage)
+}
+
+/// Counts residents with the same definition transfer capacity checks use.
+async fn cage_resident_count_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    cage_id: Uuid,
+) -> StoreResult<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM animals WHERE current_cage_id = ? AND deleted_at IS NULL",
+    )
+    .bind(cage_id.to_string())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(map_sqlx)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn write_audit(
     transaction: &mut sqlx::Transaction<'_, Sqlite>,
@@ -1252,6 +1288,42 @@ async fn validate_animal_relationships(
             return Err(StoreError::Conflict(
                 "target cage is at capacity".to_owned(),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Aggregated import capacity guard shared with the PostgreSQL adapter: all
+/// active imported animals targeting one cage are counted together before any
+/// insert, so an overflow is reported once with the batch total. The import
+/// claim inserted earlier holds SQLite's writer lock for the whole check.
+async fn validate_import_cages_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    plan: &ImportPlan,
+) -> StoreResult<()> {
+    let mut additions = BTreeMap::<Uuid, i64>::new();
+    for animal in &plan.animals {
+        if animal.meta.deleted_at.is_none()
+            && let Some(cage_id) = animal.current_cage_id
+        {
+            *additions.entry(cage_id).or_default() += 1;
+        }
+    }
+    for (cage_id, additional_residents) in additions {
+        let cage_lab = required_lab_id(tx, "cages", cage_id, "cage").await?;
+        require_same_uuid(cage_lab, plan.lab_id, "animal cage")?;
+        let (display_id, capacity, resident_count): (String, i64, i64) = sqlx::query_as(
+            "SELECT c.display_id, c.capacity, (SELECT COUNT(*) FROM animals a WHERE a.current_cage_id = c.id AND a.deleted_at IS NULL) FROM cages c WHERE c.id = ? AND c.deleted_at IS NULL",
+        )
+        .bind(cage_id.to_string())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(map_sqlx)?;
+        if resident_count + additional_residents > capacity {
+            return Err(StoreError::Conflict(format!(
+                "target cage {display_id} capacity exceeded ({}/{capacity})",
+                resident_count + additional_residents
+            )));
         }
     }
     Ok(())
@@ -2486,6 +2558,108 @@ impl MuriArcStore for SqliteStore {
         tx.commit().await.map_err(map_sqlx)
     }
 
+    async fn update_cage(&self, update: &CageUpdate, audit: &AuditContext) -> StoreResult<Cage> {
+        update
+            .validate()
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let before = active_cage_tx(&mut tx, update.lab_id, update.cage_id).await?;
+        if before.meta.revision != update.expected_revision {
+            return Err(StoreError::Conflict(
+                "cage revision changed before the update was applied".to_owned(),
+            ));
+        }
+        let residents = cage_resident_count_tx(&mut tx, before.id).await?;
+        let mut after = before.clone();
+        after
+            .apply_update(update, residents)
+            .map_err(StoreError::from_cage_rule)?;
+        let result = sqlx::query(
+            "UPDATE cages SET location = ?, capacity = ?, sort_order = ?, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL",
+        )
+        .bind(&after.location)
+        .bind(after.capacity)
+        .bind(after.sort_order)
+        .bind(after.meta.updated_at)
+        .bind(after.meta.revision)
+        .bind(after.id.to_string())
+        .bind(update.expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "cage revision changed before the update was applied".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            after.lab_id,
+            None,
+            EntityType::Cage,
+            after.id,
+            AuditAction::Update,
+            audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&after)?),
+        )
+        .await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after)
+    }
+
+    async fn archive_cage(
+        &self,
+        lab_id: Uuid,
+        id: Uuid,
+        expected_revision: i64,
+        archived_at: DateTime<Utc>,
+        audit: &AuditContext,
+    ) -> StoreResult<Cage> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let before = active_cage_tx(&mut tx, lab_id, id).await?;
+        if before.meta.revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "cage revision changed before archival".to_owned(),
+            ));
+        }
+        let residents = cage_resident_count_tx(&mut tx, before.id).await?;
+        let mut after = before.clone();
+        after
+            .archive(residents, archived_at)
+            .map_err(StoreError::from_cage_rule)?;
+        let result = sqlx::query(
+            "UPDATE cages SET deleted_at = ?, updated_at = ?, revision = ? WHERE id = ? AND revision = ? AND deleted_at IS NULL",
+        )
+        .bind(after.meta.deleted_at)
+        .bind(after.meta.updated_at)
+        .bind(after.meta.revision)
+        .bind(after.id.to_string())
+        .bind(expected_revision)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if result.rows_affected() != 1 {
+            return Err(StoreError::Conflict(
+                "cage revision changed before archival".to_owned(),
+            ));
+        }
+        write_audit(
+            &mut tx,
+            after.lab_id,
+            None,
+            EntityType::Cage,
+            after.id,
+            AuditAction::Archive,
+            audit,
+            Some(snapshot(&before)?),
+            Some(snapshot(&after)?),
+        )
+        .await?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(after)
+    }
+
     async fn get_cage(&self, id: Uuid) -> StoreResult<Cage> {
         let row = sqlx::query(&format!(
             "SELECT {CAGE_COLUMNS} FROM cages WHERE id = ? AND deleted_at IS NULL"
@@ -2984,6 +3158,9 @@ impl MuriArcStore for SqliteStore {
                 "animal event belongs to a different lab".to_owned(),
             ));
         }
+        event
+            .validate_generic_append(&animal)
+            .map_err(|error| StoreError::Validation(error.to_string()))?;
         let before = snapshot(&animal)?;
         animal
             .apply_event(event)
@@ -4188,6 +4365,7 @@ impl MuriArcStore for SqliteStore {
                 "import receipt identifier is already in use".to_owned(),
             ));
         }
+        validate_import_cages_tx(&mut tx, plan).await?;
         archive_import_source_tx(&mut tx, plan, &options, audit, committed_at).await?;
         let import_source = if audit.source == WriteSource::Migration {
             ProvenanceSource::Migration

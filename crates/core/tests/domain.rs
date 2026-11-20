@@ -28,6 +28,59 @@ fn event_updates_current_projection_and_revision() {
 }
 
 #[test]
+fn generic_append_only_records_moving_out_of_the_current_cage() {
+    let cage_id = Uuid::new_v4();
+    let other_cage_id = Uuid::new_v4();
+    let mut animal = Animal::new_mouse(Uuid::new_v4(), "M003", Sex::Male, now()).unwrap();
+    animal.current_cage_id = Some(cage_id);
+    let (lab_id, animal_id) = (animal.lab_id, animal.id);
+    let transfer = |from_cage_id, to_cage_id| {
+        AnimalEvent::new(
+            lab_id,
+            animal_id,
+            AnimalEventKind::Transferred {
+                from_cage_id,
+                to_cage_id,
+            },
+            now(),
+            now(),
+        )
+    };
+
+    assert_eq!(
+        transfer(Some(cage_id), None).validate_generic_append(&animal),
+        Ok(())
+    );
+    for to_cage_id in [cage_id, other_cage_id] {
+        assert_eq!(
+            transfer(Some(cage_id), Some(to_cage_id)).validate_generic_append(&animal),
+            Err(DomainError::CagePlacementRequiresTransfer)
+        );
+    }
+    for from_cage_id in [None, Some(other_cage_id)] {
+        assert_eq!(
+            transfer(from_cage_id, None).validate_generic_append(&animal),
+            Err(DomainError::MoveOutSourceMismatch)
+        );
+    }
+    animal.current_cage_id = None;
+    assert_eq!(
+        transfer(None, None).validate_generic_append(&animal),
+        Err(DomainError::MoveOutSourceMismatch)
+    );
+    let note = AnimalEvent::new(
+        animal.lab_id,
+        animal.id,
+        AnimalEventKind::Note {
+            body: "unaffected".to_owned(),
+        },
+        now(),
+        now(),
+    );
+    assert_eq!(note.validate_generic_append(&animal), Ok(()));
+}
+
+#[test]
 fn terminal_animal_cannot_be_revived() {
     let mut animal = Animal::new_mouse(Uuid::new_v4(), "M002", Sex::Female, now()).unwrap();
     let death = AnimalEvent::new(
@@ -128,6 +181,75 @@ fn draft_measurement_rejects_orphaned_signature_fields() {
         measurement.validate_record(),
         Err(DomainError::InvalidMeasurementSignatureState)
     );
+}
+
+#[test]
+fn cage_housing_edits_and_archival_respect_current_residents() {
+    let mut cage = Cage::new(Uuid::new_v4(), "SPF-A", "A01", now()).unwrap();
+    let original = cage.clone();
+    let later = now() + chrono::Duration::minutes(5);
+    let (cage_id, lab_id) = (cage.id, cage.lab_id);
+    let update = move |capacity: i32| CageUpdate {
+        cage_id,
+        lab_id,
+        expected_revision: 1,
+        location: Some("Rack 2".to_owned()),
+        capacity,
+        sort_order: 3,
+        updated_at: later,
+    };
+
+    assert_eq!(
+        cage.clone().apply_update(&update(0), 0),
+        Err(DomainError::InvalidCageCapacity)
+    );
+    assert_eq!(
+        cage.clone().apply_update(&update(2), 3),
+        Err(DomainError::CageCapacityBelowResidents {
+            capacity: 2,
+            residents: 3
+        })
+    );
+    cage.apply_update(&update(3), 3).unwrap();
+    assert_eq!(
+        (cage.capacity, cage.location.as_deref(), cage.sort_order),
+        (3, Some("Rack 2"), 3)
+    );
+    assert_eq!(
+        (&cage.section, &cage.display_id, cage.kind),
+        (&original.section, &original.display_id, original.kind)
+    );
+    assert_eq!(cage.meta.revision, 2);
+    assert_eq!(cage.meta.updated_at, later);
+
+    // Over-capacity data from before capacity tracking: unrelated edits stay
+    // possible, but any resize must house every current resident.
+    let mut legacy = Cage::new(Uuid::new_v4(), "SPF-A", "A02", now()).unwrap();
+    let relocate = CageUpdate {
+        cage_id: legacy.id,
+        lab_id: legacy.lab_id,
+        capacity: legacy.capacity,
+        ..update(legacy.capacity)
+    };
+    legacy.apply_update(&relocate, 7).unwrap();
+    assert_eq!(legacy.location.as_deref(), Some("Rack 2"));
+    assert_eq!(
+        legacy.clone().apply_update(&update(6), 7),
+        Err(DomainError::CageCapacityBelowResidents {
+            capacity: 6,
+            residents: 7
+        })
+    );
+    legacy.apply_update(&update(7), 7).unwrap();
+    assert_eq!(legacy.capacity, 7);
+
+    assert_eq!(
+        cage.clone().archive(1, later),
+        Err(DomainError::CageNotEmpty { residents: 1 })
+    );
+    cage.archive(0, later).unwrap();
+    assert_eq!(cage.meta.deleted_at, Some(later));
+    assert_eq!(cage.meta.revision, 3);
 }
 
 #[test]

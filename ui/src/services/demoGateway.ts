@@ -73,7 +73,9 @@ import type {
   CreateAnimalSampleInput,
   CreateBreedingLineInput,
   CreateBreedingPairInput,
+  ArchiveCageInput,
   CreateCageInput,
+  UpdateCageInput,
   CreateCohortInput,
   CreateColonyInput,
   CreateExperimentEventInput,
@@ -247,12 +249,46 @@ class DemoDomainStore {
     const cage: Cage = {
       id: crypto.randomUUID(),
       ...input,
+      location: input.rack,
+      sortOrder: 0,
+      revision: 1,
       animalIds: [],
       status: 'empty',
       summary: '空笼',
     }
     this.cages.push(cage)
     return clone(cage)
+  }
+
+  private revisionCheckedCage(id: string, expectedRevision: number) {
+    const cage = this.cages.find((item) => item.id === id)
+    if (!cage) throw new Error('笼位不存在')
+    if (cage.revision !== expectedRevision) throw new Error('笼位已更新，请刷新后重试')
+    return cage
+  }
+
+  updateCage(input: UpdateCageInput) {
+    const cage = this.revisionCheckedCage(input.id, input.expectedRevision)
+    const capacity = input.capacity ?? cage.capacity
+    if (!Number.isInteger(capacity) || capacity <= 0) throw new Error('笼位容量必须大于 0')
+    if (capacity !== cage.capacity && capacity < cage.animalIds.length) {
+      throw new Error(`容量不能低于当前在笼数量（${cage.animalIds.length}）`)
+    }
+    if (input.rack !== undefined) {
+      const location = input.rack.trim()
+      cage.location = location || null
+      cage.rack = location || '未设置'
+    }
+    cage.capacity = capacity
+    if (input.sortOrder !== undefined) cage.sortOrder = input.sortOrder
+    cage.revision += 1
+    return clone(cage)
+  }
+
+  archiveCage(input: ArchiveCageInput) {
+    const cage = this.revisionCheckedCage(input.id, input.expectedRevision)
+    if (cage.animalIds.length) throw new Error(`笼位仍有 ${cage.animalIds.length} 只动物，请先转出`)
+    this.cages = this.cages.filter((item) => item.id !== cage.id)
   }
 
   createAnimal(input: CreateAnimalInput) {
@@ -429,6 +465,8 @@ export class DemoGateway implements MuriArcGateway {
 
   async listCages(_context?: AnimalAccessContext) { await pause(20); return clone(this.store.cages) }
   async createCage(input: CreateCageInput) { await pause(20); return this.store.createCage(input) }
+  async updateCage(input: UpdateCageInput) { await pause(20); return this.store.updateCage(input) }
+  async archiveCage(input: ArchiveCageInput) { await pause(20); this.store.archiveCage(input) }
   async createAnimal(input: CreateAnimalInput) { await pause(20); return this.store.createAnimal(input) }
   async listAnimals(_context?: AnimalAccessContext) { await pause(20); return clone(this.store.animals) }
   async getAnimal(id: string, _context?: AnimalAccessContext) {

@@ -192,12 +192,20 @@ pub enum DomainError {
     InvalidQuantity,
     #[error("cage capacity must be greater than zero")]
     InvalidCageCapacity,
+    #[error("cage capacity {capacity} is below its {residents} current residents")]
+    CageCapacityBelowResidents { capacity: i32, residents: i64 },
+    #[error("cage still houses {residents} animals; transfer them out before archiving")]
+    CageNotEmpty { residents: i64 },
     #[error("at least one animal must be selected")]
     EmptyAnimalSelection,
     #[error("animal selection must not contain duplicates")]
     DuplicateAnimalSelection,
     #[error("animal transfer cannot contain more than {maximum} animals")]
     TransferSelectionTooLarge { maximum: usize },
+    #[error("placing an animal into a cage must use the animal transfer command")]
+    CagePlacementRequiresTransfer,
+    #[error("moving an animal out must name the cage it currently occupies")]
+    MoveOutSourceMismatch,
     #[error("experiment can only be completed or cancelled while it is open")]
     ExperimentNotOpen,
     #[error("experiment lifecycle target must be completed or cancelled")]

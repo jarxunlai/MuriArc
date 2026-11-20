@@ -1187,6 +1187,238 @@ async fn create_cage_accepts_capacity_and_rejects_nonpositive_values() {
 }
 
 #[tokio::test]
+async fn cage_update_route_is_revision_checked_audited_and_occupancy_aware() {
+    let fixture = Fixture::new(None).await;
+    let now = chrono::Utc::now();
+    let setup = AuditContext::system(WriteSource::Migration);
+    let mut cage = Cage::new(fixture.lab_id, "Room A", "A-01", now).unwrap();
+    cage.location = Some("R1".to_owned());
+    cage.set_capacity(2).unwrap();
+    fixture.store.create_cage(&cage, &setup).await.unwrap();
+    for display_id in ["M-UPD-1", "M-UPD-2"] {
+        let animal = Animal::new_mouse(fixture.lab_id, display_id, Sex::Female, now).unwrap();
+        fixture.store.create_animal(&animal, &setup).await.unwrap();
+        fixture
+            .store
+            .transfer_animals(
+                &muriarc_core::AnimalTransfer::new(
+                    fixture.lab_id,
+                    vec![animal.id],
+                    cage.id,
+                    now,
+                    now,
+                )
+                .unwrap(),
+                &setup,
+            )
+            .await
+            .unwrap();
+    }
+    let uri = format!("/api/v1/cages/{}", cage.id);
+    let patch = |token: &str, body: Value| fixture.request(Method::PATCH, &uri, token, body);
+
+    let forbidden = fixture
+        .app
+        .clone()
+        .oneshot(patch(
+            PROJECT_EDITOR_TOKEN,
+            json!({"expected_revision": 1, "capacity": 4}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    for (body, status) in [
+        (
+            json!({"expected_revision": 1, "capacity": 1}),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({"expected_revision": 9, "capacity": 4}),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({"expected_revision": 1, "capacity": 0}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"expected_revision": 1}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"expected_revision": 1, "display_id": "A-99"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(patch(HUMAN_TOKEN, body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{body}");
+    }
+    assert_eq!(fixture.store.get_cage(cage.id).await.unwrap(), cage);
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(patch(
+            ANIMAL_MANAGER_TOKEN,
+            json!({"expected_revision": 1, "capacity": 6, "location": "R7", "sort_order": 3}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["data"]["capacity"], json!(6));
+    assert_eq!(body["data"]["location"], json!("R7"));
+    assert_eq!(body["data"]["sort_order"], json!(3));
+    assert_eq!(body["data"]["display_id"], json!("A-01"));
+    assert_eq!(body["data"]["meta"]["revision"], json!(2));
+
+    let audits = fixture
+        .store
+        .list_audit_entries(&muriarc_core::AuditFilter {
+            lab_id: fixture.lab_id,
+            project_id: None,
+            entity_id: Some(cage.id),
+        })
+        .await
+        .unwrap();
+    let update = audits
+        .iter()
+        .find(|entry| entry.action == muriarc_core::AuditAction::Update)
+        .expect("cage update is audited");
+    assert_eq!(update.actor.actor_type, muriarc_core::ActorType::Human);
+    assert_eq!(update.actor.display_name, "Genetics animal manager");
+    assert!(update.request_id.is_some());
+    assert_eq!(update.entity_revision, Some(2));
+
+    // Cages of another lab are indistinguishable from missing ones.
+    let other_lab = muriarc_core::Lab::new("Other cage lab", now).unwrap();
+    fixture.store.create_lab(&other_lab, &setup).await.unwrap();
+    let foreign = Cage::new(other_lab.id, "Room Z", "Z-01", now).unwrap();
+    fixture.store.create_cage(&foreign, &setup).await.unwrap();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::PATCH,
+            &format!("/api/v1/cages/{}", foreign.id),
+            HUMAN_TOKEN,
+            json!({"expected_revision": 1, "capacity": 9}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fixture.store.get_cage(foreign.id).await.unwrap(), foreign);
+}
+
+#[tokio::test]
+async fn cage_archive_route_only_retires_empty_cages() {
+    let fixture = Fixture::new(None).await;
+    let now = chrono::Utc::now();
+    let setup = AuditContext::system(WriteSource::Migration);
+    let occupied = Cage::new(fixture.lab_id, "Room A", "A-01", now).unwrap();
+    let empty = Cage::new(fixture.lab_id, "Room A", "A-02", now).unwrap();
+    fixture.store.create_cage(&occupied, &setup).await.unwrap();
+    fixture.store.create_cage(&empty, &setup).await.unwrap();
+    let animal = Animal::new_mouse(fixture.lab_id, "M-ARC-1", Sex::Male, now).unwrap();
+    fixture.store.create_animal(&animal, &setup).await.unwrap();
+    fixture
+        .store
+        .transfer_animals(
+            &muriarc_core::AnimalTransfer::new(
+                fixture.lab_id,
+                vec![animal.id],
+                occupied.id,
+                now,
+                now,
+            )
+            .unwrap(),
+            &setup,
+        )
+        .await
+        .unwrap();
+    let archive = |cage_id: Uuid, token: &str, expected_revision: i64| {
+        fixture.request(
+            Method::POST,
+            &format!("/api/v1/cages/{cage_id}/archive"),
+            token,
+            json!({"expected_revision": expected_revision}),
+        )
+    };
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(archive(empty.id, PROJECT_TOKEN, 1))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(archive(occupied.id, HUMAN_TOKEN, 1))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(archive(empty.id, HUMAN_TOKEN, 2))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(archive(empty.id, HUMAN_TOKEN, 1))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["data"]["meta"]["revision"], json!(2));
+    assert!(body["data"]["meta"]["deleted_at"].is_string());
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::GET,
+            &format!("/api/v1/cages/{}", empty.id),
+            HUMAN_TOKEN,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(Method::GET, "/api/v1/cages", HUMAN_TOKEN, json!({})))
+        .await
+        .unwrap();
+    let listed = response_json(response).await;
+    let ids = listed["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|cage| cage["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec![occupied.id.to_string()]);
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(archive(empty.id, HUMAN_TOKEN, 2))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn transfer_route_uses_atomic_store_and_records_the_human_actor() {
     let fixture = Fixture::new(None).await;
     let now = chrono::Utc::now();
@@ -4138,4 +4370,145 @@ async fn public_audit_routes_hide_ai_source_storage_identity_and_legacy_sensitiv
             );
         }
     }
+}
+
+async fn upload_animal_import(fixture: &Fixture, idempotency_key: &str, csv: &str) -> Value {
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/data/imports?file_name=animals.csv&idempotency_key={idempotency_key}&import_kind=animal"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(csv.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["data"].clone()
+}
+
+async fn confirm_animal_import(fixture: &Fixture, preview: &Value) -> (StatusCode, Value) {
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::POST,
+            &format!(
+                "/api/v1/data/imports/{}/confirm",
+                preview["jobId"].as_str().unwrap()
+            ),
+            HUMAN_TOKEN,
+            json!({ "preview_hash": preview["previewHash"] }),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, response_json(response).await)
+}
+
+async fn create_capacity_cage(fixture: &Fixture, display_id: &str, capacity: i32) -> Cage {
+    let mut cage = Cage::new(fixture.lab_id, "Room A", display_id, chrono::Utc::now()).unwrap();
+    cage.set_capacity(capacity).unwrap();
+    fixture
+        .store
+        .create_cage(&cage, &AuditContext::system(WriteSource::Migration))
+        .await
+        .unwrap();
+    cage
+}
+
+async fn house_animal(fixture: &Fixture, display_id: &str, cage: &Cage) {
+    let mut animal =
+        Animal::new_mouse(fixture.lab_id, display_id, Sex::Female, chrono::Utc::now()).unwrap();
+    animal.current_cage_id = Some(cage.id);
+    fixture
+        .store
+        .create_animal(&animal, &AuditContext::system(WriteSource::Migration))
+        .await
+        .unwrap();
+}
+
+async fn cage_residents(fixture: &Fixture, cage: &Cage) -> Vec<String> {
+    fixture
+        .store
+        .list_animals(&muriarc_core::AnimalFilter {
+            lab_id: fixture.lab_id,
+            cage_id: Some(cage.id),
+            ..muriarc_core::AnimalFilter::default()
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|animal| animal.display_id)
+        .collect()
+}
+
+fn capacity_issue_rows(issues: &Value) -> Vec<u64> {
+    issues
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["code"] == "cage_capacity_exceeded")
+        .inspect(|issue| {
+            assert_eq!(issue["field"], "cage", "{issue}");
+            assert_eq!(issue["severity"], "error", "{issue}");
+        })
+        .map(|issue| issue["row"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn animal_import_preview_blocks_rows_that_would_overfill_a_cage() {
+    let fixture = Fixture::new(None).await;
+    let cage = create_capacity_cage(&fixture, "CAP-01", 2).await;
+    house_animal(&fixture, "CAP-RESIDENT", &cage).await;
+
+    let preview = upload_animal_import(
+        &fixture,
+        "cage-capacity-preview",
+        "display_id,sex,cage\nCAP-NEW-1,female,CAP-01\nCAP-NEW-2,male,Room A/CAP-01\n",
+    )
+    .await;
+
+    assert_eq!(preview["canConfirm"], json!(false), "{preview}");
+    assert_eq!(capacity_issue_rows(&preview["issues"]), vec![2, 3]);
+    let (status, body) = confirm_animal_import(&fixture, &preview).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(cage_residents(&fixture, &cage).await, vec!["CAP-RESIDENT"]);
+}
+
+#[tokio::test]
+async fn animal_import_confirm_rechecks_cage_capacity_changed_after_preview() {
+    let fixture = Fixture::new(None).await;
+    let cage = create_capacity_cage(&fixture, "CAP-02", 2).await;
+
+    let preview = upload_animal_import(
+        &fixture,
+        "cage-capacity-confirm",
+        "display_id,sex,cage\nCAP-LATE-1,female,CAP-02\nCAP-LATE-2,male,CAP-02\n",
+    )
+    .await;
+    assert_eq!(preview["canConfirm"], json!(true), "{preview}");
+
+    // Another writer fills one slot between preview and confirmation.
+    house_animal(&fixture, "CAP-INTERLOPER", &cage).await;
+
+    let (status, body) = confirm_animal_import(&fixture, &preview).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        capacity_issue_rows(&body["error"]["details"]["issues"]),
+        vec![2, 3]
+    );
+    assert_eq!(
+        cage_residents(&fixture, &cage).await,
+        vec!["CAP-INTERLOPER"]
+    );
 }

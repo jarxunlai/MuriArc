@@ -185,12 +185,12 @@ onMounted(load)
       <article class="surface">
         <span>用户配置</span>
         <strong>{{ settings.enabledUserCount }} / {{ settings.configuredUserCount }}</strong>
-        <small>已启用 / 已配置</small>
+        <small>可调用 / 已选默认对话模型</small>
       </article>
       <article class="surface">
         <span>视觉用户</span>
         <strong>{{ settings.visionUserCount }}</strong>
-        <small>启用 supports_vision</small>
+        <small>默认视觉模型可调用</small>
       </article>
       <article class="surface">
         <span>Provider 预设</span>

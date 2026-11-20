@@ -240,8 +240,15 @@ pub struct AiProviderPresetView {
 pub struct AiLabSettingsView {
     pub enabled: bool,
     pub custom_url_approval_required: bool,
+    /// Active lab users whose default conversation model profile would be
+    /// selected by runtime resolution (unarchived, same lab, current version).
     pub configured_user_count: i64,
+    /// Configured users whose default conversation model is callable: a key is
+    /// stored for its current version, or its transport needs none. The legacy
+    /// per-user `enabled` switch is not consulted because resolution ignores it.
     pub enabled_user_count: i64,
+    /// Active lab users whose default vision model profile supports vision in
+    /// its current version and is callable by the same credential rule.
     pub vision_user_count: i64,
     pub revision: i64,
     pub max_autonomy_mode: AiAutonomyMode,
@@ -3110,6 +3117,71 @@ mod postgres {
             .map_err(|_| AiProviderStoreError::Storage)
         }
 
+        /// Returns `(configured, enabled, vision)` user counts for the AI
+        /// admin page, derived from the default model profiles that `resolve`
+        /// and `resolve_vision` actually use.
+        ///
+        /// Each default is matched with the filters of
+        /// `selected_profile_binding` plus the user/lab checks of
+        /// `resolve_profile`: an active, non-deleted user of this lab, a live
+        /// defaults row, a profile owned by that user in the same lab that is
+        /// neither archived nor deleted, and its current version (which must
+        /// support vision for the vision default).
+        ///
+        /// - `configured`: users with such a default conversation profile.
+        /// - `enabled`: configured users whose default conversation version is
+        ///   callable, i.e. it has a stored credential or uses a transport that
+        ///   needs none (the `MissingCredential` rule in `resolve_profile`).
+        /// - `vision`: users with such a default vision profile that is
+        ///   callable by the same rule.
+        ///
+        /// The legacy `ai_provider_settings` row is not read at all. Its
+        /// per-user `enabled` switch is ignored on purpose because `resolve`
+        /// ignores it, and legacy saves already materialize default profiles.
+        /// The lab switch and endpoint approval are reported separately.
+        async fn default_profile_user_counts(
+            &self,
+            lab_id: Uuid,
+        ) -> Result<(i64, i64, i64), AiProviderStoreError> {
+            sqlx::query_as(
+                "SELECT count(*) FILTER (WHERE NOT selected.vision)::bigint,
+                        count(*) FILTER (WHERE NOT selected.vision AND selected.callable)::bigint,
+                        count(*) FILTER (WHERE selected.vision AND selected.callable)::bigint
+                 FROM (
+                     SELECT kind.vision,
+                            v.transport = 'local_http'
+                            OR EXISTS(
+                                SELECT 1
+                                FROM ai_model_profile_secrets s
+                                WHERE s.profile_id = p.id AND s.profile_version = v.version
+                            ) AS callable
+                     FROM users u
+                     JOIN ai_user_model_defaults d
+                       ON d.user_id = u.id AND d.deleted_at IS NULL
+                     CROSS JOIN (VALUES (FALSE), (TRUE)) AS kind(vision)
+                     JOIN ai_model_profiles p
+                       ON p.id = CASE
+                           WHEN kind.vision THEN d.default_vision_profile_id
+                           ELSE d.default_conversation_profile_id
+                       END
+                      AND p.user_id = d.user_id
+                      AND p.lab_id = u.lab_id
+                      AND p.archived_at IS NULL
+                      AND p.deleted_at IS NULL
+                     JOIN ai_model_profile_versions v
+                       ON v.profile_id = p.id AND v.version = p.current_version
+                      AND (NOT kind.vision OR v.supports_vision)
+                     WHERE u.lab_id = $1
+                       AND u.status = 'active'
+                       AND u.deleted_at IS NULL
+                 ) selected",
+            )
+            .bind(lab_id)
+            .fetch_one(self.postgres.pool())
+            .await
+            .map_err(|_| AiProviderStoreError::Storage)
+        }
+
         async fn row(
             &self,
             user_id: Uuid,
@@ -4020,21 +4092,16 @@ mod postgres {
             .fetch_optional(self.postgres.pool())
             .await
             .map_err(|_| AiProviderStoreError::Storage)?;
-            let counts: (i64, i64, i64) = sqlx::query_as(
-                "SELECT count(*)::bigint, count(*) FILTER (WHERE enabled)::bigint, count(*) FILTER (WHERE enabled AND supports_vision)::bigint FROM ai_provider_settings s JOIN users u ON u.id = s.user_id WHERE u.lab_id = $1 AND u.deleted_at IS NULL",
-            )
-            .bind(lab_id)
-            .fetch_one(self.postgres.pool())
-            .await
-            .map_err(|_| AiProviderStoreError::Storage)?;
+            let (configured_user_count, enabled_user_count, vision_user_count) =
+                self.default_profile_user_counts(lab_id).await?;
             let (enabled, custom_url_approval_required, max_autonomy_mode, revision) =
                 settings.unwrap_or((true, true, "full".to_owned(), 0));
             Ok(AiLabSettingsView {
                 enabled,
                 custom_url_approval_required,
-                configured_user_count: counts.0,
-                enabled_user_count: counts.1,
-                vision_user_count: counts.2,
+                configured_user_count,
+                enabled_user_count,
+                vision_user_count,
                 revision,
                 max_autonomy_mode: parse_autonomy_mode(&max_autonomy_mode)?,
             })
@@ -8105,6 +8172,356 @@ mod postgres {
             .await
             .unwrap();
             assert_eq!(audit_count, 2);
+        }
+
+        async fn lab_counts_fixture(
+            database_url: &str,
+            label: &str,
+        ) -> (PostgresStore, Lab, PostgresAiProviderStore) {
+            let postgres = PostgresStore::connect(database_url).await.unwrap();
+            postgres.migrate().await.unwrap();
+            let lab = Lab::new(
+                format!("AI lab counts {label} lab {}", Uuid::new_v4()),
+                Utc::now(),
+            )
+            .unwrap();
+            postgres
+                .create_lab(&lab, &AuditContext::system(WriteSource::Migration))
+                .await
+                .unwrap();
+            let store = PostgresAiProviderStore::new(postgres.clone(), master());
+            (postgres, lab, store)
+        }
+
+        async fn lab_counts_user(postgres: &PostgresStore, lab: &Lab, label: &str) -> User {
+            let user = User::new(
+                lab.id,
+                format!("ai-lab-counts-{label}-{}@example.test", Uuid::new_v4()),
+                "AI lab counts researcher",
+                Utc::now(),
+            )
+            .unwrap();
+            postgres
+                .create_user(&user, &AuditContext::system(WriteSource::Migration))
+                .await
+                .unwrap();
+            user
+        }
+
+        /// `(configured, enabled, vision)` as reported to the AI admin page.
+        async fn lab_user_counts(store: &PostgresAiProviderStore, lab: &Lab) -> (i64, i64, i64) {
+            let settings = store.get_lab_settings(lab.id).await.unwrap();
+            (
+                settings.configured_user_count,
+                settings.enabled_user_count,
+                settings.vision_user_count,
+            )
+        }
+
+        async fn legacy_row_count(postgres: &PostgresStore, user: &User) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM ai_provider_settings WHERE user_id = $1")
+                .bind(user.id)
+                .fetch_one(postgres.pool())
+                .await
+                .unwrap()
+        }
+
+        /// Creates a keyed, vision-capable profile and selects it as both the
+        /// conversation and the vision default, without any legacy row.
+        async fn select_keyed_default_profile(
+            store: &PostgresAiProviderStore,
+            user: &User,
+            label: &str,
+        ) -> Uuid {
+            let profile = store
+                .create_model_profile(
+                    user.id,
+                    model_input(
+                        &format!("{label} default"),
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "deepseek-chat",
+                        Some("lab-counts-profile-key"),
+                        None,
+                    ),
+                    &user_audit(user, &format!("lab-counts-{label}-create")),
+                )
+                .await
+                .unwrap();
+            store
+                .save_model_defaults(
+                    user.id,
+                    SaveAiModelDefaultsInput {
+                        default_conversation_profile_id: Some(profile.id),
+                        default_vision_profile_id: Some(profile.id),
+                        expected_revision: 0,
+                    },
+                    &user_audit(user, &format!("lab-counts-{label}-defaults")),
+                )
+                .await
+                .unwrap();
+            profile.id
+        }
+
+        #[tokio::test]
+        async fn lab_settings_count_profile_only_default_models() {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
+                return;
+            };
+            let (postgres, lab, store) = lab_counts_fixture(&database_url, "profile-only").await;
+            let vision_user = lab_counts_user(&postgres, &lab, "profile-vision").await;
+            let created = store
+                .create_model_profile(
+                    vision_user.id,
+                    model_input(
+                        "Conversation and vision",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "deepseek-chat",
+                        Some("profile-only-lab-counts-key"),
+                        None,
+                    ),
+                    &user_audit(&vision_user, "lab-counts-profile-only-create"),
+                )
+                .await
+                .unwrap();
+            // A profile alone selects nothing for `resolve`.
+            assert_eq!(lab_user_counts(&store, &lab).await, (0, 0, 0));
+
+            store
+                .save_model_defaults(
+                    vision_user.id,
+                    SaveAiModelDefaultsInput {
+                        default_conversation_profile_id: Some(created.id),
+                        default_vision_profile_id: Some(created.id),
+                        expected_revision: 0,
+                    },
+                    &user_audit(&vision_user, "lab-counts-profile-only-defaults"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(legacy_row_count(&postgres, &vision_user).await, 0);
+            assert_eq!(lab_user_counts(&store, &lab).await, (1, 1, 1));
+            assert!(store.resolve(vision_user.id).await.is_ok());
+            assert!(store.resolve_vision(vision_user.id).await.is_ok());
+
+            let text_user = lab_counts_user(&postgres, &lab, "profile-text").await;
+            let mut text_input = model_input(
+                "Conversation only",
+                OFFICIAL_DEEPSEEK_BASE_URL,
+                "deepseek-chat",
+                Some("profile-only-text-key"),
+                None,
+            );
+            text_input.supports_vision = false;
+            let text_profile = store
+                .create_model_profile(
+                    text_user.id,
+                    text_input,
+                    &user_audit(&text_user, "lab-counts-profile-text-create"),
+                )
+                .await
+                .unwrap();
+            store
+                .save_model_defaults(
+                    text_user.id,
+                    SaveAiModelDefaultsInput {
+                        default_conversation_profile_id: Some(text_profile.id),
+                        default_vision_profile_id: None,
+                        expected_revision: 0,
+                    },
+                    &user_audit(&text_user, "lab-counts-profile-text-defaults"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(legacy_row_count(&postgres, &text_user).await, 0);
+            assert_eq!(lab_user_counts(&store, &lab).await, (2, 2, 1));
+
+            // Still selected, but `resolve` now fails with MissingCredential.
+            store
+                .clear_model_profile_key(
+                    vision_user.id,
+                    created.id,
+                    &user_audit(&vision_user, "lab-counts-profile-only-clear-key"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(lab_user_counts(&store, &lab).await, (2, 1, 0));
+            assert!(matches!(
+                store.resolve(vision_user.id).await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+            assert!(matches!(
+                store.resolve_vision(vision_user.id).await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+        }
+
+        #[tokio::test]
+        async fn lab_settings_count_legacy_settings_saves() {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
+                return;
+            };
+            let (postgres, lab, store) = lab_counts_fixture(&database_url, "legacy").await;
+            let user = lab_counts_user(&postgres, &lab, "legacy-cloud").await;
+            store
+                .save(
+                    user.id,
+                    settings_input(
+                        "deepseek",
+                        "deepseek-chat",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        Some("legacy-lab-counts-key"),
+                    ),
+                    &user_audit(&user, "lab-counts-legacy-save"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(legacy_row_count(&postgres, &user).await, 1);
+            assert_eq!(lab_user_counts(&store, &lab).await, (1, 1, 0));
+
+            // The legacy per-user switch is not consulted by `resolve`, so the
+            // lab counts do not consult it either.
+            let mut disabled_vision = settings_input(
+                "deepseek",
+                "deepseek-chat",
+                OFFICIAL_DEEPSEEK_BASE_URL,
+                Some("legacy-lab-counts-vision-key"),
+            );
+            disabled_vision.enabled = false;
+            disabled_vision.supports_vision = true;
+            disabled_vision.vision_model = Some("legacy-lab-counts-vision".to_owned());
+            let saved = store
+                .save(
+                    user.id,
+                    disabled_vision,
+                    &user_audit(&user, "lab-counts-legacy-disabled-vision"),
+                )
+                .await
+                .unwrap();
+            assert!(!saved.enabled);
+            assert_eq!(lab_user_counts(&store, &lab).await, (1, 1, 1));
+            assert!(store.resolve(user.id).await.is_ok());
+            assert!(store.resolve_vision(user.id).await.is_ok());
+
+            store
+                .clear_key(user.id, &user_audit(&user, "lab-counts-legacy-clear"))
+                .await
+                .unwrap();
+            assert_eq!(lab_user_counts(&store, &lab).await, (1, 0, 0));
+            assert!(matches!(
+                store.resolve(user.id).await,
+                Err(AiProviderStoreError::MissingCredential)
+            ));
+
+            // Local transports never require a stored credential.
+            let local_user = lab_counts_user(&postgres, &lab, "legacy-local").await;
+            let local_audit = user_audit(&local_user, "lab-counts-legacy-local-save");
+            let base_url = "http://127.0.0.1:11434/v1";
+            let endpoint = store
+                .save_provider_endpoint(
+                    lab.id,
+                    None,
+                    SaveAiProviderEndpointInput {
+                        provider_kind: ProviderKind::LocalHttp,
+                        protocol: AiProviderProtocol::OpenaiChatCompletions,
+                        label: "Lab counts local gateway".to_owned(),
+                        base_url: base_url.to_owned(),
+                        enabled: true,
+                    },
+                    &local_audit,
+                )
+                .await
+                .unwrap();
+            let mut local_input =
+                settings_input(&endpoint.id.to_string(), "local-model", base_url, None);
+            local_input.provider_kind = ProviderKind::LocalHttp;
+            store
+                .save(local_user.id, local_input, &local_audit)
+                .await
+                .unwrap();
+            assert_eq!(lab_user_counts(&store, &lab).await, (2, 1, 0));
+            assert!(store.resolve(local_user.id).await.is_ok());
+
+            // A legacy row without selected defaults no longer counts.
+            let defaults = store.get_model_defaults(user.id).await.unwrap();
+            store
+                .save_model_defaults(
+                    user.id,
+                    SaveAiModelDefaultsInput {
+                        default_conversation_profile_id: None,
+                        default_vision_profile_id: None,
+                        expected_revision: defaults.revision,
+                    },
+                    &user_audit(&user, "lab-counts-legacy-clear-defaults"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(legacy_row_count(&postgres, &user).await, 1);
+            assert_eq!(lab_user_counts(&store, &lab).await, (1, 1, 0));
+            assert!(matches!(
+                store.resolve(user.id).await,
+                Err(AiProviderStoreError::ProviderNotSelected)
+            ));
+        }
+
+        #[tokio::test]
+        async fn lab_settings_count_skips_unconfigured_inactive_and_foreign_users() {
+            let Some(database_url) = muriarc_core::test_database::postgres_test_url() else {
+                return;
+            };
+            let (postgres, lab, store) = lab_counts_fixture(&database_url, "unconfigured").await;
+            let idle = lab_counts_user(&postgres, &lab, "idle").await;
+            let drafted = lab_counts_user(&postgres, &lab, "drafted").await;
+            store
+                .create_model_profile(
+                    drafted.id,
+                    model_input(
+                        "Never selected",
+                        OFFICIAL_DEEPSEEK_BASE_URL,
+                        "deepseek-chat",
+                        Some("lab-counts-drafted-key"),
+                        None,
+                    ),
+                    &user_audit(&drafted, "lab-counts-drafted-create"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(legacy_row_count(&postgres, &idle).await, 0);
+            assert_eq!(legacy_row_count(&postgres, &drafted).await, 0);
+            assert_eq!(lab_user_counts(&store, &lab).await, (0, 0, 0));
+            assert!(matches!(
+                store.resolve(idle.id).await,
+                Err(AiProviderStoreError::ProviderNotSelected)
+            ));
+            assert!(matches!(
+                store.resolve(drafted.id).await,
+                Err(AiProviderStoreError::ProviderNotSelected)
+            ));
+
+            let (_, other_lab, _) = lab_counts_fixture(&database_url, "other").await;
+            let foreign = lab_counts_user(&postgres, &other_lab, "foreign").await;
+            select_keyed_default_profile(&store, &foreign, "foreign").await;
+            assert_eq!(lab_user_counts(&store, &other_lab).await, (1, 1, 1));
+            assert_eq!(lab_user_counts(&store, &lab).await, (0, 0, 0));
+
+            // `resolve` only serves active, non-deleted users.
+            let suspended = lab_counts_user(&postgres, &lab, "suspended").await;
+            select_keyed_default_profile(&store, &suspended, "suspended").await;
+            let removed = lab_counts_user(&postgres, &lab, "removed").await;
+            select_keyed_default_profile(&store, &removed, "removed").await;
+            assert_eq!(lab_user_counts(&store, &lab).await, (2, 2, 2));
+            sqlx::query("UPDATE users SET status = 'suspended' WHERE id = $1")
+                .bind(suspended.id)
+                .execute(postgres.pool())
+                .await
+                .unwrap();
+            sqlx::query("UPDATE users SET deleted_at = now() WHERE id = $1")
+                .bind(removed.id)
+                .execute(postgres.pool())
+                .await
+                .unwrap();
+            assert_eq!(lab_user_counts(&store, &lab).await, (0, 0, 0));
+            assert!(store.resolve(suspended.id).await.is_err());
+            assert!(store.resolve(removed.id).await.is_err());
         }
     }
 }

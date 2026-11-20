@@ -69,6 +69,7 @@ pub struct StoreToolAccessContext {
     audit_read: bool,
     current_user_id: Option<Uuid>,
     writable_project_ids: BTreeSet<Uuid>,
+    bound_project_id: Option<Uuid>,
 }
 
 impl StoreToolAccessContext {
@@ -81,6 +82,7 @@ impl StoreToolAccessContext {
             audit_read: false,
             current_user_id: None,
             writable_project_ids: BTreeSet::new(),
+            bound_project_id: None,
         }
     }
 
@@ -115,6 +117,20 @@ impl StoreToolAccessContext {
             .filter(|id| self.allowed_project_ids.contains(id))
             .collect();
         self
+    }
+
+    /// Binds the current turn to one readable project, as persisted on its
+    /// conversation. The assistant then fills omitted `project_id` arguments
+    /// with it; this executor still authorizes every supplied identifier.
+    /// A project outside `allowed_project_ids` is ignored (fail closed: no
+    /// defaulting, and the executor keeps rejecting it).
+    pub fn with_bound_project(mut self, project_id: Option<Uuid>) -> Self {
+        self.bound_project_id = project_id.filter(|id| self.allowed_project_ids.contains(id));
+        self
+    }
+
+    pub const fn bound_project_id(&self) -> Option<Uuid> {
+        self.bound_project_id
     }
 
     pub fn allows_project(&self, project_id: Uuid) -> bool {
@@ -998,6 +1014,10 @@ impl DomainToolExecutor for StoreDomainToolExecutor {
         } else {
             None
         }
+    }
+
+    fn bound_project_id(&self) -> Option<Uuid> {
+        self.access.bound_project_id
     }
 
     async fn execute(

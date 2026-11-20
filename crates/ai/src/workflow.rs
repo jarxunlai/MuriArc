@@ -649,7 +649,8 @@ impl AiWorkflowService {
             .with_activity_read(context.read_activity)
             .with_audit_read(context.read_audit)
             .with_current_user(context.user_id)
-            .with_writable_projects(writable_projects);
+            .with_writable_projects(writable_projects)
+            .with_bound_project(project_id);
         let mut executor = StoreDomainToolExecutor::new(self.store.clone(), tool_access)
             .with_autonomy_mode(autonomy.effective_mode);
         if let Some(data_tools) = &self.data_tools {
@@ -1566,6 +1567,36 @@ impl AiWorkflowService {
                 });
             }
             tool_runs.push(tool_run);
+        }
+        // Rejected calls never read or changed business data, but they are
+        // kept as failed operation records so a turn that ended (or recovered)
+        // because of a tool rejection is diagnosable from `ai_tool_runs`.
+        for failure in &response.tool_failures {
+            let output = json!({
+                "failure": failure,
+                "provider_id": response.provider_id,
+                "model": response.model,
+                "model_profile": model_profile,
+                "model_calls": model_calls,
+                "incomplete_reason": response.incomplete_reason,
+                "source_refs": public_source_refs,
+            });
+            tool_runs.push(ToolRun {
+                id: failure.tool_run_id,
+                conversation_id: Some(conversation_id),
+                lab_id: context.lab_id,
+                project_id,
+                user_id: context.user_id,
+                tool_name: failure.tool.as_str().to_owned(),
+                input: failure.arguments.clone(),
+                output: Some(output),
+                status: ToolRunStatus::Failed,
+                source: WriteSource::Ai,
+                started_at: Some(now),
+                completed_at: Some(now),
+                error: Some(failure.code.clone()),
+                meta: RecordMeta::new(now),
+            });
         }
         (tool_runs, approvals)
     }
@@ -4492,6 +4523,134 @@ mod tests {
             .join("\n");
         assert!(second_context.contains(&second_source_id.to_string()));
         assert!(!second_context.contains(&source_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn project_bound_turn_defaults_project_id_and_persists_recovered_rejections() {
+        let store = Arc::new(SqliteStore::in_memory().await.unwrap());
+        store.migrate().await.unwrap();
+        let now = Utc::now();
+        let bootstrap = AuditContext::system(WriteSource::Migration);
+        let lab = Lab::new("Workflow bound project", now).unwrap();
+        store.create_lab(&lab, &bootstrap).await.unwrap();
+        let user = User::new(lab.id, "bound@example.test", "Bound researcher", now).unwrap();
+        store.create_user(&user, &bootstrap).await.unwrap();
+        let project = Project::new(lab.id, "Bound project", now).unwrap();
+        store.create_project(&project, &bootstrap).await.unwrap();
+        let model_profile = create_model_profile(&store, lab.id, user.id, now).await;
+        let domain: Arc<dyn MuriArcStore> = store.clone();
+        let operations: Arc<dyn AiOperationStore> = store.clone();
+        let profiles: Arc<dyn AiModelProfileStore> = store.clone();
+        let workflow = AiWorkflowService::new(domain, operations).with_model_profiles(profiles);
+        // A Lab Admin may read the lab registry, but a project-bound turn
+        // must not; an omitted project_id therefore used to fail closed with
+        // `project_required` and end the turn with a 502.
+        let context = AiExecutionContext::new(
+            lab.id,
+            user.id,
+            user.display_name.clone(),
+            "bound-project-request",
+            [project.id],
+            [project.id],
+            true,
+            AccessGrant::local_user(ScopeSet::new([ToolScope::Read])),
+        );
+        let tool_call = |id: &str, arguments: Value| {
+            Ok(CompletionResponse {
+                id: Some(format!("{id}-response")),
+                model: Some("bound-model".to_owned()),
+                content: None,
+                tool_calls: vec![ProviderToolCall {
+                    id: id.to_owned(),
+                    name: ToolName::ResourceSearch.as_str().to_owned(),
+                    arguments,
+                }],
+                finish_reason: Some("tool_calls".to_owned()),
+                usage: None,
+            })
+        };
+        let provider = MockProvider::new(
+            "bound",
+            "bound-model",
+            [
+                tool_call(
+                    "search-too-wide",
+                    json!({"resource": "animals", "query": "0714-A9", "limit": 500}),
+                ),
+                tool_call(
+                    "search-animal",
+                    json!({"resource": "animals", "query": "0714-A9"}),
+                ),
+                Ok(CompletionResponse {
+                    id: Some("bound-final".to_owned()),
+                    model: Some("bound-model".to_owned()),
+                    content: Some("No animal named 0714-A9 is assigned here.".to_owned()),
+                    tool_calls: Vec::new(),
+                    finish_reason: Some("stop".to_owned()),
+                    usage: None,
+                }),
+            ],
+        );
+        let conversation_id = start_test_conversation(
+            &workflow,
+            &context,
+            model_profile,
+            Some(project.id),
+            "Bound workflow",
+        )
+        .await;
+
+        let turn = workflow
+            .run_turn(
+                provider,
+                None,
+                &context,
+                model_profile,
+                AssistantTurnRequest {
+                    conversation_id,
+                    project_id: Some(project.id),
+                    message: "动物 0714-A9 的性别、出生日期、当前笼位和基因型分别是什么？"
+                        .to_owned(),
+                    source_refs: Vec::new(),
+                    image_ids: Vec::new(),
+                    vision_model_profile_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let bound_project = json!(project.id.to_string());
+        assert_eq!(turn.incomplete_reason, None);
+        assert_eq!(turn.tool_runs.len(), 1);
+        assert_eq!(turn.tool_runs[0].arguments["project_id"], bound_project);
+        let completed = store
+            .get_tool_run(turn.tool_runs[0].tool_run_id)
+            .await
+            .unwrap();
+        assert_eq!(completed.status, ToolRunStatus::Completed);
+        assert_eq!(completed.input["project_id"], bound_project);
+
+        assert_eq!(turn.tool_failures.len(), 1);
+        let failure = &turn.tool_failures[0];
+        assert_eq!(failure.code, "limit_out_of_range");
+        assert!(failure.recoverable);
+        let failed = store.get_tool_run(failure.tool_run_id).await.unwrap();
+        assert_eq!(failed.status, ToolRunStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("limit_out_of_range"));
+        assert_eq!(failed.tool_name, ToolName::ResourceSearch.as_str());
+        assert_eq!(failed.conversation_id, Some(conversation_id));
+        assert_eq!(failed.project_id, Some(project.id));
+        assert_eq!(failed.input["project_id"], bound_project);
+        assert!(failed.completed_at.is_some());
+
+        let detail = workflow
+            .get_conversation(&context, conversation_id, 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.messages[1].response.as_ref().unwrap().tool_failures,
+            turn.tool_failures
+        );
     }
 
     #[tokio::test]

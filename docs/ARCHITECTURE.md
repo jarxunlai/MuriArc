@@ -81,6 +81,8 @@ The model sees only fixed, typed domain tools that survive the intersection of:
 
 Raw SQL and security/transport proofs are rejected before Provider access. Reads return bounded projections and citations. Writes return a reviewable draft; sensitive or research-signing operations require explicit human steps.
 
+The orchestrator owns argument normalization and failure routing, not authorization. A conversation bound to a project supplies that project as the default `project_id` for project-scoped tools (except resources that reject a project filter) and refuses other projects before dispatch. Executor rejections on a fixed allowlist of correctable codes become sanitized `tool_error` results for the model within a bounded per-turn budget; every other rejection, and every unavailable tool, ends the turn with `ai_tool_rejected` or `ai_tool_unavailable` and preserves completed results.
+
 Vision follows either the bound conversation model or an explicitly selected vision relay. Uploaded images are size/type/dimension checked, sanitized, privately stored, and converted to candidates. A model never chooses authoritative Animal/Experiment identifiers for final writes.
 
 ## Identity and tenancy

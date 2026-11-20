@@ -27,8 +27,8 @@ pub use assistant::{
     AssistantConfigError, AssistantError, AssistantIncompleteReason, AssistantLimits,
     AssistantRequest, AssistantResponse, AssistantRuntimeConfig, AssistantService, AssistantUsage,
     Citation, ContextManagementTrace, DomainToolExecutor, DomainToolOutput, DomainToolRequest,
-    ToolExecutionError, ToolRunOutcome, ToolRunTrace, estimate_completion_input_tokens,
-    fixed_tool_definitions,
+    ToolExecutionError, ToolFailureTrace, ToolRunOutcome, ToolRunTrace,
+    estimate_completion_input_tokens, fixed_tool_definitions,
 };
 pub use autonomy::AiActionPolicy;
 pub use data_tools::{

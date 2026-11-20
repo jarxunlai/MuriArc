@@ -23,8 +23,9 @@ pub use animal_detail::*;
 pub use breeding::*;
 pub use business_read::*;
 pub use cage::{
-    CreateCageCommand, MAX_CAGE_DISPLAY_ID_CHARS, MAX_CAGE_LOCATION_CHARS, MAX_CAGE_SECTION_CHARS,
-    MAX_TRANSFER_NOTES_BYTES, TransferAnimalsCommand, create_cage, transfer_animals,
+    ArchiveCageCommand, CreateCageCommand, MAX_CAGE_DISPLAY_ID_CHARS, MAX_CAGE_LOCATION_CHARS,
+    MAX_CAGE_SECTION_CHARS, MAX_TRANSFER_NOTES_BYTES, TransferAnimalsCommand, UpdateCageCommand,
+    archive_cage, create_cage, transfer_animals, update_cage,
 };
 pub use experiment::*;
 pub use genetics::*;

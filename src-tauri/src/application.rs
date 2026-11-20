@@ -2,13 +2,14 @@ use std::{collections::BTreeMap, path::Path};
 
 use chrono::{DateTime, NaiveDate, Utc};
 use muriarc_application::{
-    ApplicationError, CreateAnimalCommand, CreateAnimalIdentifierScope, CreateCageCommand,
-    CreateCohortCommand, CreateExperimentCommand, CreateParticipationCommand,
+    ApplicationError, ArchiveCageCommand, CreateAnimalCommand, CreateAnimalIdentifierScope,
+    CreateCageCommand, CreateCohortCommand, CreateExperimentCommand, CreateParticipationCommand,
     CreateProcedureCommand, CreateProjectCommand, CreateTemplateVersionCommand,
     InitialGenotypingRecordInput, PublishTemplateVersionCommand, TransferAnimalsCommand,
-    TransitionExperimentCommand, TransitionParticipationCommand,
-    create_animal as create_animal_use_case, create_cage as create_cage_use_case,
-    create_cohort as create_cohort_use_case, create_experiment as create_experiment_use_case,
+    TransitionExperimentCommand, TransitionParticipationCommand, UpdateCageCommand,
+    archive_cage as archive_cage_use_case, create_animal as create_animal_use_case,
+    create_cage as create_cage_use_case, create_cohort as create_cohort_use_case,
+    create_experiment as create_experiment_use_case,
     create_participation as create_participation_use_case,
     create_procedure as create_procedure_use_case, create_project as create_project_use_case,
     create_template_version as create_template_version_use_case,
@@ -16,6 +17,7 @@ use muriarc_application::{
     transfer_animals as transfer_animals_use_case,
     transition_experiment as transition_experiment_use_case,
     transition_participation as transition_participation_use_case,
+    update_cage as update_cage_use_case,
 };
 use muriarc_core::{
     Actor, Animal, AnimalEvent, AnimalEventKind, AnimalFilter, AnimalOverview, AnimalStatus,
@@ -259,6 +261,57 @@ impl DesktopState {
                 kind: CageKind::Standard,
                 capacity: input.capacity,
                 sort_order: 0,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?;
+        Ok(cage_view(cage, &[]))
+    }
+
+    pub(crate) async fn update_cage(
+        &self,
+        input: UpdateCageInput,
+    ) -> Result<CageView, DesktopError> {
+        let cage_id = parse_id("cage", &input.id)?;
+        let audit = self.audit("update_cage").await?;
+        let cage = update_cage_use_case(
+            &self.store,
+            UpdateCageCommand {
+                lab_id: self.lab_id,
+                cage_id,
+                expected_revision: input.expected_revision,
+                location: input.rack,
+                capacity: input.capacity,
+                sort_order: input.sort_order,
+                now: Utc::now(),
+            },
+            &audit,
+        )
+        .await?;
+        let residents = self
+            .store
+            .list_animals(&AnimalFilter {
+                lab_id: self.lab_id,
+                cage_id: Some(cage.id),
+                ..AnimalFilter::default()
+            })
+            .await?;
+        Ok(cage_view(cage, &residents.iter().collect::<Vec<_>>()))
+    }
+
+    pub(crate) async fn archive_cage(
+        &self,
+        input: ArchiveCageInput,
+    ) -> Result<CageView, DesktopError> {
+        let cage_id = parse_id("cage", &input.id)?;
+        let audit = self.audit("archive_cage").await?;
+        let cage = archive_cage_use_case(
+            &self.store,
+            ArchiveCageCommand {
+                lab_id: self.lab_id,
+                cage_id,
+                expected_revision: input.expected_revision,
                 now: Utc::now(),
             },
             &audit,
@@ -1049,8 +1102,11 @@ fn cage_view(cage: Cage, residents: &[&Animal]) -> CageView {
         id: cage.id.to_string(),
         code: cage.display_id,
         room: cage.section,
-        rack: cage.location.unwrap_or_else(|| "未设置".to_owned()),
+        rack: cage.location.clone().unwrap_or_else(|| "未设置".to_owned()),
+        location: cage.location,
         capacity: cage.capacity,
+        sort_order: cage.sort_order,
+        revision: cage.meta.revision,
         animal_ids: residents
             .iter()
             .map(|animal| animal.id.to_string())
@@ -1228,6 +1284,15 @@ fn procedure_view(procedure: Procedure) -> ProcedureView {
     }
 }
 
+/// `cages` lists every active cage of the lab, so an id missing from it
+/// belongs to an archived cage rather than meaning "unassigned".
+fn timeline_cage_label(cage_id: Option<Uuid>, cages: &BTreeMap<Uuid, String>) -> &str {
+    match cage_id {
+        None => "未分配",
+        Some(id) => cages.get(&id).map_or("已归档笼位", String::as_str),
+    }
+}
+
 fn timeline_event(
     event: AnimalEvent,
     cages: &BTreeMap<Uuid, String>,
@@ -1245,14 +1310,8 @@ fn timeline_event(
             from_cage_id,
             to_cage_id,
         } => {
-            let from = from_cage_id
-                .and_then(|id| cages.get(&id))
-                .map(String::as_str)
-                .unwrap_or("未分配");
-            let to = to_cage_id
-                .and_then(|id| cages.get(&id))
-                .map(String::as_str)
-                .unwrap_or("未分配");
+            let from = timeline_cage_label(*from_cage_id, cages);
+            let to = timeline_cage_label(*to_cage_id, cages);
             ("transfer", "转笼".to_owned(), format!("{from} → {to}"))
         }
         AnimalEventKind::StatusChanged { from, to } => {
@@ -1440,6 +1499,25 @@ pub(crate) struct CreateCageInput {
     pub capacity: i32,
 }
 
+/// Partial housing edit; omitted fields keep their value and a blank `rack`
+/// clears the stored location.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UpdateCageInput {
+    pub id: String,
+    pub expected_revision: i64,
+    pub rack: Option<String>,
+    pub capacity: Option<i32>,
+    pub sort_order: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ArchiveCageInput {
+    pub id: String,
+    pub expected_revision: i64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct MoveAnimalsInput {
@@ -1454,7 +1532,10 @@ pub(crate) struct CageView {
     code: String,
     room: String,
     rack: String,
+    location: Option<String>,
     capacity: i32,
+    sort_order: i32,
+    revision: i64,
     animal_ids: Vec<String>,
     status: String,
     summary: String,
@@ -1619,6 +1700,139 @@ mod tests {
         let reopened = DesktopState::initialize(&path).await.unwrap();
         assert!(reopened.list_cages().await.unwrap().is_empty());
         drop(reopened);
+    }
+
+    #[tokio::test]
+    async fn cage_edits_and_archival_use_the_shared_application_rules() {
+        let temp = tempdir().unwrap();
+        let state = DesktopState::initialize(temp.path().join("muriarc.sqlite3"))
+            .await
+            .unwrap();
+        let cage = state
+            .create_cage(CreateCageInput {
+                code: "A01".to_owned(),
+                room: "SPF-A".to_owned(),
+                rack: "R1".to_owned(),
+                capacity: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(cage.revision, 1);
+        assert_eq!(cage.location.as_deref(), Some("R1"));
+        let animal = Animal::new_mouse(LOCAL_LAB_ID, "M001", Sex::Female, Utc::now()).unwrap();
+        state
+            .store()
+            .create_animal(&animal, &AuditContext::system(WriteSource::Desktop))
+            .await
+            .unwrap();
+        state
+            .move_animals(MoveAnimalsInput {
+                animal_ids: vec![animal.id.to_string()],
+                target_cage_id: cage.id.clone(),
+            })
+            .await
+            .unwrap();
+
+        let resized = state
+            .update_cage(UpdateCageInput {
+                id: cage.id.clone(),
+                expected_revision: cage.revision,
+                rack: Some("  ".to_owned()),
+                capacity: Some(4),
+                sort_order: Some(2),
+            })
+            .await
+            .unwrap();
+        assert_eq!((resized.capacity, resized.sort_order), (4, 2));
+        assert_eq!(resized.location, None);
+        assert_eq!(resized.rack, "未设置");
+        assert_eq!(resized.animal_ids, vec![animal.id.to_string()]);
+        assert_eq!(resized.revision, cage.revision + 1);
+        assert!(matches!(
+            state
+                .update_cage(UpdateCageInput {
+                    id: cage.id.clone(),
+                    expected_revision: resized.revision,
+                    rack: None,
+                    capacity: Some(0),
+                    sort_order: None,
+                })
+                .await,
+            Err(DesktopError::Domain(DomainError::InvalidCageCapacity))
+        ));
+        assert!(matches!(
+            state
+                .archive_cage(ArchiveCageInput {
+                    id: cage.id.clone(),
+                    expected_revision: resized.revision,
+                })
+                .await,
+            Err(DesktopError::Store(StoreError::Conflict(_)))
+        ));
+
+        let target = state
+            .create_cage(CreateCageInput {
+                code: "A02".to_owned(),
+                room: "SPF-A".to_owned(),
+                rack: "R1".to_owned(),
+                capacity: 2,
+            })
+            .await
+            .unwrap();
+        state
+            .move_animals(MoveAnimalsInput {
+                animal_ids: vec![animal.id.to_string()],
+                target_cage_id: target.id.clone(),
+            })
+            .await
+            .unwrap();
+        let archived = state
+            .archive_cage(ArchiveCageInput {
+                id: cage.id.clone(),
+                expected_revision: resized.revision,
+            })
+            .await
+            .unwrap();
+        assert_eq!(archived.revision, resized.revision + 1);
+        let cages = state.list_cages().await.unwrap();
+        assert_eq!(
+            cages
+                .iter()
+                .map(|cage| cage.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![target.id.as_str()]
+        );
+        // Note-less transfer history (e.g. imported events) is labelled from
+        // the active cage list, which no longer contains the archived cage.
+        let active_names = state
+            .store()
+            .list_cages(LOCAL_LAB_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|cage| (cage.id, cage.display_id))
+            .collect::<BTreeMap<_, _>>();
+        let historical = AnimalEvent::new(
+            LOCAL_LAB_ID,
+            animal.id,
+            AnimalEventKind::Transferred {
+                from_cage_id: Some(Uuid::parse_str(&cage.id).unwrap()),
+                to_cage_id: Some(Uuid::parse_str(&target.id).unwrap()),
+            },
+            Utc::now(),
+            Utc::now(),
+        );
+        assert_eq!(
+            timeline_event(
+                historical,
+                &active_names,
+                LOCAL_USER_ID,
+                LOCAL_OPERATOR_NAME
+            )
+            .detail,
+            "已归档笼位 → A02",
+            "an archived cage must not be presented as unassigned"
+        );
     }
 
     #[tokio::test]

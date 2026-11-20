@@ -58,3 +58,36 @@ test('登录后创建笼位、登记动物，并在刷新后读取服务端详�
   await expect(audits.first()).toBeVisible()
   await expect(audits.first()).toContainText(/revision \d+/)
 })
+
+test('调整笼位容量与笼架后归档空笼，刷新后从服务端读回结果', async ({ page }) => {
+  const code = `E2E-EDIT-${runId}`
+  const card = () => page.locator('.cage-card').filter({ hasText: code })
+  await login(page)
+
+  await page.getByRole('button', { name: '新增笼位' }).click()
+  const dialog = page.getByRole('dialog')
+  await dialog.locator('input').nth(0).fill(code)
+  await dialog.locator('input').nth(1).fill('SPF-E2E')
+  await dialog.locator('input').nth(2).fill('R1')
+  await dialog.getByRole('button', { name: '创建笼位' }).click()
+  await expect(page.getByText('笼位已创建')).toBeVisible()
+
+  await page.getByRole('button', { name: `编辑笼位 ${code}` }).click()
+  await dialog.locator('input').nth(0).fill('3')
+  await dialog.locator('input').nth(1).fill('R2')
+  await dialog.getByRole('button', { name: '保存' }).click()
+  await expect(page.getByText(`笼位 ${code} 已更新`)).toBeVisible()
+
+  // The revision-checked PATCH must be persisted, not only reflected locally.
+  await page.reload()
+  await expect(card()).toContainText('SPF-E2E · R2')
+  await expect(card()).toContainText('0 / 3')
+
+  await page.getByRole('button', { name: `编辑笼位 ${code}` }).click()
+  await dialog.getByRole('button', { name: '归档笼位' }).click()
+  await page.getByRole('button', { name: '归档', exact: true }).click()
+  await expect(page.getByText(`笼位 ${code} 已归档`)).toBeVisible()
+  await page.reload()
+  await expect(page.getByRole('heading', { name: '笼位视图' })).toBeVisible()
+  await expect(card()).toHaveCount(0)
+})

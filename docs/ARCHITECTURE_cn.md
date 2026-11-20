@@ -55,6 +55,7 @@ SQLite 和 PostgreSQL adapter 实现相同 Store contract，并运行共享合�
 
 - 动物登记同时写 Animal、生命周期事件、Audit 与 Provenance；
 - 转笼锁定并校验源/目标笼位，推进 Animal revision，写事件和 Audit；
+- 笼位编辑或归档锁定笼位并校验 revision，在同一锁内统计当前在笼动物（调整容量不得低于在笼数量，只有空笼可归档），再一并写入新 revision 与 Audit；
 - 将 offspring draft 登记为 Animal 时，Animal、双亲谱系、生命周期、Audit、Provenance 一次提交；
 - 实验入组同时保存 Participation 与当时采用的基因鉴定证据快照；
 - 批准测量或鉴定批次时保留人工审批、证据关系和 Provenance。

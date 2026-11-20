@@ -192,6 +192,10 @@ pub enum DomainError {
     InvalidQuantity,
     #[error("cage capacity must be greater than zero")]
     InvalidCageCapacity,
+    #[error("cage capacity {capacity} is below its {residents} current residents")]
+    CageCapacityBelowResidents { capacity: i32, residents: i64 },
+    #[error("cage still houses {residents} animals; transfer them out before archiving")]
+    CageNotEmpty { residents: i64 },
     #[error("at least one animal must be selected")]
     EmptyAnimalSelection,
     #[error("animal selection must not contain duplicates")]

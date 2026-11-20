@@ -1,9 +1,11 @@
 use chrono::{DateTime, Utc};
-use muriarc_core::{Animal, AnimalTransfer, AuditContext, Cage, CageKind, MuriArcStore};
+use muriarc_core::{
+    Animal, AnimalTransfer, AuditContext, Cage, CageKind, CageUpdate, MuriArcStore, StoreError,
+};
 use uuid::Uuid;
 
-use crate::ApplicationResult;
 use crate::validation::{ensure_max_bytes, normalized_optional, normalized_required};
+use crate::{ApplicationError, ApplicationResult};
 
 pub const MAX_CAGE_DISPLAY_ID_CHARS: usize = 64;
 pub const MAX_CAGE_SECTION_CHARS: usize = 128;
@@ -42,6 +44,85 @@ pub async fn create_cage(
     cage.sort_order = command.sort_order;
     store.create_cage(&cage, audit).await?;
     Ok(cage)
+}
+
+/// Partial edit of a cage's housing attributes at the revision the caller
+/// observed. `None` keeps the current value; a blank `location` clears it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateCageCommand {
+    pub lab_id: Uuid,
+    pub cage_id: Uuid,
+    pub expected_revision: i64,
+    pub location: Option<String>,
+    pub capacity: Option<i32>,
+    pub sort_order: Option<i32>,
+    pub now: DateTime<Utc>,
+}
+
+pub async fn update_cage(
+    store: &dyn MuriArcStore,
+    command: UpdateCageCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<Cage> {
+    if command.location.is_none() && command.capacity.is_none() && command.sort_order.is_none() {
+        return Err(ApplicationError::Validation(
+            "cage update must change location, capacity or sort_order".to_owned(),
+        ));
+    }
+    let location = command
+        .location
+        .map(|location| {
+            normalized_optional("cage.location", Some(location), MAX_CAGE_LOCATION_CHARS)
+        })
+        .transpose()?;
+
+    // Merging with the current row is safe: the Store rejects the write unless
+    // the locked row still has `expected_revision`, i.e. the state merged here.
+    let current = store.get_cage(command.cage_id).await?;
+    if current.lab_id != command.lab_id {
+        return Err(StoreError::NotFound {
+            entity: "cage",
+            id: command.cage_id,
+        }
+        .into());
+    }
+    let update = CageUpdate {
+        cage_id: current.id,
+        lab_id: command.lab_id,
+        expected_revision: command.expected_revision,
+        location: location.unwrap_or(current.location),
+        capacity: command.capacity.unwrap_or(current.capacity),
+        sort_order: command.sort_order.unwrap_or(current.sort_order),
+        updated_at: command.now,
+    };
+    update.validate()?;
+    Ok(store.update_cage(&update, audit).await?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArchiveCageCommand {
+    pub lab_id: Uuid,
+    pub cage_id: Uuid,
+    pub expected_revision: i64,
+    pub now: DateTime<Utc>,
+}
+
+/// Retires an empty cage by soft deletion; residents must be transferred out
+/// first so no animal is left pointing at an archived cage.
+pub async fn archive_cage(
+    store: &dyn MuriArcStore,
+    command: ArchiveCageCommand,
+    audit: &AuditContext,
+) -> ApplicationResult<Cage> {
+    Ok(store
+        .archive_cage(
+            command.lab_id,
+            command.cage_id,
+            command.expected_revision,
+            command.now,
+            audit,
+        )
+        .await?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +164,6 @@ pub async fn transfer_animals(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ApplicationError;
 
     #[test]
     fn transfer_notes_use_a_bounded_utf8_payload() {

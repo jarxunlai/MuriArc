@@ -99,6 +99,21 @@ export interface CreateCageInput {
   capacity: number
 }
 
+/** Partial housing edit at the observed revision; omitted fields keep their value. */
+export interface UpdateCageInput {
+  id: string
+  expectedRevision: number
+  /** Stored location; a blank value clears it. */
+  rack?: string
+  capacity?: number
+  sortOrder?: number
+}
+
+export interface ArchiveCageInput {
+  id: string
+  expectedRevision: number
+}
+
 export interface CreateAnimalInput {
   displayId: string
   identifierScope: 'lab' | 'project'
@@ -846,6 +861,9 @@ export interface MuriArcGateway {
   getRuntimeCapabilities?(): Promise<RuntimeCapabilities>
   listCages(context?: AnimalAccessContext): Promise<Cage[]>
   createCage(input: CreateCageInput): Promise<Cage>
+  updateCage(input: UpdateCageInput): Promise<Cage>
+  /** Soft-deletes an empty cage; the server rejects cages that still house animals. */
+  archiveCage(input: ArchiveCageInput): Promise<void>
   createAnimal(input: CreateAnimalInput): Promise<Animal>
   listAnimals(context?: AnimalAccessContext): Promise<Animal[]>
   getAnimal(id: string, context?: AnimalAccessContext): Promise<Animal | undefined>
@@ -1092,6 +1110,8 @@ export class LocalTauriGateway implements MuriArcGateway {
 
   listCages(_context?: AnimalAccessContext) { return this.call<Cage[]>('list_cages') }
   createCage(input: CreateCageInput) { return this.call<Cage>('create_cage', { input }) }
+  updateCage(input: UpdateCageInput) { return this.call<Cage>('update_cage', { input }) }
+  async archiveCage(input: ArchiveCageInput) { await this.call<Cage>('archive_cage', { input }) }
   createAnimal(input: CreateAnimalInput) { return this.call<Animal>('create_animal', { input }) }
   listAnimals(_context?: AnimalAccessContext) { return this.call<Animal[]>('list_animals') }
   getAnimal(id: string, _context?: AnimalAccessContext) {
@@ -1627,6 +1647,8 @@ interface RawCage {
   display_id: string
   location?: string | null
   capacity: number
+  sort_order: number
+  meta: { revision: number }
 }
 
 interface RawProjectAnimalAssignment {
@@ -2704,6 +2726,25 @@ export class RemoteHttpGateway implements MuriArcGateway {
       }),
     })
     return mapCages([response.data], [])[0]
+  }
+
+  async updateCage(input: UpdateCageInput): Promise<Cage> {
+    const body: Record<string, unknown> = { expected_revision: input.expectedRevision }
+    if (input.rack !== undefined) body.location = input.rack
+    if (input.capacity !== undefined) body.capacity = input.capacity
+    if (input.sortOrder !== undefined) body.sort_order = input.sortOrder
+    const response = await this.request<ApiItem<RawCage>>(`/cages/${encodeURIComponent(input.id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    })
+    return mapCages([response.data], [])[0]
+  }
+
+  async archiveCage(input: ArchiveCageInput): Promise<void> {
+    await this.request<ApiItem<RawCage>>(`/cages/${encodeURIComponent(input.id)}/archive`, {
+      method: 'POST',
+      body: JSON.stringify({ expected_revision: input.expectedRevision }),
+    })
   }
 
   async createAnimal(input: CreateAnimalInput): Promise<Animal> {
@@ -4823,7 +4864,10 @@ function mapCages(cages: RawCage[], animals: RawAnimal[]): Cage[] {
       code: raw.display_id,
       room: raw.section,
       rack: raw.location ?? '未设置',
+      location: raw.location ?? null,
       capacity: raw.capacity,
+      sortOrder: raw.sort_order,
+      revision: raw.meta.revision,
       animalIds: residents.map((animal) => animal.id),
       status: residents.length === 0 ? 'empty' : residents.length > raw.capacity ? 'attention' : 'normal',
       summary: residents.length === 0 ? '空笼' : strains.length ? strains.join(' · ') : `${residents.length} 只动物`,

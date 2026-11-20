@@ -35,11 +35,11 @@ use animal_details::{
     SampleView,
 };
 use application::{
-    AnimalView, CageView, CohortView, CreateAnimalInput, CreateCageInput, CreateCohortInput,
-    CreateExperimentInput, CreateProcedureInput, CreateProjectInput, CreateTemplateInput,
-    DataJobView, DesktopError, DesktopState, EnrollAnimalInput, ExperimentView,
-    LifecycleTransitionInput, MoveAnimalsInput, ParticipationView, ProcedureView, ProjectView,
-    SaveWorkspaceSettingsInput, TemplateView, WorkspaceSettingsView,
+    AnimalView, ArchiveCageInput, CageView, CohortView, CreateAnimalInput, CreateCageInput,
+    CreateCohortInput, CreateExperimentInput, CreateProcedureInput, CreateProjectInput,
+    CreateTemplateInput, DataJobView, DesktopError, DesktopState, EnrollAnimalInput,
+    ExperimentView, LifecycleTransitionInput, MoveAnimalsInput, ParticipationView, ProcedureView,
+    ProjectView, SaveWorkspaceSettingsInput, TemplateView, UpdateCageInput, WorkspaceSettingsView,
 };
 use data::{
     AnimalImportTemplateInput, AnimalImportTemplateView, AttachmentDownloadView,
@@ -468,6 +468,22 @@ async fn create_cage(
     input: CreateCageInput,
 ) -> CommandResult<CageView> {
     state.create_cage(input).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn update_cage(
+    state: tauri::State<'_, DesktopState>,
+    input: UpdateCageInput,
+) -> CommandResult<CageView> {
+    state.update_cage(input).await.map_err(Into::into)
+}
+
+#[tauri::command]
+async fn archive_cage(
+    state: tauri::State<'_, DesktopState>,
+    input: ArchiveCageInput,
+) -> CommandResult<CageView> {
+    state.archive_cage(input).await.map_err(Into::into)
 }
 
 #[tauri::command]
@@ -1751,6 +1767,8 @@ pub fn run() {
             open_local_storage_directory,
             list_cages,
             create_cage,
+            update_cage,
+            archive_cage,
             create_animal,
             list_animals,
             get_animal,

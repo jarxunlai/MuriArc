@@ -254,6 +254,70 @@ impl Cage {
         self.capacity = capacity;
         Ok(())
     }
+
+    /// Applies a housing edit and advances the revision.
+    ///
+    /// A changed capacity must still house the current residents. An
+    /// unchanged capacity is not re-checked, so cages that predate capacity
+    /// tracking (and may already be over it) can still be relocated.
+    /// `residents` must be counted under the same lock that persists the edit,
+    /// so a concurrent transfer cannot leave the cage over capacity.
+    pub fn apply_update(&mut self, update: &CageUpdate, residents: i64) -> Result<(), DomainError> {
+        update.validate()?;
+        if update.capacity != self.capacity && residents > i64::from(update.capacity) {
+            return Err(DomainError::CageCapacityBelowResidents {
+                capacity: update.capacity,
+                residents,
+            });
+        }
+        self.location.clone_from(&update.location);
+        self.capacity = update.capacity;
+        self.sort_order = update.sort_order;
+        self.meta.touch(update.updated_at);
+        Ok(())
+    }
+
+    /// Soft-deletes a cage that no longer houses any animal.
+    ///
+    /// `residents` must be counted under the same lock that persists the
+    /// archival, so no transfer can land in a cage while it is retired.
+    pub fn archive(
+        &mut self,
+        residents: i64,
+        archived_at: DateTime<Utc>,
+    ) -> Result<(), DomainError> {
+        if residents > 0 {
+            return Err(DomainError::CageNotEmpty { residents });
+        }
+        self.meta.soft_delete(archived_at);
+        Ok(())
+    }
+}
+
+/// Revision-checked edit of a cage's housing attributes.
+///
+/// Fields carry the complete post-edit values. Identity (lab, section,
+/// display id and kind) is intentionally not editable so historical transfer
+/// events keep referring to the same physical cage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CageUpdate {
+    pub cage_id: Uuid,
+    pub lab_id: Uuid,
+    pub expected_revision: i64,
+    pub location: Option<String>,
+    pub capacity: i32,
+    pub sort_order: i32,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl CageUpdate {
+    /// Revalidates the command before a persistence adapter trusts it.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.capacity <= 0 {
+            return Err(DomainError::InvalidCageCapacity);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

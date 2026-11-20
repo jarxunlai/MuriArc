@@ -33,6 +33,23 @@ describe('MuriArc gateway selection', () => {
     ]])
   })
 
+  it('passes cage edit and archive commands with the observed revision to Tauri', async () => {
+    const calls: Array<[string, Record<string, unknown> | undefined]> = []
+    const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
+      calls.push([command, args])
+      return undefined as T
+    }
+    const gateway = new LocalTauriGateway(invokeCommand)
+
+    await gateway.updateCage({ id: 'cage-1', expectedRevision: 3, capacity: 8, rack: '' })
+    await gateway.archiveCage({ id: 'cage-1', expectedRevision: 4 })
+
+    expect(calls).toEqual([
+      ['update_cage', { input: { id: 'cage-1', expectedRevision: 3, capacity: 8, rack: '' } }],
+      ['archive_cage', { input: { id: 'cage-1', expectedRevision: 4 } }],
+    ])
+  })
+
   it('sends only the one-time selection token when scheduling a local storage migration', async () => {
     const calls: Array<[string, Record<string, unknown> | undefined]> = []
     const invokeCommand = async <T>(command: string, args?: Record<string, unknown>): Promise<T> => {
@@ -1047,7 +1064,7 @@ describe('MuriArc gateway selection', () => {
       }
       if (url.endsWith('/auth/logout')) return new Response(null, { status: 204 })
       return new Response(JSON.stringify({
-        data: { id: 'cage-1', section: 'SPF-A', display_id: 'A01', location: 'R1', capacity: 5 },
+        data: { id: 'cage-1', section: 'SPF-A', display_id: 'A01', location: 'R1', capacity: 5, sort_order: 0, meta: { revision: 1 } },
         request_id: 'req-cage',
       }), { status: 201, headers: { 'Content-Type': 'application/json' } })
     }) as unknown as typeof fetch
@@ -1135,7 +1152,9 @@ describe('MuriArc gateway selection', () => {
             csrf_token: 'mac-restored',
             expires_at: '2026-07-19T11:00:00Z',
           }
-        : {
+        : url.endsWith('/cages')
+          ? { id: 'cage-2', section: 'SPF-A', display_id: 'A02', location: 'R1', capacity: 5, sort_order: 0, meta: { revision: 1 } }
+          : {
             id: 'user-1',
             lab_id: 'lab-1',
             email: null,
@@ -1186,7 +1205,7 @@ describe('MuriArc gateway selection', () => {
     const fetchRequest = vi.fn(async (input: string | URL | Request) => {
       const url = String(input)
       const data = url.endsWith('/cages')
-        ? [{ id: 'cage-1', section: 'SPF-A', display_id: 'A01', location: 'R1', capacity: 5 }]
+        ? [{ id: 'cage-1', section: 'SPF-A', display_id: 'A01', location: 'R1', capacity: 5, sort_order: 0, meta: { revision: 1 } }]
         : [{
             id: 'animal-1', display_id: 'M-001', strain: 'C57BL/6J', sex: 'male',
             current_cage_id: 'cage-1', current_status: 'alive',
@@ -1204,6 +1223,46 @@ describe('MuriArc gateway selection', () => {
       code: 'A01', room: 'SPF-A', rack: 'R1', capacity: 5, animalIds: ['animal-1'], status: 'normal',
     })])
     expect(fetchRequest).toHaveBeenCalledTimes(2)
+  })
+
+  it('maps cage revisions and sends revision-checked cage edits and archival', async () => {
+    const requests: Array<{ url: string; init?: RequestInit }> = []
+    const fetchRequest = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      requests.push({ url, init })
+      const data = url.endsWith('/auth/csrf')
+        ? { csrf_token: 'csrf-cage', expires_at: '2026-07-19T11:00:00Z' }
+        : url.endsWith('/auth/session')
+          ? {
+              id: 'user-1', lab_id: 'lab-1', email: null, display_name: '动物管理员',
+              lab_roles: ['animal_manager'], project_roles: [], authentication: 'session',
+            }
+          : {
+              id: 'cage-1', section: 'SPF-A', display_id: 'A01', location: null,
+              capacity: 8, sort_order: 2, meta: { revision: 4 },
+            }
+      return new Response(JSON.stringify({ data, request_id: 'req-cage-edit' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+    const gateway = new RemoteHttpGateway({ baseUrl: 'https://lab.example/api/v1', fetch: fetchRequest })
+    await gateway.restoreSession()
+
+    const updated = await gateway.updateCage({ id: 'cage-1', expectedRevision: 3, capacity: 8, rack: '' })
+    await gateway.archiveCage({ id: 'cage-1', expectedRevision: 4 })
+
+    expect(updated).toEqual(expect.objectContaining({
+      id: 'cage-1', rack: '未设置', location: null, capacity: 8, sortOrder: 2, revision: 4,
+    }))
+    const patch = requests.find((request) => request.init?.method === 'PATCH')!
+    expect(patch.url).toBe('https://lab.example/api/v1/cages/cage-1')
+    expect(JSON.parse(String(patch.init?.body))).toEqual({ expected_revision: 3, location: '', capacity: 8 })
+    expect(new Headers(patch.init?.headers).get('X-CSRF-Token')).toBe('csrf-cage')
+    const archive = requests.find((request) => request.url.endsWith('/cages/cage-1/archive'))!
+    expect(archive.init?.method).toBe('POST')
+    expect(JSON.parse(String(archive.init?.body))).toEqual({ expected_revision: 4 })
+    expect(new Headers(archive.init?.headers).get('X-CSRF-Token')).toBe('csrf-cage')
   })
 
   it('loads and reverses the Server animal timeline for detail views', async () => {
@@ -1225,7 +1284,7 @@ describe('MuriArc gateway selection', () => {
               genotype: '待确认', projects: [], latest_weight: null,
             }]
         : url.includes('/cages')
-          ? [{ id: 'cage-1', section: 'SPF-A', display_id: 'A01', location: 'R1', capacity: 5 }]
+          ? [{ id: 'cage-1', section: 'SPF-A', display_id: 'A01', location: 'R1', capacity: 5, sort_order: 0, meta: { revision: 1 } }]
           : {
               id: 'animal-1', display_id: 'M-001', strain: 'C57BL/6J', sex: 'male',
               current_cage_id: 'cage-1', current_status: 'alive',

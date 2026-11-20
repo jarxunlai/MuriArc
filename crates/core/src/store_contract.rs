@@ -9435,3 +9435,288 @@ async fn run_relationship_contract(store: &dyn MuriArcStore, now: chrono::DateTi
         "rejected relationships must not write Lab B audits"
     );
 }
+
+/// Verifies governed cage edits and archival: optimistic revisions, occupancy
+/// rules evaluated against current residents, lab isolation, soft deletion
+/// and Audit, identically for every Store adapter.
+pub async fn run_cage_management_contract<S>(store: &S)
+where
+    S: MuriArcStore,
+{
+    store.migrate().await.expect("migration succeeds");
+    let now = contract_now();
+    let setup = AuditContext::system(WriteSource::Migration);
+    let lab = Lab::new(format!("Cage management {}", uuid::Uuid::new_v4()), now).unwrap();
+    store.create_lab(&lab, &setup).await.unwrap();
+    let other_lab = Lab::new(format!("Other cage lab {}", uuid::Uuid::new_v4()), now).unwrap();
+    store.create_lab(&other_lab, &setup).await.unwrap();
+    let user = User::new(
+        lab.id,
+        format!("{}@cage-management.test", uuid::Uuid::new_v4()),
+        "Cage manager",
+        now,
+    )
+    .unwrap();
+    store.create_user(&user, &setup).await.unwrap();
+    let audit = AuditContext {
+        actor: Actor::human(user.id, user.display_name.clone()),
+        source: WriteSource::Web,
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        reason: Some("shared cage management contract".to_owned()),
+    };
+
+    let mut cage = Cage::new(lab.id, "SPF-C", format!("C-{}", uuid::Uuid::new_v4()), now).unwrap();
+    cage.location = Some("Rack 1".to_owned());
+    cage.set_capacity(2).unwrap();
+    store.create_cage(&cage, &audit).await.unwrap();
+    let overflow = Cage::new(lab.id, "SPF-C", format!("O-{}", uuid::Uuid::new_v4()), now).unwrap();
+    store.create_cage(&overflow, &audit).await.unwrap();
+    let residents = [
+        Animal::new_mouse(
+            lab.id,
+            format!("CM-{}", uuid::Uuid::new_v4()),
+            Sex::Male,
+            now,
+        )
+        .unwrap(),
+        Animal::new_mouse(
+            lab.id,
+            format!("CM-{}", uuid::Uuid::new_v4()),
+            Sex::Male,
+            now,
+        )
+        .unwrap(),
+    ];
+    for animal in &residents {
+        store.create_animal(animal, &audit).await.unwrap();
+    }
+    let resident_ids = residents.iter().map(|animal| animal.id).collect::<Vec<_>>();
+    store
+        .transfer_animals(
+            &AnimalTransfer::new(lab.id, resident_ids.clone(), cage.id, now, now).unwrap(),
+            &audit,
+        )
+        .await
+        .unwrap();
+
+    let edit_at = now + Duration::milliseconds(10);
+    let edit = |expected_revision: i64, capacity: i32| CageUpdate {
+        cage_id: cage.id,
+        lab_id: lab.id,
+        expected_revision,
+        location: Some("Rack 9".to_owned()),
+        capacity,
+        sort_order: 4,
+        updated_at: edit_at,
+    };
+
+    assert!(matches!(
+        store.update_cage(&edit(cage.meta.revision + 1, 3), &audit).await,
+        Err(StoreError::Conflict(message)) if message.contains("revision")
+    ));
+    assert!(matches!(
+        store.update_cage(&edit(cage.meta.revision, 1), &audit).await,
+        Err(StoreError::Conflict(message)) if message.contains("below its 2 current residents")
+    ));
+    assert!(matches!(
+        store
+            .update_cage(&edit(cage.meta.revision, 0), &audit)
+            .await,
+        Err(StoreError::Validation(_))
+    ));
+    assert!(matches!(
+        store
+            .update_cage(
+                &CageUpdate {
+                    lab_id: other_lab.id,
+                    ..edit(cage.meta.revision, 3)
+                },
+                &audit,
+            )
+            .await,
+        Err(StoreError::NotFound { entity: "cage", .. })
+    ));
+    assert_eq!(
+        store.get_cage(cage.id).await.unwrap(),
+        cage,
+        "rejected edits must not change the cage"
+    );
+
+    // Capacity may shrink to exactly the current resident count.
+    let updated = store
+        .update_cage(&edit(cage.meta.revision, 2), &audit)
+        .await
+        .unwrap();
+    assert_eq!(updated.capacity, 2);
+    assert_eq!(updated.location.as_deref(), Some("Rack 9"));
+    assert_eq!(updated.sort_order, 4);
+    assert_eq!(updated.meta.revision, cage.meta.revision + 1);
+    assert_eq!(updated.meta.updated_at, edit_at);
+    assert_eq!(
+        (
+            updated.id,
+            updated.lab_id,
+            &updated.section,
+            &updated.display_id,
+            updated.kind,
+            updated.meta.created_at,
+            updated.meta.deleted_at,
+        ),
+        (
+            cage.id,
+            cage.lab_id,
+            &cage.section,
+            &cage.display_id,
+            cage.kind,
+            cage.meta.created_at,
+            None,
+        ),
+        "identity fields stay immutable"
+    );
+    assert_eq!(store.get_cage(cage.id).await.unwrap(), updated);
+    assert!(matches!(
+        store
+            .update_cage(&edit(cage.meta.revision, 3), &audit)
+            .await,
+        Err(StoreError::Conflict(_))
+    ));
+    let cleared = store
+        .update_cage(
+            &CageUpdate {
+                location: None,
+                updated_at: edit_at + Duration::milliseconds(1),
+                ..edit(updated.meta.revision, 6)
+            },
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleared.location, None);
+    assert_eq!(cleared.capacity, 6);
+    assert_eq!(store.get_cage(cage.id).await.unwrap(), cleared);
+
+    let archive_at = now + Duration::milliseconds(20);
+    assert!(matches!(
+        store
+            .archive_cage(lab.id, cage.id, cleared.meta.revision, archive_at, &audit)
+            .await,
+        Err(StoreError::Conflict(message)) if message.contains("2 animals")
+    ));
+    assert_eq!(store.get_cage(cage.id).await.unwrap(), cleared);
+
+    store
+        .transfer_animals(
+            &AnimalTransfer::new(lab.id, resident_ids.clone(), overflow.id, now, now).unwrap(),
+            &audit,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .archive_cage(
+                other_lab.id,
+                cage.id,
+                cleared.meta.revision,
+                archive_at,
+                &audit
+            )
+            .await,
+        Err(StoreError::NotFound { entity: "cage", .. })
+    ));
+    assert!(matches!(
+        store
+            .archive_cage(lab.id, cage.id, cleared.meta.revision - 1, archive_at, &audit)
+            .await,
+        Err(StoreError::Conflict(message)) if message.contains("revision")
+    ));
+    let archived = store
+        .archive_cage(lab.id, cage.id, cleared.meta.revision, archive_at, &audit)
+        .await
+        .unwrap();
+    assert_eq!(archived.meta.deleted_at, Some(archive_at));
+    assert_eq!(archived.meta.updated_at, archive_at);
+    assert_eq!(archived.meta.revision, cleared.meta.revision + 1);
+    assert_eq!(archived.capacity, cleared.capacity);
+
+    assert!(matches!(
+        store.get_cage(cage.id).await,
+        Err(StoreError::NotFound { entity: "cage", .. })
+    ));
+    assert!(
+        !store
+            .list_cages(lab.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.id == cage.id),
+        "archived cages leave the active list"
+    );
+    assert!(matches!(
+        store
+            .archive_cage(lab.id, cage.id, archived.meta.revision, archive_at, &audit)
+            .await,
+        Err(StoreError::NotFound { entity: "cage", .. })
+    ));
+    assert!(matches!(
+        store
+            .update_cage(&edit(archived.meta.revision, 3), &audit)
+            .await,
+        Err(StoreError::NotFound { entity: "cage", .. })
+    ));
+    assert!(matches!(
+        store
+            .transfer_animals(
+                &AnimalTransfer::new(lab.id, vec![resident_ids[0]], cage.id, now, now).unwrap(),
+                &audit,
+            )
+            .await,
+        Err(StoreError::NotFound { entity: "cage", .. })
+    ));
+
+    let audits = store
+        .list_audit_entries(&AuditFilter {
+            lab_id: lab.id,
+            project_id: None,
+            entity_id: Some(cage.id),
+        })
+        .await
+        .unwrap();
+    let mutations = audits
+        .iter()
+        .filter(|entry| {
+            entry.entity_type == EntityType::Cage
+                && matches!(entry.action, AuditAction::Update | AuditAction::Archive)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mutations.len(),
+        3,
+        "rejected edits write no Audit; accepted ones write exactly one"
+    );
+    for entry in &mutations {
+        assert_eq!(entry.actor, audit.actor);
+        assert_eq!(entry.source, WriteSource::Web);
+        assert_eq!(entry.request_id, audit.request_id);
+        assert!(entry.before.is_some() && entry.after.is_some());
+    }
+    let archive_entry = mutations
+        .iter()
+        .find(|entry| entry.action == AuditAction::Archive)
+        .expect("archival is audited");
+    assert_eq!(archive_entry.operation_code, "cage.archive");
+    assert_eq!(archive_entry.entity_revision, Some(archived.meta.revision));
+    assert_eq!(
+        archive_entry.before.as_ref().unwrap()["meta"]["deleted_at"],
+        serde_json::Value::Null
+    );
+    assert!(
+        mutations
+            .iter()
+            .any(|entry| entry.action == AuditAction::Update
+                && entry.entity_revision == Some(updated.meta.revision)
+                && entry.before.as_ref().unwrap()["location"] == "Rack 1"
+                && entry.after.as_ref().unwrap()["location"] == "Rack 9"
+                && entry.after.as_ref().unwrap()["sort_order"] == 4),
+        "the housing edit records its before and after state"
+    );
+}

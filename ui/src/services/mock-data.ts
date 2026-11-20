@@ -1,12 +1,12 @@
 import type { Animal, Cage, DataJob, Experiment } from '@/domain/models'
 
 export const seedCages: Cage[] = [
-  { id: 'cage-a01', code: 'A01', room: 'SPF-A', rack: 'R1', capacity: 6, animalIds: ['animal-001', 'animal-002', 'animal-003', 'animal-004'], status: 'normal', summary: 'C57BL/6J · 雄 · WT' },
-  { id: 'cage-a02', code: 'A02', room: 'SPF-A', rack: 'R1', capacity: 6, animalIds: ['animal-005', 'animal-006', 'animal-007'], status: 'attention', summary: 'GeneA cKO · 雌', note: '1 只待确认基因型' },
-  { id: 'cage-a03', code: 'A03', room: 'SPF-A', rack: 'R1', capacity: 5, animalIds: [], status: 'empty', summary: '空笼' },
-  { id: 'cage-b01', code: 'B01', room: 'SPF-A', rack: 'R2', capacity: 5, animalIds: ['animal-008', 'animal-009', 'animal-010'], status: 'normal', summary: 'BALB/c · 雌 · 实验组' },
-  { id: 'cage-b02', code: 'B02', room: 'SPF-A', rack: 'R2', capacity: 5, animalIds: ['animal-011', 'animal-012'], status: 'normal', summary: 'C57BL/6J · 繁育' },
-  { id: 'cage-c01', code: 'C01', room: '屏障区-B', rack: 'R1', capacity: 5, animalIds: ['animal-013', 'animal-014', 'animal-015', 'animal-016', 'animal-017'], status: 'attention', summary: 'DEMO · Day 7', note: '今日需记录体重' },
+  { id: 'cage-a01', code: 'A01', room: 'SPF-A', rack: 'R1', location: 'R1', capacity: 6, revision: 1, animalIds: ['animal-001', 'animal-002', 'animal-003', 'animal-004'], status: 'normal', summary: 'C57BL/6J · 雄 · WT' },
+  { id: 'cage-a02', code: 'A02', room: 'SPF-A', rack: 'R1', location: 'R1', capacity: 6, revision: 1, animalIds: ['animal-005', 'animal-006', 'animal-007'], status: 'attention', summary: 'GeneA cKO · 雌', note: '1 只待确认基因型' },
+  { id: 'cage-a03', code: 'A03', room: 'SPF-A', rack: 'R1', location: 'R1', capacity: 5, revision: 1, animalIds: [], status: 'empty', summary: '空笼' },
+  { id: 'cage-b01', code: 'B01', room: 'SPF-A', rack: 'R2', location: 'R2', capacity: 5, revision: 1, animalIds: ['animal-008', 'animal-009', 'animal-010'], status: 'normal', summary: 'BALB/c · 雌 · 实验组' },
+  { id: 'cage-b02', code: 'B02', room: 'SPF-A', rack: 'R2', location: 'R2', capacity: 5, revision: 1, animalIds: ['animal-011', 'animal-012'], status: 'normal', summary: 'C57BL/6J · 繁育' },
+  { id: 'cage-c01', code: 'C01', room: '屏障区-B', rack: 'R1', location: 'R1', capacity: 5, revision: 1, animalIds: ['animal-013', 'animal-014', 'animal-015', 'animal-016', 'animal-017'], status: 'attention', summary: 'DEMO · Day 7', note: '今日需记录体重' },
 ]
 
 const makeTimeline = (code: string, birthDate: string, cage: string) => [

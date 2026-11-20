@@ -1,5 +1,13 @@
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
-use muriarc_application::{CreateCageCommand, create_cage};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{get, post},
+};
+use muriarc_application::{
+    ArchiveCageCommand, CreateCageCommand, UpdateCageCommand, archive_cage, create_cage,
+    update_cage,
+};
 use muriarc_core::{Cage, CageKind, Permission};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -14,7 +22,8 @@ use super::{
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/cages", get(list).post(create))
-        .route("/cages/{id}", get(get_one))
+        .route("/cages/{id}", get(get_one).patch(update))
+        .route("/cages/{id}/archive", post(archive))
 }
 
 async fn list(
@@ -123,4 +132,76 @@ async fn create(
     )
     .await?;
     Ok((StatusCode::CREATED, item(cage, &metadata)))
+}
+
+/// Partial housing edit. Omitted or `null` fields keep their value; a blank
+/// `location` clears it. Identity fields are not editable.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateRequest {
+    expected_revision: i64,
+    location: Option<String>,
+    capacity: Option<i32>,
+    sort_order: Option<i32>,
+}
+
+async fn update(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<UpdateRequest>,
+) -> Result<Json<ItemResponse<Cage>>, ApiError> {
+    authorize(&principal, Permission::ManageCage, None, &metadata)?;
+    let audit = principal.audit_context(&metadata);
+    let cage = application(
+        update_cage(
+            state.store.as_ref(),
+            UpdateCageCommand {
+                lab_id: principal.lab_id,
+                cage_id: id,
+                expected_revision: payload.expected_revision,
+                location: payload.location,
+                capacity: payload.capacity,
+                sort_order: payload.sort_order,
+                now: chrono::Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
+    Ok(item(cage, &metadata))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchiveRequest {
+    expected_revision: i64,
+}
+
+async fn archive(
+    State(state): State<AppState>,
+    principal: AuthPrincipal,
+    metadata: RequestMetadata,
+    ApiPath(id): ApiPath<Uuid>,
+    ApiJson(payload): ApiJson<ArchiveRequest>,
+) -> Result<Json<ItemResponse<Cage>>, ApiError> {
+    authorize(&principal, Permission::ManageCage, None, &metadata)?;
+    let audit = principal.audit_context(&metadata);
+    let cage = application(
+        archive_cage(
+            state.store.as_ref(),
+            ArchiveCageCommand {
+                lab_id: principal.lab_id,
+                cage_id: id,
+                expected_revision: payload.expected_revision,
+                now: chrono::Utc::now(),
+            },
+            &audit,
+        ),
+        &metadata,
+    )
+    .await?;
+    Ok(item(cage, &metadata))
 }

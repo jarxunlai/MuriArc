@@ -65,6 +65,11 @@
   --muri-sidebar-width: 224px;
   --muri-topbar-height: 58px;
   --muri-content-max: 1480px;
+  /* Card dialog widths: sm confirmations and short forms, md standard forms, lg data-heavy forms */
+  --muri-dialog-sm: 480px;
+  --muri-dialog-md: 640px;
+  --muri-dialog-lg: 800px;
+  --muri-dialog-gutter: 28px;
   --muri-transition-fast: 120ms ease;
   --muri-transition-panel: 180ms ease;
 }

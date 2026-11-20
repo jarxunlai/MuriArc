@@ -811,7 +811,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
       </div>
     </transition>
 
-    <n-modal v-model:show="showProjectBatch" preset="card" :title="projectBatchMode === 'assign' ? '批量分配到项目' : '批量从项目移除'" class="dialog-card" :bordered="false">
+    <n-modal v-model:show="showProjectBatch" preset="card" :title="projectBatchMode === 'assign' ? '批量分配到项目' : '批量从项目移除'" class="muri-dialog-md" :bordered="false">
       <n-spin :show="projectBatchLoading">
         <n-form label-placement="top">
           <n-form-item label="目标项目" required>
@@ -836,7 +836,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
       <template #footer><div class="dialog-actions"><n-button @click="showProjectBatch = false">取消</n-button><n-button :type="projectBatchMode === 'remove' ? 'warning' : 'primary'" :disabled="!projectBatchId || !projectBatchEligibleIds.length" :loading="projectBatchSaving" @click="confirmProjectBatch">确认{{ projectBatchMode === 'assign' ? '分配' : '移除' }}</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showCreate" preset="card" title="登记小鼠" class="dialog-card" :bordered="false">
+    <n-modal v-model:show="showCreate" preset="card" title="登记小鼠" class="muri-dialog-md" :bordered="false">
       <n-form label-placement="top">
         <div class="form-grid">
           <n-form-item label="显示编号" required><n-input v-model:value="newAnimal.displayId" placeholder="例如 M-26001" /></n-form-item>
@@ -883,7 +883,7 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
       <template #footer><div class="dialog-actions"><n-button @click="showCreate = false">取消</n-button><n-button type="primary" :loading="busy" @click="createAnimal">登记小鼠</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showSampleCreate" preset="card" title="登记样本" class="dialog-card" :bordered="false">
+    <n-modal v-model:show="showSampleCreate" preset="card" title="登记样本" class="muri-dialog-md" :bordered="false">
       <n-alert v-if="!selectedProjectOptions.length" type="warning" :show-icon="false">动物需先参与科研项目和实验，才能登记项目样本。</n-alert>
       <n-form label-placement="top">
         <div class="form-grid">
@@ -1083,7 +1083,6 @@ onBeforeUnmount(clearGenotypingBatchEvidence)
 .card-grid { display: grid; grid-template-columns: auto 1fr auto 1fr auto 1fr; gap: 5px; color: var(--muri-text-tertiary); font-size: 12px; }
 .card-grid b { color: var(--muri-text); font-weight: 500; }
 .animal-card > small { display: block; margin-top: 8px; color: var(--muri-text-secondary); }
-.dialog-card { width: min(700px, calc(100vw - 28px)); }
 .selection-bar { position: fixed; z-index: 40; inset: auto 24px 22px calc(var(--muri-sidebar-width) + 24px); display: flex; width: fit-content; max-width: calc(100% - var(--muri-sidebar-width) - 48px); margin: auto; align-items: center; gap: 9px; padding: 9px 10px 9px 15px; border: 1px solid var(--muri-border-strong); border-radius: var(--muri-radius); background: white; box-shadow: var(--muri-shadow); }
 .batch-preview { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
 .batch-preview > div { display: flex; flex-direction: column; gap: 3px; padding: 11px; border-radius: var(--muri-radius-sm); background: var(--muri-surface-muted); }

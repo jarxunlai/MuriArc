@@ -51,11 +51,17 @@ test('以笼位视图启动并使用适配设备的导航', async ({ page }, tes
   await expect(page.getByRole('navigation', { name: '主导航', exact: true })).toBeVisible({ visible: !compact })
 })
 
-test('可以创建空笼且刷新后的视图立即可见', async ({ page }) => {
+test('可以创建空笼且刷新后的视图立即可见', async ({ page }, testInfo) => {
   await page.goto('/#/cages')
   await page.getByRole('button', { name: '新增笼位' }).click()
 
   const dialog = page.getByRole('dialog')
+  if (testInfo.project.name === 'desktop-chromium') {
+    // n-modal teleports its card to <body>; a scoped width rule never reaches it.
+    await expect(dialog).toBeVisible()
+    const box = await dialog.boundingBox()
+    expect(box?.width).toBeLessThanOrEqual(480)
+  }
   await dialog.locator('input').nth(0).fill('T99')
   await dialog.locator('input').nth(1).fill('SPF-T')
   await dialog.locator('input').nth(2).fill('R9')

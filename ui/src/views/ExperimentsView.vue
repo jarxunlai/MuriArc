@@ -1369,7 +1369,7 @@ onMounted(loadRoute)
     </n-spin>
 
     </template>
-    <n-modal v-model:show="showCreate" preset="card" title="创建实验" class="dialog-card" :bordered="false">
+    <n-modal v-model:show="showCreate" preset="card" title="创建实验" class="muri-dialog-md" :bordered="false">
       <n-space vertical>
         <n-alert v-if="!projects.length" type="warning" :show-icon="false">请先创建科研项目。<n-button v-if="projectCreationAllowed" text type="primary" @click="showProject = true">创建项目</n-button></n-alert>
         <n-alert v-if="!templates.length" type="warning" :show-icon="false">实验必须绑定已发布模板。<n-button v-if="templatePublishAllowed" text type="primary" @click="showTemplate = true">配置并发布模板</n-button><span v-else>请联系项目管理员发布模板。</span></n-alert>
@@ -1386,12 +1386,12 @@ onMounted(loadRoute)
       <template #footer><div class="dialog-actions"><n-button @click="showCreate = false">取消</n-button><n-button type="primary" :loading="busy" :disabled="!projects.length || !templates.length" @click="createExperiment">创建实验</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showProject" preset="card" title="新建科研项目" class="small-dialog" :bordered="false">
+    <n-modal v-model:show="showProject" preset="card" title="新建科研项目" class="muri-dialog-sm" :bordered="false">
       <n-form label-placement="top"><n-form-item label="项目名称" required><n-input v-model:value="newProject.name" /></n-form-item><n-form-item label="说明"><n-input v-model:value="newProject.description" type="textarea" /></n-form-item></n-form>
       <template #footer><div class="dialog-actions"><n-button @click="showProject = false">取消</n-button><n-button type="primary" :loading="busy" @click="createProject">创建项目</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showTemplate" preset="card" title="配置并发布实验模板" class="dialog-card" :bordered="false">
+    <n-modal v-model:show="showTemplate" preset="card" title="配置并发布实验模板" class="muri-dialog-md" :bordered="false">
       <n-alert type="info" :show-icon="false">此操作先创建模板草稿、写入字段配置，再按 revision 发布；发布后不可直接修改。</n-alert>
       <n-form label-placement="top">
         <n-form-item label="模板名称" required><n-input v-model:value="newTemplate.name" /></n-form-item>
@@ -1520,16 +1520,16 @@ onMounted(loadRoute)
       </section>
     </n-spin>
 
-    <n-modal v-model:show="showCohort" preset="card" title="新增实验组" class="small-dialog"><n-form label-placement="top"><n-form-item label="组名" required><n-input v-model:value="newCohort.name" /></n-form-item><n-form-item label="说明"><n-input v-model:value="newCohort.description" /></n-form-item></n-form><template #footer><div class="dialog-actions"><n-button @click="showCohort = false">取消</n-button><n-button type="primary" :loading="busy" @click="createCohort">创建</n-button></div></template></n-modal>
-    <n-modal v-model:show="showEnroll" preset="card" title="纳入动物" class="small-dialog"><n-form label-placement="top"><n-form-item label="动物" required><n-select v-model:value="enrollment.animalId" filterable :options="animalOptions" /></n-form-item><n-form-item label="实验组"><n-select v-model:value="enrollment.cohortId" clearable :options="cohortOptions" /></n-form-item></n-form><template #footer><div class="dialog-actions"><n-button @click="showEnroll = false">取消</n-button><n-button type="primary" :loading="busy" :disabled="!enrollment.animalId" @click="enrollAnimal">确认纳入</n-button></div></template></n-modal>
-    <n-modal v-model:show="showProcedure" preset="card" title="记录实验步骤" class="small-dialog"><n-form label-placement="top"><n-form-item label="步骤名称" required><n-input v-model:value="newProcedure.name" /></n-form-item><n-form-item label="关联动物"><n-select v-model:value="newProcedure.animalId" clearable :options="participations.map((p) => ({label: animalLabels.get(p.animalId) ?? p.animalId, value: p.animalId}))" /></n-form-item><div class="form-grid"><n-form-item label="状态"><n-select v-model:value="newProcedure.status" :options="[{label:'计划',value:'planned'},{label:'已完成',value:'completed'}]" /></n-form-item><n-form-item :label="newProcedure.status === 'completed' ? '执行时间' : '计划时间'" required><n-date-picker v-model:value="newProcedure.at" type="datetime" clearable /></n-form-item></div></n-form><template #footer><div class="dialog-actions"><n-button @click="showProcedure = false">取消</n-button><n-button type="primary" :loading="busy" @click="createProcedure">保存记录</n-button></div></template></n-modal>
+    <n-modal v-model:show="showCohort" preset="card" title="新增实验组" class="muri-dialog-sm"><n-form label-placement="top"><n-form-item label="组名" required><n-input v-model:value="newCohort.name" /></n-form-item><n-form-item label="说明"><n-input v-model:value="newCohort.description" /></n-form-item></n-form><template #footer><div class="dialog-actions"><n-button @click="showCohort = false">取消</n-button><n-button type="primary" :loading="busy" @click="createCohort">创建</n-button></div></template></n-modal>
+    <n-modal v-model:show="showEnroll" preset="card" title="纳入动物" class="muri-dialog-sm"><n-form label-placement="top"><n-form-item label="动物" required><n-select v-model:value="enrollment.animalId" filterable :options="animalOptions" /></n-form-item><n-form-item label="实验组"><n-select v-model:value="enrollment.cohortId" clearable :options="cohortOptions" /></n-form-item></n-form><template #footer><div class="dialog-actions"><n-button @click="showEnroll = false">取消</n-button><n-button type="primary" :loading="busy" :disabled="!enrollment.animalId" @click="enrollAnimal">确认纳入</n-button></div></template></n-modal>
+    <n-modal v-model:show="showProcedure" preset="card" title="记录实验步骤" class="muri-dialog-sm"><n-form label-placement="top"><n-form-item label="步骤名称" required><n-input v-model:value="newProcedure.name" /></n-form-item><n-form-item label="关联动物"><n-select v-model:value="newProcedure.animalId" clearable :options="participations.map((p) => ({label: animalLabels.get(p.animalId) ?? p.animalId, value: p.animalId}))" /></n-form-item><div class="form-grid"><n-form-item label="状态"><n-select v-model:value="newProcedure.status" :options="[{label:'计划',value:'planned'},{label:'已完成',value:'completed'}]" /></n-form-item><n-form-item :label="newProcedure.status === 'completed' ? '执行时间' : '计划时间'" required><n-date-picker v-model:value="newProcedure.at" type="datetime" clearable /></n-form-item></div></n-form><template #footer><div class="dialog-actions"><n-button @click="showProcedure = false">取消</n-button><n-button type="primary" :loading="busy" @click="createProcedure">保存记录</n-button></div></template></n-modal>
 
-    <n-modal v-model:show="showExperimentEvent" preset="card" title="记录实验事件" class="small-dialog">
+    <n-modal v-model:show="showExperimentEvent" preset="card" title="记录实验事件" class="muri-dialog-sm">
       <n-form label-placement="top"><n-form-item label="事件名称" required><n-input v-model:value="newExperimentEvent.label" placeholder="例如：设备异常、提前退出或阶段完成" /></n-form-item><n-form-item label="实际发生时间"><n-date-picker v-model:value="newExperimentEvent.occurredAt" type="datetime" clearable /></n-form-item><n-form-item label="说明"><n-input v-model:value="newExperimentEvent.notes" type="textarea" :rows="3" placeholder="记录原因、影响和后续处理" /></n-form-item></n-form>
       <template #footer><div class="dialog-actions"><n-button @click="showExperimentEvent = false">取消</n-button><n-button type="primary" :loading="busy" @click="createExperimentEvent">保存事件</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showObservationDefinition" preset="card" title="添加数据列" class="dialog-card">
+    <n-modal v-model:show="showObservationDefinition" preset="card" title="添加数据列" class="muri-dialog-md">
       <n-alert type="info" :show-icon="false">数值列需要设置单位，分类列需要配置可选项；完成实验后日常录入将被锁定。</n-alert>
       <n-form label-placement="top"><div class="form-grid"><n-form-item label="内部标识" required><n-input v-model:value="newObservationDefinition.key" placeholder="body_weight" /></n-form-item><n-form-item label="列标题" required><n-input v-model:value="newObservationDefinition.label" placeholder="体重" /></n-form-item></div><div class="form-grid"><n-form-item label="数据类型" required><n-select v-model:value="newObservationDefinition.valueType" :options="[{label:'数值',value:'number'},{label:'文本',value:'text'},{label:'是/否',value:'boolean'},{label:'日期',value:'date'},{label:'分类',value:'category'}]" /></n-form-item><n-form-item label="修改规则" required><n-select v-model:value="newObservationDefinition.policy" :options="[{label:'保留每次修改',value:'versioned'},{label:'允许修订',value:'mutable'},{label:'录入后不可修改',value:'immutable'}]" /></n-form-item></div><n-form-item v-if="newObservationDefinition.valueType === 'number'" label="单位" required><n-input v-model:value="newObservationDefinition.unit" placeholder="例如 g" /></n-form-item><n-form-item v-if="newObservationDefinition.valueType === 'category'" label="可选项（逗号或换行分隔）" required><n-input v-model:value="newObservationDefinition.categoriesText" type="textarea" placeholder="正常, 轻度, 重度" /></n-form-item></n-form>
       <template #footer><div class="dialog-actions"><n-button @click="showObservationDefinition = false">取消</n-button><n-button type="primary" :loading="busy" @click="createObservationDefinition">添加数据列</n-button></div></template>
@@ -1539,7 +1539,7 @@ onMounted(loadRoute)
       v-model:show="showObservation"
       preset="card"
       title="录入实验数据"
-      class="data-entry-dialog"
+      class="data-entry-dialog muri-dialog-lg"
       :closable="!dataEntryAiBusy"
       :mask-closable="!dataEntryAiBusy"
       :close-on-esc="!dataEntryAiBusy"
@@ -1816,7 +1816,7 @@ onMounted(loadRoute)
       </template>
     </n-modal>
 
-    <n-modal v-model:show="showObservationRevision" preset="card" title="修订观察值" class="small-dialog">
+    <n-modal v-model:show="showObservationRevision" preset="card" title="修订观察值" class="muri-dialog-sm">
       <n-alert type="warning" :show-icon="false">修订不会覆盖历史值，而是追加新版本并提升 Observation revision。</n-alert>
       <n-form v-if="revisionDefinition" label-placement="top">
         <n-form-item v-if="revisionDefinition.valueType === 'number'" :label="`数值（${revisionDefinition.unit}）`" required><n-input-number v-model:value="observationValueForm.numberValue" /></n-form-item>
@@ -1831,7 +1831,7 @@ onMounted(loadRoute)
       <template #footer><div class="dialog-actions"><n-button @click="showObservationRevision = false">取消</n-button><n-button type="primary" :loading="busy" @click="reviseObservation">追加版本</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showObservationHistory" preset="card" title="观察值版本历史" class="dialog-card">
+    <n-modal v-model:show="showObservationHistory" preset="card" title="观察值版本历史" class="muri-dialog-md">
       <n-list v-if="historyObservation" bordered>
         <n-list-item v-for="value in observationValues.get(historyObservation.id) ?? []" :key="value.id">
           <div>
@@ -1874,14 +1874,11 @@ h2 { margin: 7px 0 4px; font-size: 16px; }
 .progress-panel p { display: flex; align-items: center; gap: 5px; margin: 2px 0; color: var(--muri-warning-text); font-size: 11px; }
 .progress-panel p.completed { color: var(--muri-success); }
 .progress-panel button { justify-self: end; }
-.dialog-card { width: min(620px, calc(100vw - 28px)); }
-.data-entry-dialog { width: min(760px, calc(100vw - 28px)); }
 .data-cell-form { margin-top: 14px; }
 .ai-entry-boundary { display: flex; align-items: flex-start; gap: 7px; margin: 10px 0 12px; padding: 9px 11px; border: 1px solid var(--muri-primary-border); border-radius: var(--muri-radius); color: var(--muri-text-secondary); background: var(--muri-primary-soft); font-size: 11px; line-height: 1.55; }.ai-entry-boundary svg { flex: 0 0 auto; margin-top: 1px; color: var(--muri-primary); }
 .ai-entry-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 9px; }.ai-entry-toolbar > span { color: var(--muri-text-tertiary); font-size: 11px; }
 .data-entry-images { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }.data-entry-images article { display: grid; min-width: 0; grid-template-columns: 58px minmax(0, 1fr) 32px; align-items: center; gap: 8px; padding: 7px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius); background: var(--muri-surface-muted); }.data-entry-images img { width: 58px; height: 58px; border-radius: var(--muri-radius-sm); object-fit: cover; }.data-entry-images article > div { display: flex; min-width: 0; flex-direction: column; }.data-entry-images strong,.data-entry-images small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.data-entry-images strong { font-size: 11px; }.data-entry-images small { color: var(--muri-text-tertiary); font-size: 11px; }.data-entry-images small.image-error { color: var(--muri-danger); }.data-entry-images button { display: grid; width: 32px; height: 32px; padding: 0; place-items: center; border: 0; border-radius: var(--muri-radius-sm); color: var(--muri-text-tertiary); background: transparent; cursor: pointer; transition: color var(--muri-transition-fast), background var(--muri-transition-fast); }.data-entry-images button:hover { color: var(--muri-danger); background: var(--muri-danger-soft); }.data-entry-images button:focus-visible { outline: 3px solid rgba(15, 95, 170, .22); outline-offset: 1px; }.data-entry-images button:disabled { cursor: wait; opacity: .55; }
 .vision-model-field { margin-top: 12px; }.candidate-review { display: grid; gap: 10px; margin-top: 4px; padding: 13px; border: 1px solid var(--muri-warning-border); border-radius: var(--muri-radius); background: var(--muri-warning-soft); }.candidate-review header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }.candidate-review header > div { display: flex; min-width: 0; flex-direction: column; }.candidate-review header span { display: flex; align-items: center; gap: 6px; color: var(--muri-text); font-weight: 650; }.candidate-review header span svg { color: var(--muri-primary); }.candidate-review header small { color: var(--muri-text-tertiary); font-size: 11px; }.candidate-review :deep(.n-form-item:last-child) { margin-bottom: 0; }.data-entry-error { margin: 10px 0 0; color: var(--muri-danger); font-size: 11px; line-height: 1.5; }
-.small-dialog { width: min(480px, calc(100vw - 28px)); }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .dialog-actions,.detail-actions { display: flex; justify-content: flex-end; gap: 9px; }
 .detail-actions { flex-wrap: wrap; margin-bottom: 14px; }
@@ -1894,7 +1891,7 @@ h2 { margin: 7px 0 4px; font-size: 16px; }
 .observation-actions { display: flex; align-items: center; gap: 6px; }
 :deep(.n-list-item small) { display: block; color: var(--muri-text-tertiary); font-weight: 400; }
 @media (max-width: 900px) { .metrics { grid-template-columns: 1fr 1fr; }.experiment-card { grid-template-columns: 1fr; }.progress-panel { border-top: 1px solid var(--muri-border); border-left: 0; } }
-@media (max-width: 540px) { .metrics { grid-template-columns: 1fr 1fr; }.metrics > div { grid-template-columns: 24px 1fr; }.metrics strong { grid-column: 2; }.filter-row { overflow-x: auto; justify-content: flex-start; }.form-grid { grid-template-columns: 1fr; gap: 0; }.detail-actions { flex-wrap: wrap; }.detail-actions button { flex: 1; }.data-entry-images { grid-template-columns: minmax(0, 1fr); }.data-entry-dialog :deep(.n-card__content) { padding-inline: 14px; }.data-entry-dialog :deep(.n-tabs-tab) { min-width: 0; }.candidate-review { padding: 10px; } }
+@media (max-width: 540px) { .metrics { grid-template-columns: 1fr 1fr; }.metrics > div { grid-template-columns: 24px 1fr; }.metrics strong { grid-column: 2; }.filter-row { overflow-x: auto; justify-content: flex-start; }.form-grid { grid-template-columns: 1fr; gap: 0; }.detail-actions { flex-wrap: wrap; }.detail-actions button { flex: 1; }.data-entry-images { grid-template-columns: minmax(0, 1fr); }.candidate-review { padding: 10px; } }
 
 .experiment-workspace { display: flex; flex-direction: column; gap: 16px; }
 .workspace-header { overflow: hidden; }
@@ -1993,4 +1990,9 @@ h2 { margin: 7px 0 4px; font-size: 16px; }
 @media (max-width: 1050px) { .workspace-metrics { grid-template-columns: 1fr 1fr; }.overview-grid,.design-grid,.trace-grid { grid-template-columns: 1fr; }.design-wide { grid-column: auto; }.procedure-card { grid-template-columns: 100px 1fr; }.procedure-time { grid-column: 2; align-items: flex-start; } }
 @media (max-width: 620px) { .workspace-heading { padding: 14px 14px 0; }.workspace-title-row { flex-direction: column; }.workspace-title-row h1 { font-size: 20px; }.workspace-nav { padding: 0 8px; }.workspace-metrics { grid-template-columns: 1fr 1fr; }.section-toolbar,.current-node,.attachment-row { align-items: flex-start; flex-direction: column; }.procedure-card { grid-template-columns: 1fr; }.procedure-time { grid-column: auto; align-items: flex-start; }.readiness-list { grid-template-columns: 1fr; } }
 
+</style>
+
+<style>
+/* The data-entry card is teleported to <body>, so its internals are styled unscoped (see global.css). */
+@media (max-width: 540px) { .n-modal.data-entry-dialog .n-card__content { padding-inline: 14px; }.n-modal.data-entry-dialog .n-tabs-tab { min-width: 0; } }
 </style>

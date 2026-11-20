@@ -1642,7 +1642,7 @@ onMounted(load)
       v-model:show="showCreateRelation"
       preset="card"
       title="登记父母关系"
-      class="small-dialog"
+      class="muri-dialog-sm"
       :bordered="false"
     >
       <n-alert type="info" :show-icon="false">
@@ -1680,7 +1680,7 @@ onMounted(load)
       </template>
     </n-modal>
 
-    <n-modal v-model:show="showCreateLocus" preset="card" title="新建基因位点" class="small-dialog">
+    <n-modal v-model:show="showCreateLocus" preset="card" title="新建基因位点" class="muri-dialog-sm">
       <n-form label-placement="top">
         <n-form-item label="位点符号" required><n-input v-model:value="locusForm.symbol" placeholder="例如 GeneA" /></n-form-item>
         <n-form-item label="说明"><n-input v-model:value="locusForm.description" /></n-form-item>
@@ -1688,7 +1688,7 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreateLocus = false">取消</n-button><n-button type="primary" :loading="busy" @click="createLocus">创建</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showCreateAllele" preset="card" title="新建等位基因" class="small-dialog">
+    <n-modal v-model:show="showCreateAllele" preset="card" title="新建等位基因" class="muri-dialog-sm">
       <n-form label-placement="top">
         <n-form-item label="基因位点" required><n-select v-model:value="alleleForm.locusId" :options="locusOptions" filterable /></n-form-item>
         <n-form-item label="等位基因符号" required><n-input v-model:value="alleleForm.symbol" placeholder="例如 flox" /></n-form-item>
@@ -1698,7 +1698,7 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreateAllele = false">取消</n-button><n-button type="primary" :loading="busy" @click="createAllele">创建</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showCreateDefinition" preset="card" title="新建结构化基因型定义" class="wide-dialog">
+    <n-modal v-model:show="showCreateDefinition" preset="card" title="新建结构化基因型定义" class="muri-dialog-lg">
       <n-form label-placement="top">
         <div class="form-grid">
           <n-form-item label="名称" required><n-input v-model:value="definitionForm.name" /></n-form-item>
@@ -1717,7 +1717,7 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreateDefinition = false">取消</n-button><n-button type="primary" :loading="busy" @click="createDefinition">创建定义</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showCreateRecord" preset="card" title="记录基因检测" class="small-dialog">
+    <n-modal v-model:show="showCreateRecord" preset="card" title="记录基因检测" class="muri-dialog-sm">
       <n-form label-placement="top">
         <n-form-item label="基因型定义" required><n-select v-model:value="recordForm.genotypeDefinitionId" :options="definitionOptions" filterable /></n-form-item>
         <div class="form-grid">
@@ -1730,7 +1730,7 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreateRecord = false">取消</n-button><n-button type="primary" :loading="busy" @click="createRecord">保存</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showVoidRecord" preset="card" title="作废基因检测记录" class="small-dialog">
+    <n-modal v-model:show="showVoidRecord" preset="card" title="作废基因检测记录" class="muri-dialog-sm">
       <n-alert type="warning" :show-icon="false">
         作废不会删除历史；该记录将退出当前基因型投影，但既有实验快照保持不变。
       </n-alert>
@@ -1757,7 +1757,7 @@ onMounted(load)
       </template>
     </n-modal>
 
-    <n-modal v-model:show="showCorrectRecord" preset="card" title="更正基因检测记录" class="small-dialog">
+    <n-modal v-model:show="showCorrectRecord" preset="card" title="更正基因检测记录" class="muri-dialog-sm">
       <n-alert type="warning" :show-icon="false">
         提交将在同一事务中作废原记录，并创建一条显式指向原记录的替代记录。
       </n-alert>
@@ -1797,7 +1797,7 @@ onMounted(load)
       </template>
     </n-modal>
 
-    <n-modal v-model:show="showCreateLine" preset="card" title="新建繁育品系" class="small-dialog">
+    <n-modal v-model:show="showCreateLine" preset="card" title="新建繁育品系" class="muri-dialog-sm">
       <n-form label-placement="top">
         <n-form-item label="品系名称" required><n-input v-model:value="lineForm.name" /></n-form-item>
         <n-form-item label="关联基因型定义" required><n-select v-model:value="lineForm.genotypeDefinitionIds" multiple filterable :options="definitionOptions" /></n-form-item>
@@ -1806,7 +1806,7 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreateLine = false">取消</n-button><n-button type="primary" :loading="busy" @click="createLine">创建</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showCreateColony" preset="card" title="新建 Colony" class="small-dialog">
+    <n-modal v-model:show="showCreateColony" preset="card" title="新建 Colony" class="muri-dialog-sm">
       <n-form label-placement="top">
         <n-form-item label="繁育品系" required><n-select v-model:value="colonyForm.breedingLineId" :options="lineOptions" /></n-form-item>
         <n-form-item label="Colony 名称" required><n-input v-model:value="colonyForm.name" /></n-form-item>
@@ -1815,7 +1815,7 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreateColony = false">取消</n-button><n-button type="primary" :loading="busy" @click="createColony">创建</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showCreatePair" preset="card" title="新建繁育配对" class="wide-dialog">
+    <n-modal v-model:show="showCreatePair" preset="card" title="新建繁育配对" class="muri-dialog-lg">
       <n-alert type="info" :show-icon="false">同一动物不能同时属于两个活跃配对；性别和成员角色由领域层再次校验。</n-alert>
       <n-form label-placement="top">
         <div class="form-grid">
@@ -1831,7 +1831,7 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreatePair = false">取消</n-button><n-button type="primary" :loading="busy" @click="createPair">创建配对</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showCreateMating" preset="card" title="记录交配事件" class="small-dialog">
+    <n-modal v-model:show="showCreateMating" preset="card" title="记录交配事件" class="muri-dialog-sm">
       <n-form label-placement="top">
         <n-form-item label="雌鼠" required><n-select v-model:value="matingForm.femaleAnimalId" :options="pairFemaleOptions" /></n-form-item>
         <n-form-item label="发生时间"><n-date-picker v-model:value="matingForm.occurredAt" type="datetime" clearable /></n-form-item>
@@ -1840,7 +1840,7 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreateMating = false">取消</n-button><n-button type="primary" :loading="busy" @click="createMating">记录事件</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showCreateLitter" preset="card" title="创建窝次与 Animal Draft" class="wide-dialog">
+    <n-modal v-model:show="showCreateLitter" preset="card" title="创建窝次与 Animal Draft" class="muri-dialog-lg">
       <n-form label-placement="top">
         <div class="form-grid">
           <n-form-item label="交配事件" required><n-select v-model:value="litterForm.matingEventId" :options="matingEventOptions" /></n-form-item>
@@ -1858,7 +1858,7 @@ onMounted(load)
       <template #footer><div class="dialog-actions"><n-button @click="showCreateLitter = false">取消</n-button><n-button type="primary" :loading="busy" @click="createLitter">原子创建</n-button></div></template>
     </n-modal>
 
-    <n-modal v-model:show="showRegisterDraft" preset="card" title="登记为正式 Animal" class="small-dialog">
+    <n-modal v-model:show="showRegisterDraft" preset="card" title="登记为正式 Animal" class="muri-dialog-sm">
       <n-alert type="warning" :show-icon="false">提交后将原子创建 Animal、父母双向谱系、生命周期事件、Audit 与 Provenance。</n-alert>
       <n-form label-placement="top">
         <n-form-item label="正式动物编号" required><n-input v-model:value="registerForm.displayId" /></n-form-item>
@@ -1940,9 +1940,7 @@ onMounted(load)
 .outcome-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
 .outcome-grid > div { display: flex; padding: 10px; align-items: center; justify-content: space-between; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }
 .outcome-grid span { color: var(--muri-primary); font-weight: 600; }
-.small-dialog { width: min(480px, calc(100vw - 28px)); }
-.wide-dialog { width: min(760px, calc(100vw - 28px)); }
-.small-dialog :deep(.n-alert),.wide-dialog :deep(.n-alert) { margin-bottom: 14px; }
+.n-modal .n-alert { margin-bottom: 14px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .component-editor { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; margin-bottom: 10px; padding: 10px; border: 1px solid var(--muri-border); border-radius: var(--muri-radius-sm); }

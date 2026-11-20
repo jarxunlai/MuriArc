@@ -58,3 +58,33 @@ describe('design tokens', () => {
     expect([...used].filter((token) => !(token in tokens))).toEqual([])
   })
 })
+
+// <n-modal preset="card"> teleports its card to <body>, so a width in the
+// component's scoped style never applies; size it with a global class instead.
+describe('card dialog widths', () => {
+  const sizes = ['sm', 'md', 'lg']
+
+  it('defines each dialog size as a token and a global class', () => {
+    for (const size of sizes) {
+      expect(tokens[`--muri-dialog-${size}`], size).toMatch(/^\d+px$/)
+      expect(globalCss, size).toContain(`.n-modal.muri-dialog-${size} {`)
+    }
+  })
+
+  it('gives every card modal a global size class', () => {
+    const unsized: string[] = []
+    let cardModals = 0
+    for (const [file, source] of Object.entries(components)) {
+      // Quoted attribute values may contain ">" (arrow functions), so skip them whole.
+      for (const [tag] of source.matchAll(/<n-modal\b(?:[^>"]|"[^"]*")*>/g)) {
+        if (!/\bpreset="card"/.test(tag)) continue
+        cardModals += 1
+        if (!new RegExp(`\\sclass="[^"]*\\bmuri-dialog-(${sizes.join('|')})\\b`).test(tag)) {
+          unsized.push(`${file}: ${tag.replace(/\s+/g, ' ').slice(0, 90)}`)
+        }
+      }
+    }
+    expect(cardModals).toBeGreaterThan(0)
+    expect(unsized).toEqual([])
+  })
+})

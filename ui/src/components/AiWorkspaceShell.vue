@@ -475,7 +475,7 @@ onBeforeUnmount(() => {
       :show="Boolean(renameTarget)"
       preset="card"
       title="重命名会话"
-      class="rename-modal"
+      class="muri-dialog-sm"
       @update:show="(show: boolean) => { if (!show) renameTarget = undefined }"
     >
       <n-input
@@ -517,7 +517,7 @@ onBeforeUnmount(() => {
 .sidebar-footer { display: flex; padding: 9px 2px 0; border-top: 1px solid var(--muri-border); flex-direction: column; gap: 6px; color: var(--muri-text-secondary); font-size: 11px; }.sidebar-footer div, .sidebar-footer span { display: flex; align-items: center; gap: 5px; }.sidebar-footer svg { flex: 0 0 auto; color: var(--muri-primary); }.sidebar-footer div strong { margin-left: auto; color: var(--muri-primary); }
 .conversation-panel { display: grid; min-width: 0; min-height: 0; grid-template-rows: minmax(0, 1fr); }.mobile-scope { display: none; }
 .mobile-manager { display: none; }
-.rename-modal { width: min(460px, calc(100vw - 28px)); }.rename-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.rename-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .compact { grid-template-columns: 238px minmax(0, 1fr); }
 @media (max-width: 760px) {
   .ai-shell { grid-template-columns: 1fr; }

@@ -52,6 +52,16 @@ a { color: inherit; text-decoration: none; }
   border: 0;
 }
 
+/*
+ * <n-modal preset="card"> teleports its card to <body>, outside every SFC's
+ * scoped styles, so card dialogs are sized here: class="muri-dialog-sm|md|lg".
+ * Paired with .n-modal so the width beats Naive's `.n-card { width: 100% }`
+ * regardless of style injection order.
+ */
+.n-modal.muri-dialog-sm { width: min(var(--muri-dialog-sm), calc(100vw - var(--muri-dialog-gutter))); }
+.n-modal.muri-dialog-md { width: min(var(--muri-dialog-md), calc(100vw - var(--muri-dialog-gutter))); }
+.n-modal.muri-dialog-lg { width: min(var(--muri-dialog-lg), calc(100vw - var(--muri-dialog-gutter))); }
+
 /* Enter-only: with mode="out-in" a leave animation would delay every page switch. */
 .route-enter-active { transition: opacity var(--muri-transition-fast); }
 .route-enter-from { opacity: 0; }

@@ -26,28 +26,69 @@ pub enum DirectoryResolution {
     Ambiguous,
 }
 
+/// Capacity snapshot of one cage at preview or plan-build time.
+///
+/// `residents` counts active (non-deleted) animals whose current cage is this
+/// cage, matching the store-level capacity guard. It may exceed `capacity`
+/// for legacy over-filled cages; such a cage accepts no further imports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CageOccupancy {
+    capacity: usize,
+    residents: usize,
+}
+
+impl CageOccupancy {
+    pub fn new(capacity: usize, residents: usize) -> Result<Self, DirectoryError> {
+        if capacity == 0 {
+            return Err(DirectoryError::InvalidCageCapacity);
+        }
+        Ok(Self {
+            capacity,
+            residents,
+        })
+    }
+
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub const fn residents(&self) -> usize {
+        self.residents
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CageRecord {
+    section: String,
+    display_id: String,
+    occupancy: CageOccupancy,
+}
+
 /// Lab-scoped cage lookup used while converting a confirmed animal preview.
 ///
 /// An unqualified display identifier is accepted only when it resolves to one
 /// cage across the entire directory. A caller can disambiguate it with either
-/// `section/display_id` or `section::display_id`.
+/// `section/display_id` or `section::display_id`. Every cage carries its
+/// occupancy so a plan can be rejected before the store's transactional
+/// capacity guard would refuse it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CageDirectory {
     by_qualified_id: BTreeMap<(String, String), BTreeSet<Uuid>>,
     by_display_id: BTreeMap<String, BTreeSet<Uuid>>,
+    cages: BTreeMap<Uuid, CageRecord>,
 }
 
 impl CageDirectory {
     pub fn from_entries<Section, DisplayId>(
-        entries: impl IntoIterator<Item = (Section, DisplayId, Uuid)>,
+        entries: impl IntoIterator<Item = (Section, DisplayId, Uuid, CageOccupancy)>,
     ) -> Result<Self, DirectoryError>
     where
         Section: Into<String>,
         DisplayId: Into<String>,
     {
         let mut directory = Self::default();
-        for (section, display_id, cage_id) in entries {
-            directory.insert(section, display_id, cage_id)?;
+        for (section, display_id, cage_id, occupancy) in entries {
+            directory.insert(section, display_id, cage_id, occupancy)?;
         }
         Ok(directory)
     }
@@ -57,6 +98,7 @@ impl CageDirectory {
         section: impl Into<String>,
         display_id: impl Into<String>,
         cage_id: Uuid,
+        occupancy: CageOccupancy,
     ) -> Result<(), DirectoryError> {
         let section = section.into().trim().to_owned();
         let display_id = display_id.into().trim().to_owned();
@@ -70,13 +112,21 @@ impl CageDirectory {
             return Err(DirectoryError::NilIdentifier);
         }
         self.by_qualified_id
-            .entry((section, display_id.clone()))
+            .entry((section.clone(), display_id.clone()))
             .or_default()
             .insert(cage_id);
         self.by_display_id
-            .entry(display_id)
+            .entry(display_id.clone())
             .or_default()
             .insert(cage_id);
+        self.cages.insert(
+            cage_id,
+            CageRecord {
+                section,
+                display_id,
+                occupancy,
+            },
+        );
         Ok(())
     }
 
@@ -284,6 +334,8 @@ pub enum DirectoryError {
     EmptyCageSection,
     #[error("cage display identifier must not be empty")]
     EmptyCageDisplayId,
+    #[error("cage capacity must be greater than zero")]
+    InvalidCageCapacity,
     #[error("gene locus symbol must not be empty")]
     EmptyLocusSymbol,
     #[error("allele symbol must not be empty")]
@@ -493,6 +545,7 @@ pub fn build_animal_import_plan(
             resolved_rows.push(resolved);
         }
     }
+    push_cage_capacity_issues(&preview.accepted_rows, cages, &mut issues);
     if !issues.is_empty() {
         return Err(ImportPlanBuildError::new(issues));
     }
@@ -703,6 +756,52 @@ fn resolve_animal_row<'a>(
         father_id,
         mother_id,
     })
+}
+
+/// Flags every row whose uniquely resolved target cage would exceed its
+/// capacity once all of this import's rows join the cage's current residents.
+///
+/// Unknown or ambiguous cage references already carry their own issue and do
+/// not count toward any cage. The store re-checks capacity transactionally.
+fn push_cage_capacity_issues(
+    rows: &[AnimalImportRow],
+    cages: &CageDirectory,
+    issues: &mut Vec<ImportIssue>,
+) {
+    let targets = rows
+        .iter()
+        .filter_map(|row| match cages.resolve(row.cage.as_deref()?) {
+            DirectoryResolution::Unique(cage_id) => Some((row.source_row, cage_id)),
+            DirectoryResolution::Unknown | DirectoryResolution::Ambiguous => None,
+        })
+        .collect::<Vec<_>>();
+    let mut incoming = BTreeMap::<Uuid, usize>::new();
+    for (_, cage_id) in &targets {
+        *incoming.entry(*cage_id).or_default() += 1;
+    }
+    for (source_row, cage_id) in targets {
+        let cage = cages
+            .cages
+            .get(&cage_id)
+            .expect("every resolvable cage carries an occupancy record");
+        let incoming = incoming[&cage_id];
+        let CageOccupancy {
+            capacity,
+            residents,
+        } = cage.occupancy;
+        let total = residents.saturating_add(incoming);
+        if total > capacity {
+            issues.push(plan_row_issue(
+                source_row,
+                "cage",
+                "cage_capacity_exceeded",
+                &format!(
+                    "cage {}/{} would hold {total} animals ({residents} current + {incoming} in this import) but its capacity is {capacity}",
+                    cage.section, cage.display_id
+                ),
+            ));
+        }
+    }
 }
 
 fn resolve_parent(
@@ -1265,6 +1364,17 @@ mod tests {
         }
     }
 
+    fn occupancy(capacity: usize, residents: usize) -> CageOccupancy {
+        CageOccupancy::new(capacity, residents).unwrap()
+    }
+
+    fn caged_row(display_id: &str, source_row: usize, cage: &str) -> AnimalImportRow {
+        let mut row = animal_row(display_id);
+        row.source_row = source_row;
+        row.cage = Some(cage.to_owned());
+        row
+    }
+
     fn issue_codes(error: &ImportPlanBuildError) -> BTreeSet<&str> {
         error
             .issues()
@@ -1279,9 +1389,9 @@ mod tests {
         let second = Uuid::from_u128(11);
         let unique = Uuid::from_u128(12);
         let directory = CageDirectory::from_entries([
-            ("A", "C1", first),
-            ("B", "C1", second),
-            ("A", "C2", unique),
+            ("A", "C1", first, occupancy(5, 0)),
+            ("B", "C1", second, occupancy(5, 0)),
+            ("A", "C2", unique, occupancy(5, 0)),
         ])
         .unwrap();
         assert_eq!(directory.resolve("C1"), DirectoryResolution::Ambiguous);
@@ -1330,7 +1440,8 @@ mod tests {
         let wild_type = Uuid::from_u128(22);
         let floxed = Uuid::from_u128(23);
         let definition_id = Uuid::from_u128(24);
-        let cages = CageDirectory::from_entries([("Room A", "C1", cage_id)]).unwrap();
+        let cages =
+            CageDirectory::from_entries([("Room A", "C1", cage_id, occupancy(5, 0))]).unwrap();
         let genetics = GeneticDirectory::from_entries_with_definitions(
             [("GeneA", locus_id)],
             [(locus_id, "+", wild_type), (locus_id, "fl", floxed)],
@@ -1408,8 +1519,8 @@ mod tests {
         row.cage = Some("C1".to_owned());
         row.father = Some("P1".to_owned());
         let cages = CageDirectory::from_entries([
-            ("A", "C1", Uuid::from_u128(30)),
-            ("B", "C1", Uuid::from_u128(31)),
+            ("A", "C1", Uuid::from_u128(30), occupancy(5, 0)),
+            ("B", "C1", Uuid::from_u128(31), occupancy(5, 0)),
         ])
         .unwrap();
         let parents = AnimalDirectory::from_entries([
@@ -1443,6 +1554,111 @@ mod tests {
         let codes = issue_codes(&error);
         assert!(codes.contains("unknown_cage"));
         assert!(codes.contains("unknown_parent"));
+    }
+
+    #[test]
+    fn cage_occupancy_requires_a_positive_capacity() {
+        assert_eq!(
+            CageOccupancy::new(0, 0),
+            Err(DirectoryError::InvalidCageCapacity)
+        );
+        // An already over-filled legacy cage must stay representable so the
+        // preview can explain why it accepts no further animals.
+        let overfilled = CageOccupancy::new(5, 7).unwrap();
+        assert_eq!(overfilled.capacity(), 5);
+        assert_eq!(overfilled.residents(), 7);
+    }
+
+    #[test]
+    fn cage_capacity_blocks_every_row_targeting_an_overfilled_cage() {
+        let full = Uuid::from_u128(70);
+        let roomy = Uuid::from_u128(71);
+        let cages = CageDirectory::from_entries([
+            ("Room A", "C1", full, occupancy(3, 2)),
+            ("Room A", "C2", roomy, occupancy(5, 0)),
+        ])
+        .unwrap();
+        let mut uncaged = animal_row("M4");
+        uncaged.source_row = 5;
+        // Unqualified and section-qualified references to one cage share capacity.
+        let rows = vec![
+            caged_row("M1", 2, "C1"),
+            caged_row("M2", 3, "Room A/C1"),
+            caged_row("M3", 4, "C2"),
+            uncaged,
+        ];
+
+        let error = build_animal_import_plan(
+            &preview(rows),
+            &import_context(),
+            &AnimalDirectory::default(),
+            &cages,
+            &GeneticDirectory::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.issues(),
+            [2, 3]
+                .map(|row| ImportIssue {
+                    row: Some(row),
+                    field: Some("cage".to_owned()),
+                    severity: IssueSeverity::Error,
+                    code: "cage_capacity_exceeded".to_owned(),
+                    message: "cage Room A/C1 would hold 4 animals (2 current + 2 in this import) \
+                              but its capacity is 3"
+                        .to_owned(),
+                })
+                .as_slice()
+        );
+    }
+
+    #[test]
+    fn cage_capacity_allows_an_import_that_fills_the_cage_exactly() {
+        let cage_id = Uuid::from_u128(72);
+        let cages =
+            CageDirectory::from_entries([("Room A", "C1", cage_id, occupancy(3, 1))]).unwrap();
+
+        let plan = build_animal_import_plan(
+            &preview(vec![caged_row("M1", 2, "C1"), caged_row("M2", 3, "C1")]),
+            &import_context(),
+            &AnimalDirectory::default(),
+            &cages,
+            &GeneticDirectory::default(),
+        )
+        .unwrap();
+
+        assert_eq!(plan.animals.len(), 2);
+        assert!(
+            plan.animals
+                .iter()
+                .all(|animal| animal.current_cage_id == Some(cage_id))
+        );
+    }
+
+    #[test]
+    fn already_overfilled_cage_rejects_any_additional_row() {
+        let cages =
+            CageDirectory::from_entries([("Room B", "B1", Uuid::from_u128(73), occupancy(2, 3))])
+                .unwrap();
+
+        let error = build_animal_import_plan(
+            &preview(vec![caged_row("M1", 2, "B1")]),
+            &import_context(),
+            &AnimalDirectory::default(),
+            &cages,
+            &GeneticDirectory::default(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error
+                .issues()
+                .iter()
+                .map(|issue| (issue.row, issue.code.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(Some(2), "cage_capacity_exceeded")]
+        );
     }
 
     #[test]

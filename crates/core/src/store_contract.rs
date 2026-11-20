@@ -8235,6 +8235,143 @@ async fn run_import_contract(store: &dyn MuriArcStore, now: chrono::DateTime<Utc
         cancelled_audit_count,
         "cancelled imports must write neither entities nor audits"
     );
+
+    run_import_cage_capacity_contract(store, lab.id, user.id, &import_audit, now).await;
+}
+
+/// The store re-checks cage capacity inside the import transaction, counting
+/// active residents plus every active imported animal for the same cage, and
+/// rejects an overflow atomically with one adapter-independent conflict.
+async fn run_import_cage_capacity_contract(
+    store: &dyn MuriArcStore,
+    lab_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    import_audit: &AuditContext,
+    now: chrono::DateTime<Utc>,
+) {
+    let fixture_audit = AuditContext::system(WriteSource::Migration);
+    let mut cage = Cage::new(
+        lab_id,
+        "Import Capacity",
+        format!("CAP-{}", uuid::Uuid::new_v4()),
+        now,
+    )
+    .unwrap();
+    cage.set_capacity(2).unwrap();
+    store.create_cage(&cage, &fixture_audit).await.unwrap();
+    let mut resident = Animal::new_mouse(
+        lab_id,
+        format!("CAP-RESIDENT-{}", uuid::Uuid::new_v4()),
+        Sex::Unknown,
+        now,
+    )
+    .unwrap();
+    resident.current_cage_id = Some(cage.id);
+    store
+        .create_animal(&resident, &fixture_audit)
+        .await
+        .unwrap();
+    let residents = || async {
+        store
+            .list_animals(&AnimalFilter {
+                lab_id,
+                cage_id: Some(cage.id),
+                ..AnimalFilter::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|animal| animal.id)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let audit_count = || async {
+        store
+            .list_audit_entries(&AuditFilter {
+                lab_id,
+                project_id: None,
+                entity_id: None,
+            })
+            .await
+            .unwrap()
+            .len()
+    };
+
+    let overflow = caged_import_plan(lab_id, user_id, cage.id, 2, &"5".repeat(64), now);
+    let audits_before = audit_count().await;
+    match store
+        .commit_import(&overflow, ImportCommitOptions::default(), import_audit)
+        .await
+    {
+        Err(StoreError::Conflict(message)) => assert_eq!(
+            message,
+            format!("target cage {} capacity exceeded (3/2)", cage.display_id)
+        ),
+        other => panic!("expected an import cage capacity conflict, got {other:?}"),
+    }
+    for animal in &overflow.animals {
+        assert!(matches!(
+            store.get_animal(animal.id).await,
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+    assert_eq!(
+        residents().await,
+        std::collections::BTreeSet::from([resident.id])
+    );
+    assert_eq!(
+        audit_count().await,
+        audits_before,
+        "a capacity conflict must roll back the whole import"
+    );
+
+    let fitting = caged_import_plan(lab_id, user_id, cage.id, 1, &"6".repeat(64), now);
+    store
+        .commit_import(&fitting, ImportCommitOptions::default(), import_audit)
+        .await
+        .unwrap();
+    assert_eq!(
+        residents().await,
+        std::collections::BTreeSet::from([resident.id, fitting.animals[0].id])
+    );
+}
+
+fn caged_import_plan(
+    lab_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    cage_id: uuid::Uuid,
+    count: usize,
+    preview_hash: &str,
+    now: chrono::DateTime<Utc>,
+) -> ImportPlan {
+    let mut plan = ImportPlan::empty(
+        lab_id,
+        format!("cage-capacity-import-{}", uuid::Uuid::new_v4()),
+        preview_hash,
+    );
+    for _ in 0..count {
+        let mut animal = Animal::new_mouse(
+            lab_id,
+            format!("CAP-IMPORT-{}", uuid::Uuid::new_v4()),
+            Sex::Unknown,
+            now,
+        )
+        .unwrap();
+        animal.current_cage_id = Some(cage_id);
+        for kind in [
+            AnimalEventKind::Registered,
+            AnimalEventKind::Transferred {
+                from_cage_id: None,
+                to_cage_id: Some(cage_id),
+            },
+        ] {
+            let mut event = AnimalEvent::new(lab_id, animal.id, kind, now, now);
+            event.recorded_by = Some(user_id);
+            plan.animal_events.push(event);
+        }
+        plan.animals.push(animal);
+    }
+    plan.validate().unwrap();
+    plan
 }
 
 fn source_archive_fixture(

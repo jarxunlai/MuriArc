@@ -1293,6 +1293,42 @@ async fn validate_animal_relationships(
     Ok(())
 }
 
+/// Aggregated import capacity guard shared with the PostgreSQL adapter: all
+/// active imported animals targeting one cage are counted together before any
+/// insert, so an overflow is reported once with the batch total. The import
+/// claim inserted earlier holds SQLite's writer lock for the whole check.
+async fn validate_import_cages_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    plan: &ImportPlan,
+) -> StoreResult<()> {
+    let mut additions = BTreeMap::<Uuid, i64>::new();
+    for animal in &plan.animals {
+        if animal.meta.deleted_at.is_none()
+            && let Some(cage_id) = animal.current_cage_id
+        {
+            *additions.entry(cage_id).or_default() += 1;
+        }
+    }
+    for (cage_id, additional_residents) in additions {
+        let cage_lab = required_lab_id(tx, "cages", cage_id, "cage").await?;
+        require_same_uuid(cage_lab, plan.lab_id, "animal cage")?;
+        let (display_id, capacity, resident_count): (String, i64, i64) = sqlx::query_as(
+            "SELECT c.display_id, c.capacity, (SELECT COUNT(*) FROM animals a WHERE a.current_cage_id = c.id AND a.deleted_at IS NULL) FROM cages c WHERE c.id = ? AND c.deleted_at IS NULL",
+        )
+        .bind(cage_id.to_string())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(map_sqlx)?;
+        if resident_count + additional_residents > capacity {
+            return Err(StoreError::Conflict(format!(
+                "target cage {display_id} capacity exceeded ({}/{capacity})",
+                resident_count + additional_residents
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn validate_experiment_relationships(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     experiment: &Experiment,
@@ -4326,6 +4362,7 @@ impl MuriArcStore for SqliteStore {
                 "import receipt identifier is already in use".to_owned(),
             ));
         }
+        validate_import_cages_tx(&mut tx, plan).await?;
         archive_import_source_tx(&mut tx, plan, &options, audit, committed_at).await?;
         let import_source = if audit.source == WriteSource::Migration {
             ProvenanceSource::Migration

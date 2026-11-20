@@ -4371,3 +4371,144 @@ async fn public_audit_routes_hide_ai_source_storage_identity_and_legacy_sensitiv
         }
     }
 }
+
+async fn upload_animal_import(fixture: &Fixture, idempotency_key: &str, csv: &str) -> Value {
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!(
+                    "/api/v1/data/imports?file_name=animals.csv&idempotency_key={idempotency_key}&import_kind=animal"
+                ))
+                .header(header::AUTHORIZATION, format!("Bearer {HUMAN_TOKEN}"))
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(csv.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["data"].clone()
+}
+
+async fn confirm_animal_import(fixture: &Fixture, preview: &Value) -> (StatusCode, Value) {
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(fixture.request(
+            Method::POST,
+            &format!(
+                "/api/v1/data/imports/{}/confirm",
+                preview["jobId"].as_str().unwrap()
+            ),
+            HUMAN_TOKEN,
+            json!({ "preview_hash": preview["previewHash"] }),
+        ))
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, response_json(response).await)
+}
+
+async fn create_capacity_cage(fixture: &Fixture, display_id: &str, capacity: i32) -> Cage {
+    let mut cage = Cage::new(fixture.lab_id, "Room A", display_id, chrono::Utc::now()).unwrap();
+    cage.set_capacity(capacity).unwrap();
+    fixture
+        .store
+        .create_cage(&cage, &AuditContext::system(WriteSource::Migration))
+        .await
+        .unwrap();
+    cage
+}
+
+async fn house_animal(fixture: &Fixture, display_id: &str, cage: &Cage) {
+    let mut animal =
+        Animal::new_mouse(fixture.lab_id, display_id, Sex::Female, chrono::Utc::now()).unwrap();
+    animal.current_cage_id = Some(cage.id);
+    fixture
+        .store
+        .create_animal(&animal, &AuditContext::system(WriteSource::Migration))
+        .await
+        .unwrap();
+}
+
+async fn cage_residents(fixture: &Fixture, cage: &Cage) -> Vec<String> {
+    fixture
+        .store
+        .list_animals(&muriarc_core::AnimalFilter {
+            lab_id: fixture.lab_id,
+            cage_id: Some(cage.id),
+            ..muriarc_core::AnimalFilter::default()
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|animal| animal.display_id)
+        .collect()
+}
+
+fn capacity_issue_rows(issues: &Value) -> Vec<u64> {
+    issues
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["code"] == "cage_capacity_exceeded")
+        .inspect(|issue| {
+            assert_eq!(issue["field"], "cage", "{issue}");
+            assert_eq!(issue["severity"], "error", "{issue}");
+        })
+        .map(|issue| issue["row"].as_u64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn animal_import_preview_blocks_rows_that_would_overfill_a_cage() {
+    let fixture = Fixture::new(None).await;
+    let cage = create_capacity_cage(&fixture, "CAP-01", 2).await;
+    house_animal(&fixture, "CAP-RESIDENT", &cage).await;
+
+    let preview = upload_animal_import(
+        &fixture,
+        "cage-capacity-preview",
+        "display_id,sex,cage\nCAP-NEW-1,female,CAP-01\nCAP-NEW-2,male,Room A/CAP-01\n",
+    )
+    .await;
+
+    assert_eq!(preview["canConfirm"], json!(false), "{preview}");
+    assert_eq!(capacity_issue_rows(&preview["issues"]), vec![2, 3]);
+    let (status, body) = confirm_animal_import(&fixture, &preview).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(cage_residents(&fixture, &cage).await, vec!["CAP-RESIDENT"]);
+}
+
+#[tokio::test]
+async fn animal_import_confirm_rechecks_cage_capacity_changed_after_preview() {
+    let fixture = Fixture::new(None).await;
+    let cage = create_capacity_cage(&fixture, "CAP-02", 2).await;
+
+    let preview = upload_animal_import(
+        &fixture,
+        "cage-capacity-confirm",
+        "display_id,sex,cage\nCAP-LATE-1,female,CAP-02\nCAP-LATE-2,male,CAP-02\n",
+    )
+    .await;
+    assert_eq!(preview["canConfirm"], json!(true), "{preview}");
+
+    // Another writer fills one slot between preview and confirmation.
+    house_animal(&fixture, "CAP-INTERLOPER", &cage).await;
+
+    let (status, body) = confirm_animal_import(&fixture, &preview).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        capacity_issue_rows(&body["error"]["details"]["issues"]),
+        vec![2, 3]
+    );
+    assert_eq!(
+        cage_residents(&fixture, &cage).await,
+        vec!["CAP-INTERLOPER"]
+    );
+}

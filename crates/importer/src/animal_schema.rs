@@ -156,7 +156,7 @@ pub fn animal_import_schema() -> AnimalImportSchema {
                 AnimalImportFieldType::Reference,
                 false,
                 &["display_id", "section/display_id"],
-                "编号唯一时可只写编号；有歧义时必须写 section/display_id。笼位必须已存在。",
+                "编号唯一时可只写编号；有歧义时必须写 section/display_id。笼位必须已存在；笼内现有动物数加本次导入到该笼的行数不得超过笼位容量。",
                 "A/A03",
             ),
             field(
